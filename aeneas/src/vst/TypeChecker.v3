@@ -1,0 +1,598 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Typechecks VST code, resolving all references and types
+class TypeChecker extends VstVisitor<Type, Type> {
+	def ERROR: ErrorGen;
+	def file: ParsedFile;
+	var methodEnv: MethodEnv;
+
+	def FLOW_THRU = 0;
+	def FLOW_END  = 1;
+	def FLOW_RET  = 2;
+	def FLOW_NONE = 3;
+
+	var flow: int;			// used to detect unreachable code
+	var loopStack: List<int>;	// stack of nested loops
+
+	var elimError: TypeVarEliminator;
+	var elimClose: TypeVarEliminator;
+	
+	new(ERROR, file) {
+		elimError = TypeVarEliminator.new(TypeParamInferError);
+		elimClose = TypeVarEliminator.new(null);
+	}
+	def enterMethod(m: MethodEnv) {
+		methodEnv = m;
+		loopStack = null;
+		flow = FLOW_THRU;
+	}
+	def mergeFlow(a: int, b: int) -> int {
+		if (a == FLOW_NONE) return b;
+		if (b == FLOW_NONE) return a;
+		if (a == FLOW_THRU || b == FLOW_THRU) return FLOW_THRU;
+		if (a == FLOW_END || b == FLOW_END) return FLOW_END;
+		return a;
+	}
+	def visitIf(stmt: IfStmt, outer: Type) -> Type {
+		typeCheckExpr(stmt.cond, Bool.TYPE, "if condition");
+		var tf = typeCheckStmt(stmt.tbranch);
+		flow = FLOW_THRU;
+		var ff = typeCheckStmt(stmt.fbranch);
+		flow = mergeFlow(tf, ff);
+		return Void.TYPE;
+	}
+	def visitBlock(stmt: BlockStmt, outer: Type) -> Type {
+		methodEnv.enterScope();
+		for (l = stmt.stmts.asList(); l != null; l = l.tail) typeCheckStmt(l.head);
+		methodEnv.exitScope();
+		return Void.TYPE;
+	}
+	def visitWhile(stmt: WhileStmt, outer: Type) -> Type {
+		stmt.loopNum = pushLoop();
+		typeCheckExpr(stmt.cond, Bool.TYPE, "while condition");
+		typeCheckStmt(stmt.body);
+		popLoop();
+		flow = FLOW_THRU;
+		return Void.TYPE;
+	}
+	def visitFor(stmt: ForStmt, outer: Type) -> Type {
+		methodEnv.enterScope();
+		checkVarDecl(stmt.varDecl);
+		stmt.loopNum = pushLoop();
+		typeCheckExpr(stmt.cond, Bool.TYPE, "for condition");
+		inferClosedType(stmt.update);
+		typeCheckStmt(stmt.body); // TODO: enforce no updates to loop var in body
+		popLoop();
+		flow = FLOW_THRU;
+		methodEnv.exitScope();
+		return Void.TYPE;
+	}
+	def visitForeach(stmt: ForeachStmt, outer: Type) -> Type {
+		methodEnv.enterScope();
+		var varDecl = stmt.varDecl;
+		if (varDecl.init != null) VarDeclError(stmt.varDecl, "foreach variable cannot have an initializer");
+		if (varDecl.tref != null) varDecl.vtype = methodEnv.resolveType(varDecl.tref);
+		methodEnv.bindVar(varDecl);
+		stmt.loopNum = pushLoop();
+		stmt.loopVar = VstSsaVar.new(); // synthesize new loop variable
+		setAssigned(stmt.loopVar);
+		// TODO: allow (int, int) and (byte, byte) ranges
+		var exprType = inferClosedType(stmt.expr);
+		if (V3.isArray(exprType)) {
+			var elemType = V3Array.elementType(exprType);
+			if (varDecl.tref == null) varDecl.vtype = elemType;
+			else if (!isAssignable(elemType, varDecl.vtype)) TypeError(stmt.expr.range(), varDecl.vtype, elemType, "foreach");
+		} else {
+			error(stmt.expr.range(), "TypeError", Strings.format1("foreach requires array expression and found %1", TYPE(exprType)));
+			if (varDecl.tref == null) varDecl.vtype = getErrorType();
+		}
+		typeCheckStmt(stmt.body); // TODO: enforce no updates to loop var in body
+		popLoop();
+		flow = FLOW_THRU;
+		methodEnv.exitScope();
+		return Void.TYPE;
+	}
+	def pushLoop() -> int {
+		var loopNum = methodEnv.mdecl.numLoops++;
+		loopStack = List.new(loopNum, loopStack);
+		return loopNum;
+	}
+	def popLoop() {
+		loopStack = loopStack.tail;
+	}
+	def visitLocal(stmt: LocalStmt, outer: Type) -> Type {
+		Lists.apply(stmt.vars.list, checkVarDecl);
+		return Void.TYPE;
+	}
+	def checkVarDecl(varDecl: VarDecl) {
+		if (varDecl.tref != null) {
+			varDecl.vtype = methodEnv.resolveType(varDecl.tref);
+			if (varDecl.init == null) {
+				// the variable has no initializer. make one.
+				var varexpr = VarExpr.new(null, varDecl.token, VstIdent<TypeRef>.new(varDecl.token, null));
+				varexpr.binding = ValueBinding.new(varDecl.token, Values.BOTTOM, varDecl.vtype);
+				varexpr.exactType = varDecl.vtype;
+				varDecl.init = varexpr;
+			} 
+			else typeCheckExpr(varDecl.init, varDecl.vtype, "var initialization");
+		} else {
+			if (varDecl.init == null) {
+				VarDeclError(varDecl, "must have a declared type or an initializer");
+				varDecl.vtype = getErrorType();
+			} else varDecl.vtype = inferClosedType(varDecl.init);
+		}
+		methodEnv.bindVar(varDecl);
+	}
+	def visitBreak(stmt: BreakStmt, outer: Type) -> Type {
+		if (loopStack == null) LoopError(stmt.range(), "break must be in loop");
+		flow = FLOW_END;
+		return Void.TYPE;
+	}
+	def visitContinue(stmt: ContinueStmt, outer: Type) -> Type {
+		if (loopStack == null) LoopError(stmt.range(), "continue must be in loop");
+		flow = FLOW_END;
+		return Void.TYPE;
+	}
+	def visitExpr(stmt: ExprStmt, outer: Type) -> Type {
+		var e = stmt.expr;
+		inferClosedType(e);
+		if (AppExpr.?(e)) return Void.TYPE;
+		if (AssignExpr.?(e)) return Void.TYPE;
+		if (AutoExpr.?(e)) return Void.TYPE;
+		StatementError(e.range());
+		return Void.TYPE;
+	}
+	def visitMatch(stmt: MatchStmt, outer: Type) -> Type {
+		var etype = inferClosedType(stmt.expr);
+		var bf = FLOW_NONE;
+		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
+			var c = cases.head;
+			c.vals = Lists.map2(c.values.list, checkCaseVal, etype);
+			flow = FLOW_THRU;
+			bf = mergeFlow(bf, typeCheckStmt(c.stmt));
+		}
+		if (stmt.defcase != null) {
+			flow = FLOW_THRU;
+			bf = flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
+		} else {
+			flow = FLOW_THRU;
+		}
+		return Void.TYPE;
+	}
+	def checkCaseVal(val: Expr, etype: Type) -> Val {
+		typeCheckExpr(val, etype, "match case");
+		if (VarExpr.?(val)) {
+			var ve = VarExpr.!(val), vtype = val.exactType, binding = ve.binding;
+			if (binding == null) return Values.BOTTOM;
+			if (ValueBinding.?(binding)) return convertValueBinding(val, ve, vtype, etype);
+			if (MemberBinding.?(ve.binding)) {
+				// check whether this is a constant field
+				var m = MemberBinding.!(ve.binding);
+				if (V3.isComponent(m.container) && VstFieldMember.?(m.member)) {
+					var f = VstFieldMember.!(m.member).vstField;
+					if (VarExpr.?(f.init) && f.isReadOnly) {
+						ve = VarExpr.!(f.init);
+						if (ve.binding == null) return Values.BOTTOM;
+						if (ValueBinding.?(ve.binding)) return convertValueBinding(val, ve, vtype, etype);
+					}
+				}
+			}
+		}
+		MatchError(val.range(), "match expression is not a value");
+		return Values.BOTTOM;
+	}
+	def convertValueBinding(loc: Expr, ve: VarExpr, vtype: Type, etype: Type) -> Val {
+		// convert a value binding to a value, which might require a promotion
+		var v = ValueBinding.!(ve.binding).val;
+		if (vtype != etype) {
+			if (v == null) return v;
+			if (Box<byte>.?(v) && etype == Int.TYPE) return Int.box(Byte.unbox(v));
+			else MatchError(loc.range(), "type mismatch in match value"); // shouldn't happen
+		}
+		return v;
+	}
+	def visitEmpty(stmt: EmptyStmt, outer: Type) -> Type {
+		return Void.TYPE;
+	}
+	def visitReturn(stmt: ReturnStmt, outer: Type) -> Type {
+		var returnType = methodEnv.resolveType(methodEnv.mdecl.rettype);
+		if (stmt.expr != null) typeCheckExpr(stmt.expr, returnType, "return statement");
+		else if (returnType != Void.TYPE) TypeError(stmt.src, returnType, Void.TYPE, "return statement");
+		flow = FLOW_RET;
+		return Void.TYPE;
+	}
+	def visitTuple(expr: TupleExpr, outer: Type) -> Type {
+		var etypes: List<Type>;
+		if (outer == null || !V3.isTuple(outer)) {
+			// infer the expressions' types if the outer is a not a tuple type
+			etypes = expr.exprs.mapList(inferClosedType);
+		} else {
+			// type check the expressions if the outer is a tuple type
+			etypes = Lists.reduce(expr.exprs.list, outer.nested, typeCheckTupleElem);
+		}
+		typeCheckExprs(expr, etypes, "tuple creation");
+		var ttype = Tuple.newType(etypes);
+		expr.tref = TypeUtil.typeRefOf(ttype);
+		expr.operator = V3Op.newTupleCreate(ttype);
+		return ttype;
+	}
+	def typeCheckTupleElem(e: Expr, t: Type) -> Type {
+		typeCheckExpr(e, t, "tuple creation");
+		if (e.implicitType != null) return e.implicitType;
+		return e.exactType;
+	}
+	def visitParamExpr(expr: ParamExpr, outer: Type) -> Type {
+		if (outer == null) TypeInferError(expr.range(), "cannot infer param expr type");
+		return expr.vtype = outer;
+	}
+	def visitAutoExpr(expr: AutoExpr, outer: Type) -> Type {
+		typeCheckExpr(expr.expr, Int.TYPE, "auto expression");
+		checkAssignable(expr.expr);
+		return Int.TYPE;
+	}
+	def visitArray(expr: ArrayExpr, outer: Type) -> Type {
+		var se = expr.exprs.list;
+		var etype = Void.TYPE;
+		if (outer != null && V3.isArray(outer)) {
+			etype = outer.nested.head; // element type is first type parameter to array type
+		} else {
+			if (se == null) {
+				TypeInferError(expr.range(), "cannot infer empty array type");
+			} else {
+				etype = inferClosedType(se.head);
+				for (rest = se.tail; rest != null; rest = rest.tail) {
+					etype = TypeSystem.widen(etype, inferClosedType(rest.head));
+					if (etype == null) {
+						TypeInferError(rest.head.range(), "cannot infer type of array");
+						return getErrorType();
+					}
+				}
+			}
+		}
+		Lists.apply3(expr.exprs.list, typeCheckExpr, etype, "array expression");
+		var atype = V3Array.newType(etype);
+		expr.tref = TypeUtil.typeRefOf(atype);
+		expr.operator = V3Op.newArrayInit(atype, expr.exprs.length()); // PERF: compute the length of the array
+		return atype;
+	}
+	def visitVar(expr: VarExpr, outer: Type) -> Type {
+		return unifyBinding(bind(expr, outer, false), outer);
+	}
+	def bind(expr: VarExpr, outer: Type, nested: bool) -> Binding {
+		var binding = lookupBinding(expr, outer, nested);
+		if (binding != null) {
+			expr.exactType = binding.boundType;
+			expr.binding = binding;
+		}
+		return binding;
+	}
+	def lookupBinding(expr: VarExpr, outer: Type, nested: bool) -> Binding {
+		var binding = expr.binding;
+		if (binding != null) return binding;
+		if (expr.expr == null) {
+			// "var" -- top level variable
+			binding = methodEnv.lookupVar(expr, nested);
+			if (binding == null) UnresolvedIdentifier(expr.ident.name);
+			return binding;
+		} else {
+			// "expr.var" -- a member expression
+			if (VarExpr.?(expr.expr)) {
+				// "var.var" -- a member of another var
+				binding = bind(VarExpr.!(expr.expr), null, true);
+				if (binding != null) {
+					var rtype = binding.boundType;
+					if (TypeBinding.?(binding)) {
+						binding = methodEnv.lookupTypeMember(expr, rtype);
+						if (binding == null) UnresolvedMember(expr.ident.name, true, rtype);
+					} else {
+						binding = methodEnv.lookupExprMember(expr, rtype, false);
+						if (binding == null) UnresolvedMember(expr.ident.name, false, rtype);
+					}
+				}
+			} else {
+				// "expr.var" -- a member of some other kind of expression
+				var rtype = inferClosedType(expr.expr);
+				binding = methodEnv.lookupExprMember(expr, rtype, false);
+				if (binding == null) UnresolvedMember(expr.ident.name, false, rtype);
+			}
+			return binding;
+		}
+	}
+	def unifyBinding(binding: Binding, outer: Type) -> Type {
+		if (binding != null) {
+			if (outer != null) TypeSystem.unifyWiden(binding.boundType, outer);
+			return binding.boundType;
+		}
+		if (outer == null) return getErrorType();
+		return outer;
+	}
+	def visitValueBinding(expr: VarExpr, ref: ValueBinding, outer: Type) -> Type {
+		return ref.boundType;
+	}
+	def visitString(expr: StringExpr, outer: Type) -> Type {
+		var vst = methodEnv.verifier.verifier.prog.vst;
+		expr.recordIndex = vst.numStrings++;
+		return V3.stringType;
+	}
+	def visitApp(expr: AppExpr, outer: Type) -> Type {
+		// infer an open type for the function or array
+		var exactType = inferType(expr.func);
+		if (V3.isArray(exactType)) {
+			return typeCheckArrayAccess(expr, exactType, outer);
+		} else if (V3.isFunction(exactType)) {
+			return typeCheckMethodApp(expr, exactType, outer);
+		}
+		TypeError(expr.func.range(), getErrorFunctionType(), exactType, "application");
+		return getErrorType();
+	}
+	def typeCheckArrayAccess(expr: AppExpr, arrayType: Type, outer: Type) -> Type {
+		arrayType = elim(arrayType);
+		typeCheckExprs(expr.args, V3.INTPARAM, "array index");
+		expr.func.exactType = arrayType;
+		return V3Array.elementType(arrayType);
+	}
+	def typeCheckMethodApp(expr: AppExpr, funcType: Type, outer: Type) -> Type {
+		// 1. get the parameter and return types of the function
+		var returnType = Function.getReturnType(funcType);
+		var paramType = Function.getParamType(funcType);
+
+		// 2. unify return type with the outer type if necessary
+		if (outer != null) TypeSystem.unifyWiden(returnType, outer);
+
+		// 3. unify the parameter and argument types
+		var args = expr.args.exprs.asArray();
+		if (args.length == 1) {
+			// only one argument passed, unify with (tuple) param type
+			TypeSystem.unifyWiden(paramType, inferClosedType(args(0)));
+		} else {
+			// zero or more than one argument passed
+			var paramTypes = Lists.toArray(Function.getParamTypeList(funcType));
+			for (i = 0; i < args.length; i++) {
+				var argType = inferClosedType(args(i));
+				if (i < paramTypes.length) TypeSystem.unifyWiden(paramTypes(i), argType);
+			}		
+		}
+
+		// 4. eliminate type variables in the return type and parameter types
+		returnType = elim(returnType);
+		paramType = elim(paramType);
+
+		// 5. check that each argument is assignable to the solved type
+		if (args.length == 1) {
+			typeCheckExpr(args(0), paramType, "function application");
+		} else {
+			var paramTypeList = Tuple.toTypeList(paramType);
+			typeCheckExprs(expr.args, paramTypeList, "function application");
+		}
+
+		// 6. set the exact type of the function		
+		expr.func.exactType = Function.newType(paramType, returnType);
+		return returnType;
+	}
+	def visitNot(expr: NotExpr, outer: Type) -> Type {
+		typeCheckExpr(expr.expr, Bool.TYPE, "boolean not operator");
+		return Bool.TYPE;
+	}
+	def visitAssign(expr: AssignExpr, outer: Type) -> Type {
+		var left = expr.target;
+		var rtype = inferClosedType(left);
+		checkAssignable(left);
+		typeCheckExpr(expr.expr, rtype, "assignment");
+		return rtype;
+	}
+	def checkAssignable(left: Expr) {
+		if (VarExpr.?(left)) {
+			var binding = (VarExpr.!(left)).binding;
+			if (binding != null) {
+				if (!binding.isAssignable()) AssignError(left.range());
+				if (LocalBinding.?(binding)) setAssigned(LocalBinding.!(binding).decl.ssa);
+			}
+		} else if (AppExpr.?(left)) {
+			if (!V3.isArray(AppExpr.!(left).func.exactType)) AssignError(left.range());
+		} else {
+			AssignError(left.range());
+		}
+	}
+	def setAssigned(ssa: VstSsaVar) {
+		// update info for an assigned var variable
+		if (ssa.index < 0) {
+			ssa.index = methodEnv.mdecl.numNonSsa;
+			methodEnv.mdecl.numNonSsa = ssa.index + 1;
+		}
+		for (l = loopStack; l != null; l = l.tail) {
+			ssa.setWrittenInLoop(l.head);
+		}
+	}
+	def visitBinOp(expr: BinOpExpr, outer: Type) -> Type {
+		if (expr.binop == null) {
+			UnresolvedBinOp(expr.op);
+			return getErrorType();
+		}
+		var opcode = expr.binop.opcode;
+		if (opcode == V3Opcode.Equal || opcode == V3Opcode.NotEqual) {
+			var what = "comparison";
+			var ltype = inferClosedType(expr.left);
+			var rtype = inferClosedType(expr.right);
+			var wtype = TypeSystem.widen(ltype, rtype);
+			if (wtype != null) {
+				typeCheckExpr(expr.left, wtype, what);
+				typeCheckExpr(expr.right, wtype, what);
+			} else if (TypeSystem.maybeEqual(ltype, rtype)) {
+				wtype = ltype;
+			} else {
+				TypeError(expr.range(), ltype, rtype, what);
+			}
+			if (wtype == null) wtype = ltype;
+			if (opcode == V3Opcode.Equal) expr.binop = V3Op.newEqual(wtype);
+			else expr.binop = V3Op.newNotEqual(wtype);
+			return Bool.TYPE;
+		} else {
+			var leftType = expr.binop.paramTypes(0);
+			var rightType = expr.binop.paramTypes(1);
+			typeCheckExpr(expr.left, leftType, expr.op.image);
+			typeCheckExpr(expr.right, rightType, expr.op.image);
+			return expr.binop.resultType;
+		}
+	}
+	def visitIfExpr(expr: IfExpr, outer: Type) -> Type {
+		var args = expr.exprs.asArray(), what = "if expression", len = args.length;
+		// 2 or 3 expressions required
+		if (len < 2 || len > 3) {
+			ArityMismatch(expr.range(), what, 3, len);
+			return getErrorType();
+		}
+		typeCheckExpr(args(0), Bool.TYPE, what);
+		var a = args(1), atype = outer;
+		if (outer != null) typeCheckExpr(a, outer, what);
+		else atype = inferClosedType(a);
+
+		// 1 alternative => Value.BOTTOM for false
+		if (len == 2) return atype;
+
+		// 2 alternatives => unify types if necessary
+		var b = args(2);
+		if (outer != null) {
+			typeCheckExpr(b, outer, what);
+			return outer;
+		}
+
+		// typecheck and unify
+		var btype = inferClosedType(b);
+		var wtype = TypeSystem.widen(atype, btype);
+		if (wtype != null) {
+			if (a.exactType != wtype) a.implicitType = wtype;
+			if (b.exactType != wtype) b.implicitType = wtype;
+			return wtype;
+		} else {
+			TypeError(expr.range(), atype, btype, what);
+			return atype;
+		}
+	}
+	def typeCheckExpr(expr: Expr, outerType: Type, op: string) {
+		var exactType = expr.exactType;
+		if (exactType == null) {
+			exactType = expr.accept(this, outerType);
+			exactType = elim(exactType);
+			expr.exactType = exactType;
+		}
+		if (exactType != outerType && outerType != null) {
+			if (TypeSystem.isImplicitlyConvertible(exactType, outerType)) expr.implicitType = outerType;
+			else TypeError(expr.range(), outerType, exactType, op);
+		}
+	}
+	def typeCheckExprs(args: TupleExpr, types: List<Type>, op: string) {
+		var tl = types;
+		for (el = args.exprs.list; el != null; el = el.tail) {
+			if (tl == null) {
+				ArityMismatch(el.head.range(), op, Lists.length(types), args.exprs.length());
+				break;
+			} else {
+				typeCheckExpr(el.head, tl.head, op);
+				tl = tl.tail;
+			}
+		}
+		// TODO: use a point that refers to the ')'
+		if (tl != null) ArityMismatch(args.exprs.range(), op, Lists.length(types), args.exprs.length());
+	}
+	def inferClosedType(expr: Expr) -> Type {
+		return inferClosedTypeWithOuter(expr, null);
+	}
+	def inferClosedTypeWithOuter(expr: Expr, outer: Type) -> Type {
+		var exactType = expr.accept(this, outer);
+		return expr.exactType = elim(exactType);
+	}
+	def inferType(expr: Expr) -> Type {
+		return expr.accept(this, null);
+	}
+	def inferTypeWithOuter(expr: Expr, outerType: Type) -> Type {
+		return expr.accept(this, outerType);
+	}
+	def typeCheckStmt(stmt: Stmt) -> int {
+		if (stmt != null) {
+			if (flow == FLOW_THRU) stmt.accept(this, Void.TYPE);
+			else UnreachableCode(stmt.range());
+		}
+		return flow;
+	}
+	def typeCheckBody(stmt: Stmt) {
+		if (typeCheckStmt(stmt) != FLOW_RET) {
+			if (methodEnv.resolveType(methodEnv.mdecl.rettype) != Void.TYPE) MissingReturn(stmt.range());
+		}
+	}
+	def close(vtype: Type) -> Type {
+		if (vtype == null) return null;
+		return vtype.substitute(elimClose);
+	}
+	def elim(vtype: Type) -> Type {
+		if (vtype == null) return null;
+		return vtype.substitute(elimError);
+	}
+	def isAssignable(src: Type, dest: Type) -> bool {
+		return src == dest || TypeSystem.isImplicitlyConvertible(src, dest);
+	}
+	// -- Utility methods to generate errors ----------------------------------
+	def TypeError(range: FileRange, t1: Type, t2: Type, op: string) {
+		if (ERROR.numErrors == 0 || (t1 != ERROR.errorType && t2 != ERROR.errorType)) {
+			error(range, "TypeError", Strings.format3("%1 requires %2 expression and found %3", op, TYPE(t1), TYPE(t2)));
+		}
+	}
+	def TypeParamInferError(tvar: TypeVar) {
+		if (tvar.error) return; // prevent multiple errors for same type var
+		tvar.error = true;
+		var msg = Strings.format2("cannot infer type parameter %1 of \"%2\"", tvar.typeParam.token.image, tvar.token.image);
+		error(tvar.token.range().end().rangeOf(0), "TypeParamInferError", msg);
+	}
+	def TypeInferError(range: FileRange, reason: string) {
+		error(range, "TypeInferError", reason);
+	}
+	def VarDeclError(vdecl: VarDecl, msg: string) {
+		error(vdecl.token.range(), "VarDeclError", msg);
+	}
+	def UnresolvedIdentifier(token: Token) {
+		error(token.range(), "UnresolvedIdentifier", Strings.format1("identifier \"%1\" cannot be resolved", token.image));
+	}
+	def UnresolvedBinOp(token: Token) {
+		error(token.range(), "UnresolvedBinOp", Strings.format1("binary operator \"%1\" cannot be resolved", token.image));
+	}
+	def UnresolvedMember(token: Token, inType: bool, tref: Type) {
+		var msg = "member \"%1\" cannot be resolved in expression of type %2";
+		if (inType) msg = "member \"%1\" cannot be resolved in type %2";
+		error(token.range(), "UnresolvedMember", Strings.format2(msg, token.image, TYPE(tref)));
+	}
+	def StatementError(range: FileRange) {
+		error(range, "StatementError", "expression is not a statement");
+	}
+	def UnreachableCode(point: FilePoint) {
+		error(point.rangeOf(0), "UnreachableCode", "unreachable code");
+	}
+	def MissingReturn(point: FilePoint) {
+		error(point.rangeOf(0), "MissingReturn", "method with non-void return type does not end in a return statement");
+	}
+	def AssignError(range: FileRange) {
+		error(range, "AssignError", "expression is not assignable");
+	}
+	def MatchError(point: FilePoint, msg: string) {
+		error(point.rangeOf(0), "MatchError", msg);
+	}
+	def LoopError(point: FilePoint, msg: string) {
+		error(point.rangeOf(0), "LoopError", msg);
+	}
+	def ArityMismatch(range: FileRange, op: string, expect: int, found: int) {
+		if (expect == 1) error(range, "TypeError", Strings.format2("%1 requires 1 argument and found %2", op, found));
+		else error(range, "TypeError", Strings.format3("%1 requires %2 arguments and found %3", op, expect, found));
+	}
+	def getErrorType() -> Type {
+		return ERROR.getErrorType();
+	}
+	def getErrorFunctionType() -> Type {
+		return Single_TypeCon.new("function", V3Kind.DELEGATE).singleType;
+	}
+	def error(range: FileRange, error: string, msg: string) {
+		ERROR.addError(range, range.extractLine(file.input, file.lineEnds), error, msg);
+	}
+	def TYPE(tref: Type) -> string {
+		if (tref == null) return "<unknown>";
+		return tref.render(StringBuffer.new()).toString();
+	}
+}

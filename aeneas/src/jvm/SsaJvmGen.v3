@@ -1,0 +1,661 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class JvmSsaCodeGen {
+	def builder: JvmClassfileBuilder;
+	def methodRef: IrSpec;
+	def region: SsaRegion;
+	def jmeth: JvmMethod;
+	def jsig: JvmSig;
+
+	var jprog: JvmProgram;
+	var code: JvmCodeBuilder;
+
+	new(builder, methodRef, region, jmeth, jsig, unusedThis: bool) {
+		jprog = builder.jprog;
+		code = builder.newCodeBuilder();
+		if (unusedThis) code.max_locals = 1;
+	}
+	def build() {
+		SsaJvmGen.new(jprog, region, methodRef, jsig, code).emit();
+		code.attach(jmeth);
+	}
+}
+// information about a basic block when generating JVM code
+class SsaJvmBlock {
+	def block: SsaBlock;
+	var codeStart: int = -1;
+	var refs: List<int>;
+	new(block) { }
+}
+// information about an instruction when generating JVM code
+class SsaJvmInstr {
+	var instr: SsaInstr;		// the ssa instruction
+	var kind: JvmKind;		// JVM kind of the result
+	var loads: List<SsaInstr>;	// loads inserted after instruction
+	var used: bool;
+	var store: bool;
+}
+// Emits JVM code for a method in SSA form.
+class SsaJvmGen {
+	def jprog: JvmProgram;
+	def region: SsaRegion;
+	def methodRef: IrSpec;
+	def jsig: JvmSig;
+	def code: JvmCodeBuilder;
+	def blockMap = LazyMap.new(SsaBlock.uid, SsaBlock.==, SsaJvmBlock.new);
+	var ssaDecon: SsaDeconstructor;
+
+	var instrs: Array<SsaJvmInstr>;	// per-instruction info
+	var stack: Array<SsaJvmInstr>;	// abstract stack contents
+	var last: Array<SsaJvmInstr>;	// last instruction at each stack height
+	var first = SsaJvmInstr.new();	// fake "first" instruction in a basic block
+	var curHeight: int;		// current stack height
+
+	// block queue
+	var blocks: List<SsaJvmBlock>;
+
+	var tableSwList: List<(int, SsaJvmBlock, Array<SsaJvmBlock>)>;
+	var lookupSwList: List<(int, SsaJvmBlock, Array<(int, SsaJvmBlock)>)>;
+
+	new(jprog, region, methodRef, jsig, code) {
+		ssaDecon = SsaDeconstructor.new(region, allocReg, emitMoveIR, emitMoveRR);
+	}
+	// emit code for all blocks
+	def emit() {
+		mapParams();
+		initState(region.startBlock.instrs.length + 1);
+		blocks = List.new(blockMap.get(region.startBlock), null);
+		// emit code for each block as it is queued
+		while (blocks != null) {
+			var b = blocks.head;
+			blocks = blocks.tail;
+			if (b.codeStart == -1) emitBlock(b);
+		}
+		// patch any tableswitches
+		for (l = tableSwList; l != null; l = l.tail) {
+			var s = l.head;
+			var offsets = Arrays.map(s.2, SsaJvmBlock.codeStart);
+			code.patch_tableswitch(s.0, s.1.codeStart, offsets);
+		}
+		// patch any lookupswitches
+		for (l = lookupSwList; l != null; l = l.tail) {
+			var s = l.head, pa = s.2;
+			var pairs = Array<(int, int)>.new(pa.length);
+			for (i = 0; i < pairs.length; i++) {
+				var p = pa(i);
+				pairs(i) = (p.0, p.1.codeStart);
+			}
+			code.patch_lookupswitch(s.0, s.1.codeStart, pairs);
+		}
+		ssaDecon.clear();
+	}
+	def initState(size: int) {
+		// allocate initial arrays
+		stack = Array.new(size);
+		last = Array.new(size);
+		instrs = Array.new(size);
+		for (i = 0; i < size; i++) instrs(i) = SsaJvmInstr.new();
+	}
+	// map parameters to java locals
+	def mapParams() {
+		var index = code.max_locals;
+		for (p in region.params) {
+			ssaDecon.set(p, index);
+			index = index + jprog.jvmKind(p.vtype).width;
+		}
+		code.max_locals = index;
+	}
+	// emit code for a single basic block
+	def emitBlock(b: SsaJvmBlock) {
+		// mark beginning of block and patch branches to it
+		b.codeStart = code.cur_pos;
+		for (r = b.refs; r != null; r = r.tail) code.patchBranch(r.head);
+
+		var block = b.block, ins = block.instrs, max = ins.length;
+		// initialize abstract stack and instructions
+		if (max >= instrs.length) grow(max + 1);
+		curHeight = 0;		// clear stack
+		first.loads = null;	// clear loads
+		last(0) = first;
+
+		// check for switch instruction combine first
+		if (SsaSwitch.?(block.end) && max > 0) {
+			// XXX: extract this into a method
+			var key = block.end.inputs(0).dest;
+			if (key == ins.get(max - 1) && key.useList.next == null && SsaApplyOp.?(key)) {
+				var args = key.inputs, k = SsaApplyOp.!(key);
+				match (k.op.opcode) {
+					V3Opcode.Equal:	{
+						var t = k.op.typeArgs(0);
+						match (t.typeCon.kind) {
+							V3Kind.BOOL, V3Kind.INT, V3Kind.BYTE:
+								return emitCombined(block, args, JvmBytecode.IF_ICMPEQ, JvmBytecode.IF_ICMPNE);
+							V3Kind.CLASS, V3Kind.ARRAY:
+								return emitCombined(block, args, JvmBytecode.IF_ACMPEQ, JvmBytecode.IF_ACMPNE);
+						}
+					}
+					V3Opcode.NotEqual: {
+						var t = k.op.typeArgs(0);
+						match (t.typeCon.kind) {
+							V3Kind.BOOL, V3Kind.INT, V3Kind.BYTE:
+								return emitCombined(block, args, JvmBytecode.IF_ICMPNE, JvmBytecode.IF_ICMPEQ);
+							V3Kind.CLASS, V3Kind.ARRAY:
+								return emitCombined(block, args, JvmBytecode.IF_ACMPNE, JvmBytecode.IF_ACMPEQ);
+						}
+					}
+					V3Opcode.ByteLt,	// fall through
+					V3Opcode.IntLt:		return emitCombined(block, args, JvmBytecode.IF_ICMPLT, JvmBytecode.IF_ICMPGE);
+					V3Opcode.ByteGt,	// fall through
+					V3Opcode.IntGt:		return emitCombined(block, args, JvmBytecode.IF_ICMPGT, JvmBytecode.IF_ICMPLE);
+					V3Opcode.ByteLteq,	// fall through
+					V3Opcode.IntLteq:	return emitCombined(block, args, JvmBytecode.IF_ICMPLE, JvmBytecode.IF_ICMPGT);
+					V3Opcode.ByteGteq,	// fall through
+					V3Opcode.IntGteq:	return emitCombined(block, args, JvmBytecode.IF_ICMPGE, JvmBytecode.IF_ICMPLT);
+				}
+			}
+		}
+
+		// compute the effects on the stack of each instruction
+		for (j = 0; j < max; j++) computeInstrEffect(block, j, ins.get(j));
+		computeInstrEffect(block, max, block.end);
+
+		// use previous results to emit code that uses the Java operand stack well
+		if (first.loads != null) emitLoads(first.loads);
+		for (j = 0; j < max; j++) emitCode(block, instrs(j));
+		ssaDecon.genSsaMoves(block);
+		emitEnd(block, instrs(max));
+		checkStackHeight(block);
+	}
+	def emitCombined(block: SsaBlock, args: Array<SsaDfEdge>, opTrue: byte, opFalse: byte) {
+		var ins = block.instrs, max = ins.length - 1; // skip last instr
+		// compute the effects on the stack of each instruction
+		for (j = 0; j < max; j++) computeInstrEffect(block, j, ins.get(j));
+		computeArgLoads(args);
+
+		// use previous results to emit code that uses the Java operand stack well
+		if (first.loads != null) emitLoads(first.loads);
+		for (j = 0; j < max; j++) emitCode(block, instrs(j));
+		ssaDecon.genSsaMoves(block);
+
+		// emit the combined branch
+		var b0 = block.succ(0).dest, b1 = block.succ(1).dest;
+		if (Bool.unbox(SsaSwitch.!(block.end).vals(0))) emitBranchIf(opTrue, opFalse, b0, b1);
+		else emitBranchIf(opTrue, opFalse, b1, b0);
+		checkStackHeight(block);
+	}
+	def checkStackHeight(block: SsaBlock) {
+		if (code.cur_stack != 0) {
+			var msg = Strings.format1("B#%1: stack height should be zero", block.uid);
+			jprog.compiler.ERROR.fail(msg);
+		}
+	}
+	def grow(size: int) {
+		var old = instrs.length;
+		var nsize = old + size;
+		var n = Arrays.copy(instrs, Array<SsaJvmInstr>.new(nsize));
+		for (i = old; i < nsize; i++) n(i) = SsaJvmInstr.new();
+		instrs = n;
+		// each instruction can push at most 1 element on the stack
+		stack = Array.new(nsize);
+		last = Array.new(nsize);
+	}
+	// first pass: compute effect information
+	def computeInstrEffect(block: SsaBlock, index: int, i: SsaInstr) {
+		// make the instruction
+		var sji = instrs(index);
+		sji.store = false;
+		sji.used = false;
+		sji.instr = i;
+		sji.loads = null;
+		sji.kind = jprog.jvmKind(i.getType());
+		// compute where argument loads should occur
+		computeArgLoads(i.inputs);
+		if (i.useList != null) {
+			sji.store = true;     // might need to store it
+			if (sji.kind.width > 0) push(sji); // put it on the stack for possible later use
+		}
+		last(curHeight) = sji;
+	}
+	def computeArgLoads(args: Array<SsaDfEdge>) {
+		var loads: List<SsaInstr>, s = 0, nextHeight = curHeight;
+		for (j = 0; j < args.length; j++) {
+			var a = args(j), i = a.dest;
+			if (SsaValue.?(i) || SsaParam.?(i) || SsaPhi.?(i)) {
+				// instruction won't be on stack, needs to be loaded
+				loads = List.new(i, loads);
+				continue;
+			}
+			var found = false;
+			// not a loadable, search stack for this instruction
+			while (s < curHeight) {
+				var x = stack(s);
+				if (x.instr == i) {
+					if (loads != null) insertLoadsAfter(last(s), loads);
+					if (nextHeight == curHeight) nextHeight = s;
+					loads = null;
+					markAsConsumed(x, a);
+					found = true;
+					s++;
+					break;
+				}
+				s++;
+			}
+			if (!found) {
+				// not found on the stack, load everything
+				while (j < args.length) {
+					loads = List.new(args(j++).dest, loads);
+				}
+				break;
+			}
+		}
+		if (loads != null) insertLoadsAfter(last(curHeight), loads);
+		curHeight = nextHeight;
+	}
+	def insertLoadsAfter(sji: SsaJvmInstr, loads: List<SsaInstr>) {
+		while (loads != null) {
+			sji.loads = List.new(loads.head, sji.loads);
+			loads = loads.tail;
+		}
+	}
+	def markAsConsumed(sji: SsaJvmInstr, edge: SsaDfEdge) {
+		// mark the instruction that produced the value at the stack location as used
+		sji.used = true;
+		if (edge == sji.instr.useList && edge.next == null) {
+			// this is the only use of this instruction, clear STORE
+			sji.store = false;
+		}
+	}
+	def push(sji: SsaJvmInstr) {
+		stack(curHeight++) = sji;
+	}
+	// emit actual JVM code for a single instruction
+	def emitCode(block: SsaBlock, sji: SsaJvmInstr) {
+		// emit loads before this instruction
+		var popped = false, i = sji.instr;
+		if (SsaApplyOp.?(i)) {
+			// emit an apply instruction (TODO: source info)
+			var apply = SsaApplyOp.!(i);
+			popped = emitApply(apply, apply.op, bool.||(sji.store, sji.used));
+		} 
+		if (sji.store) {
+			// store this into a temp
+			if (sji.used) code.dup();
+			code.store(sji.kind, ssaDecon.mapReg(i));
+		} else if (!popped && !sji.used && sji.kind.width > 0) {
+			// pop this value off the stack
+			code.pop();
+		}
+		emitLoads(sji.loads);
+	}
+	def emitEnd(block: SsaBlock, sji: SsaJvmInstr) {
+		var i = sji.instr;
+		emitLoads(sji.loads);
+		if (SsaThrow.?(i)) emitThrow(SsaThrow.!(i).exception);
+		else if (SsaReturn.?(i)) {
+			// JVM cannot return multiple values, box them in a tuple
+			if (i.inputs.length > 1) jprog.jrep.emitTupleCreate(methodRef.getReturnType(), code);
+			code.ret(jsig.returnType.kind);
+		}
+		else if (SsaSwitch.?(i)) emitSwitch(block, SsaSwitch.!(i));
+		else if (SsaGoto.?(i)) emitGotoOrFallThru(block.succ(0).dest);
+		else jprog.compiler.ERROR.fail("unexpected SSA end type");
+	}
+	def emitSwitch(block: SsaBlock, i: SsaSwitch) {
+		var t = i.vtype, len = i.vals.length;
+		if (len == 0) {
+			code.pop();
+			return emitGotoOrFallThru(block.succ(0).dest);
+		}
+		if (len == 1) return emitTwoWay(block, i, t, i.vals(0));
+		if (len == 2 || (t != Int.TYPE && t != Byte.TYPE)) return emitIfSeq(block, i, t);
+		// compute how big the table would have to be for a tableswitch
+		var min = Int.MAX_VALUE, max = Int.MIN_VALUE;
+		for (v in i.vals) {
+			var val = V3.unboxIntegral(v);
+			if (val < min) min = val;
+			if (val > max) max = val;
+		}
+		var size = max - min + 1;
+		// if table size is small or at least half full, emit table switch
+		if (size < 11 || ((1 + len * 2) / size) >= 1) emitTableSwitch(block, i, min, max);
+		else emitLookupSwitch(block, i, len);
+		for (s in block.succ) { // enqueue successors
+			var bi = blockMap.get(s.dest);
+			if (bi.codeStart < 0) blocks = List.new(bi, blocks);
+		}
+	}
+	def emitTableSwitch(block: SsaBlock, i: SsaSwitch, min: int, max: int) {
+		var size = max - min + 1, vals = i.vals;
+		var infos = Array<SsaJvmBlock>.new(size);
+		for (j = vals.length - 1; j >= 0; j--) {
+			var val = V3.unboxIntegral(vals(j));
+			infos(val - min) = blockMap.get(block.succ(j).dest);
+		}
+		var di = blockMap.get(block.succ(vals.length).dest);
+		for (j = 0; j < size; j++) {
+			if (infos(j) == null) infos(j) = di;
+		}
+		var pos = code.tableswitch(min, max);
+		tableSwList = List.new((pos, di, infos), tableSwList);
+	}
+	def emitLookupSwitch(block: SsaBlock, i: SsaSwitch, len: int) {
+		var pairs = Array<(int, SsaJvmBlock)>.new(len), vals = i.vals;
+		for (j = 0; j < vals.length; j++) {
+			var val = V3.unboxIntegral(vals(j));
+			pairs(j) = (val, blockMap.get(block.succ(j).dest));
+		}
+		var di = blockMap.get(block.succ(vals.length).dest);
+		pairs = Arrays.sort(pairs, 0, pairs.length, comparePair);		
+		var pos = code.lookupswitch(len);
+		lookupSwList = List.new((pos, di, pairs), lookupSwList);
+	}
+	def comparePair(a: (int, SsaJvmBlock), b: (int, SsaJvmBlock)) -> bool {
+		return a.0 < b.0;
+	}
+	def emitTwoWay(block: SsaBlock, i: SsaSwitch, t: Type, v: Val) {
+		var b0 = block.succ(0).dest, b1 = block.succ(1).dest;
+		var opTrue: byte, opFalse: byte;
+		if (t == Bool.TYPE) {
+			if (Bool.unbox(v)) return emitBranchIfNonZero(b0, b1);
+			else return emitBranchIfNonZero(b1, b0);
+		} else if (t == Int.TYPE) {
+			if (Int.unbox(v) == 0) return emitBranchIfNonZero(b1, b0);
+			opTrue = JvmBytecode.IF_ICMPEQ;
+			opFalse = JvmBytecode.IF_ICMPNE;
+		} else if (t == Byte.TYPE) {
+			if (Byte.unbox(v) == 0) return emitBranchIfNonZero(b1, b0);
+			opTrue = JvmBytecode.IF_ICMPEQ;
+			opFalse = JvmBytecode.IF_ICMPNE;
+		} else if (V3.isClass(t) || V3.isArray(t)) {
+			if (v == null) return emitBranchIf(JvmBytecode.IFNULL, JvmBytecode.IFNONNULL, b0, b1);
+			opTrue = JvmBytecode.IF_ACMPEQ;
+			opFalse = JvmBytecode.IF_ACMPNE;
+		} else if (V3.isFunction(t)) {
+			if (v == null) return emitBranchIf(JvmBytecode.IFNULL, JvmBytecode.IFNONNULL, b0, b1);
+			code.builder.emitValue(code, t, v);
+			code.invokestatic(JvmTypes.systemClassName, "equals", JvmTypes.SIG_EQUALS);
+			return emitBranchIfNonZero(b0, b1);
+		}
+		code.builder.emitValue(code, t, v);
+		emitBranchIf(opTrue, opFalse, b0, b1);
+	}
+	def emitIfSeq(block: SsaBlock, i: SsaSwitch, t: Type) {
+		var kind = jprog.jvmKind(t), tmp = allocReg(null, t);
+		code.store(kind, tmp);
+		var opcode = JvmBytecode.IF_ICMPEQ;
+		if (V3.isClass(t) || V3.isArray(t)) {
+			opcode = JvmBytecode.IF_ACMPEQ;
+		}
+		var max = i.vals.length;
+		for (j = 0; j < max; j++) {
+			code.load(kind, tmp);
+			code.builder.emitValue(code, t, i.vals(j));
+			emitBranch(opcode, blockMap.get(block.succ(j).dest));
+		}
+		// fall through to default successor
+		emitGotoOrFallThru(block.succ(max).dest);
+	}
+	def emitBranchIfNonZero(tb: SsaBlock, fb: SsaBlock) {
+		emitBranchIf(JvmBytecode.IFNE, JvmBytecode.IFEQ, tb, fb);
+	}
+	def emitBranchIf(opTrue: byte, opFalse: byte, tb: SsaBlock, fb: SsaBlock) {
+		var ti = blockMap.get(tb), fi = blockMap.get(fb);
+		if (fi.codeStart < 0) {
+			emitBranch(opTrue, ti);
+			blocks = List.new(fi, blocks);
+			return;
+		}
+		if (ti.codeStart < 0) {
+			emitBranch(opFalse, fi);
+			blocks = List.new(ti, blocks);
+			return;
+		}
+		emitBranch(opTrue, ti);
+		emitBranch(JvmBytecode.GOTO, fi);
+	}
+	def emitBranch(opcode: byte, bi: SsaJvmBlock) {
+		if (bi.codeStart >= 0) return code.branch_bw(opcode, bi.codeStart);
+		bi.refs = List.new(code.branch_fw(opcode), bi.refs);
+		blocks = List.new(bi, blocks); // enqueue block
+	}
+	def emitGotoOrFallThru(block: SsaBlock) {
+		var di = blockMap.get(block);
+		if (di.codeStart >= 0) code.goto_bw(di.codeStart); // already visited
+		else blocks = List.new(di, blocks); // visit it next (fall through)
+	}
+	def emitLoads(loads: List<SsaInstr>) {
+		for (l = loads; l != null; l = l.tail) emitLoad(l.head);
+	}
+	def emitMoveRR(t: Type, from: int, to: int) {
+		var kind = jprog.jvmKind(t);
+		code.load(kind, from);
+		code.store(kind, to);
+	}
+	def emitMoveIR(t: Type, from: SsaInstr, to: int) {
+		emitLoad(from);
+		code.store(jprog.jvmKind(t), to);
+	}
+	def emitLoad(i: SsaInstr) {
+		if (SsaValue.?(i)) code.builder.emitValue(code, i.getType(), SsaValue.!(i).val);
+		else code.load(jprog.jvmKind(i.getType()), ssaDecon.mapReg(i));
+	}
+	// emit a single apply instruction
+	def emitApply(i: SsaApplyOp, op: Operator, leave: bool) -> bool {
+		var popped = false;
+		// arguments are already assumed to be on the stack
+		match (op.opcode) {
+			V3Opcode.Equal:			code.builder.emitCompare(code, true, op.typeArgs(0));
+			V3Opcode.NotEqual:		code.builder.emitCompare(code, false, op.typeArgs(0));
+			V3Opcode.IntAdd:		code.binop(JvmBytecode.IADD);
+			V3Opcode.IntSub:		code.binop(JvmBytecode.ISUB);
+			V3Opcode.IntMul:		code.binop(JvmBytecode.IMUL);
+			V3Opcode.IntDiv:		code.binop(JvmBytecode.IDIV);
+			V3Opcode.IntMod:		code.binop(JvmBytecode.IREM);
+			V3Opcode.IntAnd:		code.binop(JvmBytecode.IAND);
+			V3Opcode.IntOr:			code.binop(JvmBytecode.IOR);
+			V3Opcode.IntXor:		code.binop(JvmBytecode.IXOR);
+			V3Opcode.IntShl: {
+				if (i.checkFact(SsaFacts.O_NO_SHIFT_CHECK)) code.binop(JvmBytecode.ISHL);
+				else jprog.invokesystem(code, "shl", JvmTypes.SIG_INT_INT_INT);
+			}
+			V3Opcode.IntShr: {
+				if (i.checkFact(SsaFacts.O_NO_SHIFT_CHECK)) code.binop(JvmBytecode.IUSHR);
+				else jprog.invokesystem(code, "shr", JvmTypes.SIG_INT_INT_INT);
+			}
+			V3Opcode.IntLt:			emitCompare(JvmBytecode.IF_ICMPLT);
+			V3Opcode.IntGt:			emitCompare(JvmBytecode.IF_ICMPGT);
+			V3Opcode.IntLteq:		emitCompare(JvmBytecode.IF_ICMPLE);
+			V3Opcode.IntGteq:		emitCompare(JvmBytecode.IF_ICMPGE);
+			V3Opcode.IntToByte: {
+				code.iconst(255); // mask off high order bits
+				code.binop(JvmBytecode.IAND);
+			}
+			V3Opcode.ByteToInt:		; // no-op
+			V3Opcode.BoolAnd:		code.binop(JvmBytecode.IAND);
+			V3Opcode.BoolOr:		code.binop(JvmBytecode.IOR);
+			V3Opcode.BoolNot: {
+				code.iconst_1();
+				code.binop(JvmBytecode.IXOR);
+			}
+			V3Opcode.ByteLt:		emitCompare(JvmBytecode.IF_ICMPLT);
+			V3Opcode.ByteGt:		emitCompare(JvmBytecode.IF_ICMPGT);
+			V3Opcode.ByteLteq:		emitCompare(JvmBytecode.IF_ICMPLE);
+			V3Opcode.ByteGteq:		emitCompare(JvmBytecode.IF_ICMPGE);
+			V3Opcode.TypeCast:		emitTypeCast(op.typeArgs(0), op.typeArgs(1));
+			V3Opcode.TypeQuery:		emitTypeQuery(op.typeArgs(0), op.typeArgs(1));
+			V3Opcode.TypeSubsume: {
+				var implicitType = op.typeArgs(1);
+				if (V3.isFunction(implicitType)) {
+					var exactType = op.typeArgs(0);
+					var adapter = jprog.newDelegateAdapter(exactType, implicitType);
+					code.invokestatic(adapter.builder.jclass.name, "$new", adapter.initSig);
+				}
+			}
+			V3Opcode.ArrayAlloc:		jprog.jrep.emitArrayAlloc(op.typeArgs(0), code);
+			V3Opcode.ArrayInit:		emitArrayInit(op);
+			V3Opcode.ArrayGetElem:		jprog.jrep.emitArrayGetElem(op.typeArgs(0), code);
+			V3Opcode.ArraySetElem: {
+				jprog.jrep.emitArraySetElem(op.typeArgs(0), code, leave);
+				if (!leave) popped = true; // already popped, pretend it's used
+			}
+			V3Opcode.ArrayGetLength:	jprog.jrep.emitArrayGetLength(op.typeArgs(0), code);
+			V3Opcode.ClassAlloc: {
+				var newRef = V3Op.extractIrSpec(op);
+				var jclass = jprog.jvmType(newRef.container);
+				var nsig = jprog.jvmSig(newRef.getMethodType());
+				code.invokestatic(jclass.name, "$new", nsig);
+			}
+			V3Opcode.ClassGetField:		jprog.jrep.emitGetField(V3Op.extractIrSpec(op), code);
+			V3Opcode.ClassSetField: {
+				jprog.jrep.emitSetField(V3Op.extractIrSpec(op), code, leave);
+				if (!leave) popped = true; // already popped, pretend it's used
+			}
+			V3Opcode.ClassGetVirtFunc: {
+				var methodRef = V3Op.extractIrSpec(op);
+				var jclass = jprog.jvmClass(methodRef.container);
+				var dclass = jprog.newDelegate(methodRef);
+				code.invokestatic(dclass.name, "$get", JvmSig.new([JvmType.!(jclass)], dclass));
+			}
+			V3Opcode.ComponentInit:		; // do nothing
+			V3Opcode.ComponentGetField:	jprog.jrep.emitGetField(V3Op.extractIrSpec(op), code);
+			V3Opcode.ComponentSetField: {
+				jprog.jrep.emitSetField(V3Op.extractIrSpec(op), code, leave);
+				if (!leave) popped = true; // already popped, pretend it's used
+			}
+			V3Opcode.ComponentGetMethod: {
+				var methodRef = V3Op.extractIrSpec(op);
+				var dclass = jprog.newDelegate(methodRef);
+				code.getstatic(dclass, "instance", dclass);
+			}
+			V3Opcode.TupleCreate:		jprog.jrep.emitTupleCreate(op.typeArgs(0), code);
+			V3Opcode.TupleGetElem:		jprog.jrep.emitTupleGetElem(op.typeArgs(0), op.attr<int>(), code);
+			V3Opcode.NullCheck: {
+				if (leave) code.dup();
+				var height = code.cur_stack - 1; // will pop receiver
+				var b = code.branch_fw(JvmBytecode.IFNONNULL);
+				code.aconst_null();
+				code.athrow();
+				code.patchBranch(b);
+				code.cur_stack = height;
+				if (!leave) popped = true; // already popped
+			}
+			V3Opcode.BoundsCheck:		jprog.jrep.emitExplicitBoundsCheck(op.typeArgs(0), code);
+			V3Opcode.CallClassMethod,	// fall through
+			V3Opcode.CallClassVirtual: {
+				var methodRef = V3Op.extractIrSpec(op);
+				var jclass = jprog.jvmType(methodRef.container);
+				if (methodRef.isNew()) {
+					var nsig = jprog.makeJvmSig(jclass, methodRef.getMethodType(), jclass);
+					code.invokestatic(jclass.name, "$init", nsig);
+				} else {
+					var nsig = jprog.jvmSig(methodRef.getMethodType());
+					code.invokevirtual(jclass.name, V3.mangleIrMember(methodRef.member), nsig);
+				}
+			}
+			V3Opcode.CallComponentMethod: {
+				var methodRef = V3Op.extractIrSpec(op);
+				var jclass = jprog.jvmClass(methodRef.container);
+				var nsig = jprog.jvmSig(methodRef.getMethodType());
+				code.invokestatic(jclass.name, V3.mangleIrMember(methodRef.member), nsig);
+			}
+			V3Opcode.CallFunction: {
+				var mtype = jprog.jvmType(i.inputs(0).dest.getType());
+				code.invokevirtual(mtype.name, "invoke", jprog.jvmSig(op.typeArgs(0)));
+			}
+			V3Opcode.SystemOp: {
+				var name = op.attr<string>();
+				jprog.invokesystem(code, name, jprog.jvmSig(op.getFunctionType()));
+			}
+			V3Opcode.ConditionalThrow: {
+				var except = op.attr<string>();
+				var b = code.branch_fw(JvmBytecode.IFEQ);
+				emitThrow(except);
+				code.patchBranch(b);
+			}
+		} else {
+			jprog.compiler.ERROR.fail(Strings.format1("unexpected opcode in SSA->JVM: %1", op.opcode));
+		}
+		return popped;
+	}
+	def emitCompare(op: byte) {
+		var height = code.cur_stack - 1;
+		var pos1 = code.branch_fw(op);
+		code.iconst_0();
+		var pos2 = code.goto_fw();
+		code.patchBranch(pos1);
+		code.iconst_1();
+		code.patchBranch(pos2);
+		code.cur_stack = height;
+	}
+	def emitTypeCast(t1: Type, t2: Type) {
+		if (isNopTypeCast(t1, t2)) return;
+		if (V3.isClass(t2) && (t1 == Null.TYPE || V3.isClass(t1))) {
+			// perform dynamic typecast
+			code.checkcast(jprog.jvmType(t2));
+		} else if (t1 == Int.TYPE && t2 == Byte.TYPE) {
+			// convert int to byte: mask off high order bits
+			code.iconst(255);
+			code.binop(JvmBytecode.IAND);
+		} else {
+			// cast will always fail
+			code.newempty(JvmTypes.java_lang_ClassCastException);
+			code.athrow();
+		}
+	}
+	def emitTypeQuery(t1: Type, t2: Type) {
+		if (V3.isClass(t2)) {
+			if (V3.isClass(t1)) code.instanceof(jprog.jvmType(t2));
+			else popValAndPushConst(t1, 0);
+		} else if (V3.isArray(t2)) {
+		 	if (V3.isArray(t1)) code.instanceof(jprog.jvmType(t2));
+			else popValAndPushConst(t1, 0);
+		} else {
+			if (TypeSystem.isSubtype(t1, t2)) popValAndPushConst(t1, 1);
+			else popValAndPushConst(t1, 0);
+		}
+	}
+	def popValAndPushConst(t1: Type, val: int) {
+		if (jprog.jvmKind(t1).width > 0) code.pop();
+		code.iconst(val);
+	}
+	def emitArrayInit(op: Operator) {
+		var arrayType = op.typeArgs(0), len = op.attr<int>();
+		code.iconst(len);
+		jprog.jrep.emitArrayAlloc(arrayType, code);
+		var elemRep = jprog.jrep.getRep(V3Array.elementType(arrayType));
+		if (elemRep.kind.width > 0) {
+			// store the elements into the array
+			for (i = len - 1; i >= 0; i--) {
+				code.dup_x1();
+				code.swap();
+				code.iconst(i);
+				code.swap();
+				jprog.jrep.emitArraySetElem(arrayType, code, false);
+			}
+		}
+	}
+	def isNopTypeCast(t1: Type, t2: Type) -> bool {
+		// XXX: the normalizer/optimizer should fold away most useless casts
+		return TypeSystem.isSubtype(t1, t2) || (t1 == Byte.TYPE && t2 == Int.TYPE);
+	}
+	def emitThrow(ex: string) {
+		if (Strings.equal(V3Exception.NullCheck, ex)) code.aconst_null();
+		else if (Strings.equal(V3Exception.Unimplemented, ex)) code.newempty(JvmTypes.java_lang_AbstractMethodError);
+		else if (Strings.equal(V3Exception.TypeCheck, ex)) code.newempty(JvmTypes.java_lang_ClassCastException);
+		else if (Strings.equal(V3Exception.DivideByZero, ex)) code.newempty(JvmTypes.java_lang_ArithmeticException);
+		else {
+			code.newobject(JvmTypes.java_lang_Exception);
+			code.dup();
+			code.ldc(code.builder.newString(ex));
+			code.invokespecial(JvmTypes.java_lang_Exception.name, "<init>", JvmTypes.SIG_STRING_VOID);
+		}
+		code.athrow();
+	}
+	def allocReg(i: SsaInstr, t: Type) -> int {
+		// for now, all types map to a single JVM stack slot
+		var t = code.max_locals;
+		code.max_locals = t + 1;
+		return t;
+	}
+}

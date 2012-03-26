@@ -1,0 +1,263 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Shared functionality for building new SSA code from old SSA code, e.g.
+// during normalization or lowering.
+class SsaRebuilder {
+	def prog: Program;
+	def oldRegion: SsaRegion;
+	def instrMap: SsaMap = SsaMap.new();
+	var newRegion: SsaRegion;
+	var newParams: Array<SsaParam>;
+	var multiMap: PartialMap<SsaInstr, Array<SsaInstr>>;
+	var blockStartMap: PartialMap<SsaBlock, SsaBlock>;
+	var blockEndMap: PartialMap<SsaBlock, SsaBlock>;
+	var oldBlock: SsaBlock;
+	var curBlock: SsaBlockBuilder;
+	var edgeMapMap: PartialMap<SsaBlock, Array<int>>;
+
+	// Stack for processing phis and blocks. Order doesn't really matter as long as a block's
+	// dominators are processed before the block. Using a queue yields breadth-first order.
+	var phiQueue: Sequence<SsaPhi>;
+	var blockQueue: Sequence<(SsaBlock, SsaBlock)>;
+
+	new(prog, oldRegion) { }
+
+	def genRegion() -> SsaRegion {
+		if (newRegion != null) return newRegion;
+		var params = genParams();
+		newRegion = SsaRegion.new(params, genReturnType());
+		var oldStart = oldRegion.startBlock;
+		var newStart = newRegion.startBlock;
+		if (oldStart.succ.length == 0) {
+			// common case of a single block that ends in return or throw
+			// no need for blockmaps, queueing, or phi handling
+			genBlock(oldStart, newStart);
+		} else {
+			// a method with multiple blocks
+			blockStartMap = HashMap.new(SsaBlock.uid, SsaBlock.==);
+			blockStartMap.set(oldStart, newStart);
+			blockEndMap = HashMap.new(SsaBlock.uid, SsaBlock.==);
+			blockEndMap.set(oldStart, newStart);
+			phiQueue = Sequence.new();
+			blockQueue = Sequence.new();
+			blockQueue.add(oldStart, newStart);
+			Sequences.drain(blockQueue, 0, genBlock); // process all blocks
+			Sequences.drain(phiQueue, 0, finishPhi); // process all phis
+		}
+		instrMap.clear();
+		return newRegion;
+	}
+	def genParams() -> Array<SsaParam> {
+		if (newParams != null) return newParams;
+		// translate parameters and allocate new region
+		var j = 0, params = Sequence<SsaParam>.new().grow(oldRegion.params.length);
+		for (p in oldRegion.params) genParam(p, params);
+		return newParams = params.extract();
+	}
+	def genReturnType() -> Type;
+	private def genBlock(ob: SsaBlock, nb: SsaBlock) {
+		this.oldBlock = ob;
+		this.curBlock = SsaBlockBuilder.new(nb);
+		var oseq = ob.instrs;
+		for (j = 0; j < oseq.length && !curBlock.end; j++) {
+			// translate each instruction in the block
+			var i = oseq.get(j);
+			if (SsaApplyOp.?(i)) genApplyOp(SsaApplyOp.!(i));
+			else if (SsaInstOp.?(i)) genInstOp(SsaInstOp.!(i));
+			else return V3.fail("unexpected instruction in block");
+		}
+		if (!curBlock.end) {
+			// translate the end of the block
+			var i = ob.end;
+			if (SsaReturn.?(i)) genReturn(SsaReturn.!(i));
+			else if (SsaSwitch.?(i)) genSwitch(SsaSwitch.!(i));
+			else if (SsaGoto.?(i)) genGoto(SsaGoto.!(i));
+			else if (SsaThrow.?(i)) genThrow(SsaThrow.!(i));
+			else return V3.fail("unexpected block end");
+		}
+	}
+	private def finishPhi(oi: SsaPhi) {
+		// XXX: if only one predecessor, replace phi with its (one) input
+		var ob = oi.block, nb = mapBlockStart(ob);
+		var edgeMap = getEdgeMap(oi, ob, nb);
+		var ni = SsaPhi.!(instrMap.get(oi));
+		if (ni != null) {
+			// phi was mapped one-to-one; map the new inputs
+			var newInputs = Array<SsaInstr>.new(nb.phis.phiEdges.length);
+			var facts = 0;
+			for (j = 0; j < newInputs.length; j++) {
+				var nii = genRef1(oi.inputs(edgeMap(j)));
+				newInputs(j) = nii;
+				if (j == 0) facts = nii.facts;
+				else facts = facts & nii.facts;
+			}
+			ni.setInputs(newInputs);
+			ni.setFact(facts);
+			nb.phis.phiInstrs.add(ni);
+			return;
+		}
+		// phi mapped to multiple phis
+		var mi = multiMap.get(oi);
+		for (w = 0; w < mi.length; w++) {
+			var wi = SsaPhi.!(mi(w));
+			var newInputs = Array<SsaInstr>.new(nb.phis.phiEdges.length);
+			for (j = 0; j < newInputs.length; j++) {
+				// XXX: interchange these loops for better performance
+				newInputs(j) = genRefN(oi.inputs(edgeMap(j)))(w);
+			}
+			wi.setInputs(newInputs);
+			nb.phis.phiInstrs.add(wi);
+		}
+	}
+	private def getEdgeMap(oi: SsaPhi, ob: SsaBlock, nb: SsaBlock) -> Array<int> {
+		if (nb.phis != null) return edgeMapMap.get(nb);
+		// map new input edges [e0, e1, e2] to old phi input indexes [i0, i2, iX]
+		nb.phis = SsaPhis.new(nb);
+		var newPreds = incomingPreds(nb);
+		var oldEdges = ob.phis.phiEdges;
+		var map = Array<int>.new(newPreds.length);
+		for (i = 0; i < oldEdges.length; i++) {
+			var newPred = blockEndMap.get(oldEdges.get(i).src);
+			for (j = 0; j < newPreds.length; j++) {
+				if (newPred == newPreds.get(j)) map(j) = i;
+			}
+		}
+		if (edgeMapMap == null) edgeMapMap = HashMap.new(SsaBlock.uid, SsaBlock.==);
+		edgeMapMap.set(nb, map);
+		return map;
+	}
+	private def incomingPreds(nb: SsaBlock) -> Sequence<(SsaBlock)> {
+		// split critical edges if more than one predecessor
+		var newEdges = nb.phis.phiEdges;
+		var newPreds = Sequence<SsaBlock>.new();
+		var list = nb.preds();
+
+		while (list != null) {
+			var inEdge = list.head;
+			if (inEdge.src.succ.length > 1) {
+				// split all edges between src & dest
+				newEdges.add(splitCriticalEdges(inEdge).succ(0));
+				newPreds.add(inEdge.src);
+				// skip to next unprocessed edge
+				while (list != null && list.head.dest != nb) {
+					list = list.tail;
+				}
+			} else {
+				// no edges to split
+				newEdges.add(inEdge);
+				newPreds.add(inEdge.src);
+				list = list.tail;
+			}
+		}
+		return newPreds;
+	}
+	private def splitCriticalEdges(inEdge: SsaCfEdge) -> SsaBlock {
+		// split all edges between src and dest by routing through a new block
+		var newBlock = SsaBlock.new(), b = inEdge.src, psucc = b.succ;
+		SsaBlockBuilder.new(newBlock).addGoto(inEdge.dest);
+		for (pe in psucc) {
+			if (pe.dest == inEdge.dest) pe.update(newBlock); // change destination to
+		}
+		return newBlock;
+	}
+
+	def genParam(oi: SsaParam, params: Sequence<SsaParam>);
+	def genPhi(oi: SsaPhi);
+	def genVal(oi: SsaValue);
+	def genInstOp(oi: SsaInstOp);
+	def genApplyOp(oi: SsaApplyOp);
+	def genLazy(oi: SsaInstr) {
+		unexpectedInstr(oi);
+	}
+
+	def genSwitch(oi: SsaSwitch);
+	def genReturn(oi: SsaReturn) {
+		curBlock.addReturn(genRefs(oi.inputs));
+	}
+	def genThrow(oi: SsaThrow) {
+		curBlock.addThrow(oi.source, oi.exception);
+	}
+	def genGoto(oi: SsaGoto) {
+		var ot = oi.target(), nt = mapBlockStart(ot);
+		curBlock.addGoto(nt);
+	}
+
+	def mapBlockStart(ob: SsaBlock) -> SsaBlock {
+		var nb = blockStartMap.get(ob);
+		if (nb == null) {
+			nb = SsaBlock.new();
+			blockStartMap.set(ob, nb);
+			blockEndMap.set(ob, nb);
+			blockQueue.add(ob, nb);
+		}
+		return nb;
+	}
+	def mapBlockEnd(ob: SsaBlock) -> SsaBlock {
+		return blockEndMap.get(ob);
+	}
+	def map1(oi: SsaInstr, ni: SsaInstr) {
+		if (SsaPhi.?(oi) && SsaPhi.?(ni)) phiQueue.add(SsaPhi.!(oi));
+		instrMap.set(oi, ni);
+		ni.facts = ni.facts | oi.facts;
+	}
+	def mapN(oi: SsaInstr, na: Array<SsaInstr>) {
+		if (na.length == 1) return map1(oi, na(0));
+		if (SsaPhi.?(oi)) phiQueue.add(SsaPhi.!(oi));
+		if (multiMap == null) multiMap = SsaUtil.newMap();
+		multiMap.set(oi, na);
+	}
+	def genRefs(a: Array<SsaDfEdge>) -> Array<SsaInstr> {
+		var seq = Sequence<SsaInstr>.new().grow(a.length);
+		for (e in a) {
+			var oi = e.dest, ni = instrMap.get(oi);
+			if (ni != null) {
+				// instruction was already translated
+				seq.add(ni);
+				continue;
+			}
+			if (multiMap != null) {
+				// could be multiple instructions
+				var nm = multiMap.get(oi);
+				if (nm != null) {
+					seq.addN(nm);
+					continue;
+				}
+			}
+			genValOrPhi(oi);
+			ni = instrMap.get(oi);
+			if (ni != null) seq.add(ni);
+			else seq.addN(multiMap.get(oi));
+		}
+		return seq.extract();
+	}
+	def genRef1(a: SsaDfEdge) -> SsaInstr {
+		var oi = a.dest, ni = instrMap.get(oi);
+		if (ni != null) return ni;
+		genValOrPhi(oi);
+		ni = instrMap.get(oi);
+		if (ni == null) {
+			Terminal.print("Expected 1-1 translation of: ");
+			SsaPrinter.new(prog).printInstr(oi);
+			return V3.fail("couldn\'t translate instruction 1-1");
+		}
+		return ni;
+	}
+	private def genRefN(a: SsaDfEdge) -> Array<SsaInstr> {
+		return genRefs([a]);
+	}
+	private def genValOrPhi(oi: SsaInstr) {
+		if (SsaValue.?(oi)) genVal(SsaValue.!(oi));
+		else if (SsaPhi.?(oi)) genPhi(SsaPhi.!(oi));
+		else genLazy(oi);
+	}
+	private def isProcessed(i: SsaInstr) -> bool {
+		if (instrMap.get(i) != null) return true;
+		return multiMap != null && multiMap.get(i) != null;
+	}
+	def unexpectedInstr(oi: SsaInstr) {
+		Terminal.print("Unexpected SSA instruction: ");
+		SsaPrinter.new(prog).printInstr(oi);
+		return V3.fail("unexpected instruction");
+	}
+}

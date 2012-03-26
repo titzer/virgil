@@ -1,0 +1,428 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+component V3Norm {
+	def NO_NESTED: Array<V3TypeNorm> = [];
+	def NO_OFFSETS: Array<int> = [];
+	def NO_FIELDS: Array<IrSpec> = [];
+
+	def VOID = V3TypeNorm.new(Void.TYPE, TypeUtil.NO_TYPES, NO_NESTED, NO_OFFSETS);
+	def BOOL = V3TypeNorm.new(Bool.TYPE, [Bool.TYPE], NO_NESTED, NO_OFFSETS);
+	def BYTE = V3TypeNorm.new(Byte.TYPE, [Byte.TYPE], NO_NESTED, NO_OFFSETS);
+	def INT  = V3TypeNorm.new(Int.TYPE, [Int.TYPE], NO_NESTED, NO_OFFSETS);
+}
+// A small closure that is used to normalize record instances
+class V3RecordNormalizer {
+	def norm: V3ProgramNormalizer;
+	def rmaType: RmaType;
+	def typeNorm: V3TypeNorm;
+	def dyn: DynamicPortion = norm.prog.dynamic;
+	new(norm, rmaType, typeNorm) { }
+	def primArray(r: Record, nr: Record) {
+		norm.recordMap.set(r, [Val.!(r)]);
+	}
+	def compRecord(r: Record, nr: Record) {
+		var decl = V3.asComponent(r.rtype).componentDecl;
+		nr = dyn.newRecord(r.rtype, rmaType.classNorm.fields.length);
+		dyn.setComponentRecord(decl, nr); // update current record for component
+		norm.recordMap.set(r, Values.NONE);
+		norm.compRecords = List.new((r, nr), norm.compRecords);
+	}
+	def classRecord(r: Record, nr: Record) {
+		norm.recordMap.set(r, [Val.!(dyn.newRecord(r.rtype, rmaType.classNorm.fields.length))]);
+	}
+	def arrayRecord(r: Record, nr: Record) {
+		norm.recordMap.set(r, typeNorm.mapP(r.values.length, newRecord));
+	}
+	def newRecord(size: int, rtype: Type) -> Val {
+		return dyn.newRecord(rtype, size);
+	}
+
+}
+// Global program normalizer. Removes all tuples from the program and performs
+// polymorphic specialization.
+class V3ProgramNormalizer {
+	def compiler: Compiler;
+	def prog: Program;
+	def rma: RMAnalyzer;
+	def recordMap = V3.newRecordMap<Array<Val>>();
+	def normMap = TypeUtil.newTypeMap<V3TypeNorm>();
+
+	var compRecords: List<(Record, Record)>;
+	var opnorm: V3OpClosureNormalizer;
+
+	new(compiler, prog, rma) {
+		opnorm = V3OpClosureNormalizer.new(this);
+	}
+	def normalizeIrClass(t: Type, rmaType: RmaType) {
+		if (rmaType.origClass == null) return;
+		if (rmaType.classNorm != null) return;
+		// build super class first
+		var s = rmaType.superInfo;
+		var sc: IrClass;
+		if (s != null) {
+			if (s.classNorm == null) normalizeIrClass(s.origType, s);
+			sc = s.classNorm;
+		}
+		// create a new builder (which adds super members)
+		var b = IrClassBuilder.new(t, sc);
+		for (l = rmaType.fields; l != null; l = l.tail) normalizeRmaField(b, l.head);
+		for (l = rmaType.methods; l != null; l = l.tail) normalizeRmaMethod(b, s, l.head);
+
+		var ic = b.build();
+		if (rmaType.isAllocated) ic.setFlag(IrUtil.C_ALLOCATED);
+		if (rmaType.instances != null) ic.setFlag(IrUtil.C_HEAP);
+		rma.newIr.setIrClass(t, ic);
+		rmaType.classNorm = ic;
+	}
+	def normalizeRmaField(b: IrClassBuilder, rm: RmaField) {
+		if (!rm.isRead) {
+			// remove write-only fields
+			rm.fieldNorm = V3Norm.NO_FIELDS;
+			return;
+		}
+		if (!rm.isWritten && rm.container.isComponent) {
+			// try to inline constant fields
+			rm.fieldNorm = V3Norm.NO_FIELDS;
+			return;
+		}
+		var source = IrField.!(rm.origMember.member).source;
+		var tne = normalizeType(rm.origMember.getFieldType()).sub;
+		var complex = tne.length > 1, fa = Array<IrSpec>.new(tne.length);
+		for (i = 0; i < tne.length; i++) {
+			var nf = IrField.new(tne(i));
+			nf.source = source;
+			if (complex) nf.setFlag(IrUtil.F_NORM);
+			if (!rm.isWritten) nf.setFlag(IrUtil.F_VALUE);
+			fa(i) = IrSpec.new(rm.container.origType, [rm.container.origType], nf);
+			b.addIrField(nf);
+		}
+		rm.fieldNorm = fa;
+	}
+	def normalizeRmaMethod(b: IrClassBuilder, superInfo: RmaType, m: RmaMethod) {
+		// this method must be declared/implemented here.
+		var om = m.origMember;
+		var nm = IrMethod.new(om.getTypes().methodTypeArgs, 
+			normalizeParamTypes(om), normalizeType(om.getReturnType()).getType());
+		m.methodNorm = nm;
+		var mm = IrMethod.!(om.member);
+		nm.source = mm.source;
+		if (mm.checkFlag(IrUtil.M_NEW)) nm.setFlag(IrUtil.M_NEW);
+		if (!m.isLive) nm.setFlag(IrUtil.M_ABSTRACT);
+		while (superInfo != null && mm.index < superInfo.origClass.methods.length) {
+			// does this method override a super method?
+			var sm = rma.oldIr.resolveMethodImpl(superInfo.origType, om);
+			if (sm != null) {
+				var s = RmaMethod.!(rma.getRmaMember(sm));
+				if (s.methodNorm != null) return b.setIrMethod(s.methodNorm.index, nm);
+			}
+			superInfo = superInfo.superInfo;
+		}
+		b.addIrMethod(nm);
+	}
+	def normalizeParamTypes(memberRef: IrSpec) -> Array<Type> {
+		var pt = memberRef.getParamTypes();
+		var seq = Sequence<Type>.new().grow(pt.length);
+		for (p in pt) seq.addN(normalizeType(p).sub);
+		return seq.extract();
+	}
+	def normalizeRecords(origType: Type, rmaType: RmaType) {
+		if (rmaType.instances == null) return;
+		var recNorm = V3RecordNormalizer.new(this, rmaType, normalizeType(origType));
+		match (origType.typeCon.kind) {
+			V3Kind.CLASS: return rmaType.instances.apply(recNorm.classRecord);
+			V3Kind.COMPONENT: return rmaType.instances.apply(recNorm.compRecord);
+			V3Kind.ARRAY: {
+				if (V3.isPrimitiveArray(origType)) return rmaType.instances.apply(recNorm.primArray);
+				else return rmaType.instances.apply(recNorm.arrayRecord);
+			}
+		}
+	}
+	def finishNormalizingRecords() {
+		recordMap.apply(populateRecord);
+		Lists.apply(compRecords, populateSimpleRecord);
+	}
+	def finishNormalization() {
+		opnorm.finishHelperComponent();
+	}
+	def populateRecord(r: Record, nr: Array<Val>) {
+		// fill in the values of the (empty) record
+		if (r.values.length == 0 || nr.length == 0) return;
+		if (V3.isPrimitiveArray(r.rtype)) return; // no need for normalization
+		if (V3.isArray(r.rtype)) {
+			// may need to convert an array of tuples to a tuple of arrays
+			var nta = Arrays.map(nr, Record.!<Val>);
+			var etn = normalizeType(V3Array.elementType(r.rtype));
+			for (i = 0; i < r.values.length; i++) {
+				var nv = normalizeValAsArray(r.values(i), etn);
+				for (j = 0; j < etn.size; j++) {
+					nta(j).values(i) = nv(j);
+				}
+			}
+		} else {
+			// normalize the (live) values of the record
+			populateSimpleRecord(r, Record.!(nr(0)));
+		}
+	}
+	def populateSimpleRecord(r: Record, nrr: Record) {
+		var rmaType = rma.getRmaType(r.rtype);
+		for (t = rmaType; t != null; t = t.superInfo) {
+			for (l = t.fields; l != null; l = l.tail) {
+				var f = l.head;
+				if (f != null && f.fieldNorm != null && f.fieldNorm.length > 0) {
+					// the field is not dead and at least one element
+					var nf = f.fieldNorm(0).member;
+					var nfn = normalizeType(f.origMember.getFieldType());
+					normalizeValIntoArray(r.values(f.origMember.member.index), nfn, nrr.values, nf.index);
+				}
+			}
+		}
+	}
+	def normalizeCode(rm: RmaMethod) {
+		var spec = rm.origMember;
+		var returnTn = normalizeType(spec.getReturnType());
+		SsaNormalizer.new(this, spec, spec.asMethod().ssa, returnTn).build(rm.methodNorm);
+	}
+	def normalizeFieldRef(memberRef: IrSpec) -> RmaField {
+		return RmaField.!(rma.getRmaMember(memberRef));
+	}
+	def normalizeMethodRef(memberRef: IrSpec) -> IrSpec {
+		var rm = rma.getRmaMember(memberRef);
+		return IrSpec.new(rm.container.origType, [rm.container.origType], RmaMethod.!(rm).methodNorm);
+	}
+	def normalizeMethod(m: IrMethod, mono: Type -> Type) -> IrMethod {
+		var s = Sequence<Type>.new().grow(m.paramTypes.length);
+		for (t in m.paramTypes) {
+			s.addN(normalizeType(mono(t)).sub);
+		}
+		var returnType = normalizeType(mono(m.returnType)).getType();
+		return IrMethod.new(null, s.extract(), returnType);
+	}
+	def normalizeType(utype: Type) -> V3TypeNorm {
+		var typeNorm: V3TypeNorm;
+		match (utype.typeCon.kind) {
+			V3Kind.VOID: return V3Norm.VOID;
+			V3Kind.BOOL: return V3Norm.BOOL;
+			V3Kind.BYTE: return V3Norm.BYTE;
+			V3Kind.INT: return V3Norm.INT;
+			V3Kind.COMPONENT: return V3Norm.VOID;
+			V3Kind.ARRAY: if ((typeNorm = normMap.get(utype)) == null) {
+				// normalize element type
+				var enorm = normalizeType(V3Array.elementType(utype));
+				if (enorm.size == 0) {
+					return setTypeNorm(utype, V3TypeNorm.new(utype, [V3.voidArrayType], V3Norm.NO_NESTED, [0]));
+				} else if (enorm.size == 1) { 
+					return setTypeNorm(utype, V3TypeNorm.new(utype, [V3Array.newType(enorm.sub(0))], enorm.nested, enorm.offsets));
+				} else {
+					var ae = Arrays.map(enorm.sub, V3Array.newType);
+					return setTypeNorm(utype, V3TypeNorm.new(utype, ae, enorm.nested, enorm.offsets));
+				}
+			}
+			V3Kind.CLASS: if ((typeNorm = normMap.get(utype)) == null) {
+				return setTypeNorm(utype, V3TypeNorm.new(utype, [utype], V3Norm.NO_NESTED, V3Norm.NO_OFFSETS));
+			}
+			V3Kind.DELEGATE: if ((typeNorm = normMap.get(utype)) == null) {
+				// normalize parameter and return types independently
+				var pt = normalizeType(Function.getParamType(utype)).getType();
+				var rt = normalizeType(Function.getReturnType(utype)).getType();
+				var open = pt.open || rt.open;
+				// translate delegate into (funcref, object) pair
+				var ft = Function.FUNCREF.create(open, Lists.cons2(pt, rt));
+				return setTypeNorm(utype, V3TypeNorm.new(utype, [ft, AnyObject.TYPE], V3Norm.NO_NESTED, V3Norm.NO_OFFSETS));
+			}
+			V3Kind.TUPLE: if ((typeNorm = normMap.get(utype)) == null) {
+				// flatten tuples
+				var seqT = Sequence<Type>.new();
+				var seqO = Sequence<int>.new();
+				var seqN = Sequence<V3TypeNorm>.new();
+				for (p = utype.nested; p != null; p = p.tail) {
+					var n = normalizeType(p.head);
+					seqO.add(seqT.length);
+					seqN.add(n);
+					seqT.addN(n.sub);
+				}
+				return setTypeNorm(utype, V3TypeNorm.new(utype, seqT.extract(), seqN.extract(), seqO.extract()));
+			}
+		} else {
+			if ((typeNorm = normMap.get(utype)) == null)
+				return setTypeNorm(utype, V3TypeNorm.new(utype, [utype], V3Norm.NO_NESTED, V3Norm.NO_OFFSETS));
+		}
+		return typeNorm;
+	}
+	def normalizeTypeArray(a: Array<Type>) -> V3TypeNorm {
+		var len = a.length;
+		if (len == 0) return V3Norm.VOID;
+		if (len == 1) return normalizeType(a(0));
+		// XXX: combine with above tuple normalization code
+		var seqT = Sequence<Type>.new();
+		var seqO = Sequence<int>.new().grow(len);
+		var seqN = Sequence<V3TypeNorm>.new().grow(len);
+		for (i = 0; i < len; i++) {
+			var n = normalizeType(a(i));
+			seqO.add(seqT.length);
+			seqN.add(n);
+			seqT.addN(n.sub);
+		}
+		return V3TypeNorm.new(null, seqT.extract(), seqN.extract(), seqO.extract());
+	}
+	def setTypeNorm(utype: Type, typeNorm: V3TypeNorm) -> V3TypeNorm {
+		normMap.set(utype, typeNorm);
+		return typeNorm;
+	}
+	def normalizeValAsVal(v: Val, tn: V3TypeNorm) -> Val {
+		if (v == Values.BOTTOM && tn.size <= 1) return Values.BOTTOM;
+		var a = normalizeValAsArray(v, tn);
+		if (a.length == 0) return Values.BOTTOM;
+		if (a.length == 1) return a(0);
+		return Tuple_Value.new(a);
+	}
+	def normalizeValAsArray(v: Val, tn: V3TypeNorm) -> Array<Val> {
+		return normalizeValIntoArray(v, tn, tn.newValArray(), 0);
+	}
+	def normalizeValIntoArray(v: Val, tn: V3TypeNorm, array: Array<Val>, index: int) -> Array<Val>{
+		if (v == Values.BOTTOM) {
+			// bottom: assume array already contains Value.BOTTOMs
+		} else if (Record.?(v)) {
+			// record: copy record val(s) into the array
+			var r = recordMap.get(Record.!(v));
+			if (r == null) return V3.fail(Strings.format2("no mapping for record %1: %2", Record.!(v).id, Record.!(v).rtype.render));
+			Arrays.copyInto(r, array, index);
+		} else if (Delegate.?(v)) {
+			// delegate: normalize record and method
+			var del = Delegate.!(v);
+			var ctn = normalizeType(del.memberRef.container);
+			var obj = normalizeValAsVal(del.val, ctn);
+			var meth = normalizeMethodRef(del.memberRef);
+			// normalize delegate value as (funcval, object) pair
+			array(index) = FuncVal.new(meth);
+			array(index + 1) = obj;
+		} else if (V3.isTuple(tn.orig)) {
+			// tuple: recursively normalize all of the sub
+			var tnn = tn.nested;
+			var ov = (Tuple_Value.!(v)).values;
+			for (i = 0; i < tnn.length; i++) {
+				var etn = tnn(i);
+				normalizeValIntoArray(ov(i), etn, array, index);
+				index = index + etn.size;
+			}
+		} else if (OpClosure.?(v)) {
+			// operator delegate: normalize and rebuild the operator
+			var val = opnorm.normalizeOpClosure(OpClosure.!(v));
+			// normalize operator as (funcref, null)
+			array(index) = FuncVal.new(val.memberRef);
+			array(index + 1) = val.val;
+		} else {
+			// primitive: simply copy the value into the array
+			array(index) = v;
+		}
+		return array;
+	}
+}
+
+class V3TypeNorm {
+	def orig: Type;
+	def sub: Array<Type>;
+	def nested: Array<V3TypeNorm>;
+	def offsets: Array<int>;
+	var size: int;
+	var vtype: Type;
+
+	new(orig, sub, nested, offsets) {
+		size = sub.length;
+	}
+	def getType() -> Type {
+		if (vtype == null) {
+			if (size == 0) vtype = Void.TYPE;
+			else if (size == 1) vtype = sub(0);
+			else vtype = Tuple.newType(Lists.fromArray(sub));
+		}
+		return vtype;
+	}
+	def isComplex() -> bool {
+		return size > 1;
+	}
+	def map0<R>(f: Type -> R) -> Array<R> {
+		return Arrays.map(sub, f);
+	}
+	def mapP<A, R>(a: A, f: (A, Type) -> R) -> Array<R> {
+		var r = Array<R>.new(sub.length);
+		for (i = 0; i < size; i++) {
+			r(i) = f(a, sub(i));
+		}
+		return r;
+	}
+	def newValArray() -> Array<Val> {
+		if (size == 0) return Values.NONE;
+		return Array<Val>.new(size);
+	}
+}
+// Normalize operator closures and produces a delegate value
+class V3OpClosureNormalizer {
+	def norm: V3ProgramNormalizer;
+	var map: PartialMap<string, Delegate>;
+	var helperType: Type;
+	var icbuilder: IrClassBuilder;
+
+	new(norm) { }
+
+	// normalize an operator closure and produce a delegate value
+	def normalizeOpClosure(opcl: OpClosure) -> Delegate {
+		return normalizeOp(opcl.op);
+	}
+	// normalize an operator, generating a helper method
+	def normalizeOp(op: Operator) -> Delegate {
+		if (map == null) {
+			var name = Strings.format1("%1$helper", norm.prog.name());
+			var decl = VstComponent.new(Token.new("<generated>", name, 0, 0), null);
+			var typeCon = V3Component_TypeCon.new(decl);
+			helperType = typeCon.create(false, null);
+			map = Strings.newMap();
+		}
+		var name = V3Op.renderOp(op);
+		var val = map.get(name);
+		if (val == null) {
+			val = genHelperSsa(op, name);
+			map.set(name, val);
+		}
+		return val;
+	}
+	// add the helper component to the IrPortion
+	def finishHelperComponent() {
+		if (helperType != null) {
+			icbuilder = IrClassBuilder.new(helperType, null);
+			map.apply(addIrMethod);
+			norm.rma.newIr.setIrClass(helperType, icbuilder.build());
+		}
+	}
+	private def addIrMethod(name: string, del: Delegate) {
+		icbuilder.addIrMethod(del.memberRef.asMethod());
+	}
+	// generate SSA code for the helper method
+	private def genHelperSsa(op: Operator, name: string) -> Delegate {
+		// build the "old" non-normalized SSA code
+		var paramTypes = op.paramTypes;
+		var seq = Sequence<SsaParam>.new();
+		var vals = Sequence<SsaInstr>.new();
+		seq.add(SsaParam.new(0, helperType));
+		for (i = 0; i < paramTypes.length; i++) {
+			var param = SsaParam.new(seq.length, paramTypes(i));
+			seq.add(param);
+			vals.add(param);
+		}
+		var oldSsa = SsaRegion.new(seq.extract(), op.resultType);
+		var block = SsaBlockBuilder.new(oldSsa.startBlock);
+		var apply = block.addApply(null, op, vals.extract());
+		block.addReturn([apply]);
+
+		// reuse the normalizer to normalize the method's code
+		// XXX: this is rather ugly
+		var returnTn = norm.normalizeType(op.resultType);
+		var ssaNorm = SsaNormalizer.new(norm, null, oldSsa, returnTn);
+		var params = ssaNorm.genParams();
+		var newParamTypes = Arrays.map(Arrays.range(params, 1, params.length), SsaParam.vtype);
+		var meth = IrMethod.new(null, newParamTypes, returnTn.getType());
+		ssaNorm.build(meth);
+		return Delegate.new(null, IrSpec.new(helperType, [helperType], meth));
+	}
+}
+

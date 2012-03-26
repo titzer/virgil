@@ -1,0 +1,617 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// global constants for Ic code. 
+component Ic {
+	def FAST = 0;
+	def SLOW = 1;
+	def EXCEPTION = 2;
+	def PAUSE = 3;
+	def DONE = 4;
+
+	def newApply(dst: int, op: Operator, args: Array<int>, source: Source) -> IcInstr {
+		match (op.opcode) {
+			V3Opcode.Equal,
+			V3Opcode.NotEqual,
+			V3Opcode.IntAdd,
+			V3Opcode.IntSub,
+			V3Opcode.IntMul,
+			V3Opcode.IntAnd,
+			V3Opcode.IntOr,
+			V3Opcode.IntXor,
+			V3Opcode.IntShl,
+			V3Opcode.IntShr,
+			V3Opcode.IntLt,
+			V3Opcode.IntGt,
+			V3Opcode.IntLteq,
+			V3Opcode.IntGteq,
+			V3Opcode.ByteLt,
+			V3Opcode.ByteGt,
+			V3Opcode.ByteLteq,
+			V3Opcode.ByteGteq: if (args.length == 2) return IcFastOp.new(dst, op, args(0), args(1), op.opcode, source);
+			V3Opcode.TypeSubsume,
+			V3Opcode.NullCheck: return IcFastOp.new(dst, op, args(0), -1, op.opcode, source);
+			V3Opcode.CallDelegate,
+			V3Opcode.CallFunction: return IcCall.new(dst, args(0), Arrays.range(args, 1, args.length), source);
+		}
+		return IcApply.new(dst, op, args, source);
+	}
+}
+// representation of a method, with parameters, registers, and code
+class IcMethod {
+	def uid: int = UID.next++;
+	def memberRef: IrSpec;
+	def iccode: Array<IcInstr>;
+	def numParams: int;
+	def numRegs: int;
+	new(memberRef, iccode, numParams, numRegs) { }
+
+	def addProbeBefore(ip: int, f: (IcInterpreter, int) -> void) {
+		var i = iccode(ip);
+		var p = IcProbe.!(if(IcProbe.?(i), i, iccode(ip) = IcProbe.new(i)));
+		p.probes.addProbeBefore(f);
+	}
+	def addProbeAfter(ip: int, f: (IcInterpreter, int) -> void) {
+		var i = iccode(ip);
+		var p = IcProbe.!(if(IcProbe.?(i), i, iccode(ip) = IcProbe.new(i)));
+		p.probes.addProbeAfter(f);
+	}
+	def removeProbeBefore(ip: int, f: (IcInterpreter, int) -> void) {
+		var i = iccode(ip);
+		if (IcProbe.?(i)) {
+			var p = IcProbe.!(i).probes;
+			p.removeProbeBefore(f);
+			if (p.before == null && p.after == null) iccode(ip) = IcProbe.!(i).orig;
+		}
+	}
+}
+// helper class to hold list of probes before and after an instruction
+class IcProbes {
+	var before: List<(IcInterpreter, int) -> void>;
+	var after: List<(IcInterpreter, int) -> void>;
+	def addProbeBefore(f: (IcInterpreter, int) -> void) {
+		before = List.new(f, before);
+	}
+	def addProbeAfter(f: (IcInterpreter, int) -> void) {
+		after = List.new(f, after);
+	}
+	def removeProbeBefore(f: (IcInterpreter, int) -> void) {
+		before = remove(before, f);
+	}
+	def removeProbeAfter(f: (IcInterpreter, int) -> void) {
+		after = remove(after, f);
+	}
+	def remove(l: List<(IcInterpreter, int) -> void>, f: (IcInterpreter, int) -> void) -> List<(IcInterpreter, int) -> void> {
+		if (l == null) return null;
+		if (l.head == f) return remove(l.tail, f);
+		return List<(IcInterpreter, int) -> void>.new(l.head, remove(l.tail, f));
+	}
+	def empty() -> bool {
+		return before == null && after == null;
+	}
+}
+// Base class of all instructions
+class IcInstr {
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int;
+}
+// Move value from one register to another
+class IcMove extends IcInstr {
+	def dst: int;
+	def src: int;
+	new(dst, src) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		regs(rp + dst) = regs(rp + src);
+		return ip + 1;
+	}
+}
+// Load a value into a register
+class IcValue extends IcInstr {
+	def dst: int;
+	def val: Val;
+	new(dst, val) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		regs(rp + dst) = val;
+		return ip + 1;
+	}
+}
+// Perform a simple, fast operation
+// XXX: one class per fast operation?
+class IcFastOp extends IcInstr {
+	def dst: int;
+	def x: int;
+	def y: int;
+	def op: Operator;
+	def opcode: int;
+	def source: Source;
+	new(dst, op, x, y, opcode, source) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		var xv = regs(rp + x), rv: Val;
+		// for performance, common operator implementations are inlined here
+		match (opcode) {
+			V3Opcode.Equal:	      rv = Bool.box(Values.equal(xv, regs(rp + y)));
+			V3Opcode.NotEqual:    rv = Bool.box(!Values.equal(xv, regs(rp + y)));
+			V3Opcode.IntAdd:      rv = Int.box(Int.unbox(xv) + Int.unbox(regs(rp + y)));
+			V3Opcode.IntSub:      rv = Int.box(Int.unbox(xv) - Int.unbox(regs(rp + y)));
+			V3Opcode.IntMul:      rv = Int.box(Int.unbox(xv) * Int.unbox(regs(rp + y)));
+			V3Opcode.IntAnd:      rv = Int.box(Int.unbox(xv) & Int.unbox(regs(rp + y)));
+			V3Opcode.IntOr:       rv = Int.box(Int.unbox(xv) | Int.unbox(regs(rp + y)));
+			V3Opcode.IntXor:      rv = Int.box(Int.unbox(xv) ^ Int.unbox(regs(rp + y)));
+			V3Opcode.IntShl:      rv = Int.box(Int.unbox(xv) #<< Int.unbox(regs(rp + y)));
+			V3Opcode.IntShr:      rv = Int.box(Int.unbox(xv) #>> Int.unbox(regs(rp + y)));
+			V3Opcode.IntLt:       rv = Bool.box(Int.unbox(xv) < Int.unbox(regs(rp + y)));
+			V3Opcode.IntGt:       rv = Bool.box(Int.unbox(xv) > Int.unbox(regs(rp + y)));
+			V3Opcode.IntLteq:     rv = Bool.box(Int.unbox(xv) <= Int.unbox(regs(rp + y)));
+			V3Opcode.IntGteq:     rv = Bool.box(Int.unbox(xv) >= Int.unbox(regs(rp + y)));
+			V3Opcode.ByteLt:      rv = Bool.box(Byte.unbox(xv) < Byte.unbox(regs(rp + y)));
+			V3Opcode.ByteGt:      rv = Bool.box(Byte.unbox(xv) > Byte.unbox(regs(rp + y)));
+			V3Opcode.ByteLteq:    rv = Bool.box(Byte.unbox(xv) <= Byte.unbox(regs(rp + y)));
+			V3Opcode.ByteGteq:    rv = Bool.box(Byte.unbox(xv) >= Byte.unbox(regs(rp + y)));
+			V3Opcode.TypeSubsume: rv = xv;
+			V3Opcode.NullCheck:   {
+				rv = xv;
+				if (rv == null) {
+					i.throw(V3Exception.NullCheck, null);
+					return ip + 1;
+				}
+			}
+		} else {
+			i.throw(V3Exception.InternalError, "not a supported fast operator");
+		}
+		regs(rp + dst) = rv;
+		return ip + 1;
+	}
+}
+// Apply an operator to arguments
+class IcApply extends IcInstr {
+	def dst: int;
+	def op: Operator;
+	def args: Array<int>;
+	def source: Source;
+	new(dst, op, args, source) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		var d = rp + dst, r = i.evalOp(op, dst, args);
+		if (i.opTailCall) {
+			// operator performed a tail call
+			i.opTailCall = false;
+			return 0;
+		} else if (!Exception.?(r)) {
+			// operator returned a non-exception result
+			i.regs(d) = Val.!(r);
+		}
+		return ip + 1;
+	}
+}
+// instantiate an operator
+class IcInst extends IcInstr {
+	def dst: int;
+	def op: Operator;
+	new(dst, op) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		regs(rp + dst) = SsaUtil.newOpClosure0(op.subst(i.topFrame.memberRef.instantiateType));
+		return ip + 1;
+	}
+}
+// create an operator closure
+class IcClosure extends IcInstr {
+	def dst: int;
+	def op: Operator;
+	def args: Array<int>;
+	def indexMap: Array<int>;
+	new(dst, op, args, indexMap) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		var op = this.op.subst(i.topFrame.memberRef.instantiateType);
+		var vals = Array<Val>.new(indexMap.length);
+		for (i = 0; i < indexMap.length; i++) {
+			vals(i) = regs(rp + args(i));
+		}
+		regs(rp + dst) = OpClosure.new(op, vals, indexMap);
+		return ip + 1;
+	}
+}
+// call a method or operator (fast path)
+class IcCall extends IcInstr {
+	def dst: int;
+	def func: int;
+	def args: Array<int>;
+	def source: Source;
+	new(dst, func, args, source) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, oldRp: int, ip: int) -> int {
+		var func = regs(oldRp + func);
+		if (Delegate.?(func)) {
+			// apply a delegate
+			var del = Delegate.!(func), icm = i.getIcMethod(del.memberRef);
+			i.pushFrame(ip, dst, del.memberRef, icm);
+			// copy the arguments into the new frame
+			regs = i.regs;
+			regs(i.rp) = del.val;
+			var argRp = i.rp + 1, ja = args, jmax = ja.length;
+			for (j = 0; j < jmax; j++) regs(argRp + j) = regs(oldRp + ja(j));
+			if (jmax != icm.numParams - 1) i.adjustArgs(argRp, icm.numParams - 1, jmax);
+			return 0; // enter at first instruction
+		} else if (OpClosure.?(func)) {
+			// apply an operator
+			// TODO: expand closure arguments if necessary
+			var op = OpClosure.!(func).op;
+			var r = i.evalOp(op, dst, args);
+			if (i.opTailCall) {
+				// operator performed a tail call
+				i.opTailCall = false;
+				return 0;
+			} else if (!Exception.?(r)) {
+				// operator returned a non-exception result
+				regs(oldRp + dst) = Val.!(r);
+			}
+			return ip + 1;
+		} else if (FuncVal.?(func)) {
+			var meth = FuncVal.!(func).memberRef, icm = i.getIcMethod(meth);
+			i.pushFrame(ip, dst, meth, icm);
+			// copy the arguments into the frame
+			regs = i.regs;
+			var argRp = i.rp, ja = args, jmax = ja.length;
+			for (j = 0; j < jmax; j++) regs(argRp + j) = regs(oldRp + ja(j));
+			if (jmax != icm.numParams) i.adjustArgs(argRp, icm.numParams, jmax);
+			return 0; // enter at first instruction
+		} else if (func == null) {
+			i.throw(V3Exception.NullCheck, null);
+			return ip;
+		} else {
+			i.throw(V3Exception.InternalError, "expected delegate or operator");
+			return ip;
+		}
+	}
+}
+// match a value against some known values
+class IcMatch extends IcInstr {
+	def arg: int;
+	def vals: Array<Val>;
+	def targets: Array<int>; 
+	new(arg, vals, targets) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		var jv = vals, jmax = jv.length;
+		var val = regs(rp + arg);
+		if (val == null) {
+			for (j = 0; j < jmax; j++) {
+				var ov = jv(j);
+				if (ov == null || ov.equals(val)) return targets(j);
+			}
+		} else {
+			for (j = 0; j < jmax; j++) {
+				if (val.equals(jv(j))) return targets(j);
+			}
+		}
+		return targets(jmax);
+	}
+}
+// conditional and unconditional branches
+class IcBranch extends IcInstr {
+	def always: bool;
+	def bval: bool;
+	def arg: int;
+	var target: int;
+	new(always, bval, arg, target) { }
+	// XXX: refactor to allow beq / bne on other values than bool
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		if (always || bval == Bool.unbox(regs(rp + arg))) return target; // branch taken
+		return ip + 1;
+	}
+}
+// return from current frame
+class IcRet extends IcInstr {
+	def arg: int;
+	new(arg) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		var retVal = regs(rp + arg);
+		var top = i.topFrame;
+		var prev = i.popFrame();
+		regs(i.rp + top.retReg) = retVal;
+		if (prev == null) i.flow = Ic.DONE;
+		return top.retIp + 1;
+	}
+}
+// throw an exception
+class IcThrow extends IcInstr {
+	def exception: string;
+	def source: Source;
+	new(exception, source) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		i.throw(exception, null);
+		return ip + 1;
+	}
+}
+// wrap an instruction with behavior before / after
+class IcProbe extends IcInstr {
+	def orig: IcInstr;
+	def probes: IcProbes = IcProbes.new();
+	new(orig) { }
+	def execute(i: IcInterpreter, regs: Array<Val>, rp: int, ip: int) -> int {
+		var probeIp = ip;
+		if (i.fireBefore(this, probes, probeIp)) return ip;
+		ip = orig.execute(i, regs, rp, ip);
+		i.pausedInstr = null;
+		i.ip = ip;
+		i.fireProbes(probes, probeIp, true);
+		return ip;
+	}
+}
+// a single activation frame within the interpreter
+class IcFrame {
+	var memberRef: IrSpec;
+	var icm: IcMethod;
+	var retIp: int;
+	var retReg: int;
+	var retRp: int;
+	var next: IcFrame;
+}
+// The interpreter for IC code, including all state such as registers and stack
+class IcInterpreter extends Arguments {
+	def dynamicPortion: DynamicPortion;
+	def compile: IrSpec -> IcMethod;
+
+	def globalProbes  = IcProbes.new(); // container for any global probes
+
+	var topFrame: IcFrame;		// currently executing frame
+	var regs: Array<Val>;		// register stack
+	var code: Array<IcInstr>;	// current code
+	var rp: int;			// register pointer
+	var ip: int;			// index of current instruction
+	var freeList: IcFrame;		// list for recycling IcFrame objects
+	var exception: Exception;	// last exception
+	var flow: int;			// flow control state
+	var pausedInstr: IcInstr;	// instruction that was last paused
+
+	new(dynamicPortion, compile) {
+		init(null, null);
+	}
+	def getTopMethod() -> IcMethod {
+		if (topFrame != null) return topFrame.icm;
+		return null;
+	}
+	def invoke(del: Delegate, args: Array<Val>) -> Result {
+		init(del.memberRef, args);
+		regs(0) = del.val;
+		run();
+		if (exception != null) return exception;
+		return regs(0);
+	}
+	def init(m: IrSpec, args: Array<Val>) {
+		regs = null;
+		code = null;
+		ip = 0;
+		rp = 0;
+		freeList = topFrame = null;
+		flow = Ic.PAUSE;
+		exception = null;
+		regs = Array<Val>.new(32); // TUNABLE: initial size of register stack
+
+		if (m != null) {
+			// initialize frame
+			var mm = m.asMethod();
+			if (mm.ic == null) mm.ic = compile(m);
+			pushFrame(0, 0, m, mm.ic);
+		}
+		if (args != null) {
+			// initialize register values
+			regs(0) = Values.BOTTOM;
+			Arrays.copyInto(args, regs, 1);
+		}
+	}
+	def addProbeBefore(f: (IcInterpreter, int) -> void) {
+		globalProbes.addProbeBefore(f);
+		if (flow == Ic.FAST) flow = Ic.SLOW;
+	}
+	def addProbeAfter(f: (IcInterpreter, int) -> void) {
+		globalProbes.addProbeAfter(f);
+		if (flow == Ic.FAST) flow = Ic.SLOW;
+	}
+	// resume execution from a previously paused state
+	def run() {
+		if (flow == Ic.PAUSE) {
+			flow = Ic.SLOW;
+			if (globalProbes.empty()) flow = Ic.FAST;
+		}
+		while (flow == Ic.FAST || flow == Ic.SLOW) {
+			while (flow == Ic.FAST) ip = code(ip).execute(this, regs, rp, ip);
+			while (flow == Ic.SLOW) step();
+		}
+	}
+	// pause the execution if it is running
+	def pause() {
+		if (flow == Ic.FAST || flow == Ic.SLOW) flow = Ic.PAUSE;
+	}
+	// execute a single instruction, firing global probe
+	def step() {
+		var i = code(ip), probeIp = ip;
+		if (fireBefore(i, globalProbes, probeIp)) return;
+		ip = i.execute(this, regs, rp, ip);
+		// execute all "after" probes
+		pausedInstr = null;
+		fireProbes(globalProbes, probeIp, true);
+	}
+	// fire probes before this instruction, return true if paused
+	def fireBefore(i: IcInstr, probes: IcProbes, probeIp: int) -> bool {
+		if (pausedInstr == i) return false;
+		// execute all "before" probes
+		fireProbes(probes, probeIp, false);
+		if (flow == Ic.PAUSE) {
+			// probe paused execution
+			pausedInstr = i;
+			return true;
+		}
+		return false;
+	}
+	// fire all of the probes in the list
+	def fireProbes(probes: IcProbes, probeIp: int, after: bool) {
+		var q = probes.before;
+		if (after) q = probes.after;
+		while (q != null) {
+			q.head(this, probeIp);
+			q = q.tail;
+		}
+	}
+	def pushFrame(retIp: int, retReg: int, memberRef: IrSpec, icm: IcMethod) {
+		// adjust register pointer first
+		var retRp = rp;
+		if (topFrame != null) rp = rp + topFrame.icm.numRegs;
+		var end = rp + icm.numRegs;
+		if (end > regs.length) regs = Arrays.grow(regs, end * 3);
+
+		// get frame from free list, or allocate a new one
+		var nf = freeList;
+		if (nf != null) freeList = nf.next;
+		else nf = IcFrame.new();
+
+		// link new frame
+		nf.next = topFrame;
+		nf.retIp = retIp;
+		nf.retReg = retReg;
+		nf.retRp = retRp;
+		nf.icm = icm;
+		nf.memberRef = memberRef;
+
+		// set code and current frame
+		topFrame = nf;
+		code = icm.iccode;
+	}
+	def popFrame() -> IcFrame {
+		// get top frame
+		var nf = topFrame;
+
+		// pop frame and add to free list
+		topFrame = nf.next;
+		nf.next = freeList;
+		freeList = nf;
+
+		// adjust register pointer
+		rp = nf.retRp;
+
+		// if not the last frame, set code
+		if (topFrame != null) code = topFrame.icm.iccode;
+		else code = null;
+		return topFrame;
+	}
+	// create a stack trace from the current activation frames
+	private def getStackTrace() -> List<Source> {
+		var list: List<Source>, fip = ip;
+		for (f = topFrame; f != null; f = f.next) {
+			list = List.new(getSource(f.icm, fip), list);
+			fip = f.retIp;
+		}
+		return Lists.reverse(list);
+	}
+	private def getSource(icm: IcMethod, ip: int) -> Source {
+		var i = if(ip >= 0, icm.iccode(ip));
+		if (IcApply.?(i)) return IcApply.!(i).source;
+		else if (IcFastOp.?(i)) return IcFastOp.!(i).source;
+		else if (IcCall.?(i)) return IcCall.!(i).source;
+		else if (IcThrow.?(i)) return IcThrow.!(i).source;
+		else return Source.new(icm.memberRef.asMethod().source, 0, ip - 1, null);
+	}
+
+	// == implementation of Argument interface for operators =================
+	private var typeArgs: Array<Type>;
+	private var argRegs: Array<int>;
+	private var opDstReg: int;
+	var opTailCall: bool;
+
+	def numArgs() -> int {
+		return argRegs.length;
+	}
+	def getArg(i: int) -> Val {
+		return regs(rp + argRegs(i));
+	}
+	def getType(i: int) -> Type {
+		var t = typeArgs(i);
+		if (t.open) t = topFrame.memberRef.instantiateType(t);
+		return t;
+	}
+	def getTypes() -> Array<Type> {
+		return topFrame.memberRef.instantiateTypes(typeArgs);
+	}
+	def getDynamicPortion() -> DynamicPortion {
+		return dynamicPortion;
+	}
+	def fwCall(memberRef: IrSpec, rcvr: Val, startArg: int, endArg: int) -> Result {
+		opTailCall = true;
+		var oldRp = rp, icm = getIcMethod(memberRef);
+		pushFrame(ip, opDstReg, memberRef, icm);
+		// copy the arguments into the frame
+		var argRp = rp + 1, numArgs = endArg - startArg;
+		for (i = 0; i < numArgs; i++) {
+			regs(argRp + i) = regs(oldRp + argRegs(startArg + i));
+		}
+		regs(rp) = rcvr;
+		// adjust size of parameters if necessary
+		if (numArgs != icm.numParams - 1) adjustArgs(argRp, icm.numParams - 1, numArgs);
+		return Values.BOTTOM;
+	}
+	def evalOp(op: Operator, dst: int, args: Array<int>) -> Result {
+		if (args.length != op.numParams) args = adjustOpArgs(op.numParams, args);
+		typeArgs = op.typeArgs;
+		opDstReg = dst;
+		argRegs = args;
+		return op.evaluate(this);
+	}
+	def throw(ex: string, msg: string) -> Exception {
+		exception = Exception.new(ex, msg, getStackTrace());
+		flow = Ic.EXCEPTION;
+		return exception;
+	}
+	def getIcMethod(memberRef: IrSpec) -> IcMethod {
+		var m = IrMethod.!(memberRef.member);
+		var icm = m.ic;
+		if (icm == null) return m.ic = compile(memberRef);
+		return icm;
+	}
+	// adjust arguments to expected parameters, either by expanding or collapsing tuples
+	def adjustArgs(argRp: int, numParams: int, numArgs: int) {
+		if (numParams == 0 || numParams == numArgs) return;
+		var max = argRp + numParams;
+		if (max >= regs.length) {
+			// allocate space for the expanded arguments if necessary
+			regs = Arrays.grow(regs, max);
+		}
+		if (numArgs == 0) {
+			// pass all BOTTOMs 
+			while (argRp < max) {
+				regs(argRp++) = Values.BOTTOM;
+			}
+		} else if (numParams == 1) {
+			// collapse into tuple
+			regs(argRp) = Tuple_Value.new(Arrays.range(regs, argRp, argRp + numArgs));
+		} else {
+			// expand tuple
+			var last = argRp + numArgs - 1;
+			var v = Tuple_Value.!(regs(last));
+			if (v == null) {
+				// pass all BOTTOMs
+				while (last < max) {
+					regs(last++) = Values.BOTTOM;
+				}
+			} else {
+				// expand tuple
+				for (i = 0; last < max; i++) {
+					regs(last++) = v.values(i);
+				}
+			}
+		}
+	}
+	// adjust arguments to parameters for operator invocation
+	def adjustOpArgs(numParams: int, args: Array<int>) -> Array<int> {
+		var slack = topFrame.icm.numRegs * 2;
+		var tempRp = rp + slack;
+		var end = tempRp + numParams + args.length;
+		if (end > regs.length) regs = Arrays.grow(regs, end * 3);
+		// use temp space at the end of registers for adjustment
+		for (i = 0; i < args.length; i++) {
+			regs(tempRp + i) = regs(rp + args(i));
+		}
+		// now perform the adjustment using in-register routine
+		adjustArgs(tempRp, numParams, args.length);
+		var result = Array<int>.new(numParams);
+		// return the new offsets of the (expanded or contracted) values
+		for (i = 0; i < result.length; i++) {
+			result(i) = slack + i;
+		}
+		return result;
+	}
+}

@@ -1,0 +1,810 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Stateless parser logic for all of Virgil-III syntax
+component Parser {
+	def III_2 = false;
+
+	def NONE      = '\x00';
+	def COMMA     = ',';
+	def precTable = Array<byte>.new(V3Opcode.totalOpcodes);
+	def opTable   = Array<Operator>.new(V3Opcode.totalOpcodes);
+	def lenTable  = Array<byte>.new(V3Opcode.totalOpcodes);
+	def kwMap     = Strings.newMap<string>();
+	def identMiddleBitMap = Array<int>.new(8);
+	def identStartBitMap = Array<int>.new(8);
+
+	def PRIVATE_VAR = VarDefParser.new(true, false);
+	def PRIVATE_DEF = VarDefParser.new(true, true);
+	def PUBLIC_VAR  = VarDefParser.new(false, false);
+	def PUBLIC_DEF  = VarDefParser.new(false, true);
+
+	new() {
+		init("||",  51, V3Op.opBoolOr);
+		init("&&",  52, V3Op.opBoolAnd);
+		init("|",   53, V3Op.opIntOr);
+		init("^",   54, V3Op.opIntXor);
+		init("&",   55, V3Op.opIntAnd);
+		init("!=",  56, V3Op.newNotEqual(Int.TYPE));
+		init("==",  57, V3Op.newEqual(Int.TYPE));
+		init("<=",  58, V3Op.opIntLteq);
+		init(">=",  59, V3Op.opIntGteq);
+		init(">",   61, V3Op.opIntGt);
+		init("<",   60, V3Op.opIntLt);
+		init("#<<", 62, V3Op.opIntShl);
+		init("#>>", 62, V3Op.opIntShr);
+		init("+",   63, V3Op.opIntAdd);
+		init("-",   63, V3Op.opIntSub);
+		init("*",   64, V3Op.opIntMul);
+		init("/",   64, V3Op.opIntDiv);
+		init("%",   64, V3Op.opIntMod);
+		init("!",   64, V3Op.newTypeCast(Int.TYPE, Int.TYPE));
+		init("?",   64, V3Op.newTypeQuery(Int.TYPE, Int.TYPE));
+
+		keyword("break");
+		keyword("class");
+		keyword("component");
+		keyword("continue");
+		keyword("def");
+		keyword("else");
+		keyword("extends");
+		keyword("field");
+		keyword("for");
+		keyword("local");
+		keyword("if");
+		keyword("in");
+		keyword("match");
+		keyword("method");
+		keyword("new");
+		keyword("private");
+		keyword("return");
+		keyword("super");
+		keyword("type");
+		keyword("value");
+		keyword("var");
+		keyword("while");
+
+		setRange(identMiddleBitMap, 'a', 'z');
+		setRange(identMiddleBitMap, 'A', 'Z');
+		setRange(identMiddleBitMap, '0', '9');
+		setRange(identMiddleBitMap, '_', '_');
+		setRange(identStartBitMap, 'a', 'z');
+		setRange(identStartBitMap, 'A', 'Z');
+	}
+	def setRange(a: Array<int>, low: int, high: int) {
+		for (i = low; i <= high; i++) {
+			var ind = i #>> 5;
+			a(ind) = a(ind) | (1 #<< (i & 0x1f));
+		}
+	}
+	def init(opname: string, p: int, op: Operator) {
+		precTable(op.opcode) = byte.!(p);
+		opTable(op.opcode) = op;
+		lenTable(op.opcode) = byte.!(opname.length);
+	}
+	def keyword(kw: string) {
+		kwMap.set(kw, kw);
+	}
+	def parseFile(fileName: string, input: Array<byte>, ERROR: ErrorGen) -> ParsedFile {
+		var file = ParsedFile.new(fileName, ERROR);
+		var p = ParserState.new(fileName, input, ERROR, skipToNextToken);
+		file.input = input;
+		file.lineEnds = p.lineEnds;
+		file.decls = parseList(0, p, NONE, NONE, NONE, parseCompound).list;
+		return file;
+	}
+	def parseCompound(p: ParserState) -> Decl {
+		var start = optKeyword(p, "class");
+		if (start != null) {
+			var id = checkKeyword(p, parseIdent(p, parseTypeParam));
+			var parent = if(optKeyword(p, "extends") != null, parseTypeRef(p));
+			var members = parseList(0, p, '{', NONE, '}', parseMember);
+			return VstClass.new(id.name, id.list(), parent, members.asList());
+		}
+		start = optKeyword(p, "component"); 
+		if (start != null) {
+			var id = checkKeyword(p, parseIdentVoid(p)).name;
+			var members = parseList(0, p, '{', NONE, '}', parseMember);
+			return VstComponent.new(id, members.asList());
+		}
+		p.error("\"class\" or \"component\" expected"); 
+		return null;
+	}
+	def parseMember(p: ParserState) -> VstMember {
+		var isPrivate = optKeyword(p, "private") != null;
+		match (p.curByte) {
+			'd': {
+				var start = optKeyword(p, "def");
+				if (start != null) return parseDef(p, isPrivate, start);
+			}
+			'f': {
+				var start = optKeyword(p, "field");
+				if (start != null) return parseField(p, isPrivate, start);
+			}
+			'm': {
+				var start = optKeyword(p, "method");
+				if (start != null) return parseMethod(p, isPrivate, start);
+			}
+			'n': {
+				var start = optKeyword(p, "new");
+				if (start != null) return parseNew(p, isPrivate, start);
+			}
+			'v': {
+				var start = optKeyword(p, "var");
+				if (start != null) return parseVar(p, isPrivate, start);
+				start = optKeyword(p, "value");
+				if (start != null) return parseValue(p, isPrivate, start);
+			}
+		}
+		p.error("invalid start of member declaration");
+		return null;
+	}
+	def parseNew(p: ParserState, isPrivate: bool, start: FilePoint) -> VstNew {
+		var params = parseList(0, p, '(', COMMA, ')', parseParam);
+		var superclause: SuperClause;
+		if (p.opt1(':') >= 0) {
+			var sstart = reqKeyword(p, "super");
+			var args = parseList(0, p, '(', COMMA, ')', parseExpr);
+			superclause = SuperClause.new(sstart, TupleExpr.new(args));
+		}
+		var body: BlockStmt, end = p.optT(';');
+		if (end < 0) body = parseBlockStmt(p);
+		var token = Token.new(p.fileName, "new", start.beginLine, start.beginColumn);
+		return VstNew.new(token, params.list, superclause, body);
+	}
+	def parseMethod(p: ParserState, isPrivate: bool, start: FilePoint) -> VstMethod {
+		var id = checkKeyword(p, parseIdent(p, parseTypeParam));
+		var params = parseList(0, p, '(', COMMA, ')', parseParamWithType);
+		var rtype = if(p.optN("->") >= 0, parseTypeRef(p), TypeRef.new(null, null, null, Void.TYPE));
+		var body = if(p.optT(';') < 0,  parseBlockStmt(p));
+		return VstMethod.new(isPrivate, id.name, id.list(), params.list, rtype, body);
+	}
+	def parseField(p: ParserState, isPrivate: bool, start: FilePoint) -> VstMember {
+		return if(isPrivate, PRIVATE_VAR, PUBLIC_VAR).parseField(p);
+	}
+	def parseValue(p: ParserState, isPrivate: bool, start: FilePoint) -> VstMember {
+		return if(isPrivate, PRIVATE_DEF, PUBLIC_DEF).parseField(p);
+	}
+	def parseVar(p: ParserState, isPrivate: bool, start: FilePoint) -> VstMember {
+		// TODO: allow declaring a list of vars
+		return if(isPrivate, PRIVATE_VAR, PUBLIC_VAR).parseField(p);
+	}
+	def parseDef(p: ParserState, isPrivate: bool, start: FilePoint) -> VstMember {
+		// TODO: allow declaring a list of defs
+		return if(isPrivate, PRIVATE_DEF, PUBLIC_DEF).parseMember(p);
+	}
+	def parseParam(p: ParserState) -> ParamDecl {
+		var id = checkKeyword(p, parseIdentVoid(p)).name;
+		if (id == null) return null;
+		var tref = if(p.opt1(':') >= 0,  parseTypeRef(p));
+		return ParamDecl.new(id, tref);
+	}
+	def parseParamWithType(p: ParserState) -> ParamDecl {
+		var id = checkKeyword(p, parseIdentVoid(p)).name;
+		if (id == null) return null;
+		p.req1(':');
+		return ParamDecl.new(id, parseTypeRef(p));
+	}
+	def parseTypeRef(p: ParserState) -> TypeRef {
+		var tref: TypeRef;
+		if (p.curByte == '(') {
+			var list = parseList(0, p, '(', COMMA, ')', parseTypeRef);
+			tref = TypeRef.new(null, list.list, Tuple.TYPECON, null);
+		} else {
+			var lastPos = p.curPos;
+			var id = parseIdent(p, parseTypeRef);
+			if (p.curPos == lastPos) return null;
+			tref = TypeRef.new(id.name, id.list(), null, null);
+		}
+		var arrow = p.optN("->");
+		while (arrow >= 0) { // type suffixes ( '->' Type )*
+			var rtype = parseTypeRef(p);
+			tref = TypeRef.new(null, Lists.cons2(tref, rtype), Function.DELEGATE, null);
+			arrow = p.optN("->");
+		}
+		return tref;
+	}
+	def parseTypeParam(p: ParserState) -> TypeParam {
+		var id = checkKeyword(p, parseIdentVoid(p)).name;
+		if (id != null) return TypeParam.new(id);
+		return null;
+	}
+	def parseStmt(p: ParserState) -> Stmt {
+		match(p.curByte) {
+			'{': return parseBlockStmt(p);
+			';': return parseEmptyStmt(p);
+			'i': return parseIfStmt(p);
+			'w': return parseWhileStmt(p);
+			'm': return parseMatchStmt(p);
+			'l': {
+				var start = optKeyword(p, "local");
+				if (start != null) return parseLocalStmt(p, start);
+			}
+			'v': {
+				var start = optKeyword(p, "var");
+				if (start != null) return parseVarStmt(p, start);
+			}
+			'd': {
+				var start = optKeyword(p, "def");
+				if (start != null) return parseDefStmt(p, start);
+			}
+			'b': return parseBreakStmt(p);
+			'c': return parseContinueStmt(p);
+			'r': return parseReturnStmt(p);
+			'f': return parseForStmt(p);
+		}
+		return parseExprStmt(p);
+	}
+	def parseBlockStmt(p: ParserState) -> BlockStmt {
+		return BlockStmt.new(parseList(0, p, '{', NONE, '}', parseStmt));
+	}
+	def parseEmptyStmt(p: ParserState) -> Stmt {
+		var src = p.point();
+		p.advance(1);
+		return EmptyStmt.new(src);
+	}
+	def parseControlExpr(p: ParserState) -> Expr {
+		p.req1('(');
+		var e = parseExpr(p);
+		p.reqT(')');
+		return e;
+	}
+	def parseIfStmt(p: ParserState) -> Stmt {
+		var start = optKeyword(p, "if");
+		if (start != null) {
+			var cond = parseControlExpr(p);
+			var tblock = parseStmt(p);
+			var fblock = if(optKeyword(p, "else") != null, parseStmt(p));
+			return IfStmt.new(start, cond, tblock, fblock);
+		}
+		return parseExprStmt(p);
+	}
+	def parseWhileStmt(p: ParserState) -> Stmt {
+		var start = optKeyword(p, "while");
+		if (start != null) {
+			var cond = parseControlExpr(p);
+			var tblock = parseStmt(p);
+			return WhileStmt.new(start, cond, tblock);
+		}
+		return parseExprStmt(p);
+	}
+	def parseForStmt(p: ParserState) -> Stmt {
+		var start = optKeyword(p, "for");
+		if (start != null) {
+			p.req1('(');
+			var decl = PRIVATE_VAR.parseLocal(p);
+			if (optKeyword(p, "in") != null) {
+				// for (vardecl in expr) { ... }
+				var expr = parseExpr(p);
+				p.req1(')');
+				var tblock = parseStmt(p);
+				return ForeachStmt.new(start, decl, expr, tblock);
+			} else {
+				// for (vardecl; cond; update) { ... }
+				p.req1(';');
+				var cond = parseExpr(p);
+				p.req1(';');
+				var update = parseExpr(p);
+				p.req1(')');
+				var tblock = parseStmt(p);
+				return ForStmt.new(start, decl, cond, update, tblock);
+			}
+		}
+		return parseExprStmt(p);
+	}
+	def parseMatchStmt(p: ParserState) -> Stmt {
+		var start = optKeyword(p, "match");
+		if (start != null) {
+			var key = parseControlExpr(p), defcase: MatchCase;
+			var list = parseList(0, p, '{', NONE, '}', parseMatchCase);
+			if (optKeyword(p, "else") != null) defcase = MatchCase.new(null, parseStmt(p));
+			return MatchStmt.new(start, key, list, defcase);
+		}
+		return parseExprStmt(p);
+	}
+	def parseMatchCase(p: ParserState) -> MatchCase {
+		var list = if (III_2, parseList(1, p, NONE, COMMA, NONE, parseExpr),
+					parseList(1, p, NONE, COMMA, ':', parseExpr));
+		var stmt = if(III_2, parseBlockStmt(p), parseStmt(p));
+		return MatchCase.new(list, stmt);
+	}
+	def parseLocalStmt(p: ParserState, start: FilePoint) -> Stmt {
+		return LocalStmt.new(start, parseList(1, p, NONE, COMMA, ';', PRIVATE_VAR.parseLocal));
+	}
+	def parseVarStmt(p: ParserState, start: FilePoint) -> Stmt {
+		return LocalStmt.new(start, parseList(1, p, NONE, COMMA, ';', PRIVATE_VAR.parseLocal));
+	}
+	def parseDefStmt(p: ParserState, start: FilePoint) -> Stmt {
+		return LocalStmt.new(start, parseList(1, p, NONE, COMMA, ';', PRIVATE_DEF.parseLocal));
+	}
+	def parseBreakStmt(p: ParserState) -> Stmt {
+		var start = optKeyword(p, "break");
+		if (start != null) return BreakStmt.new(term1(p, start, ';'));
+		return parseExprStmt(p);
+	}
+	def parseContinueStmt(p: ParserState) -> Stmt {
+		var start = optKeyword(p, "continue");
+		if (start != null) return ContinueStmt.new(term1(p, start, ';'));
+		return parseExprStmt(p);
+	}
+	def parseReturnStmt(p: ParserState) -> Stmt {
+		var start = optKeyword(p, "return");
+		if (start != null) {
+			if (p.curByte == ';') return ReturnStmt.new(term1(p, start, ';'), null);
+			var expr = parseExpr(p);
+			return ReturnStmt.new(term1(p, start, ';'), expr);
+		}
+		return parseExprStmt(p);
+	}
+	def parseExprStmt(p: ParserState) -> Stmt {
+		var expr = parseExpr(p);
+		if (expr == null) return null;
+		return ExprStmt.new(term1(p, expr.range(), ';'), expr);
+	}
+	def parseExpr(p: ParserState) -> Expr {
+		var subExpr = parseSubExpr(p);
+		if (p.curByte == '=' && p.peek(1) != '=') {
+			var pos = p.token(1);
+			var rhs = parseExpr(p);
+			return AssignExpr.new(subExpr, pos, rhs);
+		}
+		return addBinOpSuffixes(p, subExpr);
+	}
+	def parseSubExpr(p: ParserState) -> Expr {
+		return addTermSuffixes(p, parseTerm(p));
+	}
+	def parseTerm(p: ParserState) -> Expr {
+		var ch = p.curByte;
+		match (ch) {
+			'\'': return parseByteLiteral(p);
+			'\"': return parseStringLiteral(p);
+			'(':  return parseTupleExpr(p);
+			'[':  return parseArrayLiteral(p);
+			'!':  return parseNotExpr(p);
+			'_':  return parseParamExpr(p);
+			'-':  {
+				if (p.peek(1) == '-') return AutoExpr.new(p.token(2), parseSubExpr(p), V3Op.opIntSub, false);
+				return parseNumeric(p);
+			}
+			'+':  {
+				if (p.peek(1) == '+') return AutoExpr.new(p.token(2), parseSubExpr(p), V3Op.opIntAdd, false);
+			}
+			'i': {
+				if (ch == 'i') {
+					var start = optKeyword(p, "if");
+					if (start != null) {
+						var args = parseList(1, p, '(', COMMA, ')', parseExpr);
+						return IfExpr.new(start, args);
+					}
+				}
+			}
+		}
+		if (isIdentStart(ch)) return parseVarExpr(p);
+		else if (Byte.isDecimal(ch)) return parseNumeric(p);
+		p.error("invalid start of expression");
+		return null;
+	}
+	def parseParamExpr(p: ParserState) -> Expr {
+		// only "_" is allowed, not "__" or "_id"
+		if (isIdentMiddle(p.peek(1))) {
+			p.error("identifier expected");
+			return null;
+		}
+		return ParamExpr.new(p.token(1));
+	}
+	def parseNotExpr(p: ParserState) -> Expr {
+		var point = p.point();
+		var start = p.req1('!');
+		return NotExpr.new(point, parseSubExpr(p));
+	}
+	def parseByteLiteral(p: ParserState) -> Expr {
+		var parsed = Byte.parseByte(p.input, p.curPos);
+		if (parsed.passed) {
+			var token = p.token(parsed.length);
+			return newValueExpr(token, Byte.box(parsed.val), Byte.TYPE);
+		}
+		p.error("invalid character literal");
+		return null;
+	}
+	def parseStringLiteral(p: ParserState) -> Expr {
+		var parsed = Byte.parseString(p.input, p.curPos);
+		if (parsed.passed) {
+			var token = p.token(parsed.length);
+			return StringExpr.new(token, parsed.val);
+		}
+		p.error("invalid string literal");
+		return null;
+	}
+	def parseBytes(p: ParserState, delim: byte, name: string) -> Token {
+		// note: first delim byte should have been matched by outer rules
+		var d = p.input, q = p.curPos + 1;
+		while (q < d.length) {
+			var ch = d(q);
+			if (ch == delim) return p.token(q + 1 - p.curPos);
+			if (ch == '\n') break;
+			if (ch == '\\') { // skip escaped bytes
+				if (++q >= d.length) break;
+			}
+			if (ch < ' ') p.error("nonprintable character in literal");
+			q++;
+		}
+		p.advance(q - p.curPos);
+		p.error1("\"%1\" expected to end literal", delim);
+		return null;
+	}
+	def parseTupleExpr(p: ParserState) -> TupleExpr {
+		return TupleExpr.new(parseList(0, p, '(', COMMA, ')', parseExpr));
+	}
+	def parseArrayLiteral(p: ParserState) -> ArrayExpr {
+		return ArrayExpr.new(parseList(0, p, '[', COMMA, ']', parseExpr));
+	}
+	def parseNumeric(p: ParserState) -> Expr {
+		if (p.curByte == '0') {
+			var ch2 = p.peek(1);
+			if (ch2 == 'x' || ch2 == 'X') {
+				// hexadecimal constant "0x..."
+				return intLiteral("hexadecimal", p, Int.parseHex);
+			} else if (ch2 == 'b' || ch2 == 'B') { 
+				// binary constant "0b..."
+				return intLiteral("binary", p, Int.parseBin);
+			} else if (Byte.isDecimal(ch2)) { 
+				// octal constant "0..."
+				var end = p.star(2, Byte.isDecimal);
+				p.error("octal literal"); // invalid
+				p.advance(end - p.curPos);
+				return null;
+			} else {
+				// zero "0"
+				return newValueExpr(p.token(1), null, Int.TYPE);
+			}
+		} else if (p.curByte == '-') {
+			// negative decimal "-..."
+			return intLiteral("negative", p, Int.parseNegDecimal);
+		} else {
+			// positive decimal "..."
+			return intLiteral("integer", p, Int.parsePosDecimal);
+		}
+	}
+	def intLiteral(base: string, p: ParserState, f: (Array<byte>, int) -> Parsed<int>) -> Expr {
+		var parsed = f(p.input, p.curPos);
+		if (parsed.passed) {
+			var token = p.token(parsed.length);
+			return newValueExpr(token, Int.box(parsed.val), Int.TYPE);
+		} else {
+			p.error1("invalid %1 literal", base);
+			p.advance(parsed.length);
+			return null;
+		}
+	}
+	def parseVarExpr(p: ParserState) -> Expr {
+		var id = parseIdent(p, parseTypeRef);
+		if (id != null) return VarExpr.new(null, null, id);
+		return null;
+	}
+	def addTermSuffixes(p: ParserState, expr: Expr) -> Expr {
+		while (true) {
+			match (p.curByte) {
+				'.': { // expr.
+					var pos = p.point();
+					p.advance(1);
+					var ch = p.curByte;
+					if (isIdentStart(ch)) {
+						expr = VarExpr.new(expr, pos, parseIdent(p, parseTypeRef));
+					} else if (Byte.isDecimal(ch)) {
+						var end = p.plus(0, Byte.isDecimal);
+						var token = p.token(end - p.curPos);
+						expr = VarExpr.new(expr, pos, VstIdent<TypeRef>.new(token, null));
+					} else {
+						var op = parseOp(p, true);
+						if (op != null) expr = VarExpr.new(expr, pos, op);
+						else p.error("member expected");
+					}
+				}
+				'(': { // expr(
+					var args = parseList(0, p, '(', COMMA, ')', parseExpr);
+					expr = AppExpr.new(expr, TupleExpr.new(args));
+				}
+				'+': if (p.peek(1) == '+') { // expr++
+					return AutoExpr.new(p.token(2), expr, V3Op.opIntAdd, true);
+				} else break;
+				'-': if (p.peek(1) == '-') { // expr--
+					return AutoExpr.new(p.token(2), expr, V3Op.opIntSub, true);
+				} else break;
+			} else {
+				break;
+			}
+		}
+		return expr;
+	}
+	def addBinOpSuffixes(p: ParserState, expr: Expr) -> Expr {
+		var op = parseOp(p, false);
+		if (op == null) return expr;
+		var exprStack = Stack<Expr>.new();
+		var operStack = Stack<BinOp>.new();
+		exprStack.push(expr);
+		while (op != null) {
+			var binop = BinOp.new(op.name, opTable(op.name.choice));
+			var prec = int.!(precTable(op.name.choice));
+			op.name.choice = prec;
+			if (operStack.top != null && operStack.peek().token.choice >= prec) { // LR reduction
+				reduce(p, exprStack, operStack, prec);
+			}
+			operStack.push(binop);
+			exprStack.push(parseSubExpr(p));
+			op = parseOp(p, false);
+		}
+		reduce(p, exprStack, operStack, -1);
+		return exprStack.pop();
+	}
+	def reduce(p: ParserState, exprStack: Stack<Expr>, operStack: Stack<BinOp>, prec: int) {
+		while (!operStack.empty() && operStack.peek().token.choice >= prec) {
+			var right = exprStack.pop();
+			var left = exprStack.pop();
+			var binop = operStack.pop();
+			exprStack.push(BinOpExpr.new(left, binop.token, binop.op, right));
+		}
+	}
+	def parseList<T>(min: int, p: ParserState, begDelim: byte, sepByte: byte, endDelim: byte, f: ParserState -> T) -> VstList<T> {
+		var start = p.point();
+		if (p.curByte != begDelim) {
+			if (begDelim != NONE) {
+				p.error1("\'%1\' expected", begDelim);
+				return VstList<T>.new(p.point().rangeOf(0), null);
+			}
+		} else {
+			p.advance(1);
+		}
+		if (min == 0 && p.curByte == endDelim) {
+			// zero length list
+			return VstList<T>.new(eatEnd(p, start), null);
+		}
+		var list: List<T>;
+		var range: FileRange;
+		while (true) {
+			var lastPos = p.curPos;
+			var item = f(p);
+			if (p.curPos == lastPos) {
+				// didn't parse anything
+				p.opt1(endDelim);
+				return VstList<T>.new(p.end(start), Lists.reverse(list));
+			}
+			list = List<T>.new(item, list);
+			if (p.curByte == endDelim) {
+				// end of list
+				range = eatEnd(p, start);
+				break;
+			}
+			if (sepByte != NONE && p.opt1(sepByte) < 0) {
+				var msg = Strings.format2("\'%1\' or \'%2\' expected", sepByte, endDelim);
+				p.error(msg);
+				range = p.end(start);
+				break;
+			}
+		}
+		return VstList<T>.new(range, Lists.reverse(list));
+	}
+	def eatEnd(p: ParserState, start: FilePoint) -> FileRange {
+		var endLine = p.curLine;
+		var endColumn = p.curCol + 1;
+		p.advance(1);
+		return FileRange.new(p.fileName, start.beginLine, start.beginColumn, endLine, endColumn);
+	}
+	def parseIdentVoid(p: ParserState) -> VstIdent<void> {
+		return parseIdent(p, null);
+	}
+	// parse a parameterized identifier with the supplied parameter parsing function
+	def parseIdent<T>(p: ParserState, parse: ParserState -> T) -> VstIdent<T> {
+		if (isIdentStart(p.curByte)) {
+			var d = p.input;
+			for (q = p.curPos + 1; q < d.length; q++) {
+				var c = d(q);
+				if (c == '<') { // parse parameters, if allowed
+					if (parse == null) {
+						p.error("identifier cannot be parameterized here");
+						return extractIdent(p, q);
+					}
+					var start = p.curPos;
+					var token = p.token(q - start);
+					var list = parseList(1, p, '<', COMMA, '>', parse);
+					return VstIdent<T>.new(token, list);
+				}
+				// if the character is part of the middle continue
+				if (!isIdentMiddle(c)) return extractIdent(p, q);
+			}
+			// end of input
+			return extractIdent(p, d.length);
+		}
+		p.error("identifier expected");
+		return extractIdent(p, p.curPos);
+	}
+	// extract an unparameterized identifier and advance the parser
+	def extractIdent<T>(p: ParserState, end: int) -> VstIdent<T> {
+		return VstIdent<T>.new(p.token(end - p.curPos), null);
+	}
+	def checkKeyword<T>(p: ParserState, ident: VstIdent<T>) -> VstIdent<T> {
+		// XXX: keyword check: maximum length check, use sorted array?
+		var t = ident.name;
+		if (t == null) return ident;
+		if (kwMap.get(t.image) != null) {
+			p.errorAt(t.range(), Strings.format1("keyword \"%1\" cannot be used as identifier", t.image));
+		}
+		return ident;
+	}
+	// parse an infix or member operator
+	def parseOp(p: ParserState, member: bool) -> VstIdent<TypeRef> {
+		var q = p.curPos, opcode = -1, hasParams = false;
+		match (p.curByte) {
+			'=' : opcode = choose(p, '=', V3Opcode.Equal, -1);
+			'|' : opcode = choose(p, '|', V3Opcode.BoolOr, V3Opcode.IntOr);
+			'&' : opcode = choose(p, '&', V3Opcode.BoolAnd, V3Opcode.IntAnd);
+			'<' : opcode = choose(p, '=', V3Opcode.IntLteq, V3Opcode.IntLt);
+			'>' : opcode = choose(p, '=', V3Opcode.IntGteq, V3Opcode.IntGt);
+			'+' : opcode = V3Opcode.IntAdd;
+			'-' : opcode = V3Opcode.IntSub;
+			'*' : opcode = V3Opcode.IntMul;
+			'/' : opcode = V3Opcode.IntDiv;
+			'%' : opcode = V3Opcode.IntMod;
+			'^' : opcode = V3Opcode.IntXor;
+			'?' : {
+				if (member) {
+					opcode = V3Opcode.TypeQuery;
+					hasParams = (p.peek(1) == '<');
+				}
+			}
+			'!' : {
+				var ch2 = p.peek(1);
+				if (ch2 == '=') opcode = V3Opcode.NotEqual;
+				else if (member) {
+					opcode = V3Opcode.TypeCast;
+					hasParams = (ch2 == '<');
+				}
+			}
+			'#' : {
+				var d = p.input;
+				if (d.length - q > 2) {
+					if (d(q + 1) == '>' && d(q + 2) == '>') opcode = V3Opcode.IntShr;
+					if (d(q + 1) == '<' && d(q + 2) == '<') opcode = V3Opcode.IntShl;
+				}
+			}
+		}
+
+		if (opcode >= 0) {
+			var len = lenTable(opcode);
+			var start = p.curPos, end = start + len;
+			var t = p.token(len);
+			t.choice = opcode;
+			var list = if(hasParams, parseList(0, p, '<', COMMA, '>', parseTypeRef));
+			return VstIdent<TypeRef>.new(t, list);
+		}
+		return null;
+	}
+	def choose(p: ParserState, ch: byte, op1: int, op2: int) -> int {
+		if (p.peek(1) == ch) return op1;
+		return op2;
+	}
+	def reqKeyword(p: ParserState, kw: string) -> FilePoint {
+		var start = optKeyword(p, kw);
+		if (start == null) p.error1("\"%1\" expected", kw);
+		return start;
+	}
+	def optKeyword(p: ParserState, kw: string) -> FilePoint {
+		if (p.curByte != kw(0)) return null;
+		var i = p.curPos, d = p.input, max = i + kw.length;
+		if (max > d.length) return null;
+		for (j = 0; j < kw.length; j++) {
+			if (d(i + j) != kw(j)) return null;
+		}
+		if (max < d.length && isIdentMiddle(d(max))) return null;
+		var pt = FilePoint.new(p.fileName, p.curLine, p.curCol);
+		p.advance(kw.length);
+		return pt;
+	}
+	def isIdentStart(ch: byte) -> bool {
+		return 0 != (identStartBitMap(ch #>> 5) & (1 #<< (ch & 0x1f)));
+	}
+	def isIdentMiddle(ch: byte) -> bool {
+		return 0 != (identMiddleBitMap(ch #>> 5) & (1 #<< (ch & 0x1f)));
+	}
+	def term1(p: ParserState, start: FilePoint, ch: byte) -> FileRange {
+		var endLine = p.curLine;
+		var endColumn = p.curCol;
+		if (p.curByte == ch) {
+			p.advance(1);
+			endColumn++;
+		} else {
+			p.error1("\"%1\" expected", ch);
+		}
+		return FileRange.new(p.fileName, start.beginLine, start.beginColumn, endLine, endColumn);
+	}
+	def skipToNextToken(p: ParserState) {
+		// skip forward over whitespace and comments
+		var curPos = p.curPos, curLine = p.curLine, curCol = p.curCol;
+		var input = p.input, max = input.length;
+		while (curPos < max) {
+			var ch = input(curPos);
+			match (ch) {
+				'\t': { curCol = 1 + ((curCol + 8) / 8) * 8; }
+				' ' : { curCol++; }
+				'\n': {
+					p.lineEnds.add(curPos);
+					curCol = 1;
+					curLine++;
+				}
+				'/' : {
+					if (curPos >= max - 1 || input(curPos + 1) != '/') break;
+					// skip line comment
+					curPos = curPos + 2;
+					while (curPos < max) {
+						if (input(curPos) == '\n') {
+							p.lineEnds.add(curPos);
+							curCol = 1;
+							curLine++;
+							break;
+						}
+						curPos++;
+					}
+				} 
+			} else {
+				if (ch < ' ' || ch > '~') {
+					// illegal character!
+					p.setPos(curPos, curLine, curCol);
+					p.error1("invalid character valued %1", int.!(ch));
+					curCol++;
+				} else {
+					// non-whitespace character, break
+					break;
+				}
+			}
+			curPos++;
+		}
+		// reached the end or a non-whitespace character
+		p.setPos(curPos, curLine, curCol);
+	}
+	def newValueExpr(token: Token, val: Val, vtype: Type) -> Expr {
+		var expr = VarExpr.new(null, token, VstIdent<TypeRef>.new(token, null));
+		expr.binding = ValueBinding.new(token, val, vtype);
+		return expr;
+	}
+}
+// XXX: can probably replace with (Token, Operator)
+class BinOp {
+	def token: Token;
+	def op: Operator;
+	new(token, op) { }
+}
+// a small closure for parsing var/def declarations
+class VarDefParser {
+	def isPrivate: bool;
+	def isReadOnly: bool;
+	new(isPrivate, isReadOnly) {}
+	def parseMember(p: ParserState) -> VstMember {
+		var id = Parser.checkKeyword(p, Parser.parseIdent(p, Parser.parseTypeParam));
+		if (p.curByte == '(' || id.params != null) return parseMethodSuffix(p, id);
+		else return parseFieldSuffix(p, id.name);
+	}
+	def parseField(p: ParserState) -> VstField {
+		return parseFieldSuffix(p, Parser.checkKeyword(p, Parser.parseIdentVoid(p)).name);
+	}
+	private def parseFieldSuffix(p: ParserState, id: Token) -> VstField {
+		var tref = if(p.opt1(':') >= 0, Parser.parseTypeRef(p));
+		var init = if(p.opt1('=') >= 0, Parser.parseExpr(p));
+		var f = VstField.new(isPrivate, isReadOnly, id, tref, init);
+		p.req1(';');
+		return f;
+	}
+	private def parseMethodSuffix(p: ParserState, id: VstIdent<TypeParam>) -> VstMethod {
+		var params = Parser.parseList(0, p, '(', Parser.COMMA, ')', Parser.parseParamWithType);
+		var rtype = if(p.optN("->") >= 0, Parser.parseTypeRef(p), TypeRef.new(null, null, null, Void.TYPE));
+		var body = if(p.optT(';') < 0,  Parser.parseBlockStmt(p));
+		return VstMethod.new(isPrivate, id.name, id.list(), params.list, rtype, body);
+	}
+	def parseLocal(p: ParserState) -> VarDecl {
+		var id = Parser.checkKeyword(p, Parser.parseIdentVoid(p)).name;
+		if (id == null) return null;
+		var tref = if(p.opt1(':') >= 0, Parser.parseTypeRef(p));
+		var init = if(p.opt1('=') >= 0, Parser.parseExpr(p));
+		var decl = VarDecl.new(id, tref, init);
+		decl.isReadOnly = isReadOnly;
+		return decl;
+	}
+}

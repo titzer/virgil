@@ -1,0 +1,417 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Base class for all IR classes, methods, and fields.
+class IrItem {
+	def uid: int = UID.next++;
+	var flags: int;
+	def setFlag(i: int) { flags = flags | i; }
+	def clearFlag(i: int) { flags = flags & (i ^ -1); }
+	def checkFlag(i: int) -> bool { return (flags & i) != 0; }
+}
+
+// intermediate representation of classes, components, and arrays
+class IrClass extends IrItem {
+	def ctype: Type;			// type corresponding to this class
+	def typeArgs: TypeArgs;		// type arguments
+	def parent: IrClass;			// parent class if any
+	def fields: Array<IrField>;		// fields, including super fields
+	def methods: Array<IrMethod>;		// method dispatch table, #0 = constructor
+	var children: List<IrClass>;		// list of child classes
+
+	new(ctype, typeArgs, parent, fields, methods) {
+		// set container for all new fields and methods
+		for (i = 0; i < fields.length; i++) {
+			checkMember(i, fields(i));
+		}
+		for (j = 0; j < methods.length; j++) {
+			checkMember(j, methods(j));
+		}
+	}
+	def checkMember(index: int, m: IrMember) {
+		if (m == null) return; // null is OK (e.g. no constructor)
+		if (m.container == null) {
+			m.container = this;
+			m.index = index;
+		} else if (m.index != index) {
+			return V3.fail(Strings.format2("member %1 at wrong index %2", m.render, index));
+		}
+	}
+	def isClass() -> bool { return V3.isClass(ctype); }
+	def isComponent() -> bool { return V3.isComponent(ctype); }
+}
+
+// represents a member of a class or a component
+class IrMember extends IrItem {
+	var container: IrClass;	// class the member is contained in
+	var index: int;		// index into the appropriate members list
+	new() { }
+	def render(buffer: StringBuffer) -> StringBuffer;
+	def renderLong(buffer: StringBuffer) -> StringBuffer {
+		container.ctype.render(buffer);
+		return render(buffer.putc('.'));
+	}
+}
+
+// represents a field of a class or component, or the elements of an array
+class IrField extends IrMember {
+	def fieldType: Type;	// the type of the field
+	var source: Decl;	// declaration that produced the field, if any
+	var val: Val;		// the value of the field, if it is a constant
+	var offset: int;	// field offset that can be used by backends
+
+	new(fieldType) { }
+	def render(buffer: StringBuffer) -> StringBuffer {
+		if (source == null) return buffer.putc('f').puti(index);
+		else buffer.puts(source.name());
+		if (checkFlag(IrUtil.F_NORM)) {
+			buffer.putc('.').puti(index);
+		}
+		return buffer;
+	}
+}
+
+// represents a method of a class or component
+class IrMethod extends IrMember {
+	def typeArgs: TypeArgs;	// type arguments to this method (bound or unbound)
+	def paramTypes: Array<Type>;	// parameter types of method
+	def returnType: Type;		// return type
+	var source: VstMethod;	// declaration that produced the method, if any
+	var ic: IcMethod;		// interpreter code of method
+	var ssa: SsaRegion;		// SSA code for method
+
+	new(typeArgs, paramTypes, returnType) { }
+	def render(buffer: StringBuffer) -> StringBuffer {
+		if (source == null) buffer.putc('m').puti(index);
+		else buffer.puts(source.name());
+		if (typeArgs != null) typeArgs.render(buffer);
+		return buffer;
+	}
+	def getMethodType() -> Type {
+		var ptype = Tuple.newType(Lists.fromArray(paramTypes));
+		return Function.newType(ptype, returnType);
+	}
+}
+
+// Lazily-allocated internal class used to store the types associated with an IrSpec
+class IrSpecTypes {
+	def typeArgsList: List<TypeArgs>;
+	def methodTypeArgs: TypeArgs;
+	var boundType: Type;
+	var unboundType: Type;
+	new(typeArgsList, methodTypeArgs) { }
+	def instantiateType(t: Type) -> Type {
+		if (t.open) for (l = typeArgsList; l != null; l = l.tail) { t = t.substitute(l.head); }
+		return t;
+	}
+}
+
+// represents the specification (or specialization) of an IrMember,
+// including the container type and any type arguments
+class IrSpec {
+	def container: Type;
+	def typeArgs: Array<Type>;
+	def member: IrMember;
+	var types: IrSpecTypes;
+	var hashval: int;
+	new(container, typeArgs, member) { }
+	def render(buffer: StringBuffer) -> StringBuffer {
+		container.render(buffer);
+		buffer.putc('.');
+		member.render(buffer);
+		var tp = getTypes();
+		if (tp.methodTypeArgs != null) tp.methodTypeArgs.render(buffer);
+		return buffer;
+	}
+	def hash() -> int {
+		if (hashval != 0) return hashval;
+		var h = member.uid;
+		for (t in typeArgs) h = h * 33 + t.hash;
+		return hashval = h;
+	}
+	def equals(other: IrSpec) -> bool {
+		if (this == other) return true;
+		if (other == null || this.member != other.member) return false;
+		for (i = 0; i < typeArgs.length; i++) {
+			if (typeArgs(i) != other.typeArgs(i)) return false;
+		}
+		return true;
+	}
+	def instantiateType(t: Type) -> Type {
+		if (t.open) return getTypes().instantiateType(t);
+		return t;
+	}
+	def instantiateTypes(t: Array<Type>) -> Array<Type> {
+		if (t.length == 0) return t;
+		var tp = getTypes();
+		if (tp.typeArgsList == null) return t;
+		var nt = Array<Type>.new(t.length);
+		for (i = 0; i < t.length; i++) {
+			nt(i) = tp.instantiateType(t(i));
+		}
+		return nt;
+	}
+	def instantiateIrSpec(spec: IrSpec) -> IrSpec {
+		return IrSpec.new(instantiateType(spec.container), instantiateTypes(spec.typeArgs), spec.member);
+	}
+	def getBoundType() -> Type {
+		var tp = getTypes();
+		if (tp.boundType != null) return tp.boundType;
+		if (IrField.?(member)) {
+			// type of this member is just the field's type
+			return tp.boundType = tp.instantiateType(IrField.!(member).fieldType);
+		} else {
+			// get the type of the method
+			var m = IrMethod.!(member);
+			var paramType = Tuple.newType(Lists.fromArray(m.paramTypes));
+			return tp.boundType = tp.instantiateType(Function.newType(paramType, m.returnType));
+		}
+	}
+	def getUnboundType() -> Type {
+		var tp = getTypes();
+		if (tp.unboundType != null) return tp.unboundType;
+		if (IrField.?(member)) {
+			// container -> fieldType
+			return tp.unboundType = tp.instantiateType(Function.newType(container, IrField.!(member).fieldType));
+		} else {
+			// (container, params) -> returnType
+			return tp.unboundType = Function.prependParamType(instantiateType(container), getBoundType());
+		}
+	}
+
+	def isNew() -> bool { return IrMethod.?(member) && member.checkFlag(IrUtil.M_NEW); }
+	def isMethod() -> bool { return IrMethod.?(member); }
+	def isField() -> bool { return IrField.?(member); }
+	def asMethod() -> IrMethod { return IrMethod.!(member); }
+	def asField() -> IrField { return IrField.!(member); }
+	def getFieldType() -> Type { return instantiateType(IrField.!(member).fieldType); }
+	def getReturnType() -> Type { return instantiateType(IrMethod.!(member).returnType); }
+	def getParamTypes() -> Array<Type> { return instantiateTypes(IrMethod.!(member).paramTypes); }
+	def getMethodType() -> Type { return getBoundType(); }
+	def getFuncType() -> Type { return Function.funcRefType(getBoundType()); }
+	def getTypes() -> IrSpecTypes {
+		if (types != null) return types;
+		var t = container, typeArgsList: List<TypeArgs>, methodTypeArgs: TypeArgs;
+		if (V3.isClass(container)) typeArgsList = List.new(V3Class_TypeCon.!(t.typeCon).getTypeArgs(t), null);
+		if (typeArgs.length > 1) {
+			var mta = IrMethod.!(member).typeArgs;
+			methodTypeArgs = mta.copy(Arrays.range(typeArgs, 1, typeArgs.length));
+			typeArgsList = List.new(methodTypeArgs, typeArgsList);
+		}
+		return types = IrSpecTypes.new(typeArgsList, methodTypeArgs);
+	}
+}
+
+component IrUtil {
+	def NO_FIELDS: Array<IrField> = [];
+	def NO_METHODS: Array<IrMethod> = [];
+
+	// flags for classes, fields and methods
+	def F_VALUE	 = 0b000000001; // field is read-only (i.e. a value)
+	def F_NORM	 = 0b000000010; // the field is an element of a normalized field
+	def F_CONST	 = 0b000000100; // field is constant
+	def M_OVERRIDDEN = 0b000001000; // method has been overridden in a subclass
+	def M_OVERRIDE	 = 0b000010000; // method overrides a superclass method
+	def M_NEW	 = 0b000100000; // the method is a new(), i.e. a constructor
+	def M_ABSTRACT	 = 0b001000000; // the method is abstract
+	def C_ALLOCATED	 = 0b010000000; // the class is allocated
+	def C_HEAP	 = 0b100000000; // exists live in the heap
+
+	def isLive(ic: IrClass) -> bool {
+		return (ic.flags & (C_ALLOCATED | C_HEAP)) != 0;
+	}
+	def newIrSpecMap<T>() -> HashMap<IrSpec, T> {
+		return HashMap.new(IrSpec.hash, IrSpec.equals);
+	}
+	def newIrMethodMap<T>() -> HashMap<IrMethod, T> {
+		return HashMap<IrMethod, T>.new(IrMethod.uid, IrMethod.==);
+	}
+	def newIrFieldMap<T>() -> HashMap<IrField, T> {
+		return HashMap<IrField, T>.new(IrField.uid, IrField.==);
+	}
+}
+
+// builds polymorphic IR classes from VST declarations
+class IrPortion {
+	def prog: Program;
+	def classMap: PartialMap<Type, IrClass> = TypeUtil.newTypeMap();
+	def typeVarElim: TypeVarEliminator = TypeVarEliminator.new(null);
+	def classes: Sequence<IrClass> = Sequence<IrClass>.new();
+	var mainMethod: IrSpec;
+
+	new(prog) { }
+
+	def elimTypeVars(t: Type) -> Type {
+		if (t == null) return t;
+		return t.substitute(typeVarElim);
+	}
+	def fromIrMemberAndTypes(typeArgs: Array<Type>, member: IrMember) -> IrSpec {
+		return IrSpec.new(typeArgs(0), typeArgs, member);
+	}
+	def fromVstMemberAndType(container: Type, member: VstMember) -> IrSpec {
+		return fromIrMemberAndTypes([container], makeIrMember(member));
+	}
+	def fromVstMember(member: VstMember) -> IrSpec {
+		var m = makeIrMember(member), c = m.container.ctype;
+		return fromIrMemberAndTypes([c], m);
+	}
+	private def makeIrMember(m: VstMember) -> IrMember {
+		var ic = makeIrClass(m.container.getDeclaredType());
+		if (VstMethod.?(m)) return ic.methods(m.index);
+		else return ic.fields(m.index);
+	}
+	def makeIrField(f: VstField) -> IrField {
+		return makeIrClass(f.container.getDeclaredType()).fields(f.index);
+	}
+	def makeIrMethod(m: VstMethod) -> IrMethod {
+		return makeIrClass(m.container.getDeclaredType()).methods(m.index);
+	}
+	def resolveSuperMethod(irSpec: IrSpec) -> IrSpec {
+		var superType = V3.getSuperType(irSpec.container);
+		if (superType != null) return resolveMethodImpl(superType, irSpec);
+		return irSpec;
+	}
+	def resolveMethodImpl(classType: Type, irSpec: IrSpec) -> IrSpec {
+		var ic = makeIrClass(classType);
+		if (irSpec.member.index >= ic.methods.length) return null;
+		var m = ic.methods(irSpec.member.index);
+		if (m == irSpec.member) return irSpec;
+		var nt = Arrays.copy(irSpec.typeArgs, null), tc = m.container.ctype.typeCon;
+		while (classType.typeCon != tc) {
+			classType = V3.getSuperType(classType);
+		}
+		nt(0) = classType;
+		return IrSpec.new(classType, nt, m);
+	}
+	def setIrClass(ctype: Type, ic: IrClass) {
+		classMap.set(ctype, ic);
+		classes.add(ic);
+	}
+	def getIrClass(ctype: Type) -> IrClass {
+		return classMap.get(ctype);
+	}
+	def makeIrClass(ctype: Type) -> IrClass {
+		if (ctype == null) return null;
+		var ic = classMap.get(ctype);
+		if (ic == null) {
+			if (V3.isClass(ctype)) {
+				// create the IrClass from the class's members
+				var ptype = V3.asClass(ctype).classDecl.getDeclaredType();
+				if (ptype == ctype) {
+					// create a new IR class
+					var sc = makeIrClass(V3.getSuperType(ctype));
+					ic = newIrClass(ctype, sc, V3.asClass(ctype).classDecl);
+				} else {
+					// get the IR class of the polymorphic type
+					ic = makeIrClass(ptype);
+				}
+				classMap.set(ctype, ic);
+			} else if (V3.isComponent(ctype)) {
+				// create the ir class from the component's members
+				ic = newIrClass(ctype, null, V3.asComponent(ctype).componentDecl);
+				classMap.set(ctype, ic);
+			}
+		}
+		return ic;
+	}
+	def newIrClass(ctype: Type, superClass: IrClass, decl: VstCompound) -> IrClass {
+		var builder = IrClassBuilder.new(ctype, superClass);
+		builder.grow(decl.numFields, decl.numMethods + 1);
+		for (list = decl.members; list != null; list = list.tail) {
+			var m = list.head;
+			if (VstField.?(m)) builder.addVstField(VstField.!(m));
+			else if (VstNew.?(m)) builder.addVstNew(VstNew.!(m));
+			else if (VstMethod.?(m)) builder.addVstMethod(VstMethod.!(m));
+		}
+		var ic = builder.build();
+		classes.add(ic);
+		return ic;
+	}
+}
+
+class IrClassBuilder {
+	def ctype: Type;
+	def parent: IrClass;
+	def fields = Sequence<IrField>.new();
+	def methods = Sequence<IrMethod>.new();
+
+	new(ctype, parent) {
+		if (parent == null) {
+			methods.add(null); // reserve index 0 for constructor
+		} else {
+			fields.addN(parent.fields);
+			methods.addN(parent.methods);
+			methods.set(0, null); // overwrite super constructor
+		}
+	}
+	def grow(numFields: int, numMethods: int) {
+		fields.grow(numFields);
+		methods.grow(numMethods);
+	}
+	def addVstField(f: VstField) {
+		f.index = fields.length;
+		var ir = IrField.new(f.getType());
+		ir.source = f;
+		if (f.isReadOnly) ir.setFlag(IrUtil.F_VALUE);
+		fields.add(ir);
+	}
+	def addVstNew(m: VstNew) {
+		// constructors always occupy slot 0
+		m.index = 0;
+		var receiverType = m.container.getDeclaredType();
+		var ir = IrMethod.new(null, getParamTypes(m), receiverType);
+		ir.source = m;
+		ir.setFlag(IrUtil.M_NEW);
+		methods.set(0, ir);
+	}
+	def addVstMethod(m: VstMethod) {
+		var returnType = Function.getReturnType(m.getType());
+		var typeArgs: TypeArgs;
+		if (m.typeParams != null) typeArgs = TypeArgs.new(m.typeEnv, null);
+		var ir = IrMethod.new(typeArgs, getParamTypes(m), returnType);
+		ir.source = m;
+		var r = m.root;
+		if (r == m) {
+			// this is the root method of a method family
+			m.index = methods.length;
+			methods.add(ir);
+		} else {
+			// this is an override
+			parent.methods(r.index).setFlag(IrUtil.M_OVERRIDDEN);
+			ir.setFlag(IrUtil.M_OVERRIDE);
+			methods.set(m.index = r.index, ir);
+		}
+	}
+	def getParamTypes(m: VstMethod) -> Array<Type> {
+		var seq = Sequence<Type>.new();
+		for (l = m.params; l != null; l = l.tail) {
+			seq.add(l.head.vtype);
+		}
+		return seq.extract();
+	}
+	def build() -> IrClass {
+		var typeArgs: TypeArgs;
+		if (V3.isPolymorphicClass(ctype)) {
+			var decl = V3.asClass(ctype).classDecl;
+			typeArgs = TypeArgs.new(decl.typeEnv, null);
+		}
+		var ic = IrClass.new(ctype, typeArgs, parent, fields.extract(), methods.extract());
+		if (parent != null) parent.children = List.new(ic, parent.children);
+		return ic;
+	}
+	def addIrField(f: IrField) {
+		fields.add(f);
+	}
+	def addIrMethod(m: IrMethod) {
+		if (m.checkFlag(IrUtil.M_NEW)) methods.set(0, m);
+		else methods.add(m);
+	}
+	def setIrMethod(index: int, m: IrMethod) {
+		var p = methods.get(index);
+		if (p != null && p != m) {
+			p.setFlag(IrUtil.M_OVERRIDDEN);
+			m.setFlag(IrUtil.M_OVERRIDE);
+		}
+		methods.set(index, m);
+	}
+}

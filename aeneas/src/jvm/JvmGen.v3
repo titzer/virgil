@@ -1,0 +1,673 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Global state needed while translating a Virgil program to the JVM.
+class JvmProgram {
+	def compiler: Compiler;
+	def prog: Program;
+	def classMap = Strings.newMap<JvmClass>();
+	def jvmSigs = TypeUtil.newTypeMap<JvmSig>();
+	def delegateAdapters = TypeUtil.newTypePairMap<JvmV3DelegateAdapterGen>();
+	def ir = prog.dynamic.getIr();
+	def classQueue = Sequence<JvmClassGen>.new();
+
+	var jrep: JvmTypeReps;
+	var jheap: JvmHeap;
+	var makeJar: bool;
+	var test: bool;
+	var jarFile: JARFile;
+	var lastMethodID: int;
+	var abstractDelegateClass: JvmClassGen;
+	var usingSystem: bool;
+
+	new(compiler, prog) {
+		jrep = JvmTypeReps.new(this);
+		jheap = JvmHeap.new(this);
+	}
+
+	def build() {
+		if (makeJar) {
+			var main = ir.mainMethod;
+			var fileName = compiler.getOutputFileName(prog.name(), "jar");
+			jarFile = JARFile.new(fileName);
+			jarFile.create(compiler.ERROR);
+			if (jarFile.fid < 0) return;
+			jarFile.addManifest(V3.mangleTypeName("V3K_", main.container));
+		}
+
+		ir.classes.apply(processIrClass);
+		var pos = Sequences.drain(classQueue, 0, JvmClassGen.build);
+		jheap.emit();
+		Sequences.drain(classQueue, pos, JvmClassGen.build);
+		classQueue.apply(JvmClassGen.emit);
+
+		if (usingSystem) copySystemClasses();
+		if (makeJar) jarFile.finish();
+		if (JvmComponent.GEN_SCRIPT.get()) genScript();
+	}
+	def copySystemClasses() {
+		var inFile = JvmComponent.makeJvmRtFileName(JvmTypes.systemClassName, "class");
+		var data = System.fileLoad(inFile);
+		if (data != null) {
+			if (makeJar) {
+				var outFile = Strings.makeFileName(null, JvmTypes.systemClassName, "class");
+				var jff = JARFileFile.new(outFile);
+				jff.outK(data, 0, data.length);
+				jarFile.addFile(jff);
+			} else {
+				var outFile = compiler.getOutputFileName(JvmTypes.systemClassName, "class");
+				var file = System.fileOpen(outFile, false);
+				if (file >= 0) {
+					var stream = FileStream.new(file);
+					stream.outK(data, 0, data.length);
+					stream.close();
+				} else {
+					compiler.ERROR.OutputError(outFile);
+				} 
+			}
+		} else {
+			// the file couldn't be found, issue a warning
+			Terminal.print1("Warning: could not find runtime class %1\n", inFile);
+		}
+	}
+	def genScript() {
+		var programName = compiler.programName();
+		var fileName = compiler.getOutputFileName(programName, null);
+		var fd = System.fileOpen(fileName, false);
+		if (fd < 0) return compiler.ERROR.OutputError(fileName);
+		out(fd, "#!/bin/bash\n");
+		out(fd, "DIR=$(dirname ${BASH_SOURCE[0]})\n");
+		out(fd, "java ");
+		var args = JvmComponent.ARGS.get();
+		if (args != null && args.length > 0) {
+			out(fd, args);
+			out(fd, " ");
+		}
+		if (makeJar) out(fd, "-jar $DIR/");
+		else out(fd, "-cp $DIR V3K_");
+		out(fd, programName);
+		if (makeJar) out(fd, ".jar");
+		out(fd, " \"$@\"\n");
+		System.fileClose(fd);
+		compiler.makeExecutable(fileName);
+	}
+	def out(fd: int, str: string) {
+		System.fileWriteK(fd, str, 0, str.length);
+	}
+	def processIrClass(ic: IrClass) {
+		var utype = ic.ctype;
+		if (V3.isClass(utype) || V3.isComponent(utype)) jvmType(utype);
+	}
+	def getIrClass(vtype: Type) -> IrClass {
+		var ic = ir.getIrClass(vtype);
+		if (ic == null) {
+			var message = vtype.render(Strings.toBuffer("IrClass not found: "));
+			compiler.ERROR.fail(message.toString());
+		}
+		return ic;
+	}
+	def jvmClass(vtype: Type) -> JvmClass { return jrep.getJvmClass(vtype); }
+	def jvmKind(vtype: Type) -> JvmKind { return jvmType(vtype).kind; }
+	def jvmType(vtype: Type) -> JvmType {
+		return jrep.getRep(vtype);
+	}
+	def jvmSig(ftype: Type) -> JvmSig {
+		var sig = jvmSigs.get(ftype);
+		if (sig == null) {
+			sig = makeJvmSig(null, ftype, null);
+			jvmSigs.set(ftype, sig);
+		}
+		return sig;
+	}
+	def makeJvmSig(receiver: JvmType, ftype: Type, retType: JvmType) -> JvmSig {
+		var seq = Sequence<JvmType>.new();
+		if (receiver != null) { seq.add(receiver); }
+		for (p = Function.getParamTypeList(ftype); p != null; p = p.tail) {
+			var jrep = jrep.getRep(p.head);
+			if (jrep.kind.width > 0) seq.add(jrep);
+		}
+		if (retType == null) {
+			retType = jrep.getRep(Function.getReturnType(ftype));
+		}
+		return JvmSig.new(seq.extract(), retType);
+	}
+	def makeHeapSig(ctype: Type) -> JvmSig {
+		return JvmSig.new(Arrays.map(getIrClass(ctype).fields, getFieldJvmType), jvmType(ctype));
+	}
+	def getFieldJvmType(f: IrField) -> JvmType {
+		return jvmType(f.fieldType);
+	}
+	def mangleConvertName(prefix: string, exactType: Type, implicitType: Type) -> string {
+		return V3.mangleTypeName(prefix, Function.newType(exactType, implicitType));
+	}
+	def mangleDelegateName(memberRef: IrSpec) -> string {
+		var buffer = StringBuffer.new();
+		buffer.puts(V3.mangleTypeName("V3D_", memberRef.container));
+		buffer.puts("$D");
+		var methName = V3.mangleIrMember(memberRef.member);
+		buffer.puts(methName);
+		return buffer.toString();
+	}
+	def newDelegate(memberRef: IrSpec) -> JvmClass {
+		var className = mangleDelegateName(memberRef);
+		var jclass = classMap.get(className);
+		if (jclass == null) {
+			var funcType = memberRef.getFuncType();
+			jclass = JvmClass.new(className, jrep.getJvmClass(funcType).name);
+			classMap.set(className, jclass);
+			classQueue.add(JvmV3DelegateGen.new(JvmClassfileBuilder.new(this, jclass), funcType, memberRef, getMethodID(memberRef)));
+		}
+		return jclass;
+		
+	}
+	def newDelegateAdapter(exactType: Type, implicitType: Type) -> JvmV3DelegateAdapterGen {
+		var adapter = delegateAdapters.get(exactType, implicitType);
+		if (adapter == null) {
+			var className = mangleConvertName("V3A_", exactType, implicitType);
+			var superName = jrep.getJvmClass(implicitType).name;
+			var jclass = JvmClass.new(className, superName);
+			adapter = JvmV3DelegateAdapterGen.new(JvmClassfileBuilder.new(this, jclass), exactType, implicitType);
+			delegateAdapters.set((exactType, implicitType), adapter);
+			classQueue.add(adapter);
+		}
+		return adapter;
+	}
+	def getMethodID(memberRef: IrSpec) -> int {
+		// get the uid of the root member
+		while (memberRef.member.checkFlag(IrUtil.M_OVERRIDE)) {
+			memberRef = ir.resolveSuperMethod(memberRef);
+		}
+		return memberRef.member.uid;
+	}
+	def emitJvmClassfile(jvmClass: JvmClassfile) {
+		if (makeJar) {
+			var fileName = Strings.makeFileName(null, jvmClass.className, "class");
+			// TUNABLE: initial buffer size for JAR file output
+			var jfile = JARFileFile.new(fileName), buffer = Buffer.new(4096, jfile.outK);
+			jvmClass.emit(buffer.getEncoder());
+			buffer.flush();
+			jarFile.addFile(jfile);
+		} else {
+			var fileName = compiler.getOutputFileName(jvmClass.className, "class");
+			var file = System.fileOpen(fileName, false);
+			if (file >= 0) {
+				// TUNABLE: initial buffer size for class file output
+				var stream = FileStream.new(file), buffer = Buffer.new(1024, stream.outK);
+				jvmClass.emit(buffer.getEncoder());
+				buffer.flush();
+				System.fileClose(file);
+			} else {
+				compiler.ERROR.OutputError(fileName);
+			} 
+		}
+	}
+	def makeAbstractDelegateClass() -> JvmClassGen {
+		if (abstractDelegateClass == null) {
+			var jclass = JvmClass.new("V3D", JvmTypes.jlo);
+			abstractDelegateClass = JvmV3AbstractDelegateGen.new(JvmClassfileBuilder.new(this, jclass));
+			classQueue.add(abstractDelegateClass);
+		}
+		return abstractDelegateClass;
+	}
+	def isUseless(vtype: Type) -> bool {
+		return vtype == Void.TYPE || V3.isComponent(vtype);
+	}
+	def isUselessArray(vtype: Type) -> bool {
+		return V3.isArray(vtype) && isUseless(vtype.nested.head);
+	}
+	def invokesystem(code: JvmCodeBuilder, name: string, sig: JvmSig) {
+		usingSystem = true;
+		code.invokestatic(JvmTypes.systemClassName, name, sig);
+	}
+}
+// Generates a single Jvm class
+class JvmClassGen {
+	def builder: JvmClassfileBuilder;
+	def vtype: Type;
+	
+	new(builder, vtype) { }
+	def build(); // subclasses generate code
+	// shorthand utilities for subclasses
+	def jvmType(t: Type) -> JvmType { return builder.jprog.jvmType(t); }
+	def jvmKind(t: Type) -> JvmKind { return builder.jprog.jvmType(t).kind; }
+	def jvmSig(t: Type) -> JvmSig { return builder.jprog.jvmSig(t); }
+	def addEmptyInit() {
+		// add an empty initializer
+		var jinit_none = builder.newMethod("<init>", "()V");
+		var jinit_none_code = builder.newCodeBuilder();
+		jinit_none_code.aload_0();
+		jinit_none_code.invokespecial(builder.jclass.superName, "<init>", JvmTypes.SIG_VOID);
+		jinit_none_code.retvoid();
+		jinit_none_code.attach(jinit_none);
+	}
+	def genCode(builder: JvmClassfileBuilder, m: IrMethod, name: string, sig: JvmSig, static: bool) -> JvmMethod {
+		var jmeth = builder.newMethod(name, sig.descriptor());
+		jmeth.setFlag(static, JvmConstant.ACC_STATIC);
+		var methodRef = IrSpec.new(m.container.ctype, [m.container.ctype], m);
+		// generate code from SSA
+		var ssa = if(m != null, m.ssa);
+		JvmSsaCodeGen.new(builder, methodRef, ssa, jmeth, sig, false).build();
+		return jmeth;
+	}
+	def emit() {
+		builder.jprog.emitJvmClassfile(builder.file);
+	}
+}
+// Generates a Jvm class from a Virgil III class
+class JvmV3ClassGen extends JvmClassGen {
+	def classType: Type;
+	def ic: IrClass;
+	var superType: Type;
+	var typeArgs: TypeArgs;
+	new(builder: JvmClassfileBuilder, classType: Type, ic: IrClass) : super(builder, classType) {
+		this.superType = V3.getSuperType(classType);
+		this.typeArgs = V3.asClass(classType).getTypeArgs(classType);
+	}
+	def build() {
+		if (ic != null) {
+			for (f in ic.fields) buildField(f);
+			for (m in ic.methods) buildMethod(m);
+			// add a heap initializer method if there are live instances
+			if (ic.checkFlag(IrUtil.C_HEAP)) buildHeapInitializer();
+		}
+		addEmptyInit();
+	}
+	def buildNew(m: IrMethod) {
+		// build the special "$new" method which is the real constructor
+		var ntype = m.getMethodType();
+		var nsig = builder.jprog.makeJvmSig(null, ntype, builder.jclass);
+		var jnew_meth = builder.newStaticMethod("$new", nsig.descriptor());
+		var jnew_code = builder.newCodeBuilder();
+
+		jnew_code.newempty(builder.jclass);
+		builder.emitLoadArguments(jnew_code, ntype, ntype, 0);
+		var isig = builder.jprog.makeJvmSig(builder.jclass, ntype, builder.jclass);
+		jnew_code.invokestatic(builder.jclass.name, "$init", isig);
+		jnew_code.ret(JvmTypes.KIND_OBJECT);
+		jnew_code.attach(jnew_meth);
+		
+		// build the $init method which contains the constructors' translated code
+		genCode(builder, m, "$init", isig, false).setFlag(true, JvmConstant.ACC_STATIC);
+	}
+	def buildHeapInitializer() {
+		var jprog = builder.jprog;
+		var init_sig = jprog.makeHeapSig(classType);
+		var init_meth = builder.newStaticMethod("$heap", init_sig.descriptor());
+		var init_code = builder.newCodeBuilder();
+		// 1. allocate an empty object
+		init_code.newempty(builder.jclass);
+		// emit initialization of each field
+		for (i = 0; i < ic.fields.length; i++) {
+			// load each parameter
+			var f = ic.fields(i);
+			var jtype = jprog.jvmType(f.fieldType);
+			init_code.dup();
+			init_code.load(jtype.kind, i);
+			init_code.putfield(builder.jclass, V3.mangleIrMember(f), jtype);
+		}
+		init_code.max_locals = ic.fields.length + 1;
+		init_code.ret(JvmTypes.KIND_OBJECT);
+		init_code.attach(init_meth);
+	}
+	def buildField(f: IrField) {
+		if (f.container == ic) {
+			// this field is declared in this type.
+			builder.jprog.jrep.declareField(f, builder);
+		}
+	}
+	def buildMethod(m: IrMethod) {
+		if (m == null) return;
+		if (m.checkFlag(IrUtil.M_NEW)) {
+			buildNew(m);
+			return;
+		}
+		if (m.container == ic) {
+			// this method is declared in this type.
+			var name = V3.mangleIrMember(m);
+			var methType = m.getMethodType();
+			var jsig = jvmSig(methType);
+			if (m.checkFlag(IrUtil.M_ABSTRACT)) {
+				// method implementation is not used, just mark as abstract
+				var jmeth = builder.newMethod(name, jsig.descriptor());
+				jmeth.setFlag(true, JvmConstant.ACC_ABSTRACT);
+				builder.file.setFlag(true, JvmConstant.ACC_ABSTRACT);
+				return;
+			}
+			genCode(builder, m, name, jsig, false);
+			if (m.checkFlag(IrUtil.M_OVERRIDE)) {
+				// this is an override. check if bridge method is needed
+				var sic = builder.jprog.getIrClass(superType);
+				var sm = sic.methods(m.index);
+				var smType = sm.getMethodType();
+				if (smType != methType) {
+					// this method overrides the parent method's type. generate a bridge.
+					var bridge_meth = builder.newMethod(name, jvmSig(smType).descriptor());
+					var bridge_code = builder.newCodeBuilder();
+					bridge_code.aload_0();
+					builder.emitLoadArguments(bridge_code, methType, smType, 1);
+					bridge_code.invokevirtual(builder.jclass.name, name, jsig);
+					bridge_code.ret(jvmKind(Function.getReturnType(methType)));
+					bridge_code.attach(bridge_meth);
+				}
+			}
+		}
+	}
+}
+// Generates a Jvm class from a Virgil III component
+class JvmV3ComponentGen extends JvmClassGen {
+	def componentType: Type;
+	def ic: IrClass;
+	var clinit_meth: JvmMethod;
+	var clinit_code: JvmCodeBuilder;
+	new(builder: JvmClassfileBuilder, componentType, ic) : super(builder, componentType) {
+	}
+
+	def build() {
+		for (f in ic.fields) buildField(f);
+		for (m in ic.methods) buildMethod(m);
+
+		if (clinit_code != null) {
+			clinit_code.retvoid();
+			clinit_code.attach(clinit_meth);
+		}
+	}
+	def buildField(f: IrField) {
+		builder.jprog.jrep.declareField(f, builder);
+		buildInit(f);
+	}
+	def buildMethod(m: IrMethod) {
+		if (m == null) return;
+		var methType = m.getMethodType();
+		var jname = V3.mangleIrMember(m);
+		var jsig = jvmSig(methType);
+		genCode(builder, m, jname, jsig, true).setFlag(true, JvmConstant.ACC_PUBLIC);
+
+		// check to see if this method is the main method and requires a main bridge
+		if (!builder.jprog.test) {
+			var mainMethod = builder.jprog.ir.mainMethod;
+			if (mainMethod != null && m == mainMethod.member) {
+				var args = Function.getParamType(methType);
+				buildMainMethodBridge(jname, jsig, args, Function.getReturnType(methType));
+			}
+		}
+	}
+	def buildInit(f: IrField) {
+		if (clinit_code == null) {
+			clinit_meth = builder.newStaticMethod("<clinit>", "()V");
+			clinit_code = builder.newCodeBuilder();
+		}
+
+		var record = builder.jprog.prog.dynamic.getComponentRecord(V3.asComponent(componentType).componentDecl);
+		builder.emitValue(clinit_code, f.fieldType, record.values(f.index));
+		var memberRef = IrSpec.new(f.container.ctype, [f.container.ctype], f);
+		builder.jprog.jrep.emitSetField(memberRef, clinit_code, false);
+	}
+	def buildMainMethodBridge(jname: string, jsig: JvmSig, args: Type, rt: Type) {
+		var main_meth = builder.newStaticMethod("main", JvmTypes.SIG_JAVA_MAIN.descriptor());
+		main_meth.setFlag(true, JvmConstant.ACC_PUBLIC);
+		var main_code = builder.newCodeBuilder();
+
+		// create the array of byte arrays
+		if (args == V3.stringArrayType) {
+			main_code.aload_0();
+			main_code.arraylength();
+			main_code.newarray(JvmTypes.BYTE_ARRAY);
+			main_code.store(JvmTypes.KIND_OBJECT, 1);
+
+			// start the loop at index 0
+			main_code.iconst(0);
+			main_code.store(JvmTypes.KIND_INT, 2);
+
+			var loop_start = main_code.cur_pos;
+			main_code.load(JvmTypes.KIND_INT, 2);
+			main_code.aload_0();
+			main_code.arraylength();
+			var loop_test = main_code.branch_fw(JvmBytecode.IF_ICMPGE);
+
+			// load the argument from the array
+			main_code.aload_0();
+			main_code.load(JvmTypes.KIND_INT, 2);
+			main_code.aload(JvmTypes.KIND_OBJECT);
+			// and convert it to a byte array
+			main_code.invokevirtual(JvmTypes.java_lang_String.name, "getBytes", JvmTypes.SIG_VOID_BYTE_ARRAY);
+
+			// and store it in the byte array array
+			main_code.load(JvmTypes.KIND_INT, 2);
+			main_code.swap();
+			main_code.aload_1();
+			main_code.dup_x2();
+			main_code.pop();
+			main_code.astore(JvmTypes.KIND_OBJECT);
+
+			// and jump back to the beginning
+			main_code.iinc(2, 1);
+			main_code.goto_bw(loop_start);
+
+			main_code.patchBranch(loop_test);
+			main_code.aload_1();
+		} else {
+			main_code.locals(1);
+		}
+		main_code.invokestatic(builder.jclass.name, jname, jsig);
+		if (rt == Int.TYPE || rt == Byte.TYPE || rt == Bool.TYPE) {
+			main_code.invokestatic(JvmTypes.java_lang_System.name, "exit", JvmTypes.SIG_INT_VOID);
+		}
+		main_code.retvoid();
+		main_code.attach(main_meth);
+	}
+}
+// Generates a Jvm class representing a tuple
+class JvmV3TupleGen extends JvmClassGen {
+	def tupleType: Type;
+
+	new(builder: JvmClassfileBuilder, tupleType) : super(builder, null) { }
+
+	def build() {
+		// add the empty initializer
+		addEmptyInit();
+
+		// now build a static $new(...) method
+		var ftype = Function.newType(tupleType, tupleType);
+		var nsig = jvmSig(ftype);
+		var new_meth = builder.newStaticMethod("$new", nsig.descriptor());
+		var new_code = builder.newCodeBuilder();
+
+		// allocate a tuple object
+		new_code.newempty(builder.jclass);
+
+		// initialize all of its fields in the $new(...) method
+		var i = 0, localNum = 0;
+		for (list = tupleType.nested; list != null; list = list.tail) {
+			var vtype = list.head;
+			if (!builder.jprog.isUseless(vtype)) {
+				// declare the field
+				var name = Strings.format1("f%1", i);
+				var jtype = jvmType(vtype);
+				var jval = builder.newField(name, jtype.descriptor());
+				jval.setFlag(true, JvmConstant.ACC_PUBLIC);
+
+				// emit the field assignment
+				new_code.dup();
+				new_code.load(jtype.kind, localNum);
+				new_code.putfield(builder.jclass, name, jtype);
+				localNum = localNum + jtype.kind.width;
+			}
+			i++;
+		}
+		new_code.ret(builder.jclass.kind);
+		new_code.attach(new_meth);
+	}
+}
+// Generates a class representing the base class of all delegates
+class JvmV3AbstractDelegateGen extends JvmClassGen {
+	new(builder: JvmClassfileBuilder) : super(builder, null) { }
+
+	def build() {
+		builder.file.setFlag(true, JvmConstant.ACC_ABSTRACT);
+		builder.newField("method", "I");
+		addEmptyInit();
+
+		// emit the equals() method which compares "method" and "object()"
+		var equals_meth = builder.newMethod("equals", JvmTypes.SIG_EQUALV.descriptor());
+		equals_meth.setFlag(true, JvmConstant.ACC_PUBLIC);
+		var equals_code = builder.newCodeBuilder();
+		equals_code.aload_1();
+		equals_code.instanceof(builder.jclass);
+		var b1 = equals_code.branch_fw(JvmBytecode.IFNE);
+		equals_code.iconst_0();
+		equals_code.ret(JvmTypes.KIND_BOOLEAN);
+		equals_code.patchBranch(b1);
+
+		equals_code.aload_0();
+		equals_code.getfield(builder.jclass, "method", JvmTypes.INT);
+		equals_code.aload_1();
+		equals_code.checkcast(builder.jclass);
+		equals_code.getfield(builder.jclass, "method", JvmTypes.INT);
+		var b2 = equals_code.branch_fw(JvmBytecode.IF_ICMPEQ);
+		equals_code.iconst_0();
+		equals_code.ret(JvmTypes.KIND_BOOLEAN);
+		equals_code.patchBranch(b2);
+
+		equals_code.iconst_1();
+		equals_code.ret(JvmTypes.KIND_BOOLEAN);
+		equals_code.attach(equals_meth);
+	}
+}
+// Generates a delegate class which invokes a particular method on an object
+class JvmV3DelegateGen extends JvmClassGen {
+	def memberRef: IrSpec;
+	def methodID: int;
+	def methType: Type;
+	def funcType = Function.prependParamType(AnyObject.TYPE, methType);
+	var invoke_sig: JvmSig;
+
+	new(builder: JvmClassfileBuilder, methType, memberRef, methodID) : super(builder, null) {
+		invoke_sig = builder.jprog.jvmSig(funcType);
+	}
+
+	def build() {
+		var invoke_meth = builder.newMethod("invoke", invoke_sig.descriptor());
+
+		if (memberRef == null) {
+			buildAbstractClass(invoke_meth);
+		} else {
+			if (V3.isComponent(memberRef.container)) buildComponentDelegate(invoke_meth);
+			else buildClassDelegate(invoke_meth);
+		}
+	}
+	def buildAbstractClass(invoke_meth: JvmMethod) {
+		builder.file.setFlag(true, JvmConstant.ACC_ABSTRACT);
+		invoke_meth.setFlag(true, JvmConstant.ACC_ABSTRACT);
+		addEmptyInit();
+	}
+	def buildClassDelegate(invoke_meth: JvmMethod) {
+		// add the object field and the initializer
+		var classType = builder.jprog.jvmClass(memberRef.container);
+
+		addEmptyInit();
+		emitSingletonField();
+
+		// build the static $get(...) method
+		var new_method = builder.newStaticMethod("$get", JvmSig.new([JvmType.!(classType)], builder.jclass).descriptor());
+		var new_code = builder.newCodeBuilder();
+		new_code.aload_0();
+		var b = new_code.branch_fw(JvmBytecode.IFNONNULL);
+		new_code.aconst_null(); // throw NullPointerException if object is null
+		new_code.athrow();
+		new_code.patchBranch(b);
+		new_code.getstatic(builder.jclass, "instance", builder.jclass);
+		new_code.ret(classType.kind);
+		new_code.attach(new_method);
+		
+		// emit the invocation method
+		var invoke_code = builder.newCodeBuilder();
+		invoke_code.locals(invoke_sig.localsSize(true));
+		builder.emitLoadArguments(invoke_code, funcType, memberRef.getUnboundType(), 1);
+		invoke_code.invokevirtual(classType.name, V3.mangleIrMember(memberRef.member), jvmSig(methType));
+		invoke_code.ret(jvmKind(Function.getReturnType(funcType)));
+		invoke_code.attach(invoke_meth);
+	}
+	def buildGetter(classType: JvmClass, name: string, nullCheck: bool) {
+		// the getter checks that the object is null and then returns the singleton
+	}
+	def buildComponentDelegate(invoke_meth: JvmMethod) {
+		addEmptyInit();
+		emitSingletonField();
+
+		// emit the invocation method
+		var invoke_code = builder.newCodeBuilder();
+		builder.emitLoadArguments(invoke_code, methType, methType, 2);
+		var jclass = builder.jprog.jvmClass(memberRef.container);
+		invoke_code.locals(invoke_sig.localsSize(true));
+		invoke_code.invokestatic(jclass.name, V3.mangleIrMember(memberRef.member), jvmSig(methType));
+		invoke_code.ret(jvmKind(Function.getReturnType(funcType)));
+		invoke_code.attach(invoke_meth);
+	}
+	def emitSingletonField() {
+		// emit the static singleton field
+		var field_inst = builder.newField("instance", builder.jclass.descriptor());
+		field_inst.setFlag(true, JvmConstant.ACC_PUBLIC + JvmConstant.ACC_STATIC + JvmConstant.ACC_FINAL);
+
+		// emit the static initializer which creates the singleton
+		var clinit_meth = builder.newStaticMethod("<clinit>", "()V");
+		var clinit_code = builder.newCodeBuilder();
+
+		clinit_code.newempty(builder.jclass);
+		clinit_code.dup();
+		clinit_code.iconst(methodID);
+		clinit_code.putfield(builder.jclass, "method", JvmTypes.INT);
+		clinit_code.putstatic(builder.jclass, "instance", builder.jclass);
+		clinit_code.retvoid();
+		clinit_code.attach(clinit_meth);
+	}
+}
+// Generates a class that adapts between delegates (because of incompatible Jvm types)
+class JvmV3DelegateAdapterGen extends JvmClassGen {
+	var exactFuncType: Type;
+	var implicitFuncType: Type;
+	var delegateClass: JvmClass;
+	var initSig: JvmSig;
+	new(builder: JvmClassfileBuilder, exactType: Type, implicitType: Type) : super(builder, null) {
+		delegateClass = builder.jprog.jvmClass(exactType);
+		exactFuncType = Function.prependParamType(AnyObject.TYPE, exactType);
+		implicitFuncType = Function.prependParamType(AnyObject.TYPE, implicitType);
+		initSig = JvmSig.new([JvmType.!(delegateClass)], jvmType(implicitType));
+	}
+
+	def build() {
+		var invoke_sig = jvmSig(implicitFuncType);
+		var invoke_meth = builder.newMethod("invoke", invoke_sig.descriptor());
+
+		// add the delegate field to the initializer
+		var object_field = builder.newField("delegate", delegateClass.descriptor());
+
+		addEmptyInit();
+
+		// build the $new() method
+		var new_method = builder.newStaticMethod("$new", initSig.descriptor());
+		var new_code = builder.newCodeBuilder();
+		new_code.newempty(builder.jclass);
+		new_code.dup();
+		new_code.aload_0();
+		new_code.getfield(delegateClass, "method", JvmTypes.INT);
+		new_code.putfield(builder.jclass, "method", JvmTypes.INT);
+		new_code.dup();
+		new_code.aload_0();
+		new_code.putfield(builder.jclass, "delegate", delegateClass);
+		new_code.ret(JvmTypes.KIND_OBJECT);
+		new_code.attach(new_method);
+		
+		// emit the invocation method
+		var invoke_code = builder.newCodeBuilder();
+		invoke_code.locals(invoke_sig.localsSize(true));
+		invoke_code.aload_0();
+		invoke_code.getfield(builder.jclass, "delegate", delegateClass);
+		builder.emitLoadArguments(invoke_code, exactFuncType, implicitFuncType, 1);
+		invoke_code.invokevirtual(delegateClass.name, "invoke", jvmSig(exactFuncType));
+		var exactReturn = Function.getReturnType(exactFuncType);
+		var implicitReturn = Function.getReturnType(implicitFuncType);
+		builder.jprog.jheap.emitJvmTypeConversion(invoke_code, exactReturn, implicitReturn);
+		invoke_code.ret(jvmKind(implicitReturn));
+		invoke_code.attach(invoke_meth);
+	}
+}

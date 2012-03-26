@@ -1,0 +1,212 @@
+// Copyright 2012 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// and encodes CiRuntime.SRC_* tables into a compact format.
+class MachRtSrcTables {
+	def mach: MachProgram;
+	def rt: MachRuntime;
+	def runtimeRegion = mach.layout.runtimeRegion;
+	def exRegion  = Region.new("ex", mach.code);
+
+	def rt_source_pages  = rt.addr(runtimeRegion, "SRC_POINTS_PAGES");
+	def rt_sources       = rt.addr(runtimeRegion, "SRC_POINTS_TABLE");
+	def rt_methods_pages = rt.addr(runtimeRegion, "SRC_METHODS_PAGES");
+	def rt_methods       = rt.addr(runtimeRegion, "SRC_METHODS_TABLE");
+	def rt_methods_end   = rt.addr(runtimeRegion, "SRC_METHODS_TABLE_END");
+	def rt_class_table   = rt.addr(runtimeRegion, "SRC_CLASS_TABLE");
+	def rt_strings       = rt.addr(runtimeRegion, "SRC_STRINGS");
+
+	def rt_ex_start    = rt.addr(exRegion, "EX_START");
+	def rt_ex_end	   = rt.addr(exRegion, "EX_END");
+	def rt_ex_table    = rt.addr(runtimeRegion, "EX_TABLE");
+	def rt_ex_strings  = rt.addr(runtimeRegion, "EX_STRINGS");
+
+	def sourcePoints  = MachRtPageTable.new(rt_source_pages, rt_sources, null, false).grow(mach.numMethods * 3);
+	def sourceMethods = MachRtPageTable.new(rt_methods_pages, rt_methods, rt_methods_end, true).grow(mach.numMethods + 2);
+	def sourceMethodIndex = TableIndex<VstMethod, void>.new(mach.hashVstMethod);
+	def exEntries  = Sequence<(int, int)>.new();
+	def classTable = TableIndex<VstCompound, (int, int)>.new(mach.hashVstCompound);
+	def exStringTable = TableIndex<string, int>.new(Strings.hash);
+
+	def stringMap  = Strings.newMap<int>();
+	def stringData = StringBuffer.new();
+
+	var curMethod: VstMethod;
+	var curFrame: MachFrame;
+	var curMethodOffset: int = Int.MAX_VALUE;
+	var exDests: List<Addr>;
+
+	new(mach, rt) { }
+
+	def recordMethodStart(off: int, source: VstMethod, frame: MachFrame) {
+		curMethodOffset = off;
+		curFrame = frame;
+		curMethod = source;
+		var nameOffset = if(source == null, -1, getStringOffset(source.name()));
+		var classEntry = if(source == null, -1, classTable.find(source.container, addClassEntry));
+		var meth0 = (frameSlots() #<< 8) | (nameOffset #>> 16) & 0xFF;
+		var meth1 = nameOffset #<< 16 | classEntry & 0xFFFF;
+		sourceMethods.add(off, meth0, meth1);
+		sourceMethodIndex.add(source, ());
+		if (rt.debug) {
+			var str = if (source == null, "-", source.getFullName());
+			Terminal.print3("@method %1 +%2 |%3|\n", str, off, frameSlots());
+		}
+	}
+	def recordMethodEnd(off: int, source: VstMethod, frame: MachFrame) {
+		curMethodOffset = Int.MAX_VALUE;
+		curMethod = null;
+		curFrame = null;
+	}
+	def recordSource(off: int, source: Source) {
+		if (rt.debug) debugPoint("source", "-", off, source, frameSlots());
+		encodeSource(off, source);
+	}
+	def recordReturnSource(off: int, source: Source) {
+		if (rt.debug) debugPoint("retsource", "-", off - 1, source, frameSlots());
+		encodeSource(off - 1, source);
+	}
+	private def addClassEntry(compound: VstCompound) -> (int, int) {
+		var nameOffset = getStringOffset(compound.name());
+		var fileOffset = getStringOffset(compound.token.fileName);
+		return (nameOffset, fileOffset);
+	}
+	private def encodeSource(off: int, source: Source) {
+		var encoded = 0;
+		if (source != null) {
+			if (source.tail == null && source.mdecl == curMethod && source.line < 2048) {
+				encoded = source.line #<< 8 | Int.min(255, source.column);
+			} else {
+				encoded = 0xC0000 | recordExtendedEntry(null, source);
+			}
+		} else {
+			// source is null, just record the size of the frame
+			encoded = 0x80000 | frameSlots();
+		}
+		sourcePoints.add(off, encoded, 0);
+	}
+	private def recordExtendedEntry(ex: string, source: Source) -> int {
+		var exstrIndex = if (ex == null, 15, exStringTable.find(ex, getStringOffset));
+		var exEntry = exEntries.length;
+		if (source == null) {
+			// | FFFFF:20      ex:4     0:4 fw:4 ||    framewords:16   |
+			var frameWords = curFrame.slots();
+			var ex0 = (0xFFFFF000) | (exstrIndex #<< 8) | (frameWords #>> 16);
+			exEntries.add(ex0, frameWords & 0xFFFF);
+		} else if (source.tail == null) {
+			// single entry
+			recordExtendedSource(exstrIndex, source);
+		} else {
+			// multiple entries
+			// | FFFFF:20      ex:4 count:4 fw:4 ||    framewords:16   | ...
+			var count = 0;
+			for (s = source; s != null; s = s.tail) count++;
+			var frameWords = curFrame.slots();
+			var ex0 = (0xFFFFF000) | (exstrIndex #<< 8) | (count #<< 4) | (frameWords #>> 16);
+			exEntries.add(ex0, frameWords & 0xFFFF);
+			for (s = source; s != null; s = s.tail) recordExtendedSource(15, s);
+		}
+		return exEntry;
+	}
+	def recordExtendedSource(exstrIndex: int, source: Source) {
+		// | 32             ex0            0 || 16      ex1      0 |
+		// | meth:20       ex:4        col:8 ||       line:16      |
+		if (source.mdecl != curMethod) {
+			// TODO: deal with sources that aren't equal to the current method
+			mach.compiler.ERROR.fail(Strings.format1("source %1 is not current method", source.mdecl.name()));
+		}
+		var methIndex = sourceMethods.entries.length - 1;
+		var ex0 = (methIndex #<< 12) | (exstrIndex #<< 8) | Int.min(255, source.column);
+		exEntries.add(ex0, Int.min(65535, source.line));
+	}
+	def newExceptionDest(ex: string, source: Source) -> Addr {
+		var index = recordExtendedEntry(ex, source);
+		var addr = Addr.new(exRegion, null, index * 6);
+		exDests = List.new(addr, exDests);
+		return addr;
+	}
+	def getStringOffset(str: string) -> int {
+		if (stringMap.has(str)) return stringMap.get(str);
+		var off = stringData.length;
+		stringData.puts(str);
+		stringData.putc('\x00');
+		stringMap.set(str, off);
+		return off;
+	}
+	// set absolute addresses for addresses in ex region and return the size
+	def layoutExRegion(startAddr: int) -> int {
+		for (l = exDests; l != null; l = l.tail) {
+			l.head.absolute = startAddr + l.head.offset;
+		}
+		var size = exEntries.length * 6;
+		rt_ex_start.absolute = startAddr;
+		rt_ex_end.absolute = startAddr + size;
+		return size;
+	}
+	def frameSlots() -> int {
+		if (curFrame == null) {
+			mach.compiler.ERROR.fail("current frame should be set");
+			return 0;
+		}
+		return curFrame.slots();
+	}
+	def debugPoint(kind: string, p: string, off: int, source: Source, slots: int) {
+		Terminal.print2("@%1 %2 ", kind, p);
+		Terminal.print2("+%1 %2 ", off, slots);
+		if (source != null) Terminal.print1("%1\n", source.render);
+		else Terminal.puts("-\n");
+	}
+	def encode(u: MachDataEncoder) {
+		// encode source point table
+		sourcePoints.encode(rt, u);
+		// encode method table
+		sourceMethods.encode(rt, u);
+		// encode strings
+		var stringAddr = u.endAddr();
+		rt_strings.absolute = stringAddr;
+		u.iK(stringData.buffer, 0, stringData.length);
+		// encode class table
+		u.align(4);
+		rt_class_table.absolute = u.endAddr();
+		for (i = 0; i < classTable.rows.length; i++) {
+			var t = classTable.rows.get(i).1;
+			u.i4(t.0);
+			u.i4(t.1);
+		}
+		// encode extended/exception entry table
+		rt_ex_table.absolute = u.endAddr();
+		for (i = 0; i < exEntries.length; i++) {
+			var t = exEntries.get(i);
+			u.i4(t.0);
+			u.i2(t.1);
+		}
+		rt_ex_strings.absolute = u.endAddr();
+		for (i = 0; i < exStringTable.rows.length; i++) {
+			u.i4(exStringTable.rows.get(i).1 + stringAddr);
+		}
+	}
+}
+// A searchable table of entries that maps a key value to an index 0...length-1
+// and data. Allows for searching the table by key efficiently by hashing the key,
+// but assumes identity equality (==) for keys.
+class TableIndex<K, D> {
+	def hash: K -> int;
+	def rows = Sequence<(K, D)>.new();
+	var map: HashMap<K, int>;
+	new(hash) { }
+	def add(key: K, data: D) {
+		rows.add(key, data);
+		if (map != null) map.set(key, rows.length - 1);
+	}
+	def find(key: K, f: K -> D) -> int {
+		if (map == null) {
+			map = HashMap.new(hash, K.==);
+			for (i = 0; i < rows.length; i++) {
+				map.set(rows.get(i).0, i);
+			}
+		}
+		if (map.has(key)) return map.get(key);
+		add(key, f(key));
+		return rows.length - 1;
+	}
+}

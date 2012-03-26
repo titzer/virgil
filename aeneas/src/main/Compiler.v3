@@ -1,0 +1,208 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A class containing all the state var to a compilation, including
+// the program, the files, options, target, errors, etc.
+class Compiler {
+	def options: Options;			// command line options
+	def prog: Program;			// the program
+	def ERROR: ErrorGen;			// the error generator
+	def target: Target;			// target of compilation
+	var ssaOpts: SsaOptSettings;		// settings for SSA optimizations
+	var files: Array<string>;		// the input files
+	var inputs: Array<Array<byte>>;	// the input data
+	var args: Array<string>;		// input arguments
+
+	// internal options that control which phases are performed
+	var skipVerify: bool;
+	var skipInit: bool;
+	var skipRma: bool = !Aeneas.RMA.get();
+	var trace: bool = Aeneas.TRACE.get();
+	var removeVst: bool = false;
+
+	var icMon: (IrSpec, IcMethod) -> void;	 // monitor for IC generation
+	var ssaMon: (IrSpec, SsaRegion) -> void; // monitor for SSA generation
+
+	new(options, prog, ERROR, target) {
+		ssaOpts = SsaOptions.optimizations;
+	}
+	def setArgs(args: Array<string>) {
+		for (i = 0; true; i++) {
+			if (i == args.length) {
+				this.files = args;
+				this.args = [];
+				break;
+			}
+			var arg = args(i);
+			var len = arg.length;
+			if (len <= 3 || arg(len - 1) != '3' || arg(len - 2) != 'v' || arg(len - 3) != '.') {
+				this.files = Arrays.copy(args, Array<string>.new(i));
+				this.args = Arrays.range(args, i, args.length);
+				break;
+			}
+		}
+		this.inputs = Array.new(files.length);
+	}
+	def setInput(fname: string, input: Array<byte>) {
+		files = [fname];
+		inputs = [input];
+	}
+	// perform all phases of compilation
+	def compile() -> bool {
+		if (target != null) target.configure(this);
+		return doParse() 
+			&& (skipVerify || doVerify())
+			&& (skipInit || doInit())
+			&& (skipRma || doRma())
+			&& doEmit() 
+			&& ERROR.noErrors;
+	}
+	def reportErrors() -> bool {
+		if (ERROR.noErrors) return true;
+		else ERROR.report();
+		return false;
+	}
+	private def doParse() -> bool {
+		prog.vst = VstPortion.new(prog);
+		var seq = Sequence<ParsedFile>.new().grow(files.length);
+		for (i = 0; i < files.length && ERROR.notTooMany; i++) {
+			var fileName = files(i), input = inputs(i);
+			if (input == null) {
+				input = System.fileLoad(fileName);
+				if (input == null) {
+					ERROR.FileNotFound(fileName);
+					continue;
+				}
+				inputs(i) = input;
+			}
+			seq.add(Parser.parseFile(fileName, input, ERROR));
+		}
+		prog.files = seq.extract();
+		return ERROR.noErrors;
+	}
+	private def doVerify() -> bool {
+		if (ERROR.notTooMany) {
+			Verifier.new(this).verify();
+			if (Aeneas.PRINT_VST.get()) VstPrinter.new().printProgram(prog);
+		}
+		return ERROR.noErrors;
+	}
+	private def doInit() -> bool {
+		prog.dynamic = DynamicPortion.new(prog);
+		var invoker = getInterpreter(prog.dynamic);
+		for (comp = prog.vst.getComponents(); comp != null; comp = comp.tail) {
+			var result = prog.dynamic.initComponentRecord(comp.head, invoker);
+			if (Exception.?(result)) {
+				ERROR.ExceptionInInitialization(comp.head, Exception.!(result));
+				break;
+			}
+		}
+		return ERROR.noErrors;
+	}
+	private def doRma() -> bool {
+		var main = getMain();
+		if (main == null) return false;
+		var rma = RMAnalyzer.new(this, SsaRmAnalyzer.new(genSsa).analyze);
+		var root = rma.addRootMethod(main);
+		if (target != null) target.addRoots(this, rma);
+		rma.analyze().transform();
+		prog.dynamic.ir.mainMethod = root.spec;
+		return ERROR.noErrors;
+	}
+	private def doEmit() -> bool {
+		if (target != null) {
+			if (getMain() == null) return false;
+			target.emit(this);
+		}
+		return true;
+	}
+	def runMain() -> Result {
+		var main = getMain();
+		if (main == null) return null;
+		var delegate = Delegate.new(Values.BOTTOM, main);
+		var invoker = getInterpreter(prog.dynamic);
+		return invoker(delegate, evalMainArgs(prog.dynamic));
+	}
+	def getMain() -> IrSpec {
+		var ir = prog.getIr();
+		if (ir.mainMethod == null) {
+			var main = prog.vst.mainMethod;
+			if (main == null) {
+				ERROR.MainNotFound();
+				return null;
+			}
+			ir.mainMethod = prog.ir.fromVstMember(main);
+		}
+		return ir.mainMethod;
+	}
+	def programName() -> string {
+		var main = getMain();
+		if (main == null) return null;
+		return Strings.render(main.container.render);
+	}
+	private def evalMainArgs(dynamic: DynamicPortion) -> Array<Val> {
+		var atypes = getMain().getParamTypes();
+		if (atypes.length == 1 && atypes(0) == V3.stringArrayType) {
+			// box the argument as an array of strings
+			var array = dynamic.newRecord(V3.stringArrayType, args.length);
+			for (i = 0; i < args.length; i++) {
+				array.values(i) = Byte.boxString(args(i), dynamic);
+			}
+			return [Val.!(array)];
+		}
+		var avals = Array<Val>.new(atypes.length);	
+		for (i = 0; i < atypes.length; i++) {
+			// TODO: instead of passing zero, parse the arguments as values
+			avals(i) = Values.BOTTOM;
+		}
+		return avals;
+	}
+	def getInterpreter(dynamic: DynamicPortion) -> (Delegate, Array<Val>) -> Result {
+		var interp = IcInterpreter.new(prog.dynamic, genIc);
+		if (trace) IcTracer.new(prog, interp);
+		return interp.invoke;
+	}
+	def genIc(memberRef: IrSpec) -> IcMethod {
+		var icm: IcMethod;
+		icm = SsaIcGen.new(prog, memberRef, genSsa(memberRef), ssaOpts).generate();
+		if (icMon != null) icMon(memberRef, icm);
+		return icm;
+	}
+	def genSsa(memberRef: IrSpec) -> SsaRegion {
+		var meth = memberRef.asMethod();
+		if (meth.ssa == null) {
+			meth.ssa = VstSsaGen.new(prog, meth.source, ssaOpts).generate();
+		}
+		if (removeVst) meth.source = null;
+		return meth.ssa;
+	}
+	def getOutputFileName(fileName: string, ext: string) -> string {
+		return Strings.makeFileName(Aeneas.OUTPUT.get(), fileName, ext);
+	}
+	def makeExecutable(fileName: string) {
+		if (Aeneas.SET_EXEC.get()) System.chmod(fileName, 493); // 0755 = rwxr-xr-x
+	}
+}
+
+class Target {
+	def name: string;
+	var typedMain: bool;
+	new(name) { }
+	def configure(compiler: Compiler) { }
+	def emit(compiler: Compiler) { }
+	def addRoots(compiler: Compiler, rma: RMAnalyzer) { }
+	def verifyMain(main: VstMethod, error: (FileRange, string) -> void) {
+		if (!typedMain) return;
+		var ftype = main.getType();
+		var paramType = Function.getParamType(ftype);
+		if (paramType != Void.TYPE && paramType != V3.stringArrayType) {
+			error(main.token.range(), "Main method parameter type must be void|Array<string>");
+		}
+		var returnType = main.rettype.getType();
+		match (returnType.typeCon.kind) {
+			V3Kind.INT, V3Kind.BYTE, V3Kind.BOOL, V3Kind.VOID: {}
+		} else {
+			error(main.rettype.range(), "Main method return type must be void|bool|byte|int");
+		}
+	}
+}

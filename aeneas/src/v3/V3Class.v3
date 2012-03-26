@@ -1,0 +1,174 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// The type constructor for class types.
+class V3Class_TypeCon extends Member_TypeCon {
+	def classDecl: VstClass;
+	def typeArgsCache  = TypeUtil.newTypeMap<TypeArgs>();
+	def superTypeCache = TypeUtil.newTypeMap<Type>();
+
+	new(classDecl) : super(classDecl.name(), V3Kind.CLASS, Lists.length(classDecl.typeParams)) { }
+	def getSuperType(classType: Type) -> Type {
+		if (classDecl.superclass != null) {
+			var superType = superTypeCache.get(classType);
+			if (superType == null) {
+				superType = classDecl.superclass.getType().substitute(getTypeArgs(classType));
+				superTypeCache.set(classType, superType);
+			}
+			return superType;
+		}
+		return null;
+	}
+	def getTypeArgs(classType: Type) -> TypeArgs {
+		if (arity > 0) {
+			var typeArgs = typeArgsCache.get(classType);
+			if (typeArgs == null) {
+				typeArgs = TypeArgs.new(classDecl.typeEnv, Lists.toArray(classType.nested));
+				typeArgsCache.set(classType, typeArgs);
+			}
+			return typeArgs;
+		}
+		return null;
+	}
+	def getConstructorParamTypes(classType: Type) -> List<Type> {
+		var funcType = classDecl.constructor.getType().substitute(getTypeArgs(classType));
+		return Function.getParamTypeList(funcType);
+	}
+	def lookupMember(classType: Type, name: string, instance: bool, verifier: Verifier) -> Member {
+		if (!instance && Strings.equal(name, "new")) {
+			var c = classDecl.constructor;
+			var typeArgs = getTypeArgs(classType);
+			var param = Function.getParamType(c.getType()).substitute(typeArgs);
+			var mtype = Function.newType(param, classType);
+			return VstMethodMember.new(classType, c, false, mtype, null);
+		}
+		var typeCon = this;
+		while (true) {
+			// lookup a field or method
+			var member = typeCon.classDecl.memberMap.get(name);
+			if (member != null) return memberRef(classType, typeCon, member, instance, verifier);
+			// member was not found in this type
+			classType = typeCon.getSuperType(classType);
+			if (!V3.isClass(classType)) return null;
+			typeCon = V3.asClass(classType);
+		}		
+		return null;
+	}
+	def memberRef(classType: Type, typeCon: V3Class_TypeCon, member: VstMember, instance: bool, verifier: Verifier) -> Member {
+		var typeArgs = typeCon.getTypeArgs(classType);
+		var memberType = verifier.inferMemberType(member).substitute(typeArgs);
+		if (VstMethod.?(member)) {
+			if (!instance) memberType = Function.prependParamType(classType, memberType);
+			return VstMethodMember.new(classType, VstMethod.!(member), instance, memberType, null);
+		} else {
+			if (!instance) memberType = Function.newType(classType, memberType);
+			var f = VstField.!(member);
+			return VstFieldMember.new(classType, f, memberType, instance && !f.isReadOnly);
+		}
+	}
+}
+// Helper methods for Vst -> Ir translations
+component VstMemberUtil {
+	def genComponentInit<E>(member: VstMember, gen: Gen<E>, receiver: E) -> E {
+		if (receiver == null) {
+			var componentDecl = VstComponent.!(member.container);
+			var op = V3Op.newComponentInit(gen.getIr().fromVstMember(componentDecl.constructor));
+			return gen.genApplyOp(op, Array<E>.new(0));
+		}
+		return receiver;
+	}
+}
+// Represents a reference to a class or component method
+class VstMethodMember extends Member {
+	def container: Type;
+	def vstMethod: VstMethod;
+	def bound: bool;
+	def typeArgs: TypeArgs;
+	new(container, vstMethod, bound, memberType: Type, typeArgs) : super(false, memberType, vstMethod.typeParams) { }
+	def genRead<E>(gen: Gen<E>, receiver: E) -> E {
+		var spec = getIrSpec(gen.getIr());
+		if (VstNew.?(vstMethod)) {
+			gen.expectNoReceiver(receiver);
+			return gen.genOp(V3Op.newClassAlloc(spec));
+		} else if (container.typeCon.kind == V3Kind.COMPONENT) {
+			return gen.genApplyOp(V3Op.newComponentGetMethod(spec), [VstMemberUtil.genComponentInit(vstMethod, gen, receiver)]);
+		}
+		// XXX: devirtualize based on container type
+		var virtual = spec.member.checkFlag(IrUtil.M_OVERRIDDEN);
+		if (receiver != null) {
+			if (virtual) return gen.genApplyOp(V3Op.newClassGetVirtual(spec), [receiver]);
+			else return gen.genApplyOp(V3Op.newClassGetMethod(spec), [receiver]);
+		} else {
+			if (virtual) return gen.genOp(V3Op.newCallClassVirtual(spec));
+			else return gen.genOp(V3Op.newCallClassMethod(spec));
+		}
+	}
+	def genApply<E>(gen: Gen<E>, receiver: E, args: Array<E>) -> E {
+		var spec = getIrSpec(gen.getIr());
+		if (VstNew.?(vstMethod)) {
+			gen.expectNoReceiver(receiver);
+			return gen.genApplyOp(V3Op.newClassAlloc(spec), args);
+		}
+		if (container.typeCon.kind == V3Kind.COMPONENT) {
+			VstMemberUtil.genComponentInit(vstMethod, gen, receiver);
+			return gen.genApplyOp(V3Op.newCallComponentMethod(spec), args);
+		} else {
+			if (receiver != null) args = Arrays.prepend(receiver, args);
+			// XXX: devirtualize based on container type
+			var op = if(spec.member.checkFlag(IrUtil.M_OVERRIDDEN), V3Op.newCallClassVirtual(spec), V3Op.newCallClassMethod(spec));
+			return gen.genApplyOp(op, args);
+		}
+	}
+	def getIrSpec(ir: IrPortion) -> IrSpec {
+		// create an IrSpec for the member
+		var container = ir.elimTypeVars(this.container);
+		var newTa = [container];
+		if (typeArgs != null) {
+			var oldTa = typeArgs.types;
+			newTa = Array<Type>.new(1 + oldTa.length);
+			newTa(0) = (container);
+			for (i = 0; i < oldTa.length; i++) newTa(i + 1) = ir.elimTypeVars(oldTa(i));
+		}
+		var member = ir.makeIrMethod(vstMethod);
+		return IrSpec.new(container, newTa, member);
+	}
+	def bindTypeArgs(t: List<Type>) -> Member {
+		var typeArgs = TypeArgs.new(vstMethod.typeEnv, Lists.toArray(t));
+		var memberType = this.memberType.substitute(typeArgs);
+		return VstMethodMember.new(container, vstMethod, bound, memberType, typeArgs);
+	}
+	def isAccessible(decl: Decl) -> bool {
+		return !vstMethod.isPrivate || decl == vstMethod.container;
+	}
+}
+// Represents a reference to a class or component field
+class VstFieldMember extends Member {
+	def container: Type;
+	def vstField: VstField;
+	new(container, vstField, memberType: Type, writable: bool) : super(writable, memberType, null) { }
+	def genRead<E>(gen: Gen<E>, receiver: E) -> E {
+		var container = gen.getIr().elimTypeVars(this.container);
+		var spec = IrSpec.new(container, [container], gen.getIr().makeIrField(vstField));
+		if (container.typeCon.kind == V3Kind.COMPONENT) {
+			receiver = VstMemberUtil.genComponentInit(vstField, gen, receiver);
+			return gen.genApplyOp(V3Op.newComponentGetField(spec), [receiver]);
+		} else {
+			var op = V3Op.newClassGetField(spec);
+			if (receiver == null) return gen.genOp(op);
+			else return gen.genApplyOp(op, [receiver]);
+		}
+	}
+	def genWrite<E>(gen: Gen<E>, receiver: E, val: E) -> E {
+		var container = gen.getIr().elimTypeVars(container);
+		var spec = IrSpec.new(container, [container], gen.getIr().makeIrField(vstField));
+		if (container.typeCon.kind == V3Kind.COMPONENT) {
+			receiver = VstMemberUtil.genComponentInit(vstField, gen, receiver);
+			return gen.genApplyOp(V3Op.newComponentSetField(spec), [receiver, val]);
+		} else {
+			return gen.genApplyOp(V3Op.newClassSetField(spec), [gen.expectReceiver(receiver), val]);
+		}
+	}
+	def isAccessible(decl: Decl) -> bool {
+		return !vstField.isPrivate || decl == vstField.container;
+	}
+}

@@ -1,0 +1,953 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Information about a var variable, including whether it is written (i.e. non-SSA),
+// and all loops in which it is written
+class VstSsaVar {
+	var instr: SsaInstr;
+	var writeFlags: int;
+	var index: int = -1;
+	var extWriteFlags: Array<bool>;
+
+	def setWrittenInLoop(loopIndex: int) {
+		if (loopIndex < 32) { // use the flags word if loop index is low enough
+			writeFlags = writeFlags | (1 #<< loopIndex);
+			return;
+		}
+		var extIndex = loopIndex - 32;
+		if (extWriteFlags == null || extIndex >= extWriteFlags.length) {
+			// grow the extended flags
+			extWriteFlags = Arrays.grow(extWriteFlags, extIndex + 3);
+		}
+		extWriteFlags(extIndex) = true;
+	}
+	def isWritten() -> bool {
+		return index >= 0;
+	}
+	def isWrittenInLoop(loopIndex: int) -> bool {
+		if (loopIndex < 32) return ((writeFlags #>> loopIndex) & 1) != 0;
+		if (extWriteFlags == null) return false;
+		if (loopIndex - 32 >= extWriteFlags.length) return false;
+		return extWriteFlags(loopIndex - 32);
+	}
+}
+
+// Generates SSA (static single assignment) form from VST syntax trees
+// XXX: simplify conservative phis generated for loops
+// XXX: LVN and GVN
+// XXX: make all null checks and bounds checks explicit
+// XXX: iterative constant folding / control flow simplification
+class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
+	def prog: Program;			// the program
+	def meth: VstMethod;			// the method
+	var region: SsaRegion;		// the code region
+	var localOpt: SsaLocalOptimizer;	// var optimizer
+	var pir: IrPortion;			// the IR portion of the program
+	var thisType: Type;
+	var nonSsaVars: Array<VarDecl>;
+	var branchOpt: bool;
+	var ssaGen: SsaGen;
+
+	new(prog, meth, options: SsaOptSettings) {
+		region = genRegion();
+		branchOpt = options.VstBranchOpt;
+		if (options.VstLocalOpt) localOpt = SsaLocalOptimizer.new(prog, region, options, fieldConst);
+		pir = prog.getIr();
+		thisType = meth.container.getDeclaredType();
+		if (meth != null) nonSsaVars = Array.new(meth.numNonSsa);
+	}
+	def genRegion() -> SsaRegion {
+		var params = Array<SsaParam>.new(meth.numParams);
+		var receiver = params(0) = newParam(meth.thisParam);
+		if (V3.isClass(receiver.vtype)) receiver.setFact(SsaFacts.V_NON_ZERO);
+		for (l = meth.params; l != null; l = l.tail) {
+			params(l.head.index) = newParam(l.head);
+		}
+		return SsaRegion.new(params, meth.rettype.getType());
+	}
+	private def newParam(p: ParamDecl) -> SsaParam {
+		var np = SsaParam.new(p.index, p.vtype);
+		p.ssa.instr = np;
+		return np;
+	}
+	def generate() -> SsaRegion {
+		if (meth.body != null) {
+			// build SSA code
+			var initialEnv = VstSsaEnv.new(meth.numNonSsa, this, null, region.startBlock);
+			setInitialParam(meth.thisParam, initialEnv);
+			Lists.apply2(meth.params, setInitialParam, initialEnv);
+			if (VstNew.?(meth)) addConstructorCode(VstNew.!(meth), initialEnv);
+			meth.body.accept(this, initialEnv);
+			if (!initialEnv.end) {
+				// add an appropriate return
+				if (VstNew.?(meth)) initialEnv.addReturn([getThisParam()]);
+				else initialEnv.addReturn([region.nop()]);
+			}
+		} else {
+			// simply add a throw
+			// TODO: use the location of the empty method body as the point
+			region.startBlock.end = SsaThrow.new(tokenSource(meth.token), region.startBlock, V3Exception.Unimplemented);
+		}
+		if (Aeneas.PRINT_SSA.get()) {
+			Terminal.print1("Generated SSA for: %1\n", meth.getFullName());
+			SsaPrinter.new(prog).printRegion(region);
+		}
+		return region;
+	}
+	def addConstructorCode(decl: VstNew, env: VstSsaEnv) {
+		appendImplicitFieldInits(decl.params, env);
+		appendFieldInits(decl.memberinits, env);
+		appendSuperClause(decl.superclause, env);
+	}
+	def getThisParam() -> SsaInstr {
+		return region.params(0);
+	}
+	def appendImplicitFieldInits(plist: List<ParamDecl>, env: VstSsaEnv) {
+		while (plist != null) {
+			var member = plist.head.member;
+			if (member != null) {
+				// add an assignment to the field / value
+				var memberRef = pir.fromVstMember(member);
+				var op = V3Op.newClassSetField(memberRef);
+				var param: SsaInstr = region.params(plist.head.index);
+				// check if implicit conversion is necessary
+				var it = member.getType(), xt = plist.head.vtype;
+				var exp = if(xt != it, env.addApply(null, env.conversionOp(xt, it), [param]), param);
+				env.addApply(tokenSource(plist.head.token), op, [getThisParam(), exp]);
+			}
+			plist = plist.tail;
+		}
+	}
+	def appendSuperClause(sclause: SuperClause, env: VstSsaEnv) {
+		if (sclause != null) {
+			var superType = V3.getSuperType(thisType);
+			var superRef = pir.fromVstMemberAndType(superType, sclause.constructor);
+			var na = sclause.args.exprs.mapArray(env.genExpr);
+			env.addApply(tokenSource(sclause.point), V3Op.newCallClassMethod(superRef), Arrays.prepend(getThisParam(), na));
+		}
+	}
+	def appendFieldInits(list: List<VstField>, env: VstSsaEnv) {
+		var isClass = V3.isClass(thisType);
+		for (l = list; l != null; l = l.tail) {
+			var member = l.head, memberRef = pir.fromVstMember(member);
+			var op = if(isClass, V3Op.newClassSetField(memberRef), V3Op.newComponentSetField(memberRef));
+			env.addApply(exprSource(member.init), op, [getThisParam(), env.genExpr(member.init)]);
+		}
+	}
+	def setInitialParam(p: ParamDecl, env: VstSsaEnv) {
+		if (p.ssa.index >= 0) {
+			nonSsaVars(p.ssa.index) = p;
+			env.set(p.ssa, p.ssa.instr);
+		}
+	}
+	// -- Statements --------------------------------------------------------
+	def visitIf(stmt: IfStmt, env: VstSsaEnv) -> SsaInstr {
+		// translate an if statement into control flow
+		var cond = env.genExpr(stmt.cond);
+		if (env.end) return null; // condition ended the block somehow
+		if (branchOpt && SsaValue.?(cond)) {
+			if (Bool.unbox(SsaValue.!(cond).val)) {
+				// fold a branch that is always true
+				env.genStmt(stmt.tbranch);
+				return null;
+			} else {
+				// fold a branch that is always false
+				if (stmt.fbranch != null) env.genStmt(stmt.fbranch);
+				return null;
+			}
+		}
+		var tenv = env.split();
+		if (stmt.fbranch == null) {
+			// no else clause is present
+			var cont = VstSsaMerge.new(this);
+			env.addIf(cond, tenv.block, cont.block);
+			cont.mergeIncoming(env);
+			tenv.genStmt(stmt.tbranch);
+			cont.merge(tenv);
+			cont.setEnv(env);
+			return null;
+		} else {
+			// else clause is present
+			var fenv = env.split();
+			var cont = VstSsaMerge.new(this);
+			env.addIf(cond, tenv.block, fenv.block);
+			tenv.genStmt(stmt.tbranch);
+			cont.merge(tenv);
+			fenv.genStmt(stmt.fbranch);
+			cont.merge(fenv);
+			cont.setEnv(env);
+			return null;
+		}
+	}
+	def visitBlock(stmt: BlockStmt, env: VstSsaEnv) -> SsaInstr {
+		stmt.stmts.apply(env.genStmt);
+		return null;
+	}
+	def visitWhile(stmt: WhileStmt, env: VstSsaEnv) -> SsaInstr {
+		var loopStart = VstSsaMerge.new(this); // merge point for start of loop
+		var loopEnv = loopStart.startLoop(env, stmt.loopNum);	
+		var cond = loopEnv.genExpr(stmt.cond);
+		if (loopEnv.end) return null; // condition ended the block somehow
+		if (branchOpt && SsaUtil.isFalseConst(cond)) {
+			// this is not a loop at all; skip the body
+			return loopFallThru(env, loopEnv);
+		}
+		var loopEnd = VstSsaMerge.new(this);   // merge point for end of loop
+		loopEnv.loopStart = loopStart;
+		loopEnv.loopEnd = loopEnd;
+		if (branchOpt && SsaUtil.isTrueConst(cond)) {
+			// this is an infinite loop that can only terminate with a break inside
+			loopEnv.genStmt(stmt.body);
+			loopStart.merge(loopEnv);
+			loopEnd.setEnv(env);
+			return null;
+		}
+		// this is a general while loop
+		var bodyEnv = loopEnv.split();
+		loopEnv.addIf(cond, bodyEnv.block, loopEnv.loopEnd.block);
+		loopEnd.mergeIncoming(loopEnv);
+		bodyEnv.genStmt(stmt.body);
+		loopStart.merge(bodyEnv);
+		loopEnd.setEnv(env);
+		return null;
+	}
+	def visitFor(stmt: ForStmt, env: VstSsaEnv) -> SsaInstr {
+		env.genVarDecl(stmt.varDecl);
+		var loopCond = VstSsaMerge.new(this);   // merge point for start of loop
+		var loopUpdate = VstSsaMerge.new(this); // merge point for update
+		var loopEnd = VstSsaMerge.new(this);    // merge point for end of loop
+
+		var loopEnv = loopCond.startLoop(env, stmt.loopNum);
+		loopEnv.loopStart = loopUpdate;
+		loopEnv.loopEnd = loopEnd;
+		var cond = loopEnv.genExpr(stmt.cond);
+		if (loopEnv.end) return null; // condition ended the block somehow
+		if (branchOpt && SsaUtil.isFalseConst(cond)) {
+			// this is not a loop at all; skip the body
+			return loopFallThru(env, loopEnv);
+		}
+		if (branchOpt && SsaUtil.isTrueConst(cond)) {
+			// this is an infinite loop that can only terminate with a break inside
+			loopEnv.genStmt(stmt.body);
+			loopUpdate.merge(loopEnv);
+		} else {
+			// this is a regular for loop
+			var bodyEnv = loopEnv.split();
+			loopEnv.addIf(cond, bodyEnv.block, loopEnv.loopEnd.block);
+			loopEnd.mergeIncoming(loopEnv);
+			bodyEnv.genStmt(stmt.body);
+			loopUpdate.merge(bodyEnv);
+		}
+		if (loopUpdate.reachable()) {
+			var env = loopUpdate.toEnv(loopEnv);
+			env.genExpr(stmt.update);
+			loopCond.merge(env);
+		}
+		loopEnd.setEnv(env);
+		return null;
+	}
+	def visitForeach(stmt: ForeachStmt, env: VstSsaEnv) -> SsaInstr {
+		env.set(stmt.loopVar, region.nullConst(Int.TYPE));
+		// XXX: it's a hack to use a VarDecl in the nonSsaVars array
+		var varDecl = VarDecl.new(null, null, null);
+		varDecl.vtype = Int.TYPE;
+		varDecl.ssa = stmt.loopVar;
+		nonSsaVars(stmt.loopVar.index) = varDecl;
+		var arrayExpr = env.genExpr(stmt.expr), arrayType = stmt.expr.exactType;
+		if (env.end) return null; // expression generated a throw
+		var lengthExpr = env.addApply(exprSource(stmt.expr), V3Op.newArrayGetLength(arrayType), [arrayExpr]);
+		// XXX: simplify loops with 0 and 1 iterations
+
+		var loopCond = VstSsaMerge.new(this);   // merge point for start of loop
+		var loopUpdate = VstSsaMerge.new(this); // merge point for update
+		var loopEnd = VstSsaMerge.new(this);    // merge point for end of loop
+
+		var loopEnv = loopCond.startLoop(env, stmt.loopNum);
+		loopEnv.loopStart = loopUpdate;
+		loopEnv.loopEnd = loopEnd;
+		// add the loop control expression
+		var cond = loopEnv.addApply(null, V3Op.opIntLt, [loopEnv.get(stmt.loopVar), lengthExpr]);
+
+		var bodyEnv = loopEnv.split();
+		loopEnv.addIf(cond, bodyEnv.block, loopEnv.loopEnd.block);
+		loopEnd.mergeIncoming(loopEnv);
+		// generate the array access to define the element variable
+		var elem = bodyEnv.addApply(null, V3Op.newArrayGetElem(arrayType), [arrayExpr, loopEnv.get(stmt.loopVar)]);
+		var elemType = V3Array.elementType(arrayType);
+		if (elemType != stmt.varDecl.vtype) {
+			// insert a coercion
+			elem = bodyEnv.addApply(null, bodyEnv.conversionOp(elemType, stmt.varDecl.vtype), [elem]);
+		}
+		elem.setFact(SsaFacts.O_NO_NULL_CHECK | SsaFacts.O_NO_BOUNDS_CHECK); // checks would be redundant
+		bodyEnv.set(stmt.varDecl.ssa, elem);
+		// generate the body
+		bodyEnv.genStmt(stmt.body);
+		loopUpdate.merge(bodyEnv);
+
+		if (loopUpdate.reachable()) {
+			// add the update to the loop control variable
+			var env = loopUpdate.toEnv(loopEnv);
+			var update = env.addApply(null, V3Op.opIntAdd, [env.get(stmt.loopVar), region.intConst(1)]);
+			env.set(stmt.loopVar, update);
+			loopCond.merge(env);
+		}
+		loopEnd.setEnv(env);
+		return null;
+	}
+	def loopFallThru(env: VstSsaEnv, loopEnv: VstSsaEnv) -> SsaInstr {
+		env.end = loopEnv.end;
+		env.block = loopEnv.block;
+		env.varMap = loopEnv.varMap;
+		return null;
+	}
+	def visitLocal(stmt: LocalStmt, env: VstSsaEnv) -> SsaInstr {
+		// generate initialization of var variables
+		stmt.vars.apply(env.genVarDecl);
+		return null;
+	}
+	def visitBreak(stmt: BreakStmt, env: VstSsaEnv) -> SsaInstr {
+		// break out of the current loop and merge state with end
+		for (p = env; p != null; p = p.parent) {
+			if (p.loopEnd != null) {
+				p.loopEnd.merge(env);
+				return null;
+			}
+		}
+		return error(null, "break not in loop");
+	}
+	def visitContinue(stmt: ContinueStmt, env: VstSsaEnv) -> SsaInstr {
+		// continue back to beginning of current loop and merge state
+		for (p = env; p != null; p = p.parent) {
+			if (p.loopStart != null) {
+				p.loopStart.merge(env);
+				return null;
+			}
+		}
+		return error(null, "continue not in loop");
+	}
+	def visitExpr(stmt: ExprStmt, env: VstSsaEnv) -> SsaInstr {
+		// generate code for the expression
+		env.genExpr(stmt.expr);
+		return null;
+	}
+	def visitMatch(stmt: MatchStmt, env: VstSsaEnv) -> SsaInstr {
+		// generate code for key
+		var key = env.genExpr(stmt.expr);
+		if (env.end) return null; // condition ended the block somehow
+		var cases = stmt.cases.asArray();
+		if (branchOpt && SsaValue.?(key)) {
+			// the key for the match is a value, fold the match
+			var val = SsaValue.!(key).val;
+			for (c in cases) {
+				for (vl = c.vals; vl != null; vl = vl.tail) {
+					if (Values.equal(val, vl.head)) {
+						env.genStmt(c.stmt);
+						return null;
+					}
+				}
+			}
+			// no values matched
+			if (stmt.defcase != null) env.genStmt(stmt.defcase.stmt);
+			return null;
+		}
+
+		// generate control flow for a match statement
+		var end = VstSsaMerge.new(this);
+		var vseq = Sequence<Val>.new(), bseq = Sequence<SsaBlock>.new();
+		for (c in cases) {
+			// generate code for each clause of the match
+			var benv = env.split();
+			var block = benv.block;
+			benv.genStmt(c.stmt);
+			end.merge(benv);
+			for (vl = c.vals; vl != null; vl = vl.tail) {
+				vseq.add(vl.head);
+				bseq.add(block);
+			}
+		}
+		var defblock = end.block;
+		if (stmt.defcase != null) {
+			// generate code for the default case
+			var benv = env.split();
+			defblock = benv.block;
+			benv.genStmt(stmt.defcase.stmt);
+			end.merge(benv);
+		}
+		env.addSwitch(key, stmt.expr.exactType, vseq.extract(), bseq.extract(), defblock);
+		if (stmt.defcase == null) {
+			// merge with the fallthrough edge
+			end.mergeEdge(env, env.block.succ(env.block.succ.length - 1));
+		}
+		end.setEnv(env);
+		return null;
+	}
+	def visitEmpty(stmt: EmptyStmt, env: VstSsaEnv) -> SsaInstr {
+		return null; // nothing
+	}
+	def visitReturn(stmt: ReturnStmt, env: VstSsaEnv) -> SsaInstr {
+		// generate a return statement
+		env.addReturn(if(stmt.expr != null, [env.genExpr(stmt.expr)], SsaUtil.NO_INSTRS));
+		return null;
+	}
+	// -- Expressions -----------------------------------------------------
+	def visitTuple(expr: TupleExpr, env: VstSsaEnv) -> SsaInstr {
+		// generate code for a tuple creation
+		var len = expr.exprs.length();
+		if (len == 0) return region.nop();
+		if (len == 1) return env.genExpr(expr.exprs.list.head);
+		return env.addApply(exprSource(expr), V3Op.newTupleCreate(expr.exactType), expr.exprs.mapArray(env.genExpr));
+	}
+	def visitAutoExpr(expr: AutoExpr, env: VstSsaEnv) -> SsaInstr {
+		// XXX: factor common code out of visitAssign() and here
+		var one = region.intConst(1);
+		var t = expr.expr, pre: SsaInstr, post: SsaInstr;
+		if (AppExpr.?(t)) {
+			// auto-assignment to an array element
+			var se = env.genExpr(t), app = AppExpr.!(t);
+			var array = env.genExpr(app.func);
+			var index = env.genExpr(app.args.exprs.asList().head);
+			var source = exprSource(expr), arrayType = pir.elimTypeVars(app.func.exactType);
+			pre = env.addApply(source, V3Op.newArrayGetElem(arrayType), [array, index]);
+			post = env.addApply(source, expr.op, [pre, one]);
+			var store = env.addApply(source, V3Op.newArraySetElem(arrayType), [array, index, post]);
+			store.setFact(SsaFacts.O_NO_BOUNDS_CHECK);
+		} else if (VarExpr.?(t)) {
+			var varDecl = VarExpr.!(t), binding = varDecl.binding;
+			if (LocalBinding.?(binding)) {
+				// auto-assignment to a var variable
+				var lb = LocalBinding.!(binding);
+				pre = env.get(lb.decl.ssa);
+				post = env.addApply(null, expr.op, [pre, one]);
+				env.set(lb.decl.ssa, post);
+			} else if (MemberBinding.?(binding)) {
+				var ref = MemberBinding.!(binding);
+				// generate receiver expression
+				var receiver = genReceiver(ref.thisExpr, env);
+				var source = exprSource(expr), gen = genOf(expr, ref.container, env);
+				pre = ref.member.genRead(gen, receiver);
+				post = env.addApply(source, expr.op, [pre, one]);
+				ref.member.genWrite(gen, receiver, post);
+			} else return error(expr, "invalid expression as target of auto expression");
+		} else return error(expr, "invalid expression as target of auto expression");
+		if (expr.post) return pre;
+		else return post;
+	}
+	def genReceiver(expr: Expr, env: VstSsaEnv) -> SsaInstr {
+		return if (expr == null, null, env.genExpr(expr));
+	}
+	def visitArray(expr: ArrayExpr, env: VstSsaEnv) -> SsaInstr {
+		// generate code for an array initializer
+		return env.addApply(exprSource(expr), V3Op.newArrayInit(expr.exactType, expr.exprs.length()), expr.exprs.mapArray(env.genExpr));
+	}
+	def visitVar(expr: VarExpr, env: VstSsaEnv) -> SsaInstr {
+		// var expression should be bound and the appropriate binding method called
+		return error(expr, "unbound var expression");
+	}
+	def visitString(expr: StringExpr, env: VstSsaEnv) -> SsaInstr {
+		// generate a constant
+		return env.addVal(V3.stringType, prog.dynamic.getStringRecord(expr));
+	}
+	def visitApp(expr: AppExpr, env: VstSsaEnv) -> SsaInstr {
+		var args = expr.args.exprs.asArray(), f = expr.func;
+		// flatten any nested tuple expressions
+		while (args.length == 1 && TupleExpr.?(args(0))) {
+			args = (TupleExpr.!(args(0))).exprs.asArray();
+		}
+		var ftype = pir.elimTypeVars(f.exactType);
+		if (V3.isArray(ftype)) {
+			// this an array get element
+			var ssaArgs = Arrays.prepend(env.genExpr(f), Arrays.map(args, env.genExpr));
+			return env.addApply(exprSource(expr), V3Op.newArrayGetElem(ftype), ssaArgs);
+		} else if (VarExpr.?(f)) {
+			// this could be a member call
+			var func = VarExpr.!(f);
+			if (MemberBinding.?(func.binding)) {
+				var b = MemberBinding.!(func.binding);
+				var receiver: SsaInstr, noNullCheck = false;
+				if(b.thisExpr != null) {
+					// XXX: adding a null check here for special case of o.m(args)
+					receiver = env.genExpr(b.thisExpr);
+					if (V3.isClass(b.thisExpr.exactType)) {
+						env.addNullCheck(exprSource(expr), null, receiver);
+						noNullCheck = true;
+					}
+				}
+				var args = Arrays.map(args, env.genExpr);
+				var result = b.member.genApply(genOf(expr, b.container, env), receiver, args);
+				if (noNullCheck) result.setFact(SsaFacts.O_NO_NULL_CHECK);
+				return result;
+			}
+		}
+		// generate a regular delegate call
+		var ssaArgs = Arrays.prepend(env.genExpr(f), Arrays.map(args, env.genExpr));
+		return env.addCall(exprSource(expr), ftype, ssaArgs);
+	}
+	def visitNot(expr: NotExpr, env: VstSsaEnv) -> SsaInstr {
+		// generate a boolean inversion
+		return env.addApply(exprSource(expr), V3Op.opBoolNot, [env.genExpr(expr.expr)]);
+	}
+	def visitAssign(expr: AssignExpr, env: VstSsaEnv) -> SsaInstr {
+		var t = expr.target;
+		if (VarExpr.?(t)) {
+			var varDecl = VarExpr.!(t), binding = varDecl.binding;
+			if (LocalBinding.?(binding)) {
+				// assignment to a var variable
+				var lb = LocalBinding.!(binding);
+				var val = env.genExpr(expr.expr);
+				env.set(lb.decl.ssa, val);
+				return val;
+			}
+			if (MemberBinding.?(binding)) {
+				var ref = MemberBinding.!(binding);
+				// apply the operator to the receiver expression
+				var ne = genReceiver(ref.thisExpr, env);
+				var ve = env.genExpr(expr.expr);
+				ref.member.genWrite(genOf(expr, ref.container, env), ne, ve);
+				return ve;
+			}
+		}
+		if (AppExpr.?(t)) {
+			// assignment to an array element
+			var app = AppExpr.!(t);
+			var array = env.genExpr(app.func);
+			var index = env.genExpr(app.args.exprs.asList().head);
+			var val = env.genExpr(expr.expr);
+			env.addApply(exprSource(expr), V3Op.newArraySetElem(pir.elimTypeVars(app.func.exactType)), [array, index, val]);
+			return val;
+		}
+		return error(expr, "invalid expression as target of assignment");
+	}
+	def visitBinOp(expr: BinOpExpr, env: VstSsaEnv) -> SsaInstr {
+		var op = expr.binop;
+		if (op == V3Op.opBoolOr) {
+			// generate a lazy evaluation of the RHS
+			return genLazyEval(false, expr.left, expr.right, env);
+		} else if (op == V3Op.opBoolAnd) {
+			// generate a lazy evaluation of the RHS
+			return genLazyEval(true, expr.left, expr.right, env);
+		}
+		var le = env.genExpr(expr.left);
+		var re = env.genExpr(expr.right);
+		if (op != null) return env.addApply(exprSource(expr), op.subst(pir.elimTypeVars), [le, re]);
+		return error(expr, "unknown binop");
+	}
+	def genLazyEval(isAnd: bool, left: Expr, right: Expr, env: VstSsaEnv) -> SsaInstr {
+		// isAnd  &&: if(left) right; else (); phi(left, right)
+		// !isAnd ||: if(left) (); else right; phi(left, right)
+		var le = env.genExpr(left);
+		if (env.end) return region.nullConst(le.getType());
+		// fold (K && e) and (K || e)
+		if (SsaValue.?(le)) return foldLazyEvalL(isAnd, Bool.unbox(SsaValue.!(le).val), right, env);
+		var merge = VstSsaMerge.new(this);
+		var fenv = env.split();
+		if (isAnd) {
+			env.addIf(le, fenv.block, merge.block);
+			merge.mergeIncoming(env);
+		} else {
+			env.addIf(le, merge.block, fenv.block);
+			merge.mergeIncoming(env);
+		}
+		var re = fenv.genExpr(right), fend = fenv.end;
+		merge.merge(fenv);
+		// fold (e && K) and (e || K)
+		if (SsaValue.?(re)) {
+			merge.setEnv(env);
+			return foldLazyEvalR(isAnd, le, Bool.unbox(SsaValue.!(re).val));
+		}
+		if (le == re) {
+			// x [&&,||] x == x
+			merge.setEnv(env);
+			return le;
+		} else {
+			// if fenv.end, then the false branch is a dead end (e.g. a throw)
+			var ce = region.boolConst(!isAnd);
+			var result = if(fend, ce, merge.newPhi2(Bool.TYPE, ce, re));
+			merge.setEnv(env);
+			return result;
+		}
+	}
+	def foldLazyEvalL(isAnd: bool, left: bool, right: Expr, env: VstSsaEnv) -> SsaInstr {
+		if (isAnd) {
+			if (left) return env.genExpr(right);
+			else return region.boolConst(false);
+		} else {
+			if (left) return region.boolConst(true);
+			else return env.genExpr(right);
+		}
+	}
+	def foldLazyEvalR(isAnd: bool, left: SsaInstr, right: bool) -> SsaInstr {
+		if (isAnd) {
+			if (right) return left;
+			else return region.boolConst(false);
+		} else {
+			if (right) return region.boolConst(true);
+			else return left;
+		}
+	}
+	def visitIfExpr(expr: IfExpr, env: VstSsaEnv) -> SsaInstr {
+		// generate control flow for an if expression
+		var exprs = expr.exprs.asArray();
+		var cond = env.genExpr(exprs(0));
+		if (branchOpt && SsaValue.?(cond)) {
+			if (Bool.unbox(SsaValue.!(cond).val)) {
+				// condition is always true
+				return env.genExpr(exprs(1));
+			} else {
+				// condition is always false
+				return if(exprs.length == 3, env.genExpr(exprs(2)), region.valConst(expr.exactType, null));
+			}
+		}
+		var tenv = env.split(), fenv = env.split();
+		env.addIf(cond, tenv.block, fenv.block);
+		var trueVal = tenv.genExpr(exprs(1));
+		var falseVal = if(exprs.length == 3, fenv.genExpr(exprs(2)), region.valConst(expr.exactType, null)); 
+		var merge = VstSsaMerge.new(this);
+		var trueThru = !tenv.end, falseThru = !fenv.end;
+		merge.merge(tenv);
+		merge.merge(fenv);
+		merge.setEnv(env);
+		if (trueThru) {
+			// did both fall through?
+			var t = pir.elimTypeVars(expr.exactType);
+			if (falseThru) {
+				if (trueVal == falseVal) return trueVal; // same in either case
+				else return merge.newPhi2(t, trueVal, falseVal);
+			}
+			// only the true branch fell through
+			return trueVal;
+		}
+		if (falseThru) {
+			// only the false branch fell through
+			return falseVal;
+		}
+		return region.nop(); // neither fell through
+	}
+	// -- Bindings -------------------------------------------------------------
+	def visitValueBinding(expr: VarExpr, ref: ValueBinding, env: VstSsaEnv) -> SsaInstr {
+		// generate a constant
+		return env.addVal(expr.exactType, ref.val);
+	}
+	def visitLocalBinding(expr: VarExpr, ref: LocalBinding, env: VstSsaEnv) -> SsaInstr {
+		// binding to a var variable
+		return env.get(ref.decl.ssa); // get the variable mapping
+	}
+	def visitTypeBinding(expr: VarExpr, ref: TypeBinding, env: VstSsaEnv) -> SsaInstr {
+		// type should not be used as expression
+		return error(expr, "type binding used as expression");
+	}
+	def visitMemberBinding(expr: VarExpr, ref: MemberBinding, env: VstSsaEnv) -> SsaInstr {
+		var receiver = genReceiver(ref.thisExpr, env);
+		return ref.member.genRead(genOf(expr, ref.container, env), receiver);
+	}
+	// -- Utility methods ------------------------------------------------------
+	def error(expr: Expr, msg: string) -> SsaInstr {
+		return V3.fail(msg);
+	}
+	def exprSource(e: Expr) -> Source {
+		var point = e.point();
+		return Source.new(meth, point.beginLine, point.beginColumn, null);
+	}
+	def tokenSource(point: FilePoint) -> Source {
+		return Source.new(meth, point.beginLine, point.beginColumn, null);
+	}
+	def fieldConst(op: Operator) -> SsaValue {
+		var f = VstField.!(IrField.!(op.attr<IrMember>()).source), i = f.init;
+		if (f.isReadOnly && VarExpr.?(i)) {
+			var binding = VarExpr.!(i).binding;
+			if (ValueBinding.?(binding)) return region.valConst(op.resultType, ValueBinding.!(binding).val);
+		}
+		return null;
+	}
+	def genOf(expr: Expr, container: Type, env: VstSsaEnv) -> Gen<SsaInstr> {
+		if (ssaGen == null) ssaGen = SsaGen.new(this);
+		ssaGen.env = env;
+		ssaGen.expr = expr;
+		ssaGen.container = container;
+		return ssaGen;
+	}
+}
+// Generates SSA code for use by Member implementations
+class SsaGen extends Gen<SsaInstr> {
+	def gen: VstSsaGen;
+	var env: VstSsaEnv;
+	var expr: Expr;
+	var container: Type;
+	new(gen) { }
+	def source() -> Source { return gen.exprSource(expr); }
+	def getReceiverType() -> Type { return container; }
+	def getIr() -> IrPortion { return gen.prog.getIr(); }
+	def genVal(t: Type, v: Val) -> SsaInstr { return gen.region.valConst(t, v); }
+	def genApplyOp(op: Operator, args: Array<SsaInstr>) -> SsaInstr { return env.addApply(source(), op, args); }
+	def genCall(args: Array<SsaInstr>) -> SsaInstr { return env.addCall(source(), args(0).getType(), args); }
+	def genInstOp(op: Operator, args: Array<SsaInstr>, indexMap: Array<int>) -> SsaInstr {
+		return env.addInstr(SsaInstOp.new(op, indexMap, args));
+	}
+	def genOp(op: Operator) -> SsaInstr { return env.addOp(op); }
+	def subst(op: Operator) -> Operator { return op.subst(gen.pir.elimTypeVars); }
+	def expectNoReceiver(receiver: SsaInstr) {
+		if (receiver != null) gen.error(expr, "unexpected receiver");
+	}
+	def expectReceiver(receiver: SsaInstr) -> SsaInstr {
+		if (receiver == null) gen.error(expr, "expected receiver");
+		return receiver;
+	}
+}
+// An environment for generating code, including the current block and the current
+// variable map, which maps locals to the SSA instructions that produced them
+class VstSsaEnv extends SsaBlockBuilder {
+	def gen: VstSsaGen;
+	def parent: VstSsaEnv;
+	var varMap: Array<SsaInstr>;
+
+	var loopStart: VstSsaMerge;
+	var loopEnd: VstSsaMerge;
+
+	new(size: int, gen, parent, block: SsaBlock) : super(block) {
+		if (parent == null) varMap = Array.new(size);
+		else varMap = parent.varMap;
+	}
+	def split() -> VstSsaEnv {
+		return VstSsaEnv.new(varMap.length, gen, this, SsaBlock.new());
+	}
+	def get(ssa: VstSsaVar) -> SsaInstr {
+		if (ssa.isWritten()) return varMap(ssa.index);
+		return ssa.instr;
+	}
+	def set(ssa: VstSsaVar, i: SsaInstr) {
+		if (ssa.isWritten()) {
+			// perform copy-on-write update of variable map
+			if (parent != null && parent.varMap == varMap) varMap = Arrays.copy(varMap, null);
+			varMap(ssa.index) = i;
+		} else {
+			ssa.instr = i;
+		}
+	}
+	def addVal(t: Type, val: Val) -> SsaInstr {
+		return gen.region.valConst(t, val);
+	}
+	def addOp(op: Operator) -> SsaInstr {
+		// XXX: perform LVN and GVN
+		if (op.isPolymorphic()) return addInstr(SsaInstOp.new(op, SsaUtil.NO_INDEXES, SsaUtil.NO_INSTRS));
+		return gen.region.valConst(op.getFunctionType(), SsaUtil.newOpClosure0(op));
+	}
+	def addApply(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
+		var i = SsaApplyOp.new(source, op, args);
+		i.facts = Operators.facts(op.opcode);
+		if (gen.localOpt != null && args.length == op.numParams) {
+			// XXX: be less conservative, expand or contract tuples for var opt
+			var n = gen.localOpt.optimize(i, this);
+			if (i == n) addInstr(n);
+			return n;
+		}
+		return addInstr(i);
+	}
+	def addIf(e: SsaInstr, trueBlock: SsaBlock, falseBlock: SsaBlock) {
+		if (SsaApplyOp.?(e)) {
+			// generate special matches for if (e == K) and if (e != K)
+			var app = SsaApplyOp.!(e);
+			if (app.op.opcode == V3Opcode.Equal && SsaValue.?(app.inputs(1).dest)) return genIfConst(app, trueBlock, falseBlock);
+			if (app.op.opcode == V3Opcode.NotEqual && SsaValue.?(app.inputs(1).dest)) return genIfConst(app, falseBlock, trueBlock);
+		}
+		addSwitch(e, Bool.TYPE, SsaUtil.TRUE_ARRAY, [trueBlock], falseBlock);
+	}
+	def genIfConst(app: SsaApplyOp, trueBlock: SsaBlock, falseBlock: SsaBlock) {
+		var val = SsaValue.!(app.inputs(1).dest).val;
+		var e = app.inputs(0).dest;
+		addSwitch(e, app.op.typeArgs(0), [val], [trueBlock], falseBlock);
+	}
+	def genVarDecl(v: VarDecl) {
+		if (v.ssa.index >= 0) gen.nonSsaVars(v.ssa.index) = v;
+		if (v.init != null && !end) set(v.ssa, genExpr(v.init));
+	}
+	def genStmt(s: Stmt) {
+		if (!end) s.accept(gen, this);
+	}
+	def genExpr(e: Expr) -> SsaInstr {
+		if (!end) {
+			var i = e.accept(gen, this);
+			var it = e.implicitType, xt = e.exactType;
+			if (it == null || it == xt) return i;
+			it = gen.pir.elimTypeVars(it);
+			xt = gen.pir.elimTypeVars(xt);
+			if (it == xt) return i;
+			// conversion is necessary
+			return addApply(gen.exprSource(e), conversionOp(xt, it), [i]);
+		}
+		return gen.region.nop();
+	}
+	def conversionOp(xt: Type, it: Type) -> Operator {
+		match (it.typeCon.kind) {
+			V3Kind.CLASS, V3Kind.ARRAY, V3Kind.DELEGATE: return V3Op.newTypeSubsume(xt, it);
+		}
+		return V3Op.newTypeCast(xt, it);
+	}
+	def addCall(source: Source, ftype: Type, args: Array<SsaInstr>) -> SsaInstr {
+		if (end) return null;
+		var func = args(0);
+		match (func.opcode()) {
+			V3Opcode.ClassGetVirtual: return addCallClass(true, source, args);
+			V3Opcode.ClassGetMethod: return addCallClass(false, source, args);
+			-1: { // non-apply
+				if (SsaInstOp.?(func)) {
+					// convert instantiate + call into apply
+					return addCallInst(source, SsaInstOp.!(func), args);
+				} else if (SsaValue.?(func)) {
+					// convert call of closure value into apply
+					var val = SsaValue.!(func).val;
+					if (OpClosure.?(val)) return addCallClosure(source, OpClosure.!(val), args);
+				}
+			}
+		}
+		var op = V3Op.newCallDelegate(ftype);
+		if (op.paramTypes.length == 1) args = [func]; // special case of explicit void argument
+		return addInstr(SsaApplyOp.new(source, op, args));
+	}
+	private def addCallInst(source: Source, inst: SsaInstOp, args: Array<SsaInstr>) -> SsaInstr {
+		return addApply(source, inst.op, expandArgs(inst.op, inst.indexMap, inst.inputs, args));
+	}
+	private def addCallClosure(source: Source, opcl: OpClosure, args: Array<SsaInstr>) -> SsaInstr {
+		return addApply(source, opcl.op, expandArgs(opcl.op, opcl.indexMap, opcl.vals, args));
+	}
+	// expand either bound instructions or bound values (T in {SsaDfEdge, Val})
+	private def expandArgs<T>(op: Operator, indexMap: Array<int>, bound: Array<T>, args: Array<SsaInstr>) -> Array<SsaInstr> {
+		if (indexMap.length == 0) return Arrays.range(args, 1, args.length);
+		// expand arguments for closure call
+		var r = Array<SsaInstr>.new(op.paramTypes.length), ia = 1, iv = 0;
+		for (i = 0; i < r.length; i++) {
+			if (indexMap(iv) == i) {
+				var b = bound(iv++);
+				r(i) = if(SsaDfEdge.?(b), SsaDfEdge.!(b).dest, addVal(op.paramTypes(iv-1), Val.!(b)));
+			} else {
+				r(i) = args(ia++);
+			}
+		}
+		return r;
+	}
+	private def addCallClass(virtual: bool, source: Source, args: Array<SsaInstr>) -> SsaInstr {
+		var func = args(0), irSpec = V3Op.extractIrSpec(SsaApplyOp.!(func).op);
+		args(0) = func.inputs(0).dest;
+		if (virtual) return addApply(source, V3Op.newCallClassVirtual(irSpec), args);
+		else return addApply(source, V3Op.newCallClassMethod(irSpec), args);
+	}
+}
+// handles all merges in the control flow
+class VstSsaMerge {
+	def gen: VstSsaGen;
+	def predValues = Sequence<Array<SsaInstr>>.new();
+	def block = SsaBlock.new();
+	def phis = SsaPhis.new(block);
+
+	var varMap: Array<SsaInstr>;
+
+	new(gen) { }
+	def startLoop(env: VstSsaEnv, loopNum: int) -> VstSsaEnv {
+		// create the variable map with phis at the given positions
+		var vm = env.varMap, ssa = gen.nonSsaVars;
+		varMap = Array.new(vm.length);
+		for (i = 0; i < ssa.length; i++) {
+			var v = ssa(i);
+			if (v != null && v.ssa.isWrittenInLoop(loopNum)) {
+				varMap(v.ssa.index) = newPhi(v.vtype, SsaUtil.NO_INSTRS);
+			} else {
+				varMap(i) = vm(i);
+			}
+		}
+		merge(env);
+		var nenv = VstSsaEnv.new(varMap.length, gen, env, block);
+		nenv.varMap = Arrays.copy(varMap, null);
+		return nenv;
+	}
+	def merge(env: VstSsaEnv) {
+		// merge with the given ssa environment if it falls through
+		if (!env.end) {
+			env.addGoto(block);
+			mergeEdge(env, env.block.succ(0));
+		}
+	}
+	def mergeEdge(env: VstSsaEnv, edge: SsaCfEdge) {
+		if (edge.dest != block) return V3.fail(Strings.format3("mergeEdge B%1: edge B%2 -> B%3 doesn\'t go here", block.uid, edge.src.uid, edge.dest.uid));
+		phis.phiEdges.add(edge);
+		predValues.add(env.varMap);
+		if (varMap == null) varMap = Arrays.copy(env.varMap, null);
+		else mergeNewest();
+	}
+	def mergeIncoming(env: VstSsaEnv) {
+		for (edge in env.block.succ) {
+			if (edge.dest == block) mergeEdge(env, edge);
+		}
+	}
+	private def mergeNewest() {
+		// merge newest predecessor map into current variable map
+		var vm = predValues.get(predValues.length - 1), numVars = vm.length;
+		var numPreds = predValues.length;
+		for (v = 0; v < numVars; v = v + 1) {
+			var x = varMap(v), y = vm(v);
+			if (y == null && x != null) {
+				// this variable is dead on this edge, remove it
+				killVar(x, v);
+				continue;
+			}
+			if (SsaPhi.?(x)) {
+				var phi = SsaPhi.!(x);
+				if (phi.block == block) {
+					// there is already a phi at this position
+					phi.inputs = Arrays.append(SsaDfEdge.new(phi, y), phi.inputs);
+					continue;
+				}
+			}
+			if (x != null && x != y) {
+				// a new phi is required here
+				var inputs = Array<SsaInstr>.new(numPreds);
+				for (j = 0; j < numPreds; j++) {
+					inputs(j) = predValues.get(j)(v);
+				}
+				var t = gen.nonSsaVars(v).vtype;
+				varMap(v) = newPhi(t, inputs);
+			}
+		}
+	}
+	private def killVar(x: SsaInstr, v: int) {
+		if (SsaPhi.?(x)) {
+			var phi = SsaPhi.!(x);
+			if (phi.block == block) {
+				// there is already a phi for this var for this block, kill it
+				phis.phiInstrs.remove(phi); // XXX: this is the only use of Sequence.remove()
+				if (phis.phiInstrs.length == 0) block.phis = null;
+				phi.kill();
+			}
+		}
+		varMap(v) = null;
+	}
+	def setEnv(env: VstSsaEnv) {
+		// set the environment to be this block, if reachable
+		if (predValues.length > 0) {
+			env.block = block;
+			env.varMap = Arrays.copy(varMap, null);
+			env.end = false;
+			// XXX: optimize phis at this point
+		} else {
+			env.block = null;
+			env.varMap = null;
+			env.end = true;
+		}
+	}
+	def reachable() -> bool {
+		return predValues.length > 0;
+	}
+	def toEnv(parent: VstSsaEnv) -> VstSsaEnv {
+		var env = VstSsaEnv.new(varMap.length, gen, parent, block);
+		env.varMap = Arrays.copy(varMap, null);
+		return env;
+	}
+	def newPhi(t: Type, args: Array<SsaInstr>) -> SsaPhi {
+		block.phis = phis;
+		var phi = phis.newPhi(t, args);
+		return phi;
+	}
+	def newPhi2(t: Type, a: SsaInstr, b: SsaInstr) -> SsaPhi {
+		var args = [a, b];
+		var phi = newPhi(t, args);
+		phi.facts = a.facts & b.facts;
+		return phi;
+	}
+}

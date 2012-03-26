@@ -1,0 +1,219 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Manages the translation of Virgil types to JVM types
+class JvmTypeReps {
+	def jprog: JvmProgram;
+	def jvmReps    = TypeUtil.newTypeMap<JvmType>();
+	def jvmClasses = TypeUtil.newTypeMap<JvmClass>();
+
+	new(jprog) { }
+
+	def getRep(utype: Type) -> JvmType {
+		var jtype = jvmReps.get(utype);
+		if (jtype == null) jvmReps.set(utype, jtype = makeRep(utype));
+		return jtype;
+	}
+	def makeRep(utype: Type) -> JvmType {
+		match (utype.typeCon.kind) {
+			V3Kind.VOID: return JvmTypes.VOID;
+			V3Kind.BOOL: return JvmTypes.BOOLEAN;
+			V3Kind.BYTE: return JvmTypes.BYTE;
+			V3Kind.INT: return JvmTypes.INT;
+			V3Kind.ARRAY: return makeJvmArray(utype);
+			V3Kind.COMPONENT: return makeJvmComponent(utype);
+			V3Kind.CLASS: {
+				if (utype == Null.TYPE || utype == AnyObject.TYPE) return JvmTypes.java_lang_Object;
+				var superType = V3.getSuperType(utype);
+				var srep = if(superType != null, getRep(superType));
+				return makeJvmClass(srep, utype);
+			}
+			V3Kind.FUNCREF: return makeJvmFunction(utype);
+			V3Kind.TUPLE: return makeJvmTuple(utype);
+		} else {
+			jprog.compiler.ERROR.fail(Strings.format1("unknown type: %1", utype.render));
+			return JvmTypes.INT;
+		}
+	}
+	def getJvmClass(utype: Type) -> JvmClass {
+		var rep = getRep(utype);
+		if (JvmClass.?(rep)) return JvmClass.!(rep);
+		return jvmClasses.get(utype); // TODO: a hack for component types
+	}
+	private def makeJvmClass(superRep: JvmType, utype: Type) -> JvmType {
+		var ic = jprog.ir.getIrClass(utype);
+		var className = V3.mangleTypeName("V3C_", utype);
+		var superName = JvmTypes.jlo;
+		if (superRep != null) superName = superRep.name;
+		var jclass = JvmClass.new(className, superName);
+		jvmClasses.set(utype, jclass);
+		jprog.classQueue.add(JvmV3ClassGen.new(JvmClassfileBuilder.new(jprog, jclass), utype, ic));
+		return jclass;
+	}
+	private def makeJvmComponent(utype: Type) -> JvmType {
+		var ic = jprog.ir.getIrClass(utype);
+		var className = V3.mangleTypeName("V3K_", utype);
+		var jclass = JvmClass.new(className, JvmTypes.jlo);
+		jvmClasses.set(utype, jclass);
+		jprog.classQueue.add(JvmV3ComponentGen.new(JvmClassfileBuilder.new(jprog, jclass), utype, ic));
+		return JvmTypes.VOID;
+	}
+	private def makeJvmArray(utype: Type) -> JvmType {
+		var elemRep = getRep(utype.nested.head);
+		var jtype: JvmType = JvmTypes.java_lang_Integer;
+		if (elemRep.kind.width > 0) jtype = JvmTypes.newJvmArrayType(elemRep);
+		return jtype;
+	}
+	private def makeJvmTuple(utype: Type) -> JvmType {
+		var className = V3.mangleTypeName("V3T_", utype);
+		var jclass = JvmClass.new(className, JvmTypes.jlo);
+		jvmClasses.set(utype, jclass);
+		jprog.classQueue.add(JvmV3TupleGen.new(JvmClassfileBuilder.new(jprog, jclass), utype));
+		return jclass;
+	}
+	private def makeJvmFunction(utype: Type) -> JvmType {
+		var className = V3.mangleTypeName("V3F_", Function.DELEGATE.create(false, utype.nested));
+		var superName = jprog.makeAbstractDelegateClass().builder.jclass.name;
+		var jclass = JvmClass.new(className, superName);
+		jvmClasses.set(utype, jclass);
+		jprog.classQueue.add(JvmV3DelegateGen.new(JvmClassfileBuilder.new(jprog, jclass), utype, null, 0));
+		return jclass;
+	}
+	def emitGetField(memberRef: IrSpec, code: JvmCodeBuilder) {
+		var r = getRep(memberRef.getFieldType());
+		var isStatic = V3.isComponent(memberRef.container);
+		if (r.kind.width == 0 && !isStatic) {
+			emitExplicitNullCheck(code);
+		} else {
+			var jclass = getJvmClass(memberRef.container);
+			var fieldName = V3.mangleIrMember(memberRef.member);
+			if (isStatic) code.getstatic(jclass, fieldName, r);
+			else code.getfield(jclass, fieldName, r);
+			if (r == JvmTypes.BYTE) {
+				code.iconst(255);
+				code.binop(JvmBytecode.IAND);
+			}
+		}
+	}
+	def emitSetField(memberRef: IrSpec, code: JvmCodeBuilder, asVal: bool) {
+		var r = getRep(memberRef.getFieldType());
+		var isStatic = V3.isComponent(memberRef.container);
+		if (r.kind.width == 0 && !isStatic) {
+			emitExplicitNullCheck(code);
+		} else {
+			var jclass = getJvmClass(memberRef.container);
+			var fieldName = V3.mangleIrMember(memberRef.member);
+			if (isStatic) {
+				if (asVal) code.dup();
+				code.putstatic(jclass, fieldName, r);
+			} else {
+				if (asVal) code.dup_x1();
+				code.putfield(jclass, fieldName, r);
+			}
+		}
+	}
+	def declareField(f: IrField, builder: JvmClassfileBuilder) {
+		var rep = getRep(f.fieldType);
+		if (rep.kind.width > 0) {
+			var static = V3.isComponent(f.container.ctype);
+			var jf = builder.newField(getFieldName(f), rep.descriptor());
+			if (static) {
+				jf.setFlag(true, JvmConstant.ACC_STATIC + JvmConstant.ACC_PUBLIC);
+				if (f.checkFlag(IrUtil.F_VALUE)) jf.setFlag(true, JvmConstant.ACC_FINAL);
+			}
+		}
+	}
+	def getFieldName(f: IrField) -> string {
+		var buffer = f.render(StringBuffer.new());
+		return Mangle.mangleB(buffer, StringBuffer.new()).toString();
+	}
+	def emitTupleCreate(t: Type, code: JvmCodeBuilder) {
+		code.invokestatic(getJvmClass(t).name, "$new", jprog.jvmSig(Function.newType(t, t)));
+	}
+	def emitTupleGetElem(t: Type, index: int, code: JvmCodeBuilder) {
+		var jclass = getJvmClass(t);
+		var elemType = Lists.get(t.nested, index);
+		// for now, we can assume that tuples are never null,
+		// since they are only produced on return from a method
+		code.getfield(jclass, Strings.format1("f%1", index), jprog.jvmType(elemType));
+		if (elemType == Byte.TYPE) {
+			code.iconst(255);
+			code.binop(JvmBytecode.IAND);
+		}
+	}
+	def emitArrayGetLength(arrayType: Type, code: JvmCodeBuilder) {
+		var rep = getRep(arrayType);
+		if (rep == JvmTypes.java_lang_Integer) {
+			code.invokevirtual(JvmTypes.java_lang_Integer.name, "intValue", JvmTypes.SIG_VOID_INT);
+		} else {
+			code.arraylength();
+		}
+	}
+	def emitArrayGetElem(arrayType: Type, code: JvmCodeBuilder) {
+		var elemRep = getRep(V3Array.elementType(arrayType));
+		if (elemRep.kind.width == 0) {
+			emitExplicitBoundsCheck(arrayType, code);
+		} else {
+			code.aload(elemRep.kind);
+			if (elemRep == JvmTypes.BYTE) {
+				code.iconst(255);
+				code.binop(JvmBytecode.IAND);
+			}
+		}
+	}
+	def emitArraySetElem(arrayType: Type, code: JvmCodeBuilder, asVal: bool) {
+		var elemRep = getRep(V3Array.elementType(arrayType));
+		if (elemRep.kind.width == 0) {
+			emitExplicitBoundsCheck(arrayType, code);
+		} else {
+			if (asVal) code.dup_x2();
+			code.astore(elemRep.kind);
+		}
+	}
+	def emitArrayAlloc(arrayType: Type, code: JvmCodeBuilder) {
+		var elemRep = getRep(V3Array.elementType(arrayType));
+		if (elemRep.kind.width == 0) {
+			code.dup();
+			emitExplicitArraySizeCheck(code);
+			code.invokestatic(JvmTypes.java_lang_Integer.name, "valueOf", JvmTypes.SIG_INT_INTEGER);
+		} else {
+			code.newarray(elemRep);
+		}
+	}
+	def emitExplicitBoundsCheck(arrayType: Type, code: JvmCodeBuilder) {
+		var rep = getRep(arrayType);
+		var height = code.cur_stack;
+		if (rep == JvmTypes.java_lang_Integer) {
+			code.swap();
+			code.invokevirtual(JvmTypes.java_lang_Integer.name, "intValue", JvmTypes.SIG_VOID_INT);
+		} else {
+			code.swap();
+			code.arraylength();
+		}
+		code.dup();
+		code.iconst(0);
+		var b1 = code.branch_fw(JvmBytecode.IF_ICMPGE);
+		emitThrow(code, JvmTypes.java_lang_ArrayIndexOutOfBoundsException);
+		code.patchBranch(b1);
+		var b2 = code.branch_fw(JvmBytecode.IF_ICMPLT);
+		emitThrow(code, JvmTypes.java_lang_ArrayIndexOutOfBoundsException);
+		code.patchBranch(b2);
+		code.cur_stack = height - 2;
+	}
+	def emitExplicitArraySizeCheck(code: JvmCodeBuilder) {
+		code.iconst(0); // array size is already on stack
+		var b = code.branch_fw(JvmBytecode.IF_ICMPGE);
+		emitThrow(code, JvmTypes.java_lang_NegativeArraySizeException);
+		code.patchBranch(b);
+	}
+	def emitExplicitNullCheck(code: JvmCodeBuilder) {
+		var b = code.branch_fw(JvmBytecode.IFNONNULL);
+		code.aconst_null();
+		code.athrow();
+		code.patchBranch(b);
+	}
+	def emitThrow(code: JvmCodeBuilder, jclass: JvmClass) {
+		code.newempty(jclass);
+		code.athrow();
+	}
+}

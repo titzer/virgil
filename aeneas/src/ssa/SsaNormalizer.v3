@@ -1,0 +1,622 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Normalizes SSA code by performing polymorphic specialization and expanding all
+// tuples. Note that SSA form supports returns with multiple values.
+// XXX: preserve the dataflow facts when normalizing an instruction
+class SsaNormalizer extends SsaRebuilder {
+	def norm: V3ProgramNormalizer;
+	def oldMethod: IrSpec;			// old method
+	def returnTn: V3TypeNorm;			// new return type
+	var voidArray: Array<SsaInstr>;
+	var ssaOpts: SsaOptSettings;
+
+	new(norm, oldMethod, oldRegion: SsaRegion, returnTn) : super(norm.prog, oldRegion) {
+		ssaOpts = norm.compiler.ssaOpts;
+	}
+	def build(newMethod: IrMethod) {
+		newMethod.ssa = genRegion();
+		if (Aeneas.PRINT_SSA.get()) {
+			Terminal.print1("Normalized SSA for: %1\n", newMethod.render);
+			SsaPrinter.new(norm.prog).printRegion(newRegion);
+		}
+	}
+	def genParam(oldParam: SsaParam, params: Sequence<SsaParam>) {
+		var tn = normalize(oldParam.vtype);
+		if (params.length == 0 || tn.size == 1) {
+			var np = SsaParam.new(params.length, tn.getType());
+			params.add(np);
+			if (tn.size == 1) map1(oldParam, np);
+			else map0(oldParam);
+			return;
+		}
+		// one-zero or one-many mapping
+		var newParams = Array<SsaInstr>.new(tn.size);
+		for (j = 0; j < newParams.length; j++) {
+			var np = SsaParam.new(params.length, tn.sub(j));
+			newParams(j) = np;
+			params.add(np);
+		}
+		mapN(oldParam, newParams);
+	}
+	def genReturnType() -> Type {
+		return returnTn.getType();
+	}
+	def genPhi(oldPhi: SsaPhi) {
+		// create new phi(s)
+		var tn = normalize(oldPhi.vtype);
+		if (tn.size == 0) return map0(oldPhi);
+		if (tn.size == 1) return map1(oldPhi, SsaPhi.new(tn.getType(), mapBlockStart(oldPhi.block), SsaUtil.NO_INSTRS));
+		var values = Array<SsaInstr>.new(tn.size);
+		for (i = 0; i < values.length; i++) {
+			values(i) = SsaPhi.new(tn.sub(i), mapBlockStart(oldPhi.block), SsaUtil.NO_INSTRS);
+		}
+		mapN(oldPhi, values);
+	}
+	def genVal(oldVal: SsaValue) {
+		// normalize values
+		mapN(oldVal, normalizeVals(oldVal.val, normalize(oldVal.vtype)));
+	}
+	def genInstOp(oldOp: SsaInstOp) {
+		// don't generate values for instantiate operators until used
+	}
+	def genApplyOp(app: SsaApplyOp) {
+		var op = app.op.subst(mono), args = app.inputs;
+		match (op.opcode) {
+			V3Opcode.Equal:			normEqualOp(app, op);
+			V3Opcode.NotEqual:		normEqualOp(app, op);
+			V3Opcode.IntAdd,		// fallthru
+			V3Opcode.IntSub,		// fallthru
+			V3Opcode.IntMul,		// fallthru
+			V3Opcode.IntDiv,		// fallthru
+			V3Opcode.IntMod,		// fallthru
+			V3Opcode.IntAnd,		// fallthru
+			V3Opcode.IntOr,			// fallthru
+			V3Opcode.IntXor,		// fallthru
+			V3Opcode.IntShl,		// fallthru
+			V3Opcode.IntShr,		// fallthru
+			V3Opcode.IntLt,			// fallthru
+			V3Opcode.IntGt,			// fallthru
+			V3Opcode.IntLteq,		// fallthru
+			V3Opcode.IntGteq,		// fallthru
+			V3Opcode.BoolAnd,		// fallthru
+			V3Opcode.ByteLt,		// fallthru
+			V3Opcode.ByteGt,		// fallthru
+			V3Opcode.ByteLteq,		// fallthru
+			V3Opcode.ByteGteq,		// fallthru
+			V3Opcode.BoolOr:		normSimpleOp(app, op, 2);
+			V3Opcode.IntToByte,		// fallthru
+			V3Opcode.ByteToInt,		// fallthru
+			V3Opcode.BoolNot:		normSimpleOp(app, op, 1);
+
+			V3Opcode.TypeCast:		normTypeCast(app, op);
+			V3Opcode.TypeQuery:		normTypeQuery(app, op);
+			V3Opcode.TypeSubsume:		normTypeSubsume(app, op);
+			V3Opcode.ArrayAlloc:		normArrayAlloc(app, op);
+			V3Opcode.ArrayInit:		normArrayInit(app, op);
+			V3Opcode.ArrayGetElem:		normArrayGetElem(app, op);
+			V3Opcode.ArraySetElem:		normArraySetElem(app, op);
+			V3Opcode.ArrayGetLength:	normArrayGetLength(app, op);
+			V3Opcode.ClassAlloc:		normClassAlloc(app, op);
+			V3Opcode.ClassGetField:		normClassGetField(app, op);
+			V3Opcode.ClassSetField:		normClassSetField(app, op);
+			V3Opcode.ClassGetMethod:{
+				var obj = genRef1(app.inputs(0));
+				curBlock.addNullCheck(app.source, app, obj);
+				mapN(app, [funcRef(extractMethodRef(op)), obj]);
+			}
+			V3Opcode.ClassGetVirtual: {
+				var m = extractMethodRef(op), newOp: Operator;
+				var mono = ssaOpts.ChaDevirtualize && !m.member.checkFlag(IrUtil.M_OVERRIDDEN);
+				var obj = genRef1(app.inputs(0));
+				if (mono) {
+					curBlock.addNullCheck(app.source, app, obj);
+					mapN(app, [funcRef(m), obj]);
+				} else {
+					mapN(app, [curBlock.addApply(app.source, V3Op.newClassGetVirtFunc(m), [obj]), obj]);
+				}
+			}
+			V3Opcode.ComponentInit:		map0(app);
+			V3Opcode.ComponentGetField:	normComponentGetField(app, op);
+			V3Opcode.ComponentSetField:	normComponentSetField(app, op);
+			V3Opcode.ComponentGetMethod:	normComponentGetMethod(app, op);
+			V3Opcode.TupleCreate: {
+				var tn = normParamType(op);
+				mapN(app, normalizeArgs(app.inputs, tn, tn.size));
+			}
+			V3Opcode.TupleGetElem: {
+				normTupleGetElem(app, app.inputs, normParamType(op), op.attr<int>());
+			}
+			V3Opcode.NullCheck:		normNullCheck(app, op);
+			V3Opcode.BoundsCheck:		normBoundsCheck(app, op);
+			V3Opcode.CallClassMethod:	normGeneralOp(app, op, V3Op.newCallClassMethod(extractMethodRef(op)));
+			V3Opcode.CallClassVirtual: {
+				// devirtualize methods that are not overridden
+				var m = extractMethodRef(op), newOp: Operator;
+				if (ssaOpts.ChaDevirtualize && !m.member.checkFlag(IrUtil.M_OVERRIDDEN)) {
+					// devirtualized to call abstract method => no objects instantiated of that type
+					if (m.member.checkFlag(IrUtil.M_ABSTRACT)) return map1(app, newRegion.nullConst(m.getReturnType()));
+					else newOp = V3Op.newCallClassMethod(m);
+				} else {
+					newOp = V3Op.newCallClassVirtual(m);
+				}
+				normGeneralOp(app, op, newOp);
+			}
+			V3Opcode.CallComponentMethod:	normGeneralOp(app, op, V3Op.newCallComponentMethod(extractMethodRef(op)));
+			V3Opcode.CallDelegate: {
+				var tn = normalize(op.typeArgs(0));
+				// normalize CallDelegate into CallFunction
+				normGeneralOp(app, op, V3Op.newCallFunction(tn.sub(0)));
+			}
+			V3Opcode.SystemOp:		normGeneralOp(app, op, op);
+			V3Opcode.ConditionalThrow:	normGeneralOp(app, op, op);
+		} else {
+			// TODO: don't depend on MachOpcodes in SsaNormalizer
+			if (MachOpcode.inRange(op.opcode)) normGeneralOp(app, op, op);
+		}
+	}
+	def genLazy(oi: SsaInstr) {
+		// instantiations of operators are generated lazily,
+		// because they may trigger generation of helper methods that contain
+		// the normalized version of the code
+		if (!SsaInstOp.?(oi)) unexpectedInstr(oi);
+		var oldOp = SsaInstOp.!(oi);
+		var del = norm.opnorm.normalizeOp(oldOp.op.subst(mono));
+		return mapN(oldOp, [funcRef(del.memberRef), newRegion.nullConst(AnyObject.TYPE)]);
+	}
+	def genSwitch(oldSw: SsaSwitch) {
+		var tn = normalize(oldSw.vtype);
+		if (tn.size == 0) {
+			// comparison will always be true
+			return curBlock.addGoto(mapEdge(oldSw.block.succ(0)));
+		}
+		var numVals = oldSw.vals.length;
+		var keys = genRefs(oldSw.inputs);
+		if (tn.size > 1) {
+			// a multi-valued switch requires special treatment
+			if (numVals == 1) return normalizeTupleIf(oldSw, keys, tn);
+			// TODO: a cascade of if's is necessary. for now, insert a tuple creation and...
+			keys = [curBlock.addApply(null, V3Op.newTupleCreate(tn.getType()), keys)];
+			// fall through
+		}
+		var keyVal = keys(0);
+		var ov = oldSw.vals, os = oldSw.block.succ;
+		if (SsaValue.?(keyVal)) {
+			// fold a constant branch
+			var v = SsaValue.!(keyVal).val, succ = os(numVals);
+			for (i = 0; i < numVals; i++) {
+				if (Values.equal(v, norm.normalizeValAsVal(ov(i), tn))) {
+					succ = os(i);
+					break;
+				}
+			}
+			return curBlock.addGoto(mapEdge(succ));
+		}
+		// normalize branch values and successors
+		var vals = Array<Val>.new(numVals);
+		var valSucc = Array<SsaBlock>.new(numVals);
+		for (i = 0; i < numVals; i++) {
+			vals(i) = norm.normalizeValAsVal(ov(i), tn);
+			valSucc(i) = mapEdge(os(i));
+		}
+		return curBlock.addSwitch(keyVal, tn.getType(), vals, valSucc, mapEdge(os(vals.length)));
+	}
+	def normalizeTupleIf(oldSw: SsaSwitch, keys: Array<SsaInstr>, tn: V3TypeNorm) {
+		// turn the switch back into an if
+		var nvals = normalizeVals(oldSw.vals(0), tn);
+		var expr: SsaInstr;
+		for (i = 0; i < tn.size; i++) {
+			// XXX: var opt
+			var cmp = curBlock.addApply(null, V3Op.newEqual(tn.sub(i)), [keys(i), nvals(i)]);
+			if (expr == null) expr = cmp;
+			else expr = curBlock.addApply(null, V3Op.opBoolAnd, [expr, cmp]);
+		}
+		return curBlock.addSwitch(expr, Bool.TYPE, SsaUtil.TRUE_ARRAY, [mapEdge(oldSw.block.succ(0))], mapEdge(oldSw.block.succ(1)));
+	}
+	def genReturn(oldRet: SsaReturn) {
+		// map a return (may return multiple values)
+		return curBlock.addReturn(genRefs(oldRet.inputs));
+	}
+	def normalizeVals(v: Val, tn: V3TypeNorm) -> Array<SsaInstr> {
+		// normalize values into an array of SSA instructions
+		var nv = norm.normalizeValAsArray(v, tn);
+		var vals = Array<SsaInstr>.new(nv.length);
+		for (j = 0; j < vals.length; j++) {
+			vals(j) = newRegion.valConst(tn.sub(j), nv(j));
+		}
+		return vals;
+	}
+	// normalize a general, non-pure, operator
+	def normGeneralOp(oldInstr: SsaApplyOp, op: Operator, newOp: Operator) {
+		var atn = normParamType(op), rtn = normReturnType(op);
+		var newArgs = normalizeArgs(oldInstr.inputs, atn, atn.size);
+		var newInstr = curBlock.addApply(oldInstr.source, newOp, newArgs);
+		if (rtn.size == 0) {
+			newInstr.facts = newInstr.facts | oldInstr.facts;
+			return map0(oldInstr);
+		}
+		if (rtn.size == 1) return map1(oldInstr, newInstr);
+		// 2 or more return values, projections are necessary
+		addProjections(oldInstr, newInstr, rtn);
+	}
+	def addProjections(oldInstr: SsaInstr, newInstr: SsaInstr, rtn: V3TypeNorm) {
+		var values = Array<SsaInstr>.new(rtn.size);
+		var ttype = rtn.getType();
+		for (i = 0; i < rtn.size; i++) {
+			values(i) = curBlock.addApply(null, V3Op.newTupleGetElem(ttype, i), [newInstr]);
+		}
+		mapN(oldInstr, values);
+	}
+	// normalize an operator that has a fixed N->1 arity
+	def normSimpleOp(oldInstr: SsaApplyOp, op: Operator, numParams: int) {
+		var newArgs = genRefs(oldInstr.inputs);
+		if (newArgs.length != numParams) arityError(numParams, newArgs);
+		return map1(oldInstr, curBlock.addApply(oldInstr.source, op, newArgs));
+	}
+	// normalize an operator that should be K -> K
+	def normTypeSubsume(oldInstr: SsaApplyOp, op: Operator) {
+		var atn = normParamType(op), rtn = normReturnType(op);
+		var arity = rtn.size;
+		if (arity > 0) {
+			// complex operator
+			var newArgs = normalizeArgs(oldInstr.inputs, atn, arity);
+			var vals = Array<SsaInstr>.new(arity);
+			for (i = 0; i < arity; i++) {
+				var pt = atn.sub(i), rt = rtn.sub(i);
+				if (pt != rt) vals(i) = curBlock.addApply(oldInstr.source, V3Op.newTypeSubsume(pt, rt), [newArgs(i)]);
+				else vals(i) = newArgs(i);
+			}
+			mapN(oldInstr, vals);
+		}
+	}
+	def normalizeArgs(args: Array<SsaDfEdge>, tn: V3TypeNorm, arity: int) -> Array<SsaInstr> {
+		if (args.length < tn.nested.length) {
+			// rare (ugly) case: need to expand last argument
+			var lastArg = args.length - 1;
+			var first = genRefs(Arrays.range(args, 0, lastArg));
+			// expand last argument to be the rest of the arguments
+			var tl: List<Type>;
+			for (i = tn.nested.length - 1; i >= lastArg; i--) {
+				tl = List.new(tn.nested(i).getType(), tl);
+			}
+			var lastTn = normalize(Tuple.newType(tl));
+			var last = genRefs([args(lastArg)]);
+			var result = Sequence<SsaInstr>.new();
+			result.addN(first);
+			result.addN(last);
+			return checkArity(arity, tn, result.extract());
+		}
+		// multiple arguments
+		return checkArity(arity, tn, genRefs(args));
+	}
+	// normalize an equality operator
+	def normEqualOp(oldApp: SsaApplyOp, op: Operator) {
+		var tn = normalize(op.typeArgs(0));
+		if (tn.size == 0) {
+			// comparison is a constant for zero-length values
+			return map1(oldApp, newRegion.boolConst(op.opcode == V3Opcode.Equal));
+		}
+		var newArgs = genRefs(oldApp.inputs);
+		var newOp = V3Op.newNotEqual; // the function which creates each comparison
+		if (op.opcode == V3Opcode.Equal) newOp = V3Op.newEqual;
+		if (tn.size == 1) {
+			// a simple comparison
+			return map1(oldApp, curBlock.addApply(oldApp.source, newOp(tn.getType()), newArgs));
+		} else {
+			// a complex comparison
+			var expr: SsaInstr;
+			var join = V3Op.opBoolOr; // the operator to join each comparsion with
+			if (op.opcode == V3Opcode.Equal) join = V3Op.opBoolAnd;
+			for (i = 0; i < tn.size; i++) {
+				// XXX: var opt, fold chained boolean expressions
+				var cmp = curBlock.addApply(oldApp.source, newOp(tn.sub(i)), [newArgs(i), newArgs(i + tn.size)]);
+				if (expr == null) expr = cmp;
+				else expr = curBlock.addApply(null, join, [expr, cmp]);
+			}
+			return map1(oldApp, expr);
+		}
+	}
+	def normTupleGetElem(oldInstr: SsaInstr, args: Array<SsaDfEdge>, tn: V3TypeNorm, index: int) {
+		var args = normalizeArgs(args, tn, tn.size);
+		var start = tn.offsets(index), size = tn.nested(index).size;
+		if (size == 0) return map0(oldInstr);
+		// becomes multiple values
+		var vals = Array<SsaInstr>.new(size);
+		for (i = start; i < start + size; i++) {
+			vals(i - start) = args(i);
+		}
+		mapN(oldInstr, vals);
+	}
+	def newNullCheck(t1: Type, t2: Type) -> Operator {
+		return V3Op.newNullCheck(t1);
+	}
+	def normTypeCast(oldApp: SsaApplyOp, op: Operator) {
+		var atn = normParamType(op), rtn = normReturnType(op);
+		if (atn.size != rtn.size) {
+			// cast will always fail
+			var vals = Array<SsaInstr>.new(rtn.size);
+			for (i = 0; i < rtn.size; i++) {
+				vals(i) = newRegion.nullConst(rtn.sub(i));
+			}
+			curBlock.addThrow(oldApp.source, V3Exception.TypeCheck);
+			return mapN(oldApp, vals);
+		}
+		var arity = rtn.size;
+		var newArgs = normalizeArgs(oldApp.inputs, atn, arity);
+		var vals = Array<SsaInstr>.new(arity);
+		for (i = 0; i < arity; i++) {
+			vals(i) = newTypeCast(oldApp.source, atn.sub(i), rtn.sub(i), newArgs(i));
+		}
+		mapN(oldApp, vals);
+	}
+	def newTypeCast(source: Source, ft: Type, tt: Type, arg: SsaInstr) -> SsaInstr {
+		if (Aeneas.DISABLE_TYPE_CHECKS.get()) return arg;
+		match (TypeSystem.decideTypeCast(ft, tt)) {
+			TypeSystem.TRUE: return arg;
+			TypeSystem.FALSE: {
+				curBlock.addThrow(source, V3Exception.TypeCheck);
+				return newRegion.nullConst(tt);
+			}
+			TypeSystem.TRUE_X_NULL: {
+				var nullConst = newRegion.nullConst(ft);
+				var cmp = curBlock.addApply(source, V3Op.newEqual(ft), [arg, nullConst]);
+				var throw = curBlock.addApply(source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp]);
+				return arg;
+			}
+			TypeSystem.FALSE_X_NULL: {
+				var nullConst = newRegion.nullConst(ft);
+				var cmp = curBlock.addApply(source, V3Op.newNotEqual(ft), [arg, nullConst]);
+				var throw = curBlock.addApply(source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp]);
+				return newRegion.nullConst(tt);
+			}
+		} else {
+			if (curBlock.end) return newRegion.nullConst(tt);
+			else return curBlock.addApply(source, V3Op.newTypeCast(ft, tt), [arg]);
+		}
+	}
+	def normTypeQuery(oldApp: SsaApplyOp, op: Operator) {
+		var atn = normalize(op.typeArgs(0)), rtn = normalize(op.typeArgs(1));
+		if (atn.size != rtn.size) {
+			// query will always fail
+			return map1(oldApp, newRegion.nullConst(Bool.TYPE));
+		}
+		var newArgs = normalizeArgs(oldApp.inputs, atn, atn.size);
+		if (atn.size == 0) return map1(oldApp, newRegion.boolConst(true));
+		if (atn.size == 1) return map1(oldApp, newTypeQuery(oldApp.source, atn.sub(0), rtn.sub(0), newArgs(0)));
+		// a complex type query
+		var expr: SsaInstr;
+		for (i = 0; i < atn.size; i++) {
+			var cmp = newTypeQuery(oldApp.source, atn.sub(i), rtn.sub(i), newArgs(i));
+			if (SsaValue.?(cmp)) {
+				// this part of the type query can be statically decided
+				if (Bool.unbox(SsaValue.!(cmp).val)) continue;
+				return map1(oldApp, cmp);
+			}
+			if (expr == null) expr = cmp;
+			else expr = curBlock.addApply(null, V3Op.opBoolAnd, [expr, cmp]);
+		}
+		if (expr == null) return map1(oldApp, newRegion.boolConst(true));
+		map1(oldApp, expr);
+	}
+	def newTypeQuery(source: Source, ft: Type, tt: Type, arg: SsaInstr) -> SsaInstr {
+		var known = TypeSystem.decideTypeQuery(ft, tt);
+		if (known == TypeSystem.TRUE) return newRegion.boolConst(true);
+		if (known == TypeSystem.FALSE) return newRegion.boolConst(false);
+		if (known == TypeSystem.TRUE_X_NULL) {
+			var nullConst = newRegion.nullConst(ft);
+			return curBlock.addApply(source, V3Op.newNotEqual(ft), [arg, nullConst]);
+		}
+		return curBlock.addApply(source, V3Op.newTypeQuery(ft, tt), [arg]);
+	}
+	def normArrayAlloc(oldApp: SsaApplyOp, op: Operator) {
+		var rtn = nonzero(normReturnType(op));
+		var length = genRef1(oldApp.inputs(0));
+		if (rtn.size == 1) return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newArrayAlloc(rtn.getType()), [length]));
+		// complex array allocation
+		return mapN(oldApp, Arrays.map2(rtn.sub, newArrayAlloc, (oldApp.source, [length])));
+	}
+	def newArrayAlloc(arrayType: Type, t: (Source, Array<SsaInstr>)) -> SsaInstr {
+		return curBlock.addApply(t.0, V3Op.newArrayAlloc(arrayType), t.1);
+	}
+	def normArrayInit(oldApp: SsaApplyOp, op: Operator) {
+		var arrayType = op.typeArgs(0);
+		var rtn = nonzero(normalize(arrayType));
+		var etn = normalize(V3Array.elementType(op.typeArgs(0)));
+		var len = op.attr<int>(), width = etn.size;
+		if (width == 0) {
+			// this is a void array
+			var length: SsaInstr = newRegion.intConst(len);
+			return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newArrayAlloc(rtn.getType()), [length]));
+		}
+		var atn = normParamType(op);
+		var newArgs = normalizeArgs(oldApp.inputs, atn, atn.size);
+		if (rtn.size == 1) return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newArrayInit(rtn.getType(), newArgs.length), newArgs));
+		// complex array initialization
+		var arrays = Array<SsaInstr>.new(width);
+		for (i = 0; i < width; i++) {
+			var vals = Array<SsaInstr>.new(len);
+			for (j = 0; j < len; j++) {
+				vals(j) = newArgs(i + j * width);
+			}
+			arrays(i) = curBlock.addApply(oldApp.source, V3Op.newArrayInit(rtn.sub(i), len), vals);
+		}
+		mapN(oldApp, arrays);
+	}
+	def normArrayGetElem(oldApp: SsaApplyOp, op: Operator) {
+		var atn = normParamType(op), rtn = normReturnType(op);
+		var newArgs = normalizeArgs(oldApp.inputs, atn, atn.size);
+		if (rtn.size == 0) return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newBoundsCheck(atn.sub(0)), newArgs));
+		if (rtn.size == 1) return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newArrayGetElem(atn.sub(0)), newArgs));
+		// complex array access
+		var width = rtn.size, vals = Array<SsaInstr>.new(width);
+		var index = newArgs(width);
+		for (i = 0; i < width; i++) {
+			var get = curBlock.addApply(oldApp.source, V3Op.newArrayGetElem(atn.sub(i)), [newArgs(i), index]);
+			vals(i) = get;
+			if (i > 0) get.setFact(SsaFacts.O_NO_BOUNDS_CHECK);
+		}
+		mapN(oldApp, vals);
+	}
+	def normArraySetElem(oldApp: SsaApplyOp, op: Operator) {
+		var atn = normParamType(op), rtn = normReturnType(op);
+		var width = rtn.size;
+		var newArgs = normalizeArgs(oldApp.inputs, atn, atn.size);
+		if (width == 0) return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newBoundsCheck(atn.sub(0)), newArgs));
+		if (width == 1) return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newArraySetElem(atn.sub(0)), newArgs));
+		// complex array set
+		var vals = Array<SsaInstr>.new(width), index = newArgs(width);
+		for (i = 0; i < width; i++) {
+			var set = curBlock.addApply(oldApp.source, V3Op.newArraySetElem(atn.sub(i)), [newArgs(i), index, newArgs(i + 1 + width)]);;
+			vals(i) = set;
+			if (i > 0) set.setFact(SsaFacts.O_NO_BOUNDS_CHECK);
+		}
+		mapN(oldApp, vals);
+	}
+	def normArrayGetLength(oldApp: SsaApplyOp, op: Operator) {
+		var atn = nonzero(normParamType(op));
+		var array = normalizeArgs(oldApp.inputs, atn, atn.size);
+		// get the length from the first component array
+		return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newArrayGetLength(atn.sub(0)), [array(0)]));
+	}
+	def normComponentGetMethod(oldApp: SsaApplyOp, op: Operator) {
+		// map ComponentGetMethod to (funcref, null)
+		return mapN(oldApp, [funcRef(extractMethodRef(op)), newRegion.nullConst(AnyObject.TYPE)]);
+	}
+	def normComponentGetField(oldApp: SsaApplyOp, op: Operator) {
+		var rmaField = extractFieldRef(op);
+		if (ssaOpts.RmaConstFields && !rmaField.isWritten) {
+			// OPT: inline the field as a constant
+			var tn = normalize(rmaField.origMember.getFieldType());
+			return mapN(oldApp, normalizeVals(rmaField.val, tn));
+		}
+		var fieldRefs = rmaField.fieldNorm;
+		if (fieldRefs.length == 1) return map1(oldApp, newComponentGetField(oldApp.source, fieldRefs(0)));
+		var reads = Array<SsaInstr>.new(fieldRefs.length);
+		for (i = 0; i < fieldRefs.length; i++) {
+			reads(i) = newComponentGetField(oldApp.source, fieldRefs(i));
+		}
+		return mapN(oldApp, reads);
+	}
+	def normComponentSetField(oldApp: SsaApplyOp, op: Operator) {
+		var fieldRefs = extractFieldRef(op).fieldNorm;
+		var ftn = normParamType(op);
+		var fieldVals = normalizeArgs(oldApp.inputs, ftn, ftn.size);
+		if (fieldRefs.length == 1) return map1(oldApp, newComponentSetField(oldApp.source, fieldRefs(0), fieldVals(0)));
+		var writes = Array<SsaInstr>.new(fieldRefs.length);
+		for (i = 0; i < fieldRefs.length; i++) {
+			writes(i) = newComponentSetField(oldApp.source, fieldRefs(i), fieldVals(i));
+		}
+		return mapN(oldApp, writes);
+	}
+	def newComponentGetField(source: Source, fieldRef: IrSpec) -> SsaInstr {
+		// XXX: var field optimizations
+		return curBlock.addApply(source, V3Op.newComponentGetField(fieldRef), voidConsts());
+	}
+	def newComponentSetField(source: Source, fieldRef: IrSpec, val: SsaInstr) -> SsaInstr {
+		// XXX: remove useless field writes
+		return curBlock.addApply(source, V3Op.newComponentSetField(fieldRef), [voidConst(), val]);
+	}
+	def normClassAlloc(oldApp: SsaApplyOp, op: Operator) {
+		var tn = normParamType(op);
+		op = V3Op.newClassAlloc(extractMethodRef(op));
+		var newArgs = normalizeArgs(oldApp.inputs, tn, tn.size);
+		return map1(oldApp, curBlock.addApply(oldApp.source, op, newArgs));
+	}
+	def normClassGetField(oldApp: SsaApplyOp, op: Operator) {
+		var receiver = genRef1(oldApp.inputs(0));
+		var fieldNorm = extractFieldRef(op).fieldNorm;
+		if (fieldNorm.length == 1) return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newClassGetField(fieldNorm(0)), [receiver]));
+		if (fieldNorm.length == 0) return newNullCheckInstr(oldApp, receiver);
+		var vals = Array<SsaInstr>.new(fieldNorm.length), newArgs = [receiver];
+		for (i = 0; i < vals.length; i++) {
+			// XXX: fold constant getfields
+			vals(i) = curBlock.addApply(oldApp.source, V3Op.newClassGetField(fieldNorm(i)), newArgs);
+		}
+		return mapN(oldApp, vals);
+	}
+	def normClassSetField(oldApp: SsaApplyOp, op: Operator) {
+		var tn = normParamType(op);
+		var fieldNorm = extractFieldRef(op).fieldNorm;
+		var newArgs = normalizeArgs(oldApp.inputs, tn, tn.size);
+		var receiver = newArgs(0);
+		if (fieldNorm.length == 1) return map1(oldApp, curBlock.addApply(oldApp.source, V3Op.newClassSetField(fieldNorm(0)), newArgs));
+		if (fieldNorm.length == 0) return newNullCheckInstr(oldApp, receiver);
+		var vals = Array<SsaInstr>.new(fieldNorm.length);
+		for (i = 0; i < vals.length; i++) {
+			vals(i) = curBlock.addApply(oldApp.source, V3Op.newClassSetField(fieldNorm(i)), [receiver, newArgs(i + 1)]);
+		}
+		return mapN(oldApp, vals);
+	}
+	def normNullCheck(oldApp: SsaApplyOp, op: Operator) {
+		var newArgs = genRefs(oldApp.inputs);
+		for (i = 0; i < newArgs.length; i++) {
+			curBlock.addNullCheck(oldApp.source, oldApp, newArgs(i));
+		}
+		map0(oldApp);
+	}
+	def normBoundsCheck(oldApp: SsaApplyOp, op: Operator) {
+		normSimpleOp(oldApp, op, 2);
+	}
+	def newNullCheckInstr(oldApp: SsaApplyOp, receiver: SsaInstr) {
+		curBlock.addNullCheck(oldApp.source, oldApp, receiver);
+		map0(oldApp);
+	}
+	private def checkArity(expected: int, tn: V3TypeNorm, args: Array<SsaInstr>) -> Array<SsaInstr> {
+		if (tn.size != expected) {
+			return V3.fail(Strings.format2("type norm has size %1, expected %2", tn.size, expected));
+		}
+		if (args.length != expected) arityError(expected, args);
+		return args;
+	}
+	private def arityError(expected: int, args: Array<SsaInstr>) {
+		// for debugging purposes, print the args
+		var msg = Strings.format2("args have size %1, expected %2", args.length, expected);
+		Terminal.print(msg);
+		for (i = 0; i < args.length; i++) {
+			if (i == 0) Terminal.print(" [");
+			else Terminal.print(", ");
+			SsaPrinter.new(norm.prog).printInstr(args(i));
+		}
+		Terminal.print("]\n");
+		return V3.fail(msg);
+	}
+	private def mono(t: Type) -> Type {
+		if (oldMethod == null || !t.open) return t;
+		return oldMethod.instantiateType(t);
+	}
+	private def normalize(t: Type) -> V3TypeNorm {
+		return norm.normalizeType(mono(t));
+	}
+	private def mapEdge(edge: SsaCfEdge) -> SsaBlock {
+		return mapBlockStart(edge.dest);
+	}
+	private def extractFieldRef(op: Operator) -> RmaField {
+		return norm.normalizeFieldRef(V3Op.extractIrSpec(op));
+	}
+	private def extractMethodRef(op: Operator) -> IrSpec {
+		return norm.normalizeMethodRef(V3Op.extractIrSpec(op));
+	}
+	private def normParamType(op: Operator) -> V3TypeNorm {
+		return norm.normalizeTypeArray(op.paramTypes);
+	}
+	private def normReturnType(op: Operator) -> V3TypeNorm {
+		return normalize(op.resultType);
+	}
+	private def voidConst() -> SsaInstr {
+		return voidConsts()(0);
+	}
+	private def voidConsts() -> Array<SsaInstr> {
+		if (voidArray == null) voidArray = [newRegion.nop()];
+		return voidArray;
+	}
+	private def funcRef(m: IrSpec) -> SsaInstr {
+		return newRegion.valConst(Function.funcRefType(m.getFuncType()), FuncVal.new(m));
+	}
+	private def map0(oi: SsaInstr) {
+		mapN(oi, SsaUtil.NO_INSTRS);
+	}
+	private def nonzero(tn: V3TypeNorm) -> V3TypeNorm {
+		if (tn.size == 0) return V3.fail("expected at least one type");
+		return tn;
+	}
+}

@@ -1,0 +1,190 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Translates SSA-form IR into IC code, which is more suitable for interpretation.
+class SsaIcGen {
+	def prog: Program;
+	def memberRef: IrSpec;
+	def region: SsaRegion;
+	def blockInfo = LazyMap.new(SsaBlock.uid, SsaBlock.==, SsaIcBlock.new);
+	def code = Sequence<IcInstr>.new();
+	var ssaDecon: SsaDeconstructor;
+	var switches: List<(SsaSwitch, IcMatch)>;
+	var branches: List<(SsaBlock, IcBranch)>;
+	var stack = Stack<SsaIcBlock>.new();
+	var numRegs: int;
+	var voidReg: int;
+	var doSubsumeOpt: bool;
+
+	new(prog, memberRef, region, options: SsaOptSettings) {
+		ssaDecon = SsaDeconstructor.new(region, allocReg, moveIR, moveRR);
+		doSubsumeOpt = options.IcSubsumeOpt;
+	}
+	def generate() -> IcMethod {
+		assignParams();
+		assignValues();
+		stack.push(blockInfo.get(region.startBlock));
+		while (!stack.empty()) {
+			var info = stack.pop();
+			if (!info.generated) genBlock(info);
+		}
+		Lists.apply(branches, patchBranch);
+		Lists.apply(switches, patchSwitch);
+		ssaDecon.clear();
+		return IcMethod.new(memberRef, code.extract(), region.params.length, numRegs);
+	}
+	def patchBranch(target: SsaBlock, br: IcBranch) {
+		// patch the target of the goto
+		br.target = blockInfo.get(target).codeStart;
+	}
+	def patchSwitch(sw: SsaSwitch, m: IcMatch) {
+		// patch the targets of the match
+		var s = sw.block.succ;
+		for (i = 0; i < m.targets.length; i++) {
+			m.targets(i) = blockInfo.get(s(i).dest).codeStart;
+		}
+	}
+	def genInstr(i: SsaInstr) {
+		// generate code for a single instruction
+		var dst = ssaDecon.mapReg(i);
+		if (SsaApplyOp.?(i)) {
+			// generate an apply instruction
+			var apply = SsaApplyOp.!(i), args = Arrays.map(apply.inputs, genRef);
+			if (apply.op.opcode == V3Opcode.TypeSubsume && doSubsumeOpt) code.add(IcMove.new(dst, args(0)));
+			else code.add(Ic.newApply(dst, apply.op, args, apply.source));
+		} else if (SsaInstOp.?(i)) {
+			// generate an instantiation or closure creation
+			var inst = SsaInstOp.!(i);
+			if (inst.complex()) {
+				var args = Arrays.map(inst.inputs, genRef);
+				return code.add(IcClosure.new(dst, inst.op, args, inst.indexMap));
+			} else {
+				return code.add(IcInst.new(dst, inst.op));
+			}
+		} else if (SsaSwitch.?(i)) {
+			// generate a switch
+			genSwitch(SsaSwitch.!(i));
+		} else if (SsaGoto.?(i)) {
+			// generate a goto
+			genJump(blockInfo.get(SsaGoto.!(i).target()));
+		} else if (SsaReturn.?(i)) {
+			// generate a return
+			var ret = SsaReturn.!(i), args = Arrays.map(ret.inputs, genRef);
+			if (args.length == 0) code.add(IcRet.new(voidReg));
+			else if (args.length == 1) code.add(IcRet.new(args(0)));
+			else {
+				var reg = newTmp();
+				code.add(Ic.newApply(reg, V3Op.newTupleCreate(memberRef.getReturnType()), args, null));
+				code.add(IcRet.new(reg));
+			}
+		} else if (SsaThrow.?(i)) {
+			// generate a throw
+			var t = SsaThrow.!(i);
+			code.add(IcThrow.new(t.exception, t.source));
+		}
+		// don't generate code for params, constants, or phis
+	}
+	def genSwitch(sw: SsaSwitch) {
+		var key = genRef(sw.inputs(0)), succ = sw.block.succ;
+		if (sw.vals == SsaUtil.TRUE_ARRAY) {
+			var tInfo = blockInfo.get(succ(0).dest);
+			var fInfo = blockInfo.get(succ(1).dest);
+			if (tInfo.generated) {
+				// generate a simple branch to true target
+				code.add(IcBranch.new(false, true, key, tInfo.codeStart));
+				genJump(fInfo);
+			} else {
+				// generate a simple branch to false target
+				var br = IcBranch.new(false, false, key, 0);
+				branches = List.new((fInfo.block, br), branches);
+				push(succ(1));
+				code.add(br);
+				genJump(tInfo);
+			}
+		} else {
+			// generate a normal switch
+			var m = IcMatch.new(key, sw.vals, Array<int>.new(sw.vals.length + 1));
+			switches = List.new((sw, m), switches);
+			code.add(m);
+			for (e in succ) push(e);
+		}
+	}
+	def genJump(info: SsaIcBlock) {
+		if (info.generated) {
+			// code has already been generated for this block, just go there
+			code.add(IcBranch.new(true, true, 0, info.codeStart));
+		} else {
+			// don't generate code, push the block so it is generated next
+			stack.push(info);
+			info.queued = true;
+		}
+	}
+	def genBlock(b: SsaIcBlock) {
+		// mark start of code and mark block
+		b.codeStart = code.length;
+		b.generated = true;
+		b.queued = true;
+		// 1. generate code for body
+		b.block.instrs.apply(genInstr);
+		// 2. generate any moves for phis at the end of this block
+		ssaDecon.genSsaMoves(b.block);
+		// 3. generate code for end of block
+		genInstr(b.block.end);
+	}
+	def genRef(ref: SsaDfEdge) -> int {
+		return ssaDecon.mapReg(ref.dest);
+	}
+	def newTmp() -> int {
+		return (numRegs, numRegs = numRegs + 1).0;
+	}
+	def allocReg(i: SsaInstr, t: Type) -> int {
+		return (numRegs, numRegs = numRegs + 1).0;
+	}
+	def assignParams() {
+		// assign registers for parameters
+		for (i = 0; i < region.params.length; i++) {
+			var p = region.params(i);
+			ssaDecon.set(p, p.index);
+		}
+		numRegs = numRegs + region.params.length;
+	}
+	def assignValues() {
+		// assign registers for all (global) constants
+		voidReg = newTmp();
+		code.add(IcValue.new(voidReg, null));
+		if (region.valCache != null) region.valCache.apply(assignVal);
+	}
+	def assignVal(a: (Type, Val), i: SsaValue) {
+		if (i.val == null) {
+			// just use the voidReg
+			ssaDecon.set(i, voidReg);
+			return;
+		}
+		// assign a register for a constant
+		ssaDecon.set(i, numRegs);
+		// generate code to load the value at the very beginning
+		code.add(IcValue.new(numRegs++, i.val));
+	}
+	def moveIR(t: Type, i: SsaInstr, dst: int) {
+		code.add(IcMove.new(dst, ssaDecon.mapReg(i)));
+	}
+	def moveRR(t: Type, src: int, dst: int) {
+		code.add(IcMove.new(dst, src));
+	}
+	def push(block: SsaCfEdge) {
+		var info = blockInfo.get(block.dest);
+		if (!info.queued) {
+			stack.push(info);
+			info.queued = true;
+		}
+	}
+}
+
+// information about a block that is being translated to Ic code
+class SsaIcBlock {
+	def block: SsaBlock;
+	var queued: bool;
+	var generated: bool;
+	var codeStart: int;
+	new(block) { }
+}

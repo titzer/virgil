@@ -1,0 +1,165 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A machine-independent representation of an instruction.
+class MachInstr {
+	def name: string;	// name of instruction
+	var live: bool;		// used for marking dead code
+	var useStart: int;	// index into code describing use/def info
+	var useEnd: int;	// end index into code describing use/def info
+	var moves: MachMoves;	// moves to be inserted before instruction
+	new(name) { }
+	def render(buf: StringBuffer) -> StringBuffer;
+	def emit();
+}
+// Moves inserted before/after an instruction, either due to SSA deconstruction,
+// spilling, register moves, calling conventions, etc
+class MachMoves {
+	var before: MoveResolver;	// phys -> phys moves, before
+	var varMoves: List<(int, int)>; // usepos -> defpos moves, before
+	var valMoves: List<(Val, int)>; // value -> usepos moves, before
+	var after: MoveResolver;	// phys -> phys moves, after
+}
+// Machine-independent representation of a variable (virtual register).
+class MachVar {
+	// -- state for code gen --------------------------------
+	def ssa: SsaInstr;		// corresponding ssa instruction (if any)
+	def varNum: int;		// virtual register number
+	def varSize: int;		// number of virtual registers this var represents
+	var start: int = -1;		// start position of code that defines this var
+	var end: int = -1;		// end position of code that defines this var
+	var live: bool;			// true if live
+	// -- state for register allocation ---------------------
+	var hint: byte;			// physical register hint
+	var reg: byte;			// assigned physical register
+	var prev: MachVar;		// prev link for list management
+	var next: MachVar;		// next link for list management
+	var spill: int;			// assigned spill slot (< 0 indicates a constant)
+	var endPos: int;		// last live position
+	var freeSpillEntry: int;	// position in the free spill queue
+
+	new(ssa, varNum, varSize, isConst: bool) {
+		if (isConst) spill = -2 - varNum; // constants have invalid spill slots
+	}
+
+	def render(buf: StringBuffer) -> StringBuffer {
+		return buf.format2("#%1:@%2", varNum, ssa.uid);
+	}
+	def loc() -> int {
+		if (reg != 0) return reg;
+		else return spill;
+	}
+	def isConst() -> bool {
+		return spill < 0;
+	}
+}
+// Representation of a machine frame, including spill slots and space for outgoing params
+class MachFrame {
+	def conv: MachCallConv;		// calling convention
+	var spillVars: int;		// spilled variables
+	var spillArgs: int;		// space for outgoing spilled arguments
+	var frameSize: int = -1;	// architecture-specific total frame size
+	new(conv) { }
+	def allocSpill() -> int {
+		return conv.regSet.spillStart + spillVars++;
+	}
+	def allocCallerSpace(conv: MachCallConv) -> MachCallConv {
+		allocOverflow(conv.overflow);
+		return conv;
+	}
+	def allocOverflow(overflow: int) {
+		if (overflow > spillArgs) spillArgs = overflow;
+	}
+	def slots() -> int {
+		return spillVars + spillArgs;
+	}
+	def size() -> int {
+		return if(frameSize >= 0, frameSize, V3.fail("frame size not set"));
+	}
+}
+// Defines physical locations (registers, register sets, and stack locations).
+// 1. 0 means an un-assigned location.
+// 2. Physical registers have low numbers in the range [1 ... physregs].
+// 3. Sets of registers have numbers in the range (physregs ... spillStart).
+// 4. Spill locations have numbers [spillStart ... callerStart).
+// 5. Caller locations have numbers [callerStart ... calleeStart).
+// 6. Callee locations have numbers [calleeStart ... MAX_INT).
+class MachRegSet {
+	def physRegs: int;			// number of physical registers
+	def regSets: Array<Array<byte>>;	// registers in each set
+	def names: Array<string>;		// names of each register and set
+	def scratch: int;
+	def spillStart: int = regSets.length;	
+	def callerStart: int;
+	def calleeStart: int;
+	def matrix = BitMatrix.new(physRegs + 1, regSets.length);
+	new(physRegs, regSets, names, scratch, callerStart, calleeStart) {
+		// compute the matrix of physical register / register set membership
+		for (i = 0; i < regSets.length; i++) {
+			var rs = regSets(i);
+			if (rs == null) continue;
+			for (r in rs) matrix.set(r, i);
+		}
+	}
+	def isInRegSet(loc: int, snum: int) -> bool {
+		if (loc < 1 || loc >= regSets.length) return false;
+		return matrix.get(loc, snum);
+	}
+	def isReg(loc: int) -> bool {
+		return loc > 0 && loc <= physRegs;
+	}
+	def isRegSet(loc: int) -> bool {
+		return loc > 0 && loc <= regSets.length;
+	}
+	def isStack(loc: int) -> bool {
+		return loc >= spillStart;
+	}
+	def isCallerStack(loc: int) -> bool {
+		return loc >= callerStart && loc < calleeStart;
+	}
+	def isMultiple(loc: int) -> bool {
+		if (loc == 0) return true;
+		if (loc <= physRegs) return false;
+		return loc < spillStart;
+	}
+	def identify(loc: int) -> string {
+		if (loc < 0) return Strings.format1("invalid#%1", loc);
+		if (loc == 0) return "unassigned";
+		if (loc < spillStart) {
+			var name = names(loc);
+			if (name != null) return name;
+			if (loc <= physRegs) return Strings.format1("r#%1", loc);
+			else return Strings.format1("set#%1", loc);
+		}
+		if (loc < callerStart) return Strings.format1("spill#%1", loc - spillStart);
+		if (loc < calleeStart) return Strings.format1("caller#%1", loc - callerStart);
+		return Strings.format1("callee#%1", loc - calleeStart);
+	}
+}
+// Machine-independent representation of the calling convention for a specific call.
+class MachCallConv {
+	def regSet: MachRegSet;	// associated register set
+	def paramTypes: Array<Type>;  // parameter types
+	def paramLocs: Array<int>;	// locations of parameters
+	def retType: Type;		// return type
+	def retLocs: Array<int>;	// locations of return value(s)
+	def overflow: int;		// number of overflow stack arguments
+	new(regSet, paramTypes, paramLocs, retType, retLocs, overflow) { }
+	def callerParam(i: int) -> int {
+		return adjust(paramLocs(i), regSet.callerStart);
+	}
+	def callerRet(i: int) -> int {
+		return adjust(retLocs(i), regSet.callerStart);
+	}
+	def calleeParam(i: int) -> int {
+		return adjust(paramLocs(i), regSet.calleeStart);
+	}
+	def calleeRet(i: int) -> int {
+		return adjust(retLocs(i), regSet.calleeStart);
+	}
+	private def adjust(loc: int, adjust: int) -> int {
+		if (loc <= regSet.physRegs) return loc;
+		return loc - regSet.spillStart + adjust;
+	}
+}
+

@@ -1,0 +1,230 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Base class for machine code generators. 
+class MachCodeGen {
+	def mach: MachProgram;
+	def rt = mach.runtime;
+	def rtsrc = mach.runtime.src;
+	def rtgc = mach.runtime.gc;
+	def region: SsaRegion;
+	def source: VstMethod;
+	def code = Sequence<MachInstr>.new();
+	def vars = Sequence<MachVar>.new();
+	def uses  = Sequence<int>.new();
+	def markQueue = Sequence<MachVar>.new();
+	def blocks = SsaBlockOrder.new(region);
+
+	var frame: MachFrame;
+	var instrs: List<SsaInstr>;
+	var phiList: List<SsaPhis>;
+	var encoder: MachDataEncoder;
+	var codeStartOffset: int;
+	var lsra: LinearScanRegAlloc;
+	var refSlots: Array<int>;
+	// current position in the uses array
+	var curUse: int;
+	var curBlock: SsaBlock;
+	var curBlockStart: int;
+	var curValMoves: List<(Val, int)>;
+	var numLivePoints: int;
+	// constants for encoding the used mach vars
+	def USE  = 0x0;
+	def DEF  = 0x1;
+	def LIVE = 0x2;
+	def KILL = 0x3;
+	def TYPE_MASK = 0x3;
+	def UNUSED_MASK   = 0x8;
+	def ASSIGNED_MASK = 0x4;
+	def VAR_SHIFT = 4;
+
+	new(mach, region, source) { }
+	
+	def makeVar(i: SsaInstr) -> MachVar {
+		if (i.mark >= 0) return vars.get(i.mark); // already has a variable
+		var isConst = SsaValue.?(i);
+		var num = numVars(i), machVar = MachVar.new(i, vars.length, num, isConst);
+		vars.add(machVar);
+		while (--num > 0) vars.add(MachVar.new(i, vars.length, 1, isConst));
+		i.mark = machVar.varNum; // maps instruction to var
+		instrs = List.new(i, instrs); // to clear marks after code generation
+		return machVar;
+	}
+	def val(i: SsaInstr) -> Val {
+		return SsaValue.!(i).val;
+	}
+	def id(i: SsaInstr, machVar: MachVar) -> MachVar {
+		i.mark = machVar.varNum;
+		return machVar;
+	}
+	def info(b: SsaBlock) -> SsaBlockInfo {
+		return blocks.order.get(b.mark);
+	}
+	def clear() {
+		for (l = instrs; l != null; l = l.tail) l.head.mark = -1;
+		blocks.clear();
+	}
+	def markLive(v: MachVar) {
+		if (!v.live) {
+			markQueue.add(v);
+			v.live = true;
+		}
+	}
+	def markAllLiveVars() {
+		for (j = 0; j < markQueue.length; j++) {
+			var v = markQueue.get(j);
+			if (v.start >= 0) {
+				markUsesLive(v);
+			} else {
+				var inputs = v.ssa.inputs;
+				for (k = 0; k < inputs.length; k++) markLive(makeVar(inputs(k).dest));
+			}
+		}
+	}
+	def markUsesLive(v: MachVar) {
+		if (SsaPhi.?(v.ssa)) {
+			// mark all inputs to the SsaPhi as live
+			for (i in v.ssa.inputs) markLive(makeVar(i.dest));
+			return;
+		}
+		for (i = v.start; i < v.end; i++) {
+			// for each instruction corresponding to this instruction
+			var c = code.get(i);
+			c.live = true;
+			for (j = c.useStart; j < c.useEnd; j = j + 2) {
+				// for every input to the instruction, mark it live
+				var u = uses.get(j), uv = u & TYPE_MASK;
+				if (uv == USE) markLive(vars.get(u #>> VAR_SHIFT));
+			}
+		}
+	}
+	def genPhis() {
+		// for each block that has phis
+		for (l = phiList; l != null; l = l.tail) {
+			var phis = l.head, firstInstr = code.get(info(phis.block).start);
+
+			// define the live phis
+			firstInstr.useStart = uses.length;
+			var livePhis = definePhis(phis.phiInstrs);
+			firstInstr.useEnd = uses.length; // update defs of first instruction
+
+			// add moves at control flow predecessors
+			if (livePhis != null) addPhiMoves(livePhis, phis.phiEdges);
+		}
+	}
+	def definePhis(phis: Sequence<SsaPhi>) -> List<(SsaPhi, int)> {
+		// for each live phi in this block, define it at this instruction
+		var livePhis: List<(SsaPhi, int)>;
+		for (j = 0; j < phis.length; j++) {
+			var phi = phis.get(j);
+			if (phi.mark >= 0) {
+				var machVar = vars.get(phi.mark);
+				// define the phi at the beginning of the block
+				if (machVar.live) {
+					var defpos = dfnAt(machVar, 0);
+					livePhis = List.new((phi, defpos), livePhis);
+				}
+			}
+		}
+		return livePhis;
+	}
+	def addPhiMoves(livePhis: List<(SsaPhi, int)>, edges: Sequence<SsaCfEdge>) {
+		// for each incoming edge to this block
+		for (j = 0; j < edges.length; j++) {
+			var e = edges.get(j), endInstr = code.get(info(e.src).end - 2);
+			if (endInstr.moves != null) failCriticalEdge(e);
+			if (e.src.succ.length > 1) failCriticalEdge(e);
+			var m = MachMoves.new();
+			endInstr.moves = m;
+			endInstr.useStart = uses.length;
+			// for each live phi
+			for (lp = livePhis; lp != null; lp = lp.tail) {
+				// use phi input at end of respective predecessor
+				var input = lp.head.0.inputs(j).dest, defpos = lp.head.1;
+				var phivar = makeVar(lp.head.0);
+				if (SsaValue.?(input)) {
+					// add a value move
+					m.valMoves = List.new((val(input), defpos), m.valMoves);
+				} else {
+					// add a var-var move, and a hint
+					var inputvar = makeVar(input);
+					m.varMoves = List.new((useAt(inputvar, 0), defpos), m.varMoves);
+					hintVar(inputvar, phivar);
+				}
+			}
+			endInstr.useEnd = uses.length;
+		}
+	}
+	def failCriticalEdge(e: SsaCfEdge) {
+		mach.compiler.ERROR.fail(Strings.format2("critical edge #%1 -> #%2", e.src.uid, e.dest.uid));
+	}
+	def kill(fixed: int) -> int {
+		return record(KILL, -1, fixed);
+	}
+	def livePoint() -> int {
+		var lp = numLivePoints++;
+		record(LIVE, lp, 0);
+		return lp;
+	}
+	def useAt(v: MachVar, fixed: int) -> int {
+		var usepos = record(USE, v.varNum, fixed);
+		if (v.isConst()) curValMoves = List.new((val(v.ssa), usepos), curValMoves);
+		return usepos;
+	}
+	def dfnAt(v: MachVar, fixed: int) -> int {
+		return record(DEF, v.varNum, fixed);
+	}
+	def hintVar(src: MachVar, dest: MachVar) {
+		// XXX: record a register hint
+	}
+	def hint(src: SsaInstr, dest: MachVar) {
+		// XXX: record a register hint
+	}
+	private def record(mode: int, num: int, fixed: int) -> int {
+		var pos = uses.length;
+		uses.add(mode | (num #<< VAR_SHIFT));
+		uses.add(fixed);
+		return pos;
+	}
+	def renderInstr(i: MachInstr, buf: StringBuffer) -> StringBuffer {
+		var p = buf.length;
+		if (!i.live) return buf; // nothing to print
+		buf.puts(i.name).pad(' ', p + 8);
+		for (j = i.useStart; j < i.useEnd; j = j + 2) {
+			buf.puts(" ");
+			renderUse(j, buf);
+		}
+		return buf;
+	}
+	def renderUse(use: int, buf: StringBuffer) {
+		var u = uses.get(use), v = u #>> VAR_SHIFT;
+		buf.puts(useType(u));
+		buf.putc(':');
+		if (v >= 0 && v < (-1 #>> VAR_SHIFT)) buf.puti(v);
+		// render the constraint of the use
+		var fixed = uses.get(use + 1);
+		if (fixed != 0) {
+			if ((u & ASSIGNED_MASK) != 0) buf.putc('=');
+			else buf.putc('@');
+			buf.puts(frame.conv.regSet.identify(fixed));
+		}
+	}
+	def varOfUse(use: int) -> MachVar {
+		return vars.get(uses.get(use) #>> VAR_SHIFT);
+	}
+	def regOfUse(use: int) -> int {
+		return uses.get(use + 1);
+	}
+	def numVars(i: SsaInstr) -> int;
+	def blockAddr(i: SsaBlock) -> Addr {
+		return Address.new(mach.layout.codeRegion, i);
+	}
+	def useType(u: int) -> string {
+		u = u & TYPE_MASK;
+		if (u == USE) return "use";
+		if (u == DEF) return "def";
+		if (u == KILL) return "kill";
+		if (u == LIVE) return "live";
+		return "??";
+	}
+}

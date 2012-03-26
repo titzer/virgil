@@ -1,0 +1,376 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Local optimizer for SSA code that performs constant folding, strength reduction,
+// and algebraic reassociation. It also computes SsaFacts about operations
+// (e.g. whether safety checks are required) based on facts of inputs.
+class SsaLocalOptimizer {
+	def prog: Program;
+	def region: SsaRegion;
+	def fieldConst: Operator -> SsaValue;
+	var doConstantFolding: bool;
+	var doCommuting: bool;
+	var doReassociation: bool;
+	var doStrengthReduction: bool;
+	var builder: SsaBlockBuilder;
+
+	new(prog, region, options: SsaOptSettings, fieldConst) {
+		doConstantFolding = options.LocalFolding;
+		doCommuting = options.LocalCommute;
+		doReassociation = options.LocalReassoc;
+		doStrengthReduction = options.LocalReduction;
+	}
+
+	// perform var optimizations on this instruction
+	def optimize(i: SsaApplyOp, b: SsaBlockBuilder) -> SsaInstr {
+		this.builder = b;
+		var ifacts = i.facts;
+		var a = i.inputs;
+		if (doConstantFolding && (0 != (ifacts & SsaFacts.O_FOLDABLE))) {
+			// try to fold the computation
+			var foldable = true;
+			for (i in a) {
+				if (!SsaValue.?(i.dest)) {
+					foldable = false;
+					break;
+				}
+			}
+			if (foldable) return fold(i); // all inputs are values
+		}
+		if (doCommuting && a.length == 2) {
+			var left = a(0);
+			if (SsaValue.?(left.dest)) {
+				if (0 != (ifacts & SsaFacts.O_COMMUTATIVE)) {
+					// swap constant to the right
+					a(0) = a(1);
+					a(1) = left;
+				} else if (0 != (ifacts & SsaFacts.O_FLIPPABLE)) {
+					// flip operation and swap constant to right
+					i = SsaApplyOp.!(newOp(i.source, flip(i.op), [a(1).dest, left.dest]));
+				}
+			}
+		}
+		if (doReassociation && a.length == 2 && 0 != (ifacts & SsaFacts.O_ASSOCIATIVE)) {
+			// attempt to fold ((x + K1) + K2) to (x + (K1 + K2))
+			var x = a(0).dest;
+			if (x.opcode() == i.op.opcode) {
+				var l = SsaApplyOp.!(x);
+				var xr = l.inputs(1).dest;
+				var r = a(1).dest;
+				if (SsaValue.?(xr) && SsaValue.?(r)) {
+					var k = fold(SsaApplyOp.new(null, l.op, [xr, r]));
+					var op = region.newApplyOp(i.source, i.op, [l.inputs(0).dest, k]);
+					var r = optimize(op, builder);
+					if (r == op) return builder.addInstr(r);
+					return r;
+				}
+			}
+		}
+		if (doStrengthReduction && 0 != (ifacts & SsaFacts.O_REDUCIBLE)) {
+			// attempt strength reduction
+			return reduce(i);
+		}
+		return i;
+	}
+	// perform strength reductions on this instruction
+	def reduce(i: SsaApplyOp) -> SsaInstr {
+		// note: commutative ops will have had their constants put on the right
+		var a = i.inputs, x: SsaInstr, y: SsaInstr, xfacts: int, yfacts: int;
+		
+		// grab x and y to simplify code below
+		if (a.length > 1) {
+			y = a(1).dest;
+			yfacts = y.facts;
+			x = a(0).dest;
+			xfacts = x.facts;
+		} else if (a.length > 0) {
+			x = a(0).dest;
+			xfacts = x.facts;
+		}
+
+		// strength reduce certain operators if possible
+		match (i.op.opcode) {
+			V3Opcode.Equal: {
+				if (x == y) return trueConst(); // x == x == true
+				if (SsaValue.?(y)) {
+					var val = SsaValue.!(y).val;
+					if (val == null && 0 != (xfacts & SsaFacts.V_NON_ZERO)) return falseConst();
+				}
+			}
+			V3Opcode.NotEqual: {
+				if (x == y) return falseConst(); // x != x == false
+				if (SsaValue.?(y)) {
+					var val = SsaValue.!(y).val;
+					if (val == null && 0 != (xfacts & SsaFacts.V_NON_ZERO)) return trueConst();
+				}
+			}
+			V3Opcode.IntAdd: { 
+				if (SsaValue.?(y) && iv(y) == 0) return x; // x + 0 == x
+			}
+			V3Opcode.IntSub: {
+				if (x == y) return region.nullConst(Int.TYPE); // x - x == 0
+				if (SsaValue.?(y)) {
+					var yv = iv(y);
+					if (yv == 0) return x; // x - 0 == x
+					return newOp(i.source, V3Op.opIntAdd, // x - K = x + -K
+						[x, region.intConst(0 - yv)]);
+				}
+			}
+			V3Opcode.IntMul: {
+				if (SsaValue.?(y)) {
+					var yv = iv(y);
+					if (yv == 0) return y; // x * 0 == 0
+					if (yv == 1) return x; // x * 1 == x
+					if (yv == -1) return newOp(i.source, V3Op.opIntSub, [region.nullConst(Int.TYPE), x]); // x * -1 == 0 - x
+					if (yv == 2) return newOp(i.source, V3Op.opIntAdd, [x, x]); // x * 2 == x + x
+					if ((yv & (yv - 1)) == 0) {
+						// x * 2^k == x << k
+						return newOp(i.source, V3Op.opIntShl, [x, region.intConst(log(yv))]);
+					}
+				}
+			}
+			V3Opcode.IntDiv: {
+				if (SsaValue.?(y)) {
+					var yv = iv(y);
+					if (yv == 0) return builder.addThrow(i.source, V3Exception.DivideByZero);
+					if (yv == 1) return x; // x / 1 == x
+					if (yv == -1) return newOp(i.source, V3Op.opIntSub, [region.nullConst(Int.TYPE), x]); // x / -1 == 0 - x
+					if ((yv & (yv - 1)) == 0 && 0 != (xfacts & SsaFacts.V_NON_NEGATIVE)) {
+						// x / 2^k == x >> k for non-negative x
+						return newOp(i.source, V3Op.opIntShr, [x, region.intConst(log(yv))]);
+					}
+				}
+				if (0 != (yfacts & SsaFacts.V_NON_ZERO)) { // x / non-zero(y)
+					if (x == y) return region.intConst(1);
+					i.setFact(SsaFacts.O_NO_ZERO_CHECK);
+				}
+				if (0 != (yfacts & SsaFacts.V_ZERO)) {
+					return builder.addThrow(i.source, V3Exception.DivideByZero);
+				}
+				i.setFact(x.facts & y.facts & SsaFacts.V_NON_NEGATIVE); // nonneg(x) / nonneg(y) => nonneg
+			}
+			V3Opcode.IntMod: {
+				if (0 != (yfacts & SsaFacts.V_NON_ZERO)) { // x % non-zero(y)
+					if (x == y) return region.nullConst(Int.TYPE);
+					i.setFact(SsaFacts.O_NO_ZERO_CHECK);
+				}
+				if (SsaValue.?(y)) {
+					var yv = iv(y);
+					if (yv == 0) return builder.addThrow(i.source, V3Exception.DivideByZero);
+					if (yv == 1) return region.nullConst(Int.TYPE);
+					if ((yv & (yv - 1)) == 0 && 0 != (xfacts & SsaFacts.V_NON_NEGATIVE)) {
+						// x % 2^k == x & (2^k - 1) for non-negative x
+						return newOp(i.source, V3Op.opIntAnd, [x, region.intConst(yv - 1)]);
+					}
+				}
+				i.setFact(x.facts & y.facts & SsaFacts.V_NON_NEGATIVE); // nonneg(x) % nonneg(y) => nonneg
+			}
+			V3Opcode.IntAnd: {
+				if (x == y) return x; // x & x == x
+				if (SsaValue.?(y)) {
+					var yv = iv(y);
+					if (yv == -1) return x; // x & -1 == x
+					if (yv == 0) return y; // x & 0 == 0
+				}
+				i.setFact((x.facts | y.facts) & SsaFacts.V_NON_NEGATIVE);
+			}
+			V3Opcode.IntOr: { // or
+				if (x == y) return x; // x | x == x
+				if (SsaValue.?(y)) {
+					var yv = iv(y);
+					if (yv == -1) return y; // x | -1 == -1
+					if (yv == 0) return x; // x | 0 == x
+				}
+				i.setFact((x.facts | y.facts) & SsaFacts.V_NON_ZERO);
+			}
+			V3Opcode.IntXor: {
+				if (x == y) return region.nullConst(Int.TYPE); // x ^ x == 0
+				if (SsaValue.?(y)) {
+					if (iv(y) == 0) return x; // x ^ 0 == x
+				}
+			}
+			V3Opcode.IntShl, V3Opcode.IntShr: {
+				if (SsaValue.?(y)) {
+					var yv = iv(y);
+					if (yv == 0) return x; // x (shift) 0 == x
+					if (yv < 0 || yv >= 32) return region.nullConst(Int.TYPE);
+					i.setFact(SsaFacts.O_NO_SHIFT_CHECK);
+				}
+			}
+			V3Opcode.IntLt: {
+				if (x == y) return falseConst(); // x < x == false
+				if (SsaValue.?(y)) {
+					var yv = iv(y);
+					if (yv == 0 && 0 != (xfacts & SsaFacts.V_NON_ZERO)) return falseConst();
+				}
+			}
+			V3Opcode.IntGt: {
+				if (x == y) return falseConst(); // x > x == false
+			}
+			V3Opcode.IntLteq: {
+				// XXX: x <= y - 1 == x < y
+				if (x == y) return trueConst(); // x <= x == true
+			}
+			V3Opcode.IntGteq: {
+				// XXX: x >= y + 1 == x > y
+				if (x == y) return trueConst(); // x >= x == true
+			}
+			V3Opcode.BoolAnd: {
+				if (x == y) return x; // x & x == x
+				if (SsaValue.?(y)) {
+					if (bv(y)) return x; // x & true == x
+					else return y;    // x & false == false
+				}
+			}
+			V3Opcode.BoolOr: {
+				if (x == y) return x; // x | x == x
+				if (SsaValue.?(y)) {
+					if (bv(y)) return y; // x | true == true
+					else return x;    // x | false == x
+				}
+			}
+			V3Opcode.BoolNot: {
+				if (SsaApplyOp.?(x)) {
+					var ax = SsaApplyOp.!(x), axc = ax.op.opcode;
+					// XXX: negate comparisons >= to <, etc
+					if (axc == V3Opcode.Equal) {
+						// !(x == y) == (x != y)
+						return newOp(ax.source, V3Op.newNotEqual(ax.op.typeArgs(0)), [ax.inputs(0).dest, ax.inputs(1).dest]);
+					} else if (axc == V3Opcode.NotEqual) {
+						// !(x != y) == (x == y)
+						return newOp(ax.source, V3Op.newEqual(ax.op.typeArgs(0)), [ax.inputs(0).dest, ax.inputs(1).dest]);
+					} else if (axc == V3Opcode.BoolNot) {
+						// !(!x) == x
+						return ax.inputs(0).dest;
+					}
+				}
+			}
+			V3Opcode.ArrayGetLength: {
+				var xc = x.opcode();
+				if (xc == V3Opcode.ArrayInit) {
+					// get length from init
+					var index: int = SsaApplyOp.!(x).op.attr();
+					return region.intConst(index);
+				}
+				if (xc == V3Opcode.ArrayAlloc) {
+					// get length from allocation
+					return SsaApplyOp.!(x).inputs(0).dest;
+				}
+				if (0 != (xfacts & SsaFacts.V_NON_ZERO)) {
+					i.setFact(SsaFacts.O_NO_NULL_CHECK);
+					i.setFact(SsaFacts.O_PURE);
+				}
+			}
+			V3Opcode.TupleGetElem: {
+				// (e0, ... eN ...).N == eN
+				if (x.opcode() == V3Opcode.TupleCreate) {
+					return SsaApplyOp.!(x).inputs(i.op.attr<int>()).dest;
+				}
+			}
+			V3Opcode.NullCheck: {
+				// nullcheck(@nonnull(x)) == x
+				if (0 != (xfacts & SsaFacts.V_NON_ZERO)) return x;
+			}
+			V3Opcode.ArrayAlloc: {
+				if (0 != (xfacts & SsaFacts.V_NON_NEGATIVE)) i.setFact(SsaFacts.O_NO_LENGTH_CHECK);
+			}
+			V3Opcode.ClassGetVirtual: {
+				if (x.opcode() == V3Opcode.ClassAlloc) {
+					// turn a virtual dispatch into a non-virtual dispatch
+					var classType = SsaApplyOp.!(x).op.typeArgs(0);
+					var meth = prog.getIr().resolveMethodImpl(classType, V3Op.extractIrSpec(i.op));
+					return newOp(i.source, V3Op.newClassGetMethod(meth), [i.inputs(0).dest]);
+				}
+			}
+			V3Opcode.CallClassVirtual: {
+				if (x.opcode() == V3Opcode.ClassAlloc) {
+					// turn a virtual dispatch into a non-virtual dispatch
+					var classType = SsaApplyOp.!(x).op.typeArgs(0);
+					var meth = prog.getIr().resolveMethodImpl(classType, V3Op.extractIrSpec(i.op));
+					return newOp(i.source, V3Op.newCallClassMethod(meth), inputs(i));
+				}
+			}
+			V3Opcode.ClassGetField: {
+				var val = fieldConst(i.op);
+				if (val != null) {
+					builder.addNullCheck(i.source, i, x);
+					return val;
+				}
+			}
+			V3Opcode.ComponentGetField: {
+				var val = fieldConst(i.op);
+				if (val != null) return val;
+			}
+		}
+		return i;
+	}
+	def inputs(i: SsaApplyOp) -> Array<SsaInstr> {
+		var r = Array<SsaInstr>.new(i.inputs.length);
+		for (j = 0; j < r.length; j++) r(j) = i.inputs(j).dest;
+		return r;
+	}
+	def newOp(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
+		return builder.addInstr(region.newApplyOp(source, op, args));
+	}
+	def fold(i: SsaApplyOp) -> SsaInstr {
+		var r = i.op.evaluate(SsaFoldingArguments.new(prog, i));
+		if (r == null || Val.?(r)) return region.valConst(i.op.resultType, Val.!(r));
+		else return builder.addThrow(i.source, Exception.!(r).error);
+	}
+	def flip(op: Operator) -> Operator {
+		match(op.opcode) {
+			V3Opcode.IntLt:		return V3Op.opIntGt;
+			V3Opcode.IntLteq:	return V3Op.opIntGteq;
+			V3Opcode.IntGt:		return V3Op.opIntLt;
+			V3Opcode.IntGteq:	return V3Op.opIntLteq;
+			V3Opcode.ByteLt:	return V3Op.opByteGt;
+			V3Opcode.ByteLteq:	return V3Op.opByteGteq;
+			V3Opcode.ByteGt:	return V3Op.opByteLt;
+			V3Opcode.ByteGteq:	return V3Op.opByteLteq;
+		}
+		return op;
+	}
+	def iv(y: SsaInstr) -> int {
+		return Int.unbox(SsaValue.!(y).val);
+	}
+	def bv(y: SsaInstr) -> bool {
+		return Bool.unbox(SsaValue.!(y).val);
+	}
+	def falseConst() -> SsaValue {
+		return region.boolConst(false);
+	}
+	def trueConst() -> SsaValue {
+		return region.boolConst(true);
+	}
+	def log(v: int) -> int {
+		// XXX: faster integer logarithm
+		for (l = 0; l < 32; l++) {
+			if ((1 #<< l) == v) return l; 
+		}
+		return 32;
+	}
+}
+
+// Implementation of dynamic arguments for folding (evaluating) operators
+class SsaFoldingArguments extends Arguments {
+	def prog: Program;
+	def apply: SsaApplyOp;
+	new(prog, apply) { }
+	def getArg(i: int) -> Val {
+		// TODO: fix arity mismatch in folding due to void
+		if (i >= apply.inputs.length) return Values.BOTTOM;
+		return SsaValue.!(apply.inputs(i).dest).val;
+	}
+	def getType(i: int) -> Type {
+		return apply.op.typeArgs(i);
+	}
+	def getTypes() -> Array<Type> {
+		return apply.op.typeArgs;
+	}
+	def getDynamicPortion() -> DynamicPortion {
+		return prog.dynamic;
+	}
+	def throw(ex: string, msg: string) -> Exception {
+		return Exception.new(ex, msg, List.new(apply.source, null));
+	}
+}

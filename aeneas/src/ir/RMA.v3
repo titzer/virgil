@@ -1,0 +1,327 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Performs reachable members analysis and builds a new version of the program
+// which includes only the live fields, methods, and objects.
+class RMAnalyzer {
+	def compiler: Compiler;
+	def prog: Program = compiler.prog;
+	def analyzeMethod: (RMAnalyzer, RmaMember) -> void;
+
+	def typeMap = TypeUtil.newTypeMap<RmaType>();
+	def memberMap = IrUtil.newIrSpecMap<RmaMember>();
+	var liveMethods: List<RmaMethod>;
+	var norm: V3ProgramNormalizer;
+
+	var oldIr: IrPortion;
+	var newIr: IrPortion;
+	var listHead: Unit;
+	var listTail: Unit;
+	var roots: List<RmaRoot>;
+
+	new(compiler, analyzeMethod) {
+		oldIr = prog.dynamic.getIr();
+		newIr = IrPortion.new(prog);
+		norm = V3ProgramNormalizer.new(compiler, prog, this);
+	}
+	def analyze() -> RMAnalyzer {
+		var unit: Unit;
+		while ((unit = dequeue()) != null) unit.analyze();
+		if (Aeneas.PRINT_RMA.get()) RMPrinter.print(this);
+		return this;
+	}
+	def transform() -> RMAnalyzer {
+		// normalize and specialize all class representations
+		typeMap.apply(norm.normalizeIrClass);
+		// normalize root methods
+		for (l = roots; l != null; l = l.tail) {
+			l.head.spec = norm.normalizeMethodRef(l.head.spec);
+		}
+		// normalize all records
+		typeMap.apply(norm.normalizeRecords);
+		norm.finishNormalizingRecords();
+		// normalize and optimize all method bodies
+		Lists.apply(liveMethods, norm.normalizeCode);
+		// finishing adding any helper methods
+		norm.finishNormalization();
+		// set the new IR
+		prog.dynamic.ir = newIr;
+		return this;
+	}
+	def getRmaType(t: Type) -> RmaType {
+		if (t.open) compiler.ERROR.fail(Strings.format1("open type: %1", t.render)); 
+		var rmaType = typeMap.get(t);
+		if (rmaType == null) {
+			// create a new type info structure for this type
+			rmaType = RmaType.new(this, t, oldIr.makeIrClass(t));
+			typeMap.set(t, rmaType);
+			// recursively get the type information for the nested types
+			Lists.map(t.nested, getRmaType);
+			if (V3.isClass(t)) {
+				// get the information for the super class, if any
+				var superType = V3.getSuperType(t);
+				if (superType != null) rmaType.superInfo = getRmaType(superType);
+			} else if (rmaType.isComponent) {
+				// make the record for this component live
+				if (prog.dynamic != null) {
+					var compDecl = V3.asComponent(t).componentDecl;
+					var record = prog.dynamic.getComponentRecord(compDecl);
+					if (record != null) rmaType.addInstance(record);
+				}
+			}
+		}
+		return rmaType;
+	}
+	def getRmaMemberIn(memberRef: IrSpec, context: IrSpec) -> RmaMember {
+		if (context != null) memberRef = context.instantiateIrSpec(memberRef);
+		return getRmaMember(memberRef);
+	}
+	def getRmaMember(memberRef: IrSpec) -> RmaMember {
+		var rmaMember = memberMap.get(memberRef);
+		if (rmaMember == null) {
+			var rmaType = getRmaType(memberRef.container);
+			if (memberRef.isMethod()) {
+				var m = RmaMethod.new(rmaType, memberRef);
+				rmaMember = m;
+				rmaType.methods = List.new(m, rmaType.methods);
+			} else {
+				var f = RmaField.new(rmaType, memberRef);
+				rmaMember = f;
+				rmaType.fields = List.new(f, rmaType.fields);
+			}
+			memberMap.set(memberRef, rmaMember);
+		}
+		return rmaMember;
+	}
+	def dequeue() -> Unit {
+		var unit = listHead;
+		if (unit != null) listHead = unit.next;
+		return unit;
+	}
+	def defer<A, B>(f: (A, B) -> void, a: A, b: B) {
+		var unit: Unit = RMClosure<A, B>.new(f, a, b);
+		if (listHead == null) {
+			listHead = listTail = unit;
+		} else {
+			listTail.next = unit;
+			listTail = unit;
+		}
+	}
+	def addRootMethod(meth: IrSpec) -> RmaRoot {
+		getRmaMember(meth).getMethod();
+		var root = RmaRoot.new(meth);
+		roots = List.new(root, roots);
+		return root;
+	}
+	def analyzeFieldOfRecord(record: Record, rmaMember: RmaField) {
+		var val = record.values(rmaMember.origMember.member.index);
+		if (rmaMember.numValues == 0) {
+			rmaMember.val = val;
+			rmaMember.numValues = 1;
+		} else if (rmaMember.numValues == 1 && !Values.equal(rmaMember.val, val)) {
+			rmaMember.numValues = 2;
+		}
+		deferValue(val);
+	}
+	def deferValue(val: Val) {
+		if (val == null) return;
+		if (Box<int>.?(val)) return;
+		if (Box<bool>.?(val)) return;
+		if (Box<byte>.?(val)) return;
+		if (Tuple_Value.?(val)) for (e in Tuple_Value.!(val).values) deferValue(e);
+		defer(analyzeValue, val, null);
+	}
+	def analyzeValue(val: Val, context: IrSpec) {
+		if (Record.?(val)) {
+			var record = Record.!(val);
+			var rmaType = getRmaType(record.rtype);
+			rmaType.addInstance(record);
+		} else if (Delegate.?(val)) {
+			var delegate = Delegate.!(val);
+			var record = Record.!(delegate.val);
+			analyzeValue(record, context);
+			var rmaType = getRmaType(delegate.memberRef.container);
+			var rmaMember = getRmaMember(delegate.memberRef);
+			rmaMember.getMethod();
+		} else if (Tuple_Value.?(val)) {
+			for(e in (Tuple_Value.!(val)).values) analyzeValue(e, context);
+		} else if (OpClosure.?(val)) {
+			var closure = OpClosure.!(val);
+			analyzeOperator(closure.op, context);
+			for (e in closure.vals) analyzeValue(e, context);
+		}
+	}
+	def analyzeOperator(exp: Operator, env: IrSpec) {
+		if (env != null) exp = exp.subst(env.instantiateType);
+		var ta = exp.typeArgs;
+		for (t in ta) getRmaType(t);
+		match (exp.opcode) {
+			V3Opcode.ArrayAlloc: getRmaType(ta(0)).becomeAllocated();
+			V3Opcode.ArrayInit: getRmaType(ta(0)).becomeAllocated();
+			V3Opcode.ClassAlloc: {
+				var m = extractRmaMember(exp, env);
+				m.container.becomeAllocated();
+				m.getMethod();
+			}
+			V3Opcode.ClassGetField: extractRmaMember(exp, env).getField();
+			V3Opcode.ClassSetField: extractRmaMember(exp, env).setField();
+			V3Opcode.ClassGetMethod: extractRmaMember(exp, env).getMethod();
+			V3Opcode.ClassGetVirtual: extractRmaMember(exp, env).getVirtual();
+			V3Opcode.CallClassMethod: extractRmaMember(exp, env).getMethod();
+			V3Opcode.CallClassVirtual: extractRmaMember(exp, env).getVirtual();
+			V3Opcode.CallComponentMethod: extractRmaMember(exp, env).getMethod();
+			V3Opcode.ComponentGetField: extractRmaMember(exp, env).getField();
+			V3Opcode.ComponentSetField: extractRmaMember(exp, env).setField();
+			V3Opcode.ComponentGetMethod: extractRmaMember(exp, env).getMethod();
+		}
+	}
+	def extractRmaMember(exp: Operator, env: IrSpec) -> RmaMember {
+		return getRmaMemberIn(V3Op.extractIrSpec(exp), env);
+	}
+}
+// represents a root method, i.e. an entrypoint. Updated to point to normalized code after RMA.
+class RmaRoot {
+	var spec: IrSpec;
+	new(spec) { }
+}
+// A unit of work
+class Unit {
+	var next: Unit;
+	new() { }
+	def analyze() { }
+}
+// XXX: replace with m(a, _) when possible
+class RMClosure<A, B> extends Unit {
+	def f: (A, B) -> void;
+	def a: A;
+	def b: B;
+	new(f, a, b) { }
+	def analyze() { f(a, b); }
+}
+
+class RmaType {
+	def rma: RMAnalyzer;
+	def origType: Type;
+	def origClass: IrClass;
+	def isComponent = (origType.typeCon.kind == V3Kind.COMPONENT);
+	var classNorm: IrClass;
+	var superInfo: RmaType;
+	var subInfos: PartialMap<Type, RmaType>;
+	var fields: List<RmaField>;
+	var methods: List<RmaMethod>;
+	var instances: PartialMap<Record, Record>;
+	var isAllocated: bool;
+
+	new(rma, origType, origClass) { }
+	def addInstance(record: Record) {
+		if (instances == null) {
+			instances = V3.newRecordMap();
+			if (!isAllocated) becomeLive();
+		}
+		var rec = instances.get(record);
+		if (rec != null) return;
+		instances.set(record, record);
+		if (V3.isArray(origType) && !V3.isPrimitiveArray(origType)) {
+			// analyze all values of this array
+			for (v in record.values) rma.deferValue(v);
+		} else {
+			// analyze the live fields of this record
+			applyFields(rma.analyzeFieldOfRecord, record);
+		}
+	}
+	def addSubInfo(rmaType: RmaType) {
+		if (subInfos == null) subInfos = TypeUtil.newTypeMap();
+		subInfos.set(rmaType.origType, rmaType);
+	}
+	def applySubInfo(f: (Type, RmaType) -> void) {
+		if (subInfos != null) subInfos.apply(f);
+	}
+	def becomeAllocated() {
+		if (!isAllocated) {
+			isAllocated = true;
+			if (instances == null) becomeLive();
+		}
+	}
+	private def becomeLive() {
+		// reprocess all fields and methods now this type is live
+		for (t = this; t != null; t = t.superInfo) {
+			t.addSubInfo(this);
+			for (l = t.fields; l != null; l = l.tail) {
+				if (l.head.isRead) l.head.analyzeField(origType, this);
+			}
+			for (l = t.methods; l != null; l = l.tail) {
+				if (l.head.isRead) l.head.analyzeVirtual(origType, this);
+			}
+		}
+	}
+	def applyFields<T>(f: (T, RmaField) -> void, p: T) {
+		for (t = this; t != null; t = t.superInfo) {
+			for (l = t.fields; l != null; l = l.tail) f(p, l.head);
+		}
+	}
+	def applyMethods<T>(f: (T, RmaMethod) -> void, p: T) {
+		for (t = this; t != null; t = t.superInfo) {
+			for (l = t.methods; l != null; l = l.tail) f(p, l.head);
+		}
+	}
+	def isLive() -> bool {
+		return isAllocated || instances != null;
+	}
+}
+
+class RmaMember {
+	def container: RmaType;	// original container type
+	def origMember: IrSpec;	// original member
+	var isRead: bool;
+	var isWritten: bool;
+	var isLive: bool;
+	var isInit: bool;
+	var index: int = -1;
+
+	new(container, origMember) { }
+
+	def getField() {
+		if (isRead) return;
+		isRead = true;
+		container.applySubInfo(analyzeField);
+	}
+	def setField() {
+		isWritten = true;
+	}
+	def getVirtual() {
+		if (isRead) return;
+		isRead = true;
+		container.applySubInfo(analyzeVirtual);
+	}
+	def getMethod() {
+		if (isLive) return;
+		isLive = true;
+		var rma = container.rma;
+		rma.defer(rma.analyzeMethod, rma, this);
+		rma.liveMethods = List.new(RmaMethod.!(this), rma.liveMethods);
+	}
+	def analyzeField(t: Type, rmaType: RmaType) {
+		if (isRead && rmaType.instances != null) rmaType.instances.apply(analyzeRecord);
+	}
+	def analyzeVirtual(t: Type, rmaType: RmaType) {
+		if (isRead) {
+			var impl = container.rma.oldIr.resolveMethodImpl(t, origMember);
+			container.rma.getRmaMember(impl).getMethod();
+		}
+	}
+	def analyzeRecord(r: Record, p: Record) {
+		if (isRead) container.rma.analyzeFieldOfRecord(r, RmaField.!(this));
+	}
+}
+
+class RmaMethod extends RmaMember {
+	var methodNorm: IrMethod;
+	new(container: RmaType, member: IrSpec) : super(container, member) { }
+}
+
+class RmaField extends RmaMember {
+	var numValues: int;
+	var val: Val;
+	var fieldNorm: Array<IrSpec>;
+	new(container: RmaType, member: IrSpec) : super(container, member) { }
+}

@@ -1,0 +1,638 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class X86DarwinTarget extends Target {
+	def test: bool;
+	def space = AddressSpace.new("mem", false, 32, 4, 4);
+	def ciRtName = "CiRuntime"; // CiRuntime provided by compiler
+	def riRtName = "RiRuntime"; // RiRuntime library written in Virgil
+
+	new(name: string, test) : super(name) {
+		this.typedMain = !test;
+	}
+	def emit(compiler: Compiler) {
+		var rt = getRuntime(compiler);
+		rt.mach.build();
+		rt.emit();
+	}
+	def configure(compiler: Compiler) {
+		var mach = MachProgram.new(compiler, space, space);
+		var rt = X86Darwin.new(compiler, test, mach);
+		mach.runtime = rt;
+		compiler.skipRma = false;
+		MachModule.install(compiler);
+		DarwinModule.install(compiler);
+		// install "CiRuntime" module
+		compiler.prog.typeEnv.store(ciRtName, rt.typeCon);
+	}
+	def addRoots(compiler: Compiler, rma: RMAnalyzer) {
+		var typeCon = compiler.prog.typeEnv.lookup(riRtName);
+		if (V3Component_TypeCon.?(typeCon)) {
+			// some RiRuntime methods are called by compiled code
+			var ctype = V3Component_TypeCon.!(typeCon).componentDecl.getDeclaredType();
+			var ic = compiler.prog.getIr().getIrClass(ctype), rt = getRuntime(compiler);
+			for (meth in ic.methods) {
+				var name = meth.source.name();
+				if (Aeneas.RT_GC.get() && Strings.equal(name, "gc")) rt.ri_gc = addRoot(rma, meth);
+				else if (Strings.equal(name, "init")) rt.ri_init = addRoot(rma, meth);
+				else if (Strings.equal(name, "signal")) rt.ri_signal = addRoot(rma, meth);
+			}
+		}
+	}
+	private def addRoot(rma: RMAnalyzer, meth: IrMethod) -> RmaRoot {
+		return rma.addRootMethod(IrSpec.new(meth.container.ctype, TypeUtil.NO_TYPES, meth));
+	}
+	private def getRuntime(compiler: Compiler) -> X86Darwin {
+		return X86Darwin.!(MachRuntime_TypeCon.!(compiler.prog.typeEnv.lookup(ciRtName)).runtime);
+	}
+}
+// Directs the creation of an x86-darwin binary.
+class X86Darwin extends MachRuntime {
+	def compiler: Compiler;
+	def test: bool;
+
+	def PAGE_SIZE = 4096;
+	def fatalStubs = Strings.newMap<Addr>();
+	def debugMach = Aeneas.PRINT_MACH.get();
+	var allocator: X86Allocator;
+	var header: MachO_Header;
+	var codeStartOffset: int;
+
+	new(compiler, test, mach: MachProgram) : super(mach) {
+		// Mach-O header
+		header = MachO_Header.new(false); 
+		header.cputype = MachO.CPU_TYPE_X86;
+		header.filetype = MachO.MH_EXECUTE;
+		allocator = X86Allocator.new(mach, Aeneas.RT_GC.get(), Aeneas.RT_TEST_GC.get());
+	}
+	def emit() {
+		// protect page zero for trapping null accesses
+		var pz = newSegmentLoad("__NULL", 0);
+		pz.vmsize = PAGE_SIZE;
+		// code (text) segment starts at page 1
+		var cs = newSegmentLoad("__TEXT", MachO.VM_PROT_RX);
+		// data segment immediately follows code segment
+		var ds = newSegmentLoad("__DATA", MachO.VM_PROT_RW);
+		// initial thread state for registers (includes starting IP)
+		var ts = MachO_X86ThreadState.new();
+		header.addCmd(ts);
+		// ex segment for trapping explicit checks
+		var ex = if(src != null, newSegmentLoad("__EX", 0));
+		// create the encoder
+		var encoder = MachDataEncoder.new(PAGE_SIZE, 0, false, 300 + mach.numMethods * 50);
+		// skip mach-o headers
+		encoder.skipN(header.totalsize);
+		// skip page zero
+		encoder.skipPage();
+		// generate code and runtime tables into encoder
+		codeStartOffset = encoder.end();
+		encodeCode(encoder, cs, ts);
+		// generate the unmapped "ex" region for trapping explicit checks
+		if (ex != null) {
+			encoder.skipPage();
+			var exStart = encoder.endPageAddr();
+			var exSize = pageAlign(src.layoutExRegion(exStart));
+			encoder.startAddr = encoder.startAddr + exSize;
+			ex.vmaddr = exStart;
+			ex.vmsize = exSize;
+			ex.filesize = 0;
+			ex.fileoff = 0;
+		}
+		// generate data into encoder
+		encoder.skipPage();
+		// compute starting location of data
+		encodeData(encoder, ds);
+		// patch all addresses in the binary
+		encoder.patch(patchCodeAddr);
+		// encode header at position 0 now that all addresses and offsets are known
+		header.encode(encoder.at(0));
+		header.encodeCmds(encoder);
+		// open the output file
+		var file = compiler.getOutputFileName(compiler.programName(), null);
+		var fd = System.fileOpen(file, false);
+		if (fd < 0) return compiler.ERROR.OutputError(file);
+		// write the entire file from the encoder array
+		System.fileWriteK(fd, encoder.array, 0, encoder.end());
+		System.fileClose(fd);
+		// change permissions to make binary executable
+		compiler.makeExecutable(file);
+	}
+	def newSegmentLoad(name: string, prot: int) ->  MachO_SegmentLoad {
+		var s = MachO_SegmentLoad.new(name);
+		s.initprot = prot;
+		s.maxprot = prot;
+		header.addCmd(s);
+		return s;
+	}
+	def pageAlign(v: int) -> int {
+		return (v + PAGE_SIZE - 1) & (-1 ^ (PAGE_SIZE - 1));
+	}
+	def encodeCode(u: MachDataEncoder, cs: MachO_SegmentLoad, ts: MachO_X86ThreadState) {
+		allocator.init(this);
+		ts.eip = u.endAddr();
+		cs.vmaddr = u.endPageAddr();
+		recordCodeStart(ts.eip);
+		genMainStub(u);
+		allocator.genAllocStub(u);
+		mach.layout.layoutCode(u, genX86Code);
+		genSignalHandler(u);
+		recordCodeEnd(u.endAddr());
+		mach.layout.layoutMeta(u);
+		mach.layout.layoutRuntime(u);
+		// XXX: fatalStubs.apply(genFatalStub(_, _, u));
+		for (l = Maps.keyList(fatalStubs); l != null; l = l.tail) {
+			genFatalStub(l.head, fatalStubs.get(l.head), u);
+		}
+		cs.filesize = u.end();
+		cs.vmsize = pageAlign(cs.filesize);
+		cs.fileoff = 0;
+	}
+	def encodeData(u: MachDataEncoder, ds: MachO_SegmentLoad) {
+		u.atEnd().align(mach.data.addressSize);
+		ds.vmaddr = u.endPageAddr();
+		ds.fileoff = ds.vmaddr - u.startAddr;
+		recordDataStart(u.endAddr());
+		mach.layout.layoutData(u);
+		recordDataEnd(u.endAddr());
+		addHeapPointers(u);
+		ds.filesize = u.end() - ds.fileoff;
+		ds.vmsize = pageAlign(ds.filesize + heapSize);
+	}
+	def genX86Code(irm: IrMethod, u: MachDataEncoder) {
+		var gen = X86CodeGen.new(mach, irm.ssa, irm.source), prog = mach.compiler.prog;
+		if (debugMach) IrPrinter.new(prog).printMethodName(irm, irm.container, true);
+		var methodStart = u.endAddr();
+		gen.genCode(u, codeStartOffset);
+		if (Aeneas.PRINT_BIN.get()) reportSize(irm, methodStart, u.endAddr() - methodStart);
+		if (Aeneas.PRINT_CFG.get()) gen.blocks.print();
+	}
+	def reportSize(irm: IrMethod, methodStart: int, size: int) {
+		var buf = StringBuffer.new().puti(size).pad(' ', 6);
+		buf.puts(": ").put1(irm.renderLong).puts(" @ ");
+		buf.putx(methodStart);
+		Terminal.putbln(buf);
+	}
+	def genTestOutput(asm: X86MachAssembler, frame: MachFrame) {
+		// output the return register as a 4-byte integer to stdout
+		asm.push(asm.loc_rm(frame, frame.conv.callerRet(0)));
+		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
+		asm.push_i(4);			// size to write
+		asm.push(X86Regs.EBX);		// pointer into stack
+		asm.push_i(1);			// stdout
+		asm.push_i(0);
+		asm.movd_rm_i(X86Regs.EAX, 4); // write()
+		asm.intK(0x80);
+	}
+	def genTestInputs(main: IrMethod, asm: X86MachAssembler, frame: MachFrame) {
+		// load "argc" off stack
+		asm.movd_r_rm(X86Regs.EBX, X86Regs.ESP.indirect()); // load "argc"
+		var params = main.ssa.params, conv = frame.conv;
+		var vals = parseTestInputs(params.length - 1), u = MachDataEncoder.!(asm.encoder);
+		if (conv.overflow > 0) {
+			// allocate space for overflow arguments
+			asm.sub.rm_i(X86Regs.ESP, conv.overflow * mach.data.addressSize);
+		}
+		for (i = 0; i < conv.paramLocs.length; i++) {
+			var dest = asm.loc_rm(frame, conv.calleeParam(i));
+			if (i == 0) {
+				// load the component "this" pointer with NULL
+				asm.movd_rm_i(dest, 0);
+				continue;
+			}
+			var loadOffset = 0;
+			if (X86Addr.?(dest)) {
+				// TODO: don't use scratch register
+				var scratch = X86MachRegs.SCRATCH;
+				asm.movd_r_rm(scratch, X86Addr.new(X86Regs.EBX, 4, X86Addrs.ABS_CONST));
+				loadOffset = asm.pos() - 4;
+				asm.movd_rm_r(dest, scratch);
+			} else {
+				// load the register value from the table to follow
+				asm.movd_r_rm(X86Reg.!(dest), X86Addr.new(X86Regs.EBX, 4, X86Addrs.ABS_CONST));
+				loadOffset = asm.pos() - 4;
+			}
+			asm.jmp(vals.length * 4); // jump over the table
+			var tableAddr = u.posAddr();
+			// emit table of argument values
+			for (v in vals) u.i4le(V3.unboxIntegral(v(i - 1)));
+			u.at(loadOffset).i4le(tableAddr - 4);
+			u.atEnd();
+		}
+	}
+	def parseTestInputs(expected: int) -> Array<Array<Val>> {
+		var p = ParserState.new(compiler.files(0), compiler.inputs(0), compiler.ERROR, SpecParser.skipSpaces);
+		if (p.optN("//@execute") < 0) {
+			p.error("Could not parse execute test case");
+			return [];
+		}
+		var runs = Lists.toArray(SpecParser.parseRuns(p));
+		var result = Array<Array<Val>>.new(runs.length);
+		for (i = 0; i < runs.length; i++) {
+			result(i) = Lists.toArray(runs(i).input);
+		}
+		if (p.optN("//@heap-size=") > 0) {
+			var size = Int.parsePosDecimal(p.input, p.curPos);
+			if (size.passed) heapSize = size.val;
+			else p.error("Could not parse heap size in test case");
+		}
+		return result;
+	}
+	def genMainStub(u: MachDataEncoder) {
+		var main = mach.compiler.prog.getIr().mainMethod.asMethod();
+		var frame = getFrame(main.ssa);
+		var asm = X86MachAssembler.new(mach, u);
+		// initialize runtime if necessary
+		genMainInit(asm, frame);
+		if (test) genTestInputs(main, asm, frame);
+		// call main
+		asm.call_addr(mach.layout.addrOfMethod(main));
+		// write return value to stdout if this is a test
+		if (test) genTestOutput(asm, frame);
+		// exit with the return value of main
+		if (main.returnType == Void.TYPE) asm.push_i(0);
+		else asm.push(asm.loc_rm(frame, frame.conv.callerRet(0)));
+		asm.push(X86Regs.EAX); // unused
+		asm.movd_rm_i(X86Regs.EAX, 1); // exit()
+		asm.intK(0x80);
+	}
+	def genSignalHandler(u: MachDataEncoder) {
+		if (ri_signal == null) return;
+		var handler_meth = ri_signal.spec.asMethod();
+		var frame = getFrame(handler_meth.ssa);
+		var asm = X86MachAssembler.new(mach, u);
+		rt_handle_signal.absolute = u.posAddr();
+		// "this" = null
+		asm.movd_rm_i(asm.loc_rm(frame, frame.conv.calleeParam(0)), 0); // "this" = null
+		var scratch = X86MachRegs.SCRATCH;
+		// param 1 = signum @ [esp + 12]
+		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(1)), X86Regs.ESP.plus(3 * mach.data.addressSize), scratch);
+		// param 2 = siginfo @ [esp + 16]
+		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(2)), X86Regs.ESP.plus(4 * mach.data.addressSize), scratch);
+		// param 3 = ucontext @ [esp + 20]
+		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(3)), X86Regs.ESP.plus(5 * mach.data.addressSize), scratch);
+		// call RiRuntime.signal(signum: int, siginfo: Pointer, ucontext: Pointer)
+		asm.call_addr(mach.layout.addrOfMethod(handler_meth));
+		// should not return
+	}
+	def genSigInstalls(asm: X86Assembler) {
+		genSigHandlerInstall(asm, 8, getFatalAddress(V3Exception.DivideByZero));
+		genSigHandlerInstall(asm, 10, getFatalAddress(V3Exception.NullCheck));
+		genSigHandlerInstall(asm, 11, getFatalAddress(V3Exception.NullCheck));
+	}
+	def patchCodeAddr(u: DataEncoder, a: Addr, posAddr: int, pos: int) {
+		var abs = mach.layout.absolute(a);
+		if (debugMach) {
+			var buf = Strings.toBuffer("patch-code @ ").putx(posAddr).puts(" <- ");
+			compiler.prog.renderResult(a, null, buf);
+			buf.puts(" = ").putx(abs);
+			Terminal.putbln(buf);
+		}
+		if (u.array(pos) == 0x05) {
+			// encode a RIP-relative address
+			abs = abs - (posAddr + 4);
+		}
+		u.at(pos).i4le(abs);
+	}
+	def genFatalStub(ex: string, addr: Addr, u: MachDataEncoder) {
+		var asm = X86Assembler.new(u);
+		addr.absolute = u.endAddr();
+		// 1. encode a call to write() on stderr
+		asm.push_i(ex.length + 1);			// size to write
+		asm.push_i(X86Addrs.ABS_CONST);			// pointer to msg
+		var msgAddrPos = asm.pos() - 4;
+		asm.push_i(2);					// stderr
+		asm.push_i(0);					// unused
+		asm.movd_rm_i(X86Regs.EAX, 4);			// write()
+		asm.intK(0x80);
+		// 2. encode a call to exit()
+		asm.push_i(-1);
+		asm.push_i(-1);
+		asm.movd_rm_i(X86Regs.EAX, 1);			// exit()
+		asm.intK(0x80);
+		// 3. output message at end of code
+		var msgAddr = u.posAddr();
+		u.i1('!');
+		u.iN(ex);
+		u.at(msgAddrPos).i4(msgAddr);
+		u.atEnd();
+	}
+	def getExceptionDest(off: int, ex: string, source: Source) -> Addr {
+		if (src != null) {
+			// allocate a unique, unmapped address
+			if (debug) src.debugPoint("throw", ex, off, source, src.frameSlots());
+			return src.newExceptionDest(ex, source);
+		}
+		return getFatalAddress(ex);
+	}
+	def getFatalAddress(ex: string) -> Addr {
+		var addr = fatalStubs.get(ex);
+		if (addr == null) {
+			var name = Strings.toBuffer("vrt_throw_").puts(ex).toString();
+			addr = Address.new(codeRegion, name);
+			fatalStubs.set(ex, addr);
+		}
+		return addr;
+	}
+	// generate code that installs a signal handler
+	def genSigHandlerInstall(asm: X86Assembler, signo: int, handler: Addr) {
+		asm.push_i(0);			// sa_flags
+		asm.push_i(0);			// sa_mask
+		asm.push_i(X86Addrs.ABS_CONST);	// sa_handler: handler address
+		recordPatch(asm, handler);
+		asm.push_i(2);			// TODO: why a nonzero value here?
+		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
+		asm.push_i(0);			// sigaction *oact
+		asm.push(X86Regs.EBX);		// sigaction *act
+		asm.push_i(signo);		// signal number
+		asm.push_i(0);			// "dummy" value
+		asm.movd_rm_i(X86Regs.EAX, 46); // sigaction
+		asm.intK(0x80);
+		asm.add.rm_i(X86Regs.ESP, 32);	// pop params off stack
+	}
+	def genMainInit(asm: X86MachAssembler, frame: MachFrame) {
+		// call RiRuntime.init() if it exists
+		if (ri_init != null) return genRiInit(asm, frame);
+		// if this is a test, install custom signal handlers
+		if (test) return genSigInstalls(asm);
+		// TODO: remove compiler-generated initialization of args
+		if (frame.conv.paramTypes.length <= 1) return; // don't bother, main doesn't use it
+		// initialize arg array from OS-supplied argv and envp
+		var argc = X86Regs.EBX, argp = X86Regs.EBX, argArray = X86Regs.EDX;
+		var arrayType = V3Array.newType(mach.machType(V3.stringType));
+
+		asm.movd_r_rm(argc, X86Regs.ESP.indirect());
+		asm.sub.rm_i(argc, 1); // adjust for first arg
+		asmArrayAlloc(asm, arrayType, argArray, argc);
+		asm.push(argArray); // save array on stack
+		
+		asm.lea(argArray, argArray.plus(mach.getArrayElemOffset(arrayType)));
+		asm.lea(argp, X86Regs.ESP.plus(3 * mach.data.addressSize));
+
+		// loop over individual arguments
+		var loopStart = asm.pos();
+		var str = X86Regs.EDI, strlen = X86Regs.ECX;
+
+		// load the argument and test against null
+		asm.movd_r_rm(str, argp.indirect());
+		asm.cmp.rm_i(str, 0);
+		asm.jz(0);
+		var cmpPatch = asm.pos() - 1;
+
+		// compute length of string by finding null byte
+		asm.movd_rm_i(strlen, -1);
+		asm.repne().scasb(); // updates EDI and ECX, kills EAX
+		asm.not(strlen);
+		asm.dec(strlen);
+		
+		// allocate a byte array of length strlen
+		var argString = X86Regs.EDI;
+		asmArrayAlloc(asm, V3.stringType, argString, strlen);
+		asm.movd_rm_r(argArray.indirect(), argString); // write into arg array
+
+		// copy data into array
+		asm.lea(X86Regs.EDI, argString.plus(mach.getArrayElemOffset(V3.stringType)));
+		asm.movd_r_rm(X86Regs.ESI, argp.indirect());
+		asm.repne().movsb();
+		
+		// increment argp and argarray position
+		asm.add.rm_i(argArray, 4);
+		asm.add.rm_i(argp, 4);
+		var offset = loopStart - (asm.pos() + 2);
+		asm.jmp(offset); // loop back to start
+
+		var offset2 = asm.pos() - cmpPatch - 1;
+		asm.encoder.at(cmpPatch).i1(offset2); // patch the branch that skips the loop
+		asm.encoder.atEnd();
+		asm.pop(asm.loc_rm(frame, frame.conv.callerParam(1)));
+	}
+	def genRiInit(asm: X86MachAssembler, frame: MachFrame) {
+		// generate a call to the RiRuntime.init() method
+		var init_meth = ri_init.spec.asMethod();
+		var addr = mach.layout.addrOfMethod(init_meth);
+		var frame = getFrame(init_meth.ssa), conv = frame.conv;
+		// "this" = null
+		asm.movd_rm_i(asm.loc_rm(frame, conv.calleeParam(0)), 0); // "this" = null
+		var scratch = X86MachRegs.SCRATCH;
+		// param 1 = argc @ [esp]
+		asm.movd_rm_rm(asm.loc_rm(frame, conv.calleeParam(1)), X86Regs.ESP.indirect(), scratch);
+		var param2 = asm.loc_rm(frame, conv.calleeParam(2));
+		if (test) {
+			// if testing, param 2 = argv = NULL
+			asm.movd_rm_i(param2, 0);
+		} else {
+			// otherwise param 2 = argv @ [esp + 4]
+			var argp = X86Regs.ESP.plus(mach.data.addressSize);
+			if (X86Reg.?(param2)) {
+				asm.lea(X86Reg.!(param2), argp);
+			} else {
+				asm.lea(scratch, argp);
+				asm.movd_rm_r(param2, scratch);
+			}
+		}
+		// param 3 = envp @ [esp + 8] = null
+		asm.movd_rm_i(asm.loc_rm(frame, conv.calleeParam(3)), 0);
+		// call RiRuntime.init(argc: int, argv: Pointer, envp: Pointer) -> Array<string>
+		asm.call_addr(addr);
+		// ret -> dest
+		if (!test) {
+			var retReg = asm.loc_r(conv.calleeRet(0));
+			var dest = asm.loc_rm(frame, frame.conv.callerParam(1));
+			asm.movd_rm_rm(dest, retReg, scratch);
+		}
+	}
+	def asmArrayAlloc(asm: X86Assembler, arrayType: Type, dest: X86Reg, len: X86Reg) {
+		var scale = mach.getArrayElemScale(arrayType), align = (scale % mach.data.addressSize) != 0;
+		var adjust = if(align, mach.data.addressSize - 1, 0);
+		asm.lea(dest, X86Addr.new(len, scale, mach.getArrayElemOffset(arrayType) + adjust));
+		if (align) asm.and.rm_i(dest, -1 ^ adjust);
+		asmAlloc(asm, dest);
+		asm.movd_rm_i(dest.indirect(), Int.unbox(mach.objectTag(arrayType)));
+		asm.movd_rm_r(dest.plus(mach.getArrayLengthOffset(arrayType)), len);
+	}
+	def asmAlloc(asm: X86Assembler, reg: X86Reg) {
+		// exchange-add with heap current pointer
+		asm.xadd(X86Addrs.ABS_PATCH, reg);
+		recordPatch(asm, mach.runtime.rt_heap_cur_loc);
+	}
+	private def recordPatch(asm: X86Assembler, addr: Addr) {
+		MachDataEncoder.!(asm.encoder).recordPatch(addr, asm.pos() - 4);
+	}
+	def genSystemOp(g: MachCodeGen, sys: SsaApplyOp, rv: MachVar) {
+		var gen = X86CodeGen.!(g);
+		var syscall = sys.op.attr<DarwinSyscall>();
+		var inputs = sys.inputs;
+		gen.frame.allocOverflow((1 + inputs.length) * mach.data.addressSize);
+		// define first result in EAX
+		if (rv.varSize > 0) gen.dfnAt(rv, X86MachRegs.EAX);
+		// define second result (if any) in EDX
+		if (rv.varSize > 1) gen.dfnAt(gen.vars.get(rv.varNum + 1), X86MachRegs.EDX);
+		else if (syscall.killEdx) gen.kill(X86MachRegs.EDX);
+		// accept arguments on callee's portion of stack of current frame
+		var start = gen.frame.conv.regSet.calleeStart;
+		for (i = 0; i < inputs.length; i++) {
+			gen.useFixed(inputs(i).dest, start + i + 1);
+		}
+		gen.gen("darwin:int80", asmSystemOp, (gen, syscall));
+	}
+	def genAlloc(g: MachCodeGen, i: SsaApplyOp, mv: MachVar) {
+		return allocator.gen_alloc(g, i, mv);
+	}
+	def getFrame(ssa: SsaRegion) -> MachFrame {
+		var frame = MachFrame.new(X86VirgilCallConv.getForRegion(ssa));
+		frame.frameSize = mach.data.addressSize;
+		return frame;
+	}
+	private def asmSystemOp(gen: X86CodeGen, syscall: DarwinSyscall) {
+		var asm = gen.asm;
+		asm.movd_rm_i(X86Regs.EAX, syscall.sysnum);
+		asm.intK(0x80);
+		if (syscall.cfneg) {
+			asm.jnc(2); // skip next instruction if CF = 0
+			asm.neg(X86Regs.EAX); // negate EAX to indicate an error
+		}
+	}
+}
+// a mach-O thread state command for x86
+class MachO_X86ThreadState extends MachO_LoadCmd {
+	var eip: int;
+	def encode(is64: bool, u: DataEncoder) {
+		u.i4(0x5); // unix thread
+		u.i4(80);  // 80 bytes for x86
+		u.i4(1);   // X86 thread state
+		u.i4(16);  // number of words
+		// eax ebx ecx edx edi
+		u.zeroN(5 * 4);
+		// esi ebp esp ss eflags
+		u.zeroN(5 * 4);
+		// entrypoint address
+		u.i4(eip);
+		// cs ds es fs gs
+		u.zeroN(5 * 4);
+	}
+	def size(is64: bool) -> int {
+		return 80;
+	}
+}
+// handles assembly-level details of allocating memory on x86.
+class X86Allocator {
+	def mach: MachProgram;
+	def stub: bool;
+	def alwaysGc: bool;
+	var objLoc: int;
+	var sizeLoc: int;
+	var allocStubAddr: Addr;
+	var frame: MachFrame;
+	var gcmeth: IrMethod;
+
+	new(mach, stub, alwaysGc) { }
+	def init(rt: X86Darwin) {
+		if (stub) {
+			// initialize locations based on calling convention to RiRuntime.gc()
+			allocStubAddr = Address.new(mach.layout.codeRegion, "alloc_stub");
+			var ri_gc = mach.runtime.ri_gc;
+			if (ri_gc != null) {
+				// call the RiRuntime.gc() method
+				gcmeth = ri_gc.spec.asMethod();
+				frame = rt.getFrame(gcmeth.ssa);
+				objLoc = frame.conv.calleeRet(0);
+				sizeLoc = frame.conv.calleeParam(1); // param 0 = "this"
+			} else {
+				// there is no appropriate RiRuntime.gc() method
+				objLoc = X86MachRegs.EAX;
+				sizeLoc = X86MachRegs.EAX;
+			}
+		}
+	}
+	def gen_alloc(g: MachCodeGen, i: SsaApplyOp, mv: MachVar) {
+		var gen = X86CodeGen.!(g);
+		var size = i.inputs(0).dest;
+		if (stub) {
+			// generate a call to the allocation stub
+			gen.dfnAt(mv, objLoc);
+			var lp = if(mach.runtime.gc != null, gen.livePoint());
+			gen.kill(X86MachRegs.ALL);
+			gen.useAt(gen.makeVar(size), sizeLoc);
+			gen.gen("alloc", asm_alloc_rt, (gen, lp, i.source));
+		} else {
+			// generate inlined (test) allocation
+			gen.hint(size, mv);
+			gen.gen("alloc", asm_alloc_test, (gen, gen.dfngpr(mv), gen.gpr(size), i.source));
+		}
+	}
+	def asm_alloc_test(gen: X86CodeGen, dest: int, sz: int, source: Source) {
+		// exchange-add [CiRuntime.heapCurLoc] with size
+		var rd = gen.r(dest), ra = gen.r(sz);
+		if (rd != ra) gen.asm.movd_rm_r(rd, ra);
+		var pos = gen.asm.pos();
+		gen.asm.xadd(X86Addrs.ABS_PATCH, rd);
+		gen.recordPatch(pos, mach.runtime.rt_heap_cur_loc);
+	}
+	def asm_alloc_rt(gen: X86CodeGen, lp: int, source: Source) {
+		// call a shared allocation stub routine
+		gen.asm.call_addr(allocStubAddr);
+		var off = gen.codeOffset();
+		if (gen.rtgc != null) gen.rtgc.recordStackRefMap(off, gen.buildStackMap(null, lp));
+		if (gen.rtsrc != null) gen.rtsrc.recordReturnSource(off, source);
+	}
+	def genAllocStub(u: MachDataEncoder) {
+		if (!stub) return;
+		allocStubAddr.absolute = u.endAddr();
+		var asm = X86MachAssembler.new(mach, u);
+		var sizeReg = asm.loc_r(sizeLoc);
+
+		if (alwaysGc) {
+			// just call the GC directly for every allocation
+			if (gcmeth == null) return mach.compiler.ERROR.fail("no collector method found");
+			return jumpRiGc(asm);
+		}
+
+		// %sizeReg = alloc(%sizeReg = size)
+		asm.movd_r_rm(X86MachRegs.SCRATCH, sizeReg);
+		// add size = size + [heapCurLoc]
+		var addPos = asm.pos();
+		asm.add.r_rm(sizeReg, X86Addrs.ABS_PATCH);
+		asm.recordPatch(addPos, mach.runtime.rt_heap_cur_loc);
+		// check for addition overflow
+		asm.jmpx(X86Conds.C, 0);
+		var branchPos1 = asm.pos() - 1;
+		// compare with [heapEndLoc]
+		var cmpPos = asm.pos();
+		asm.cmp.r_rm(sizeReg, X86Addrs.ABS_PATCH);
+		asm.recordPatch(cmpPos, mach.runtime.rt_heap_end_loc);
+
+		if (gcmeth == null) {
+			// branch to the fatal address
+			asm.jmpx_addr(X86Conds.A, mach.runtime.getFatalAddress(V3Exception.HeapOverflow));
+		} else {
+			// branch forward to the slow path
+			asm.jmpx(X86Conds.A, 0);
+		}
+
+		var branchPos2 = asm.pos() - 1;
+		asm.movd_rm_r(X86Addrs.ABS_PATCH, sizeReg);
+		asm.recordPatch(branchPos2 + 1, mach.runtime.rt_heap_cur_loc);
+		asm.sub.r_rm(sizeReg, X86MachRegs.SCRATCH);
+		asm.ret();
+
+		if (gcmeth == null) return;
+		// slow path: call RiRuntime.gc
+		var callRtPos = asm.pos();
+		asm.encoder.at(branchPos1).i1(callRtPos - (branchPos1 + 1));
+		asm.encoder.at(branchPos2).i1(callRtPos - (branchPos2 + 1));
+		asm.encoder.atEnd();
+		// callerParam(0) = this
+		// callerParam(1) = size
+		asm.movd_rm_r(sizeReg, X86MachRegs.SCRATCH); // reload saved size
+		jumpRiGc(asm); // load other args and simply jump into runtime
+	}
+	def jumpRiGc(asm: X86MachAssembler) {
+		// callerParam(2) = ip
+		var ipRm = asm.loc_rm(frame, frame.conv.calleeParam(2));
+		asm.movd_rm_rm(ipRm, X86Regs.ESP.indirect(), X86MachRegs.SCRATCH);
+		// callerParam(3) = sp
+		var spReg = asm.loc_r(frame.conv.calleeParam(3));
+		asm.lea(spReg, X86Addr.new(X86Regs.ESP, 1, mach.data.addressSize));
+		asm.jmpx_addr(null, mach.layout.addrOfMethod(gcmeth));
+		// no need to return, this is a tail call
+	}
+}

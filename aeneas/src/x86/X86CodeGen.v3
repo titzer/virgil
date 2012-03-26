@@ -1,0 +1,1089 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Utilities for X86 addresses
+component X86Addrs {
+	// absolute patch constant
+	def ABS_CONST  = 0x44332211;
+	def ABS_CONST0 = 0x11;
+	def ABS_CONST1 = 0x22;
+	def ABS_CONST2 = 0x33;
+	def ABS_CONST3 = 0x44;
+
+	// relative patch constant
+	def REL_CONST = 0x44332205;
+
+	def ABS_PATCH = X86Addr.new(null, 1, 0x44332211);
+}
+// Pattern match of a comparison between two vars or a var and a constant
+class X86CmpMatch {
+	def cond: X86Cond;
+	def x: SsaInstr;
+	def y: SsaInstr;
+	def val: Val;
+	new(cond, x, y, val) { }
+	def negate() -> X86CmpMatch { return X86CmpMatch.new(cond.negate, x, y, val); }
+}
+// Represents an X86 instruction for register allocation and assembling
+class X86Instr<T> extends MachInstr {
+	def emitFunc: T -> void;
+	def params: T;
+	new(name: string, emitFunc, params) : super(name) { }
+	def emit() { emitFunc(params); }
+	def has<U>() -> bool { return X86Instr<U>.?(this); }
+	def get<U>() -> U { return X86Instr<U>.!(this).params; }
+}
+// Generates X86 code from SSA-M32 form.
+// XXX: emit short branch instructions where possible
+// XXX: align loop headers to cache boundaries
+// XXX: schedule loads of constants for calls, phis, etc
+// XXX: remove use of scratch register
+class X86CodeGen extends MachCodeGen {
+	def scratchReg = X86MachRegs.SCRATCH;
+	var multiBlock: bool;
+	var branches: List<(int, SsaBlock)>; // XXX: pull branches up to MachCodeGen?
+	var asm: X86MachAssembler;
+
+	new(mach: MachProgram, region: SsaRegion, source: VstMethod) : super(mach, region, source) {
+		multiBlock = region.startBlock.succ.length > 0;
+		frame = MachFrame.new(X86VirgilCallConv.getForRegion(region));
+	}
+	def genCode(encoder: MachDataEncoder, codeStartOffset: int) {
+		this.codeStartOffset = codeStartOffset;
+		this.encoder = encoder;
+		blocks.computeOrder();
+		gen_entry();
+		var blocks = blocks.order;
+		for (i = 0; i < blocks.length; i++) {
+			// emit all blocks in order
+			var info = blocks.get(i);
+			info.start = code.length;
+			genBlock(info.block);
+			info.end = code.length;
+		}
+		markAllLiveVars();
+		genPhis();
+		lsra = LinearScanRegAlloc.new(this, X86MachRegs.regs);
+		lsra.assignRegs();
+		frame.frameSize = mach.alignTo(frame.slots() * mach.refSize + mach.code.addressSize, mach.stackAlign);
+		if (Aeneas.PRINT_MACH.get()) print();
+		emitInstrs();
+	}
+	def genBlock(b: SsaBlock) {
+		// generate code for each instruction in a block
+		curBlock = b;
+		curBlockStart = code.length;
+		if (b.phis != null) gen_phi_dfn(b.phis); // special instruction defines phis
+		var oseq = b.instrs;
+		for (j = 0; j < oseq.length; j++) {
+			// translate code in middle of block
+			var i = oseq.get(j), mv = makeVar(i);
+			mv.start = code.length;
+			var root = genApply(SsaApplyOp.!(i), mv);
+			mv.end = code.length;
+			if (root) markUsesLive(mv);
+		}
+		// translate the end of the block
+		var i = b.end, mv = makeVar(i);
+		mv.start = code.length;
+		if (SsaReturn.?(i)) genReturn(SsaReturn.!(i));
+		else if (SsaSwitch.?(i)) genSwitch(SsaSwitch.!(i));
+		else if (SsaGoto.?(i)) genGoto(SsaGoto.!(i).target());
+		else if (SsaThrow.?(i)) genThrow(SsaThrow.!(i));
+		else mach.fail("unknown block end");
+		mv.end = code.length;
+		markLive(mv);
+	}
+	def emitInstrs() {
+		getAsm(encoder); // allocate assembler
+		if (rtsrc != null) rtsrc.recordMethodStart(codeOffset(), source, frame);
+		var offsets = Array<int>.new(code.length);
+		// assemble the code for each instruction
+		for (i = 0; i < code.length; i++) {
+			var instr = code.get(i);
+			offsets(i) = encoder.pos;
+			if (!instr.live) continue;
+			var m = instr.moves;
+			if (m != null) { // emit any spills / constants before instruction
+				emitMoves(m.before);
+				emitVarMoves(m.varMoves);
+				emitValMoves(m.valMoves);
+			}
+			instr.emit();
+			if (m != null) { // emit any restores after instruction
+				emitMoves(m.after);
+			}
+		}
+		// patch any branch instructions with the target address
+		for (l = branches; l != null; l = l.tail) {
+			var p = l.head.0;
+			var t = offsets(blocks.order.get(l.head.1.mark).start);
+			encoder.at(p).i4le(t - p - 4); // encode pc-relative address
+		}
+		encoder.atEnd();
+		if (rtsrc != null) rtsrc.recordMethodEnd(codeOffset(), source, frame);
+	}
+	def getAsm(encoder: MachDataEncoder) -> X86MachAssembler {
+		this.encoder = encoder;
+		if (asm == null) asm = X86MachAssembler.new(mach, encoder);
+		encoder.atEnd();
+		return asm;
+	}
+	def genApply(i: SsaApplyOp, mv: MachVar) -> bool {
+		var root = false;
+		match (i.op.opcode) {
+			V3Opcode.IntAdd:		genAdd(i, mv);
+			V3Opcode.IntMul:		genMul(i, mv);
+			V3Opcode.IntDiv:		root = genDiv(i, mv, true);
+			V3Opcode.IntMod:		root = genDiv(i, mv, false);
+			V3Opcode.IntAnd,		// fall through
+			V3Opcode.BoolAnd:		genOp2("and", i, mv, X86Assembler.and);
+			V3Opcode.IntOr,			// fall through
+			V3Opcode.BoolOr:		genOp2("or", i, mv, X86Assembler.or);
+			V3Opcode.IntSub:		genOp2("sub", i, mv, X86Assembler.sub);
+			V3Opcode.IntXor:		genOp2("xor", i, mv, X86Assembler.xor);
+			V3Opcode.IntShl:		genShift(i, mv, true);
+			V3Opcode.IntShr:		genShift(i, mv, false);
+			V3Opcode.Equal,			// fall through
+			V3Opcode.NotEqual,		// fall through
+			V3Opcode.IntLt,			// fall through
+			V3Opcode.ByteLt,		// fall through
+			V3Opcode.IntGt,			// fall through
+			V3Opcode.ByteGt,		// fall through
+			V3Opcode.IntLteq,		// fall through
+			V3Opcode.ByteLteq,		// fall through
+			V3Opcode.IntGteq,		// fall through
+			MachOpcode.UnsignedLt,		// fall through
+			MachOpcode.UnsignedLteq,	// fall through
+			MachOpcode.UnsignedGt,		// fall through
+			MachOpcode.UnsignedGteq,	// fall through
+			V3Opcode.ByteGteq:		genCmpSet(matchCmp(i), mv);
+			V3Opcode.IntToByte:		gen_op2_i("and", X86Assembler.and, mv, i.inputs(0).dest, Int.box(0xFF));
+			V3Opcode.ByteToInt:		id(i, makeVar(i.inputs(0).dest));
+			V3Opcode.BoolNot:		gen_op2_i("xor", X86Assembler.xor, mv, i.inputs(0).dest, Int.box(1));
+			V3Opcode.TupleGetElem: {
+				// make tuple element refer to appropriate variable
+				i.mark = makeVar(i.inputs(0).dest).varNum + i.op.attr<int>();
+			}
+			V3Opcode.ConditionalThrow:	root = genCondThrow(i, mv);
+			MachOpcode.PtrLoad:		root = genLoad(i, mv);
+			MachOpcode.PtrStore:		root = genStore(i, mv);
+			MachOpcode.PtrAdd:		genAdd(i, mv);
+			MachOpcode.PtrSub:		genOp2("sub", i, mv, X86Assembler.sub);
+			MachOpcode.Alloc: {
+				rt.genAlloc(this, i, mv);
+				root = true;
+			}
+			MachOpcode.CallAddress:		root = genCall(i, mv);
+			MachOpcode.MachSystemOp: {
+				rt.genSystemOp(this, i, mv);
+				root = true;
+			}
+		} else {
+			mach.fail(Strings.format1("Unexpected opcode %1", i.op.opcode));
+		}
+		return root;
+	}
+	def genAdd(i: SsaApplyOp, mv: MachVar) {
+		var xe = i.inputs(0), y = i.inputs(1).dest, x = xe.dest;
+		if (SsaValue.?(y)) {
+			// match x + K
+			var disp = intVal(y), xscale = matchScale(xe);
+			if (xscale.1 > 1) return gen_lea(mv, xscale.0, xscale.1, disp);
+			else return gen_add_i(mv, x, disp);
+		}
+		// XXX: match a + (b * K) -> lea [a + b * K]
+		// XXX: match a + (b * K) + K -> lea [a + b * K + K]
+		gen_op2("add", true, X86Assembler.add, mv, x, y);
+	}
+	def genMul(i: SsaApplyOp, mv: MachVar) {
+		// XXX: strength reduce here also, or just rely on local optimizer?
+		var y = i.inputs(1).dest;
+		if (SsaValue.?(y)) gen_imul_i(mv, i.inputs(0).dest, intVal(y));
+		else gen_imul(mv, i.inputs(0).dest, y);
+	}
+	def genOp2(name: string, i: SsaApplyOp, mv: MachVar, m: X86Assembler -> X86Op2) {
+		var x = i.inputs(0).dest, y = i.inputs(1).dest;
+		if (SsaValue.?(y)) {
+			// X <op> K
+			var val = SsaValue.!(y).val;
+			if (i.op.opcode == V3Opcode.IntXor) {
+				if (Int.MINUS_1.equals(val)) gen_not(mv, x);
+				else gen_op2_i(name, m, mv, x, val);
+			} else {
+				gen_op2_i(name, m, mv, x, val);
+			}
+		} else if (SsaValue.?(x)) {
+			// K <op> Y
+			var val = SsaValue.!(x).val;
+			if (i.op.opcode == V3Opcode.IntSub) {
+				if (val == null || val.equals(null)) gen_neg(mv, y);	// generate negation
+				else gen_op2(name, false, m, mv, x, y); // not commutative
+			} else if (i.op.opcode == V3Opcode.IntXor) {
+				if (Int.MINUS_1.equals(val)) gen_not(mv, y);
+				else gen_op2_i(name, m, mv, y, val);
+			} else {
+				gen_op2_i(name, m, mv, y, val);
+			}
+		} else {
+			// gen a basic two-address operation
+			gen_op2(name, i.op.opcode != V3Opcode.IntSub, m, mv, x, y);
+		}
+	}
+	def genCmp(cmp: X86CmpMatch) {
+		if (cmp.y == null) {
+			if (Addr.?(cmp.val)) gen_cmp_a(cmp.x, Addr.!(cmp.val));
+			else gen_cmp_i(cmp.x, V3.unboxIntegral(cmp.val));
+		} else {
+			gen_cmp(cmp.x, cmp.y);
+		}
+	}
+	def genCmpBr(cmp: X86CmpMatch, target: SsaBlock) {
+		genCmp(cmp);
+		gen_br(cmp.cond, target);
+	}
+	def genCmpSet(cmp: X86CmpMatch, mv: MachVar) {
+		genCmp(cmp);
+		gen_set(cmp.cond, mv);
+	}
+	def genLoad(i: SsaApplyOp, mv: MachVar) -> bool {
+		var ptr = i.inputs(0);
+		if (SsaValue.?(ptr.dest)) {
+			// an absolute address
+			var addr = Addr.!(val(ptr.dest));
+			if (mach.layout.isValid(addr)) { // is valid?
+				gen_loada(mv, mach.sizeOf(i.op.typeArgs(1)), addr);
+				return false;
+			}
+			// invalid address, generate a throw
+			gen("throw_null", asm_throw, (i.source, V3Exception.NullCheck));
+			return true;
+		}
+		if (matchEdge(ptr, MachOpcode.PtrAdd)) {
+			// load(x + y)
+			var add = SsaApplyOp.!(ptr.dest);
+			var y = add.inputs(1).dest;
+			var x = add.inputs(0);
+			if (SsaValue.?(y)) {
+				var xscale = matchScale(x);
+				return genLoadAddr(i, mv, xscale.0, xscale.1, intVal(y));
+			}
+			if (SsaValue.?(x.dest)) {
+				// load(<addr> + y)
+				var addr = Addr.!(val(x.dest));
+				gen_loada_disp(mv, mach.sizeOf(i.op.typeArgs(1)), addr, y);
+				return !i.checkFact(SsaFacts.O_NO_NULL_CHECK);
+			}
+		}
+		return genLoadAddr(i, mv, ptr.dest, 1, 0);
+	}
+	def genLoadAddr(i: SsaApplyOp, mv: MachVar, x: SsaInstr, scale: int, disp: int) -> bool {
+		var nullCheck = V3Op.needsNullCheck(i, x);
+		gen_loadx(mv, mach.sizeOf(i.op.typeArgs(1)), x, scale, disp, nullCheck, i.source);
+		return nullCheck;
+	}
+	def genStore(i: SsaApplyOp, mv: MachVar) -> bool {
+		var ptr = i.inputs(0), v = i.inputs(1).dest;
+		if (SsaValue.?(ptr.dest)) {
+			// store to absolute address
+			var addr = Addr.!(val(ptr.dest));
+			gen_storex_abs(mach.sizeOf(i.op.typeArgs(1)), addr, v);
+			// XXX: store immediate constants to absolute addresses
+			return true;
+		}
+		if (matchEdge(ptr, MachOpcode.PtrAdd)) {
+			var add = SsaApplyOp.!(ptr.dest);
+			var y = add.inputs(1).dest;
+			if (SsaValue.?(y)) {
+				var xscale = matchScale(add.inputs(0));
+				return genStoreAddr(i, mv, xscale.0, xscale.1, intVal(y), v);
+			}
+		}
+		return genStoreAddr(i, mv, ptr.dest, 1, 0, v);
+	}
+	def genStoreAddr(i: SsaApplyOp, mv: MachVar, x: SsaInstr, scale: int, disp: int, val: SsaInstr) -> bool {
+		var size = mach.sizeOf(i.op.typeArgs(1));
+		if (size == 1 && SsaApplyOp.?(val)) {
+			// eliminate int -> byte conversions in stores
+			var vop = SsaApplyOp.!(val);
+			if (vop.op.opcode == V3Opcode.IntToByte) val = vop.inputs(0).dest;
+		}
+		var nullCheck = V3Op.needsNullCheck(i, x);
+		if (SsaValue.?(val)) {
+			// match stores of immediates
+			var v = SsaValue.!(val).val;
+			if (v == null) return gen_storex_i(size, x, scale, disp, 0, nullCheck, i.source);
+			if (Box<int>.?(v)) return gen_storex_i(size, x, scale, disp, Int.unbox(v), nullCheck, i.source);
+			if (Box<byte>.?(v)) return gen_storex_i(size, x, scale, disp, Byte.unbox(v), nullCheck, i.source);
+			if (Box<bool>.?(v)) return gen_storex_i(size, x, scale, disp, Bool.toInt(Bool.unbox(v)), nullCheck, i.source);
+			// XXX: store of immediate addresses
+		}
+		gen_storex(size, x, scale, disp, val, nullCheck, i.source);
+		return true;
+	}
+	def genDiv(i: SsaApplyOp, mv: MachVar, div: bool) -> bool {
+		var a = i.inputs(0).dest, b = i.inputs(1).dest;
+		var zeroCheck = !i.checkFact(SsaFacts.O_NO_ZERO_CHECK);
+		if (div) {
+			dfnAt(mv, X86MachRegs.EAX);
+			kill(X86MachRegs.EDX);
+			useFixed(a, X86MachRegs.EAX);
+			var bu = useFixed(b, X86MachRegs.NOT_EDX);
+			gen("idiv", asm_idiv, (bu, zeroCheck, i.source));
+		} else {
+			dfnAt(mv, X86MachRegs.EDX);
+			kill(X86MachRegs.EAX);
+			useFixed(a, X86MachRegs.EAX);
+			var bu = useFixed(b, X86MachRegs.NOT_EDX);
+			gen("imod", asm_idiv, (bu, zeroCheck, i.source));
+		}
+		return zeroCheck;
+	}
+	def genCondThrow(i: SsaApplyOp, mv: MachVar) -> bool {
+		// generate a branch to the throw function
+		var cmp = matchCmp(i.inputs(0).dest);
+		genCmp(cmp);
+		gen("br", asm_brthrow, (cmp.cond, i.op.attr<string>(), i.source));
+		return true;
+	}
+	def genCall(call: SsaApplyOp, rv: MachVar) -> bool {
+		var func = call.inputs(0).dest, mi: MachInstr;
+		var conv = frame.allocCallerSpace(X86VirgilCallConv.getForType(call.op.typeArgs(0)));
+
+		// define the return value(s) of the call		
+		for (i = 0; i < rv.varSize; i++) {
+			dfnAt(vars.get(rv.varNum + i), conv.calleeRet(i));
+		}
+		var lp = if(rtgc != null, livePoint());
+		kill(X86MachRegs.ALL);
+		// use the arguments to the call
+		var inputs = call.inputs, m = MachMoves.new();
+		var adjust = if(call.op.attr<bool>(), -1, 0); // adjust for receiver if necessary
+		for (i = 1; i < inputs.length; i++) {
+			useFixed(inputs(i).dest, conv.calleeParam(i + adjust));
+		}
+		if (SsaValue.?(func)) {
+			// generate a (patchable) direct call
+			mi = gen("call", asm_call, (conv, lp, Addr.!(val(func)), call.source));
+		} else {
+			// generate an indirect call
+			mi = gen("icall", asm_icall, (conv, lp, gpr(func), call.source));
+		}
+		return true;
+	}
+	def genShift(i: SsaApplyOp, mv: MachVar, shl: bool) {
+		var y = i.inputs(1).dest;
+		if (SsaValue.?(y)) {
+			// shift by constant
+			var val = intVal(y);
+			if (val >= 0 && val < 32) {
+				if (shl) gen_shl_i(mv, i.inputs(0).dest, val);
+				else gen_shr_i(mv, i.inputs(0).dest, val);
+			} else {
+				// XXX: use the valMoves machinery?
+				gen_const(mv, null);
+			}
+		} else {
+			// gen shift by cl
+			var xv = i.inputs(0).dest;
+			var check = !i.checkFact(SsaFacts.O_NO_SHIFT_CHECK) && !Aeneas.DISABLE_SHIFT_CHECKS.get();
+			if (shl) gen_shl(mv, xv, y, check);
+			else gen_shr(mv, xv, y, check);
+		}
+	}
+	def genReturn(i: SsaReturn) {
+		for (j = 0; j < i.inputs.length; j++) {
+			useFixed(i.inputs(j).dest, frame.conv.callerRet(j));
+		}
+		gen("ret", asm_ret, ());
+	}
+	def genGoto(target: SsaBlock) {
+		if (target.phis != null) gen("phi_resolve", asm_phi_resolve, code.length);
+		if (blocks.isImmediatelyAfter(curBlock, target)) gen("nop", asm_nop, ());
+		else gen_br(null, target);
+	}
+	def genJump(target: SsaBlock) {
+		if (!blocks.isImmediatelyAfter(curBlock, target)) gen_br(null, target);
+	}
+	def genThrow(i: SsaThrow) {
+		gen("throw", asm_throw, (i.source, i.exception));
+	}
+	def genSwitch(i: SsaSwitch) {
+		var vals = i.vals, key = i.inputs(0).dest, succ = i.block.succ;
+		if (vals.length == 1) {
+			var cmp: X86CmpMatch;
+			if (i.vtype == MachType.BOOL) {
+				// this is a simple boolean branch
+				cmp = matchCmp(key);
+				if (!Bool.unbox(vals(0))) cmp = cmp.negate();
+			} else {
+				// this is a compare with immediate
+				cmp = X86CmpMatch.new(X86Conds.Z, key, null, vals(0));
+			}
+			var s0 = succ(0).dest, s1 = succ(1).dest;
+			if (blocks.isImmediatelyAfter(curBlock, s0)) {
+				// can fall through to first successor
+				genCmpBr(cmp.negate(), s1);
+			} else {
+				// branch to first successor
+				genCmpBr(cmp, s0);
+				genJump(s1);
+			}
+			return;
+		}
+		// XXX: generate a jump table or lookup table
+		// generate a series of compares
+		for (j = 0; j < vals.length; j++) {
+			var target = succ(j).dest;
+			genCmpBr(X86CmpMatch.new(X86Conds.Z, key, null, vals(j)), target);
+		}
+		genJump(succ(vals.length).dest);
+	}
+
+	def numVars(i: SsaInstr) -> int {
+		match (i.opcode()) {
+			MachOpcode.CallAddress, MachOpcode.MachSystemOp: {
+				// a call could have multiple return values
+				var rtype = i.getType();
+				if (rtype.typeCon.kind == V3Kind.TUPLE) return Lists.length(rtype.nested);
+			}
+		}
+		return 1; // all other instructions get at most 1 virtual register
+	}
+	def intVal(i: SsaInstr) -> int {
+		return Int.unbox(SsaValue.!(i).val);
+	}
+	def matchEdge(e: SsaDfEdge, opcode: int) -> bool {
+		return soleEdge(e) && e.dest.opcode() == opcode;
+	}
+	def soleEdge(e: SsaDfEdge) -> bool {
+		if (e.next != null) return false; // not the only use
+		var i = e.dest;
+		if (i.useList != e) return false; // not the only use
+		return inSameBlock(i);
+	}
+	def matchOpcode(i: SsaInstr) -> int {
+		if (inSameBlock(i)) return i.opcode();
+		return -1;
+	}
+	def inSameBlock(i: SsaInstr) -> bool {
+		if (multiBlock) {
+			if (i.mark < 0) return false;
+			return vars.get(i.mark).start >= curBlockStart;
+		}
+		return true;
+	}
+	// pattern-match a comparison
+	def matchCmp(i: SsaInstr) -> X86CmpMatch {
+		match (matchOpcode(i)) {
+			V3Opcode.Equal:				return newCmp2(i, X86Conds.Z);
+			V3Opcode.NotEqual:			return newCmp2(i, X86Conds.NZ);
+			V3Opcode.IntLt, V3Opcode.ByteLt:	return newCmp2(i, X86Conds.L);
+			V3Opcode.IntGt, V3Opcode.ByteGt:	return newCmp2(i, X86Conds.G);
+			V3Opcode.IntLteq, V3Opcode.ByteLteq:	return newCmp2(i, X86Conds.LE);
+			V3Opcode.IntGteq, V3Opcode.ByteGteq:	return newCmp2(i, X86Conds.GE);
+			MachOpcode.UnsignedLt:			return newCmp2(i, X86Conds.C);
+			MachOpcode.UnsignedLteq:		return newCmp2(i, X86Conds.NA);
+			MachOpcode.UnsignedGt:			return newCmp2(i, X86Conds.A);
+			MachOpcode.UnsignedGteq:		return newCmp2(i, X86Conds.NC);
+			V3Opcode.BoolNot: {
+				var cmp = matchCmp(i.inputs(0).dest);
+				return X86CmpMatch.new(cmp.cond.negate, cmp.x, cmp.y, cmp.val);
+			}
+		}
+		return X86CmpMatch.new(X86Conds.NZ, i, null, null);
+	}
+	def matchScale(e: SsaDfEdge) -> (SsaInstr, int) {
+		var i = e.dest;
+		if (!soleEdge(e)) return (i, 1);
+		match (i.opcode()) {
+			V3Opcode.IntMul: {
+				var y = i.inputs(1).dest;
+				if (SsaValue.?(y)) { // match i = x * K
+					var scale = intVal(y);
+					match (scale) {
+						1, 2, 4, 8: return (i.inputs(0).dest, scale);
+					}
+				}
+			}
+			V3Opcode.IntShl: {
+				var y = i.inputs(1).dest;
+				if (SsaValue.?(y)) { // match i = x #<< K
+					var shift = intVal(y);
+					match (shift) {
+						0, 1, 2, 3: return (i.inputs(0).dest, 1 #<< shift);
+					}
+				}
+			}
+			V3Opcode.IntAdd: {
+				var x = i.inputs(0).dest;
+				if (i.inputs(1).dest == x) return (x, 2); // i = x + x
+			}
+		}
+		return (i, 1);
+	}
+	def matchInt(i: SsaInstr, val: int) -> bool {
+		return SsaValue.?(i) && Int.unbox(SsaValue.!(i).val) == val;
+	}
+	def newCmp2(i: SsaInstr, cond: X86Cond) -> X86CmpMatch {
+		var x = i.inputs(0).dest;
+		var y = i.inputs(1).dest;
+		if (SsaValue.?(y)) return X86CmpMatch.new(cond, x, null, val(y));
+		if (SsaValue.?(x) && cond.commute != null) return X86CmpMatch.new(cond.commute, y, null, val(x));
+		return X86CmpMatch.new(cond, x, y, null);
+	}
+
+	def gen_entry() {
+		// add defs of each parameter as the first instruction
+		var p = region.params, max = p.length;
+		var defs = Array<int>.new(max);
+		for (i = 0; i < max; i++) {
+			var pvar = makeVar(p(i)), loc = frame.conv.callerParam(i);
+			if (frame.conv.regSet.isReg(loc)) {
+				defs(i) = dfnAt(pvar, loc);
+				pvar.hint = byte.!(loc); // register hint
+			} else {
+				defs(i) = dfnAt(pvar, loc);
+				pvar.spill = loc; // reuse spill slot in caller frame
+			}
+		}
+		gen("entry", asm_entry, defs).live = true;
+	}
+	def asm_entry(defs: Array<int>) {
+		var adjust = frameAdjust();
+		if (adjust > 0) asm.sub.rm_i(X86Regs.ESP, adjust); // allocate frame
+	}
+
+	// ---------- Loads ----------------------------------------------
+	def gen_const(dest: MachVar, val: Val) {
+		gen("const", asm_const, (dfn(dest), val));
+	}
+	def asm_const(dest: int, val: Val) {
+		asm.movd_l_val(frame, loc(dest), val);
+	}
+	def gen_loadx(dest: MachVar, size: int, base: SsaInstr, scale: int, disp: int, canTrap: bool, source: Source) {
+		if (size == 4) gen("loadd", asm_loadx, (X86Assembler.movd_r_rm, dfngpr(dest), gpr(base), scale, disp, canTrap, source));
+		else if (size == 1) gen("loadb", asm_loadx, (X86Assembler.movbzx, dfngpr(dest), gpr(base), scale, disp, canTrap, source));
+		else if (size == 0) gen("test_i", asm_test_i, (gpr(base), scale, disp, 0, canTrap, source));
+		else if (size == 2) gen("loadw", asm_loadx, (X86Assembler.movwzx, dfngpr(dest), gpr(base), scale, disp, canTrap, source));
+		else mach.fail("invalid size for load");
+	}
+	def gen_loada(dest: MachVar, size: int, addr: Addr) {
+		if (size == 4) gen("loadd", asm_loada, (X86Assembler.movd_r_rm, dfngpr(dest), addr));
+		else if (size == 1) gen("loadb", asm_loada, (X86Assembler.movbzx, dfngpr(dest), addr));
+		else if (size == 2) gen("loadw", asm_loada, (X86Assembler.movwzx, dfngpr(dest), addr));
+		else mach.fail("invalid size for load");
+	}
+	def gen_loada_disp(dest: MachVar, size: int, addr: Addr, disp: SsaInstr) {
+		if (size == 4) gen("loadd", asm_loada_disp, (X86Assembler.movd_r_rm, dfngpr(dest), addr, gpr(disp)));
+		else if (size == 1) gen("loadb", asm_loada_disp, (X86Assembler.movbzx, dfngpr(dest), addr, gpr(disp)));
+		else if (size == 2) gen("loadw", asm_loada_disp, (X86Assembler.movwzx, dfngpr(dest), addr, gpr(disp)));
+		else mach.fail("invalid size for load");
+	}
+	def asm_loadx(m: (X86Assembler, X86Reg, X86Rm) -> void, dest: int, base: int, scale: int, disp: int, canTrap: bool, source: Source) {
+		var off = codeOffset();
+		m(asm, r(dest), X86Addr.new(r(base), scale, disp));
+		if (canTrap && rtsrc != null) rtsrc.recordSource(off, source);
+	}
+	def asm_loada(m: (X86Assembler, X86Reg, X86Rm) -> void, dest: int, addr: Addr) {
+		var pos = asm.pos();
+		m(asm, r(dest), X86Addrs.ABS_PATCH);
+		recordPatch(pos, addr);
+	}
+	def asm_loada_disp(m: (X86Assembler, X86Reg, X86Rm) -> void, dest: int, addr: Addr, disp: int) {
+		var pos = asm.pos();
+		m(asm, r(dest), r(disp).plus(X86Addrs.ABS_CONST));
+		recordPatch(pos, addr);
+	}
+	// ---------- Stores ----------------------------------------------
+	def gen_storex(size: int, base: SsaInstr, scale: int, disp: int, val: SsaInstr, canTrap: bool, source: Source) {
+		if (size == 4) gen("stored", asm_storex, (X86Assembler.movd_rm_r, gpr(base), scale, disp, gpr(val), canTrap, source));
+		else if (size == 1) gen("storeb", asm_storex, (X86Assembler.movb_rm_r, gpr(base), scale, disp, byt(val), canTrap, source));
+		else if (size == 0) gen("test_i", asm_test_i, (gpr(base), scale, disp, 0, canTrap, source));
+		else if (size == 2) gen("storew", asm_storex, (X86Assembler.movw_rm_r, gpr(base), scale, disp, gpr(val), canTrap, source));
+		else mach.fail("invalid size for store");
+	}
+	def gen_storex_i(size: int, base: SsaInstr, scale: int, disp: int, val: int, canTrap: bool, source: Source) -> bool {
+		if (size == 4) gen("stored_i", asm_storex_i, (X86Assembler.movd_rm_i, gpr(base), scale, disp, val, canTrap, source));
+		else if (size == 1) gen("storeb_i", asm_storex_i, (X86Assembler.movb_rm_i, gpr(base), scale, disp, val, canTrap, source));
+		else if (size == 0) gen("test_i", asm_test_i, (gpr(base), scale, disp, 0, canTrap, source));
+		else if (size == 2) gen("storew_i", asm_storex_i, (X86Assembler.movw_rm_i, gpr(base), scale, disp, val, canTrap, source));
+		else mach.fail("invalid size for store");
+		return true;
+	}
+	def asm_storex(m: (X86Assembler, X86Rm, X86Reg) -> void, base: int, scale: int, disp: int, val: int, canTrap: bool, source: Source) {
+		var off = codeOffset();
+		m(asm, X86Addr.new(r(base), scale, disp), r(val));
+		if (canTrap && rtsrc != null) rtsrc.recordSource(off, source);
+	}
+	def gen_storex_abs(size: int, addr: Addr, val: SsaInstr) {
+		if (size == 4) gen("stored_abs", asm_storex_abs, (X86Assembler.movd_rm_r, addr, gpr(val)));
+		else if (size == 1) gen("storeb_abs", asm_storex_abs, (X86Assembler.movb_rm_r, addr, byt(val)));
+		else if (size == 2) gen("storew_abs", asm_storex_abs, (X86Assembler.movw_rm_r, addr, gpr(val)));
+		else mach.fail("invalid size for store");
+	}
+	def asm_storex_abs(m: (X86Assembler, X86Rm, X86Reg) -> void, addr: Addr, val: int) {
+		var pos = asm.pos();
+		m(asm, X86Addrs.ABS_PATCH, r(val));
+		recordPatch(pos, addr);
+	}
+	def asm_storex_i(m: (X86Assembler, X86Rm, int) -> void, base: int, scale: int, disp: int, imm: int, canTrap: bool, source: Source) {
+		var off = codeOffset();
+		m(asm, X86Addr.new(r(base), scale, disp), imm);
+		if (canTrap && rtsrc != null) rtsrc.recordSource(off, source);
+	}
+	// ---------- Lea and test --------------------------------------------------
+	def gen_lea(dest: MachVar, base: SsaInstr, scale: int, disp: int) {
+		gen("lea", asm_lea, (dfngpr(dest), gpr(base), scale, disp));
+	}
+	def asm_lea(dest: int, base: int, scale: int, disp: int) {
+		asm.lea(r(dest), X86Addr.new(r(base), scale, disp));
+	}
+	def asm_test_i(base: int, scale: int, disp: int, imm: int, canTrap: bool, source: Source) {
+		var off = codeOffset();
+		asm.test_rm_i(X86Addr.new(r(base), scale, disp), imm);
+		if (canTrap && rtsrc != null) rtsrc.recordSource(off, source);
+	}
+	// ---------- Basic operations ----------------------------------------------
+	def gen_op2(name: string, commutative: bool, m: X86Assembler -> X86Op2, dest: MachVar, a: SsaInstr, b: SsaInstr) {
+		var f = if(commutative, asm_op2_comm, asm_op2);
+		gen(name, f, (m, dfngpr(dest), use(a), use(b), hint(a, dest)));
+	}
+	// ---------- Basic operations (immediate) ---------------------------------
+	def gen_op2_i(name: string, m: X86Assembler -> X86Op2, dest: MachVar, a: SsaInstr, imm: Val) {
+		if (imm == null || Box<int>.?(imm)) gen(name, asm_op2_i, (m, dfn(dest), use(a), Int.unbox(imm), hint(a, dest)));
+		else if (Addr.?(imm)) gen(name, asm_op2_a, (m, dfn(dest), use(a), Addr.!(imm), hint(a, dest)));
+		else mach.compiler.ERROR.fail("not a valid immediate");
+
+	}
+	def gen_add_i(dest: MachVar, a: SsaInstr, imm: int) {
+		gen("add_i", asm_add_i, (dfn(dest), use(a), imm, hint(a, dest)));
+	}
+	def gen_neg(dest: MachVar, a: SsaInstr) {
+		gen("neg", asm_neg, (dfn(dest), use(a), hint(a, dest)));
+	}
+	def gen_not(dest: MachVar, a: SsaInstr) {
+		gen("not", asm_not, (dfn(dest), use(a), hint(a, dest)));
+	}
+	def gen_add_a(dest: MachVar, a: SsaInstr, addr: Addr) {
+		gen("add_a", asm_op2_a, (X86Assembler.add, dfn(dest), use(a), addr, hint(a, dest)));
+	}
+	def asm_op2(m: X86Assembler -> X86Op2, dest: int, a: int, b: int, v: void) {
+		dest = loc(dest); a = loc(a); b = loc(b);
+		if (dest != a) {
+			if (dest == b) {
+				asm_movd_l_l(b, frame.conv.regSet.scratch);
+				b = frame.conv.regSet.scratch;
+			}
+			asm_movd_l_l(a, dest);
+		}
+		m(asm).r_rm(loc_r(dest), loc_rm(b));
+	}
+	def asm_op2_comm(m: X86Assembler -> X86Op2, dest: int, a: int, b: int, v: void) {
+		dest = loc(dest); a = loc(a); b = loc(b);
+		if (dest == a) return m(asm).r_rm(loc_r(dest), loc_rm(b)); // op(dest = a, b)
+		if (dest == b) return m(asm).r_rm(loc_r(dest), loc_rm(a)); // op(dest = b, a)
+		if (dest != a) asm_movd_l_l(a, dest);
+		m(asm).r_rm(loc_r(dest), loc_rm(b));
+	}
+	def asm_op2_i(m: X86Assembler -> X86Op2, dest: int, a: int, imm: int, v: void) {
+		m(asm).rm_i(resolveOp1(dest, a), imm);
+	}
+	def asm_add_i(dest: int, a: int, imm: int, v: void) {
+		dest = loc(dest); a = loc(a);
+		if (dest != a) {
+			if (frame.conv.regSet.isReg(dest) && frame.conv.regSet.isReg(a)) return asm.lea(loc_r(dest), loc_r(a).plus(imm));
+			asm_movd_l_l(a, dest);
+		}
+		asm.add.rm_i(loc_rm(dest), imm);
+	}
+	def asm_op2_a(m: X86Assembler -> X86Op2, dest: int, a: int, addr: Addr, v: void) {
+		var drm = resolveOp1(dest, a), pos = asm.pos();
+		m(asm).rm_i(drm, X86Addrs.ABS_CONST);
+		recordPatch(pos, addr);
+	}
+	def gen_cmp(a: SsaInstr, b: SsaInstr) {
+		gen("cmp", asm_cmp, (gpr(a), use(b)));
+	}
+	def gen_cmp_i(a: SsaInstr, imm: int) {
+		gen("cmp_i", asm_cmp_i, (use(a), imm));
+	}
+	def gen_cmp_a(a: SsaInstr, addr: Addr) {
+		gen("cmp_a", asm_cmp_a, (use(a), addr));
+	}
+	def asm_cmp(a: int, b: int) {
+		asm.cmp.r_rm(r(a), rm(b));
+	}
+	def asm_cmp_i(a: int, imm: int) {
+		asm.cmp.rm_i(rm(a), imm);
+	}
+	def asm_cmp_a(a: int, addr: Addr) {
+		var pos = asm.pos();
+		asm.cmp.rm_i(rm(a), X86Addrs.ABS_CONST);
+		recordPatch(pos, addr);
+	}
+	def asm_not(dest: int, a: int, v: void) {
+		asm.not(resolveOp1(dest, a));
+	}
+	def asm_neg(dest: int, a: int, v: void) {
+		asm.neg(resolveOp1(dest, a));
+	}
+	def resolveOp1(dest: int, a: int) -> X86Rm {
+		dest = loc(dest); a = loc(a);
+		if (dest != a) asm_movd_l_l(a, dest);
+		return loc_rm(dest);
+	}
+	// ---------- Shift operations ---------------------------------------------
+	def gen_shl(dest: MachVar, a: SsaInstr, b: SsaInstr, check: bool) {
+		var sh = if(check, asm_shift_check, asm_shift);
+		gen("shl", sh, (X86Assembler.shl_cl, dfn(dest), useFixed(b, X86MachRegs.ECX), use(a), hint(a, dest)));
+	}
+	def gen_shr(dest: MachVar, a: SsaInstr, b: SsaInstr, check: bool) {
+		var sh = if(check, asm_shift_check, asm_shift);
+		gen("shr", sh, (X86Assembler.shr_cl, dfn(dest), useFixed(b, X86MachRegs.ECX), use(a), hint(a, dest)));
+	}
+	def asm_shift(m: (X86Assembler, X86Rm) -> void, dest: int, cl: int, a: int, v: void) {
+		m(asm, resolveOp1(dest, a));
+	}
+	def asm_shift_check(m: (X86Assembler, X86Rm) -> void, dest: int, cl: int, a: int, v: void) {
+		// XXX: are shift checks possible without a branch?
+		dest = loc(dest); a = loc(a);
+		asm.cmp.rm_i(X86Regs.ECX, 32);
+		asm.jnc(0);
+		var jump1 = asm.pos();
+
+		if (dest != a) {
+			if (dest == X86MachRegs.ECX) {
+				// don't overwrite ECX before shift, use scratch
+				var s = frame.conv.regSet.scratch;
+				asm_movd_l_l(a, s);
+				m(asm, loc_rm(s));
+				asm_movd_l_l(s, dest);
+			} else {
+				// move shiftor into destination first
+				asm_movd_l_l(a, dest);
+				m(asm, loc_rm(dest));
+			}
+		} else {
+			// no moves necessary
+			m(asm, loc_rm(dest));
+		}
+		asm.jmp(0);
+		var jump2 = asm.pos();
+
+		asm.movd_rm_i(loc_rm(dest), 0);
+		var end = asm.pos();
+		asm.encoder.at(jump1 - 1).i1(byte.!(jump2 - jump1));
+		asm.encoder.at(jump2 - 1).i1(byte.!(end - jump2));
+		asm.encoder.atEnd();
+	}
+	def gen_shl_i(dest: MachVar, a: SsaInstr, imm: int) {
+		gen("shl_i", asm_shift_i, (X86Assembler.shl_i, dfn(dest), use(a), imm, hint(a, dest)));
+	}
+	def gen_shr_i(dest: MachVar, a: SsaInstr, imm: int) {
+		gen("shr_i", asm_shift_i, (X86Assembler.shr_i, dfn(dest), use(a), imm, hint(a, dest)));
+	}
+	def asm_shift_i(m: (X86Assembler, X86Rm, int) -> void, dest: int, a: int, imm: int, v: void) {
+		m(asm, resolveOp1(dest, a), imm);
+	}
+	// ---------- Multiply / Divide -------------------------------------------
+	def gen_imul  (dest: MachVar, a: SsaInstr, b: SsaInstr) {
+		gen("imul", asm_imul, (dfngpr(dest), use(a), use(b), hint(a, dest)));
+	}
+	def asm_imul(dest: int, a: int, b: int, v: void) {
+		dest = loc(dest); a = loc(a); b = loc(b);
+		if (dest == a) return asm.imul_r_rm(loc_r(dest), loc_rm(b)); // op(dest = a, b)
+		if (dest == b) return asm.imul_r_rm(loc_r(dest), loc_rm(a)); // op(dest = b, a)
+		if (dest != a) asm_movd_l_l(a, dest);
+		asm.imul_r_rm(loc_r(dest), loc_rm(b));
+	}
+	def gen_imul_i(dest: MachVar, a: SsaInstr, imm: int) {
+		gen("imul_i", asm_imul_i, (dfngpr(dest), use(a), imm, hint(a, dest)));
+	}
+	def asm_imul_i(dest: int, a: int, imm: int, v: void) {
+		dest = loc(dest); a = loc(a);
+		if (dest != a) asm_movd_l_l(a, dest);
+		asm.imul_r_i(loc_r(dest), imm);
+	}
+	def asm_idiv(b: int, zeroCheck: bool, source: Source) {
+		asm.cdq();
+		var off = codeOffset();
+		asm.idiv(rm(b));
+		if (zeroCheck && rtsrc != null) rtsrc.recordSource(off, source);
+	}
+	def gen_set(cond: X86Cond, a: MachVar) {
+		gen("set", asm_set, (cond, dfnAt(a, X86MachRegs.BYTE)));
+	}
+	def asm_set(cond: X86Cond, a: int) {
+		var reg = r(a);
+		asm.setx(cond, reg);
+		asm.movbzx(reg, reg); // XXX: make movzbx unnecessary
+	}
+	def gen_br(cond: X86Cond, target: SsaBlock) {
+		gen(if(cond == null, "jmp", "br"), asm_br, (cond, target));
+	}
+	def asm_br(cond: X86Cond, target: SsaBlock) {
+		asm.jmpx(cond, X86Addrs.REL_CONST);
+		recordBranch(asm.pos() - 4, target);
+	}
+	def asm_brthrow(cond: X86Cond, ex: string, source: Source) {
+		asm.jmpx_addr(cond, rt.getExceptionDest(codeOffset(), ex, source));
+	}
+	def gen_phi_dfn(phis: SsaPhis) {
+		phiList = List.new(phis, phiList);
+		gen("phi_dfn", asm_nop, ()).live = true;
+	}
+	def asm_nop() {
+		// do nothing.
+	}
+	def asm_phi_resolve(pos: int) {
+		// do nothing. all moves should be inserted by main emit() loop
+	}
+	def asm_ret() {
+		var adjust = frameAdjust();
+		if (adjust > 0) asm.add.rm_i(X86Regs.ESP, adjust); // deallocate frame
+		asm.ret();
+	}
+	def asm_call(conv: MachCallConv, lp: int, target: Addr, source: Source) {
+		asm.call_addr(target);
+		var off = codeOffset();
+		if (rtgc != null) rtgc.recordStackRefMap(off, buildStackMap(conv, lp));
+		if (rtsrc != null) rtsrc.recordReturnSource(off, source);
+	}
+	def asm_icall(conv: MachCallConv, lp: int, addr: int, source: Source) {
+		// TODO: record canTrap for indirect calls
+		asm.icall(rm(addr));
+		var off = codeOffset();
+		if (rtgc != null) rtgc.recordStackRefMap(off, buildStackMap(conv, lp));
+		if (rtsrc != null) rtsrc.recordReturnSource(off, source);
+	}
+	def buildStackMap(conv: MachCallConv, lp: int) -> int {
+		var builder = rtgc.beginRefMap(frame.slots(), 20);
+		if (conv != null && conv.overflow > 0) {
+			// record any outgoing overflow parameters that are references
+			var pt = conv.paramTypes, rs = conv.regSet;
+			for (i = 0; i < pt.length; i++) {
+				var ploc = conv.calleeParam(i);
+				if (rs.isStack(ploc) && mach.isRefType(pt(i))) {
+					builder.setRefMap(ploc - rs.calleeStart);
+				}
+			}
+		}
+		if (refSlots == null) computeRefSlots(); // lazily compute reference slots
+		var width = lsra.livemap.width, start = width * lp;
+		var bits = lsra.livemap.bits;
+		// for each live variable, set the appropriate bit (if any) in the stackmap
+		for (i = 0; i < width; i++) {
+			var vnum = i * 32;
+			for (b = bits(i + start); b != 0; b = b #>> 1) {
+				if ((b & 1) != 0) { // variable is live
+					var refSlot = refSlots(vnum);
+					if (refSlot > 0) builder.setRefMap(refSlot - 1 + frame.spillArgs);
+				}
+				vnum++;
+			}
+		}
+		return builder.finishRefMap();
+	}
+	// compute the reference slot index for each (not dead) MachVar
+	def computeRefSlots() {
+		// XXX: pull this code up to MachCodeGen--currently depends on frame layout
+		refSlots = Array<int>.new(vars.length);
+		var regSet = frame.conv.regSet;
+		for (i = 0; i < refSlots.length; i++) {
+			var machVar = vars.get(i);
+			if (machVar.live && machVar.ssa != null && mach.isRefType(machVar.ssa.getType())) {
+				var spill = machVar.spill;
+				if (spill >= regSet.spillStart && spill < regSet.callerStart) {
+					refSlots(i) = 1 + spill - regSet.spillStart;
+				}
+			}
+		}
+	}
+	def asm_throw(source: Source, ex: string) {
+		asm.jmpx_addr(null, rt.getExceptionDest(codeOffset(), ex, source));
+	}
+
+	// generates a single X86Instr and adds it to the "code" sequence
+	def gen<T>(name: string, f: T -> void, params: T) -> MachInstr {
+		var i = X86Instr.new(name, f, params);
+		if (curValMoves != null) {
+			i.moves = MachMoves.new();
+			i.moves.valMoves = curValMoves;
+			curValMoves = null;
+		}
+		i.useStart = curUse;
+		i.useEnd = uses.length;
+		curUse = uses.length;
+		code.add(i);
+		return i;
+	}
+
+	def gpr(a: SsaInstr) -> int {
+		return useAt(makeVar(a), X86MachRegs.GPR);
+	}
+	def dfngpr(a: MachVar) -> int {
+		return dfnAt(a, X86MachRegs.GPR);
+	}
+	def byt(a: SsaInstr) -> int {
+		return useAt(makeVar(a), X86MachRegs.BYTE);
+	}
+	def use(a: SsaInstr) -> int {
+		return useAt(makeVar(a), 0);
+	}
+	def useFixed(a: SsaInstr, fixed: int) -> int {
+		return useAt(makeVar(a), fixed);
+	}
+	def dfn(a: MachVar) -> int {
+		return dfnAt(a, 0);
+	}
+	// get the location assignment for a use position
+	def loc(usepos: int) -> int {
+		return lsra.getAssignment(usepos);
+	}
+	// convert a use into an x86 register
+	def r(usepos: int) -> X86Reg {
+		return loc_r(loc(usepos));
+	}
+	// convert a use into an x86 register/memory
+	def rm(usepos: int) -> X86Rm {
+		return loc_rm(loc(usepos));
+	}
+	def recordBranch(pos: int, target: SsaBlock) {
+		branches = List.new((pos, target), branches);
+	}
+	def print() {
+		if (lsra != null) lsra.print();
+	}
+	// amount to adjust the frame at the beginning and end of invocation
+	def frameAdjust() -> int {
+		return frame.size() - mach.code.addressSize; // assumes return address already pushed
+	}
+	def allocMoveTmp() -> int {
+		return frame.conv.regSet.scratch;
+	}
+	def loc_r(loc: int) -> X86Reg {
+		return asm.loc_r(loc); // XXX: inline
+	}
+	def loc_rm(loc: int) -> X86Rm {
+		return asm.loc_rm(frame, loc); // XXX: inline?
+	}
+	def asm_movd_l_l(src: int, dst: int) {
+		if (src <= 0) return; // nothing to do
+		if (src == dst) return; // nothing to do
+		asm.movd_rm_rm(asm.loc_rm(frame, dst), asm.loc_rm(frame, src), null);
+	}
+	def recordPatch(start: int, addr: Addr) {
+		asm.recordPatch(start, addr);
+	}
+	def emitMoves(mr: MoveResolver) {
+		if (mr != null) mr.genMoves(allocMoveTmp, asm_movd_l_l);
+	}
+	def emitVarMoves(list: List<(int, int)>) {
+		var mr = MoveResolver.new(mach.compiler.ERROR);
+		for (l = list; l != null; l = l.tail) mr.addMove(loc(l.head.0), loc(l.head.1));
+		mr.genMoves(allocMoveTmp, asm_movd_l_l);
+	}
+	def emitValMoves(list: List<(Val, int)>) {
+		for (l = list; l != null; l = l.tail) asm.movd_l_val(frame, loc(l.head.1), l.head.0);
+	}
+	def codeOffset() -> int {
+		return encoder.pos - codeStartOffset;
+	}
+}
+// An extended X86Assembler that has additional machine-level utilities, such as
+// recording patch locations and translating between regset locations and x86
+// registers/memory.
+class X86MachAssembler extends X86Assembler {
+	def mach: MachProgram;		  // machine program
+	def machEncoder: MachDataEncoder; // machine-level encoder
+	def regSet: MachRegSet;		  // register set in use
+
+	new(mach, machEncoder) : super(machEncoder) { }
+	// call an absolute address and record the patch location
+	def call_addr(addr: Addr) {
+		call(X86Addrs.REL_CONST);
+		machEncoder.recordPatch(addr, machEncoder.pos - 4);
+	}
+	// jump (conditionally) to an absolute address and record the patch location
+	def jmpx_addr(cond: X86Cond, addr: Addr) {
+		jmpx(cond, X86Addrs.REL_CONST);
+		machEncoder.recordPatch(addr, machEncoder.pos - 4);
+	}
+	// a macro to move between any two register/memory operands
+	def movd_rm_rm(d: X86Rm, s: X86Rm, scratch: X86Reg) {
+		if (s == d) return;
+		if (X86Reg.?(d)) return movd_r_rm(X86Reg.!(d), s);
+		if (X86Reg.?(s)) return movd_rm_r(d, X86Reg.!(s));
+		if (scratch != null) {
+			movd_r_rm(scratch, s);
+			movd_rm_r(d, scratch);
+		}
+		// XXX: use XMM register for memory-memory move instead of stack
+		push(s);            // push value from source memory onto the stack
+		pop(X86Addr.!(d));  // pop value off stack into destination memory
+	}
+	// a macro to move a value into a location
+	def movd_l_val(frame: MachFrame, loc: int, val: Val) {
+		var d = loc_rm(frame, loc);
+		if (val == null) {
+			if (X86Reg.?(d)) xor.r_rm(X86Reg.!(d), X86Reg.!(d));
+			else movd_rm_i(d, 0);
+		} else if (Addr.?(val)) {
+			var pos = encoder.pos;
+			movd_rm_i(d, X86Addrs.ABS_CONST);
+			recordPatch(pos, Addr.!(val));
+		} else {
+			movd_rm_i(d, V3.unboxIntegral(val));
+		}
+	}
+	// convert a location into an x86 register
+	def loc_r(loc: int) -> X86Reg {
+		match(loc) {
+			X86MachRegs.EAX: return X86Regs.EAX;
+			X86MachRegs.EBX: return X86Regs.EBX;
+			X86MachRegs.ECX: return X86Regs.ECX;
+			X86MachRegs.EDX: return X86Regs.EDX;
+			X86MachRegs.ESI: return X86Regs.ESI;
+			X86MachRegs.EDI: return X86Regs.EDI;
+			X86MachRegs.EBP: return X86Regs.EBP;
+		}
+		return failLocation("required x86 register", loc);
+	}
+	// convert a location into an x86 register/memory reference
+	def loc_rm(frame: MachFrame, loc: int) -> X86Rm {
+		match(loc) {
+			0: return failLocation("unassigned location", loc);
+			X86MachRegs.EAX: return X86Regs.EAX;
+			X86MachRegs.EBX: return X86Regs.EBX;
+			X86MachRegs.ECX: return X86Regs.ECX;
+			X86MachRegs.EDX: return X86Regs.EDX;
+			X86MachRegs.ESI: return X86Regs.ESI;
+			X86MachRegs.EDI: return X86Regs.EDI;
+			X86MachRegs.EBP: return X86Regs.EBP;
+		}
+		var regSet = frame.conv.regSet, wordSize = mach.data.addressSize, offset: int;
+		if (loc >= regSet.calleeStart) offset = wordSize * (loc - regSet.calleeStart);
+		else if (loc >= regSet.callerStart) offset = frame.size() + (wordSize * (loc - regSet.callerStart));
+		else if (loc >= regSet.spillStart) offset = wordSize * (loc - regSet.spillStart + frame.spillArgs);
+		else return failLocation("invalid spill location", loc);
+		return X86Regs.ESP.plus(offset);
+	}
+	def failLocation(msg: string, loc: int) -> X86Reg {
+		mach.compiler.ERROR.fail(Strings.format2("%1: %2", msg, regSet.identify(loc)));
+		return X86MachRegs.SCRATCH;
+	}
+	// patch an absolute address, scanning backwards up to "start"
+	def recordPatch(start: int, target: Addr) {
+		// scan backwards, looking for the absolute constant
+		var data = encoder.array;
+		for (i = encoder.pos; i >= start; i--) {
+			if (data(i-4) != X86Addrs.ABS_CONST0) continue;
+			if (data(i-3) != X86Addrs.ABS_CONST1) continue;
+			if (data(i-2) != X86Addrs.ABS_CONST2) continue;
+			if (data(i-1) != X86Addrs.ABS_CONST3) continue;
+			return machEncoder.recordPatch(target, i - 4);
+		}
+		mach.fail("Could not find absolute constant to patch");
+	}
+}

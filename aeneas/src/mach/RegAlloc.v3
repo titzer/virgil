@@ -1,0 +1,687 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class LsraPoint {
+	def machVar: MachVar;
+	var pos: int;
+	var next: LsraPoint;
+	var prev: LsraPoint;
+	new(pos, machVar) { }
+}
+class LsraUse extends LsraPoint {
+	def useStart: int;
+	var useEnd: int;
+	new(pos: int, useStart) : super(pos, null) { }
+}
+class LsraDef extends LsraPoint {
+	def defStart: int;
+	var defEnd: int;
+	new(pos: int, defStart) : super(pos, null) { }
+}
+class LsraStart extends LsraPoint {
+	new(pos: int, machVar: MachVar) : super(pos, machVar) { }
+}
+class LsraEnd extends LsraPoint {
+	new(pos: int, machVar: MachVar) : super(pos, machVar) { }
+}
+class LsraLive extends LsraPoint {
+	def index: int;
+	new(pos: int, index) : super(pos, null) { }
+}
+class LsraKill extends LsraPoint {
+	def regset: int;
+	new(pos: int, regset) : super(pos, null) { }
+}
+
+// Linear scan register allocator. Note that this implementation has a number of
+// requirements that are guaranteed by SSA form. In particular:
+//   1. Each MachVar has at most one definition, which dominates all uses
+//   2. Block order preserves dominance; A dom B => A.start < B.start
+//   3. Loops are reducible and their bodies are contiguous
+//   4. Uses/defs of variables in each instruction follow a particular order
+// These guarantees must be established by a code generator or incorrect register
+// assignments may occur. Violations may or may not be detected by this implementation.
+class LinearScanRegAlloc {
+	def gen: MachCodeGen;
+	def regSet: MachRegSet;
+	def vars = gen.vars.array; // XXX dirty: internal array access
+	def uses = gen.uses.array; // XXX dirty: internal array access
+	def regState = Array<MachVar>.new(regSet.physRegs + 1);
+	def PARANOID = false;
+	def livemap  = BitMatrix.new(gen.numLivePoints, vars.length);
+	var freeSpills: Sequence<(int, int)>;
+	var freeSpillPos: int;
+	var activeList: MachVar;
+	var curPoint: LsraPoint;
+
+	var pointList: LsraPoint;
+
+	new(gen, regSet) { }
+
+	def assignRegs() {
+		pointList = IntervalBuilder.new(gen, regSet).buildIntervals();
+		// iterate over intervals and assign registers
+		for (p = pointList; p != null; p = p.next) {
+			curPoint = p;
+			if (LsraStart.?(p)) makeActive(LsraStart.!(p).machVar);
+			else if (LsraEnd.?(p)) assignEnd(p);
+			else if (LsraUse.?(p)) assignUses(LsraUse.!(p));
+			else if (LsraDef.?(p)) assignDef(LsraDef.!(p));
+			else if (LsraLive.?(p)) recordLive(LsraLive.!(p).index);
+			else if (LsraKill.?(p)) assignKill(LsraKill.!(p));
+		}
+	}
+	def recordLive(index: int) {
+		for (l = activeList; l != null; l = l.next) {
+			livemap.set(index, l.varNum);
+		}
+	}
+	def makeActive(machVar: MachVar) {
+		if (machVar.reg > 0) {
+//			if (PARANOID && regState(machVar.reg) != null) fail("register conflict on var %1", machVar.varNum);
+			regState(machVar.reg) = machVar;
+		}
+		// add to the active list
+//		if (PARANOID && (machVar.next != null || machVar.prev != null)) fail("var %1 should not be in list", machVar.varNum);
+		var prev = activeList;
+		machVar.next = prev;
+		activeList = machVar;
+		if (prev != null) prev.prev = machVar;
+	}
+	def assignEnd(p: LsraPoint) {
+		// remove from active list
+		var pos = p.pos;
+		var machVar = p.machVar, p = machVar.prev, n = machVar.next;
+		if (p != null) p.next = n;
+		if (n != null) n.prev = p;
+		machVar.prev = null;
+		machVar.next = null;
+		if (activeList == machVar) activeList = n;
+		if (machVar.reg > 0) {
+			// free the register
+//			if (PARANOID && regState(machVar.reg) != machVar) fail("var %1 should be in register", machVar.varNum);
+			regState(machVar.reg) = null;
+		}
+		// free the spill slot after the last range of the variable
+		var spill = machVar.spill;
+		if (spill != 0 && machVar.endPos <= pos) {
+			// reuse spill slots that are not on the caller frame
+			if (!regSet.isCallerStack(spill)) freeSpill(spill);
+		}
+	}
+	def assignUses(p: LsraUse) {
+		if (checkUseConstraints(p.useStart, p.useEnd)) return;
+		var mm = allocMovesAt(p.pos), before = mm.before;
+		// process all uses
+		for (i = p.useStart; i < p.useEnd; i = i + 2) {
+			var fixed = getFixed(i), machVar = getVar(i), vloc = machVar.loc();
+			if (fixed == 0) {
+				// process unconstrained use
+				var result = allocRegOrSpill(mm, machVar);
+				before.addMove(vloc, result);
+				setAssignment(i, result);
+			} else if (regSet.isMultiple(fixed)) {
+				// process register set use
+				var result = allocFromRegSet(mm, vloc, fixed);
+				before.addMove(vloc, result);
+				setAssignment(i, result);
+			} else {
+				// process single location use
+				if (machVar.reg == fixed) before.addMove(-1, machVar.reg); // mark as used
+				else if (regSet.isStack(fixed)) before.addMove(vloc, fixed); // store to spill
+				else before.addMove(vloc, spillTempReg(mm, fixed)); // move value into reg
+				setAssignment(i, fixed);
+			}
+		}
+	}
+	def allocFromRegSet(mm: MachMoves, vloc: int, fixed: int) -> int {
+		// check if the var is in suitable location
+		var mr = mm.before, node = mr.getNode(vloc);
+		if (regSet.isInRegSet(vloc, fixed) && isUsable(node)) {
+			mr.addMove(-1, vloc);
+			return vloc;
+		}
+		if (node != null) {
+			for (n = node.dstList; n != null; n = n.dstNext) {
+				// check node aliases for match
+				if (regSet.isInRegSet(n.loc, fixed)) return n.loc;
+			}
+		}
+		// allocate a register in the set, spilling one if necessary
+		var regs = regSet.regSets(fixed), pick = 0;
+		for (i = 0; i < regs.length; i++) {
+			var reg = regs(i);
+			if (!mr.isOverwritten(reg)) { // free and not overwritten
+				if (regState(reg) == null) return reg;
+				pick = reg;
+			}
+		}
+		// no free register found, spill the last one not used in this instr
+		if (pick == 0) {
+			fail("could not allocate or spill register in set %1", regSet.identify(fixed));
+			return 0;
+		}
+		return spillTempReg(mm, pick);
+	}
+	def allocRegOrSpill(mm: MachMoves, machVar: MachVar) -> int {
+		// check if the var is in suitable location
+		var vloc = machVar.loc(), mr = mm.before, node = mr.getNode(vloc);
+		if (vloc > 0 && isUsable(node)) {
+			mr.addMove(-1, vloc);
+			return vloc;
+		}
+		if (node != null) {
+			// check node aliases for match
+			for (n = node.dstList; n != null; n = n.dstNext) {
+				if (n.loc > 0) return n.loc;
+			}
+		}
+		// allocate a free register
+		for (i = 1; i < regState.length; i++) {
+			if (regState(i) == null && !mr.isOverwritten(i)) return i;
+		}
+		// no free register, allocate a spill slot and immediately free it
+		if (machVar.isConst()) return freeSpill(allocSpill());
+		else return spillVar(machVar);
+	}
+	def allocSpill() -> int {
+		if (freeSpills == null) return gen.frame.allocSpill();
+		var pos = curPoint.pos;
+		while (freeSpillPos < freeSpills.length) {
+			// allocate spill from free list if possible
+			var t = freeSpills.get(freeSpillPos);
+			if (pos < t.0) break;    // not free yet
+			freeSpillPos++;
+			if (t.1 > 0) return t.1; // spill is now free
+		}
+		return gen.frame.allocSpill();
+	}
+	def freeSpill(spill: int) -> int {
+		if (freeSpills == null) freeSpills = Sequence.new();
+		freeSpills.add(curPoint.pos + 1, spill); // will be free on next position
+		return spill;
+	}
+	def isUsable(node: MoveNode) -> bool {
+		return node == null || node.src == null || node.src.loc == -1;
+	}
+	def assignDef(p: LsraDef) {
+		var fixedList: List<(int, int)>;
+		// process all defs
+		for (i = p.defStart; i < p.defEnd; i = i + 2) {
+			var fixed = getFixed(i), machVar = getVar(i);
+			var used = (uses(i) & gen.UNUSED_MASK) == 0;
+			var dloc: int, vloc: int;
+			if (fixed == 0) {
+				// no constraint on variable placement
+				dloc = vloc = allocReg(machVar);
+			} else if (regSet.isMultiple(fixed)) {
+				// variable def must be from set
+				dloc = allocOrSpill(machVar, fixed);
+				vloc = machVar.loc();
+			} else {
+				// variable def is fixed to a single physical location
+				setAssignment(i, fixed);
+				if (regSet.isReg(fixed)) {
+					if (regState(fixed) == null) {
+						machVar.reg = byte.!(fixed);
+						if (used) makeActive(machVar);
+						continue;
+					}
+					spillTempReg(allocMovesAt(p.pos), fixed);
+				}
+				fixedList = List.new((i, fixed), fixedList);
+				continue;
+			}
+
+			if (regSet.isReg(dloc) && regState(dloc) != null) {
+				spillTempReg(allocMovesAt(p.pos), dloc);
+			}
+			if (used) {
+				if (dloc != vloc) allocMovesAt(p.pos).after.addMove(dloc, vloc);
+				makeActive(machVar);
+			}
+			setAssignment(i, dloc);
+		}
+		// process fixed defs that couldn't be allocated to their respective locations
+		for (l = fixedList; l != null; l = l.tail) {
+			var i = l.head.0, dloc = l.head.1, machVar = getVar(i);
+			var vloc = allocReg(machVar);
+			
+			if ((uses(i) & gen.UNUSED_MASK) == 0) {
+				allocMovesAt(p.pos).after.addMove(dloc, vloc);
+				makeActive(machVar);
+			} else if (machVar.spill > 0) {
+				// XXX: reuse spill of dead vars
+			}
+		}
+	}
+	// allocate a register in the given set, spilling one if necessary
+	def allocOrSpill(machVar: MachVar, fixed: int) -> int {
+		var regs = regSet.regSets(fixed);
+		for (i = 0; i < regs.length; i++) {
+			var r = regs(i);
+			if (regState(r) == null) return machVar.reg = byte.!(r);
+		}
+		// couldn't find free reg in set, search for another register anyway
+		allocReg(machVar);
+		return regs(0); // TODO: choose a different a register if multiple defs
+	}
+	// allocate a register for the variable if possible, but don't spill others
+	def allocReg(machVar: MachVar) -> int {
+		// first check the definition point
+		if (machVar.hint != 0) {
+			// look for a register in the hint set next
+			var regs = regSet.regSets(machVar.hint);
+			for (i = 0; i < regs.length; i++) {
+				var r = regs(i);
+				if (regState(r) == null) return machVar.reg = byte.!(r);
+			}
+		}
+		// no hint, or nothing in the hint set is available
+		for (i = 1; i < regState.length; i++) {
+			if (regState(i) == null) return machVar.reg = byte.!(i);
+		}
+		spillVar(machVar);
+		return machVar.spill;
+	}
+	// check each used var/const against use site constraints
+	def checkUseConstraints(start: int, end: int) -> bool {
+		for (i = start; i < end; i = i + 2) {
+			var machVar = getVar(i), vloc = machVar.loc(), fixed = getFixed(i);
+			if (fixed == 0) {
+				if (vloc < 0) return false; // constant
+				continue;
+			}
+			if (vloc == fixed) continue;
+			if (regSet.isRegSet(fixed)) {
+				if (vloc < 0) return false; // constant
+				if (!regSet.isInRegSet(vloc, fixed)) return false;
+				continue;
+			}
+			return false;
+		}
+		return true;
+	}
+	// spill all variables in the given register set at this location
+	def assignKill(p: LsraKill) {
+		var regs = regSet.regSets(p.regset);
+		var mm: MachMoves;
+		for (r in regs) {
+			if (regState(r) != null) {
+				if (mm == null) mm = allocMovesAt(p.pos);
+				spillTempReg(mm, r);
+			}
+		}
+	}
+	def spillVar(machVar: MachVar) -> int {
+		if (machVar.spill == 0) machVar.spill = allocSpill();
+		return machVar.spill;
+	}
+	def spillTempReg(mm: MachMoves, reg: int) -> int {
+		var machVar = regState(reg);
+		if (machVar != null) {
+			spillVar(machVar);
+			mm.before.addMove(machVar.reg, machVar.spill);
+			mm.after.addMove(machVar.spill, machVar.reg);
+		}
+		return reg;
+	}
+	def allocMovesAt(pos: int) -> MachMoves {
+		var mi = gen.code.get(pos #>> 1), mm = mi.moves;
+		if (mm == null) mm = mi.moves = MachMoves.new();
+		if (mm.before == null) mm.before = MoveResolver.new(gen.mach.compiler.ERROR);
+		if (mm.after == null) mm.after = MoveResolver.new(gen.mach.compiler.ERROR);
+		return mm;
+	}
+	// gets the register or spill location assigned to the variable at the use/def site
+	def getAssignment(usepos: int) -> int {
+		// check for a site-specific assignment first
+		var u = uses(usepos), result: int;
+		if ((u & gen.ASSIGNED_MASK) == 0) result = gen.varOfUse(usepos).loc();
+		else result = uses(usepos + 1);
+		if (result <= 0) gen.mach.compiler.ERROR.fail(Strings.format1("invalid location @ usepos: %1", usepos));
+		return result;
+	}
+	def print() {
+		IntervalPrinter.new(gen, regSet, pointList).print();
+	}
+	def getVar(usepos: int) -> MachVar {
+		return vars(uses(usepos) #>> gen.VAR_SHIFT);
+	}
+	def getFixed(usepos: int) -> int {
+		return uses(usepos + 1);
+	}
+	def setAssignment(usepos: int, loc: int) {
+		uses(usepos) = gen.ASSIGNED_MASK | uses(usepos);
+		uses(usepos + 1) = loc;
+		if (loc <= 0) fail("invalid location", ());
+	}
+	def fail<T>(msg: string, p: T) {
+		var fmt = Strings.format1(msg, p);
+		fmt = Strings.format2("LSRA @ %1: %2", curPoint.pos, fmt);
+		gen.mach.compiler.ERROR.fail(fmt);
+	}
+}
+
+// Builds a list of LSRA "points" that represent starts and ends of intervals, sorted
+// by increasing code position
+class IntervalBuilder {
+	def gen: MachCodeGen;
+	def regSet: MachRegSet;
+	def vars = gen.vars.array; // variables
+	def uses = gen.uses.array; // uses
+	def PARANOID: bool = false;
+	var pointList: LsraPoint;	// points sorted in code position order
+
+	new(gen, regSet) { }
+
+	def buildIntervals() -> LsraPoint {
+		// iterate blocks backwards
+		var blocks = gen.blocks.order;
+		var livein = BitMatrix.new(blocks.length, vars.length);
+		for (i = blocks.length - 1; i >= 0; i--) {
+			// for each block in reverse order
+			var b = blocks.get(i);
+			processBlock(b, livein, i);
+			if (b.loop != null) finishLoop(b, livein.range(i, i + 1));
+			if (i > 0) finishBlock(b, livein, i, i - 1);
+		}
+		// process instruction(s) before first block
+		processInstrs(0, blocks.get(0).start, livein, 0);
+		return pointList;
+	}
+	def processInstrs(start: int, end: int, livein: BitMatrix, blindex: int) {
+		var code = gen.code;
+		for (i = end - 1; i >= start; i--) {
+			// for each instruction in reverse order
+			var mi = code.get(i), pos = i * 2;
+			if (!mi.live) continue;
+			processUses(livein, blindex, pos, mi);
+		}
+	}
+	def processBlock(b: SsaBlockInfo, livein: BitMatrix, blindex: int) {
+		// process instructions in this block
+		processInstrs(b.start, b.end, livein, blindex);
+		// propagate live-in information to predecessors' liveout
+		for (l = b.block.pred(); l != null; l = l.next) {
+			livein.or(l.src.mark, blindex);
+		}
+	}
+	def finishBlock(b: SsaBlockInfo, livein: BitMatrix, bnum: int, pnum: int) {
+		// add a start for all variables live at the start of this block
+		// that are not also live at the end of the previous block
+		// (note that the previous block is not necessarily a predecessor of this)
+		var blockStartPos = b.start * 2, bi = bnum * livein.width, pi = pnum * livein.width;
+		for (i = 0; i < livein.width; i++) {
+			var vnum = i * 32, bb = livein.bits(bi + i), pb = livein.bits(pi + i);
+			for (bits = bb & (-1 ^ pb); bits != 0; bits = bits #>> 1) {
+				if ((bits & 1) != 0) insertHead(LsraStart.new(blockStartPos, vars(vnum)));
+				vnum++;
+			}
+		}
+		// add ends for all variables live at the end of the previous block
+		// that are not also live at the start of this block
+		for (i = 0; i < livein.width; i++) {
+			var vnum = i * 32, bb = livein.bits(bi + i), pb = livein.bits(pi + i);
+			for (bits = (-1 ^ bb) & pb; bits != 0; bits = bits #>> 1) {
+				if ((bits & 1) != 0) insertHead(LsraEnd.new(blockStartPos, vars(vnum)));
+				vnum++;
+			}
+		}
+		// all other variables are live at both the start of this and the end of previous
+	}
+	def processUses(livein: BitMatrix, blindex: int, pos: int, mi: MachInstr) {
+//		if (PARANOID) checkUseOrder(pos, mi.useStart, mi.useEnd);
+		var max = mi.useEnd;
+		var defPoint: LsraDef, usePoint: LsraUse;
+		// assumes order of defs, kills/liveness, uses
+		for (i = mi.useStart; i < max; i = i + 2) {
+			var u = uses(i), uv = u & gen.TYPE_MASK, fixed = uses(i + 1);
+			if (uv == gen.DEF) {
+				// process def of variable
+				var vnum = u #>> gen.VAR_SHIFT;
+				if (defPoint == null) insertHead(defPoint = LsraDef.new(pos + 1, i));
+				if (!livein.clear(blindex, vnum)) uses(i) = uses(i) | gen.UNUSED_MASK;
+				defPoint.defEnd = i + 2;
+			} else if (uv == gen.USE) {
+				// process use of variable
+				var vnum = u #>> gen.VAR_SHIFT, machVar = vars(vnum);
+				if (usePoint == null) insertHead(usePoint = LsraUse.new(pos, i));
+				if (!machVar.isConst()) {
+					if (!livein.set(blindex, vnum)) insertHead(LsraEnd.new(pos, machVar));
+					if (machVar.hint == 0 && regSet.isReg(fixed)) machVar.hint = byte.!(fixed);
+					if (pos > machVar.endPos) machVar.endPos = pos;
+				}
+				usePoint.useEnd = i + 2;
+			} else if (uv == gen.KILL) {
+				// process killing of register set
+				insertHead(LsraKill.new(pos, fixed));
+			} else if (uv == gen.LIVE) {
+				// process livepoint, which records what is live at this point
+				insertHead(LsraLive.new(pos, u #>> gen.VAR_SHIFT));
+			}
+		}
+	}
+	def checkUseOrder(pos: int, usepos: int, max: int) {
+		// check that defs and uses appear in the correct order
+		var NONE = 0, DEF_FIXED = 1, DEF_SET = 2, DEF = 3, KILL = 4, USE_FIXED = 5, USE_SET = 6, USE = 7;
+		var state = NONE;
+		for (i = usepos; i < max; i = i + 2) {
+			var uv = uses(i) & gen.TYPE_MASK, fixed = uses(i + 1);
+			var next = 0;
+			if (uv == gen.DEF) {
+				if (fixed == 0) next = DEF;
+				else if (regSet.isMultiple(fixed)) next = DEF_SET;
+				else next = DEF_FIXED;
+			} else if (uv == gen.USE) {
+				if (fixed == 0) next = USE;
+				else if (regSet.isMultiple(fixed)) next = USE_SET;
+				else next = USE_FIXED;
+			} 
+			else if (uv == gen.KILL) next = KILL;
+			else if (uv == gen.LIVE) next = KILL;
+			if (next < state) gen.mach.compiler.ERROR.fail(Strings.format1("uses/defs out of order at %1", pos));
+			state = next;
+		}
+	}
+	def finishLoop(b: SsaBlockInfo, livein: BitMatrix) {
+		// make every variable live-in to a loop header live for the entire loop
+		var loopEnd = gen.blocks.order.get(b.loop.end - 1);
+		var loopEndPos = loopEnd.end * 2;
+		var l = pointList, p: LsraPoint;
+
+		// Remove all interior start/end points for variables live at loop start
+		while (l != null && l.pos < loopEndPos) {
+			if (l.machVar != null && livein.get(0, l.machVar.varNum)) {
+				// remove all starts and ends within the loop
+				if (LsraStart.?(l)) { l = removePoint(l); continue; }
+				if (LsraEnd.?(l)) { l = removePoint(l); continue; }
+			}
+			p = l;
+			l = l.next;
+		}
+
+		// process any points exactly at loop end
+		var insertPoint = l;
+		while (l != null && l.pos == loopEndPos) {
+			if (l.machVar != null) {
+				var vnum = l.machVar.varNum;
+				if (livein.get(0, vnum)) {
+					if (LsraStart.?(l)) { // remove start points
+						if (l == insertPoint) l = insertPoint = removePoint(l);
+						else l = removePoint(l);
+						livein.clear(0, vnum);
+						continue;
+					}
+					if (LsraEnd.?(l)) { // preserve end point
+						livein.clear(0, vnum);
+					}
+				}
+			}
+			p = l;
+			l = l.next;
+		}
+		if (insertPoint == null) {
+			// if there are no points after the loop end, add a dummy one
+			insertPoint = LsraEnd.new(-1, null);
+			insertPoint.prev = p;
+			if (p != null) p.next = insertPoint;
+		}
+		// insert ends for all remaining variables
+		for (i = 0; i < livein.width; i++) {
+			var vnum = i * 32;
+			for (bits = livein.bits(i); bits != 0; bits = bits #>> 1) {
+				if ((bits & 1) != 0) {
+					var machVar = vars(vnum);
+					insertBefore(LsraEnd.new(loopEndPos, machVar), insertPoint);
+					if (loopEndPos > machVar.endPos) machVar.endPos = loopEndPos;
+				}
+				vnum++;
+			}
+		}
+		// remove dummy point
+		if (insertPoint.pos == -1) removePoint(insertPoint);
+	}
+	def insertHead(n: LsraPoint) {
+		// insert "n" at head of list
+		var p = pointList;
+		n.next = p;
+		if (p != null) p.prev = n;
+		pointList = n;
+	}
+	def insertBefore(p: LsraPoint, n: LsraPoint) {
+		// insert "p" immediately before "n"
+		var pp = n.prev;
+		p.next = n;
+		p.prev = pp;
+		n.prev = p;
+		if (pp != null) pp.next = p;
+		else pointList = p;
+	}
+	def removePoint(x: LsraPoint) -> LsraPoint {
+		// remove "x" from the list of variable points
+		var n = x.next, p = x.prev;
+		if (p != null) p.next = n;
+		else pointList = n;
+		if (n != null) n.prev = p;
+		x.prev = null;
+		x.next = null;
+		return n;
+	}
+}
+
+// Renders the intervals in a human-readable format, along side instructions
+class IntervalPrinter {
+	def gen: MachCodeGen;
+	def regSet: MachRegSet;
+	def pointList: LsraPoint;
+	var state = Array<byte>.new(1 + gen.vars.length);
+	var live  = Array<byte>.new(1 + gen.vars.length);
+	var map   = Array<int>.new(gen.vars.length);
+	var vnum: int;
+	var pressure: int;
+
+	new(gen, regSet, pointList) {
+		for (i = 0; i < state.length; i++) live(i) = ' ';
+	}
+	
+	def print() {
+		var buf = StringBuffer.new();
+		// print out all LSRA points
+		for (l = pointList; l != null; l = l.next) {
+			buf.reset();
+			buf.format2("@%1:%2", l.pos, pointType(l));
+			buf.pad(' ', 12);
+			if (l.machVar != null) buf.putc('#').puti(l.machVar.varNum);
+			if (LsraUse.?(l)) appendUseVars(buf, LsraUse.!(l).useStart, LsraUse.!(l).useEnd);
+			if (LsraDef.?(l)) appendUseVars(buf, LsraDef.!(l).defStart, LsraDef.!(l).defEnd);
+			Terminal.putbln(buf);
+		}
+		var points = pointList;
+		// print out code, with live variables on each line
+		for (i = 0; i < gen.code.length; i++) {
+			var before = i * 2, after = i * 2 + 1;
+			var mi = gen.code.get(i);
+			// print out the live variables and the instruction
+			points = updateState(before, points);
+			if (mi.moves != null && mi.moves.before != null && !mi.moves.before.empty()) {
+				// print moves generated before instruction
+				buf.reset();
+				buf.puts("  [");
+				mi.moves.before.render(buf, regSet);
+				buf.puts("]");
+				Terminal.putbln(buf);
+				buf = appendState(before, buf);
+			}
+			buf = appendState(before, buf);
+			gen.renderInstr(mi, buf);
+			Terminal.putbln(buf);
+			// print out the live variables after the instruction
+			points = updateState(after, points);
+			buf = appendState(after, buf);
+			Terminal.putbln(buf);
+			if (mi.moves != null && mi.moves.after != null && !mi.moves.after.empty()) {
+				// print moves generated after instruction
+				buf.reset();
+				buf.puts("  [");
+				mi.moves.after.render(buf, regSet);
+				buf.puts("]");
+				Terminal.putbln(buf);
+			}
+		}
+	}
+	def appendState(pos: int, buf: StringBuffer) -> StringBuffer {
+		buf.reset();
+		buf.puti(pos).putc(':').pad(' ', 6);
+		return buf.puts(state).putc(' ');
+	}
+	def appendUseVars(buf: StringBuffer, start: int, end: int) {
+		for (i = start; i < end; i = i + 2) {
+			buf.format1("#%1 ", gen.uses.get(i) #>> gen.VAR_SHIFT);
+		}
+	}
+	def updateState(pos: int, points: LsraPoint) -> LsraPoint {
+		for (i = 0; i < live.length; i++) state(i) = live(i);
+		while (points != null && points.pos == pos) {
+			if (LsraUse.?(points)) processUses(LsraUse.!(points));
+			else if (LsraDef.?(points)) processDefs(LsraDef.!(points));
+			else if (LsraStart.?(points)) live(mapVar(points.machVar.varNum)) = '|';
+			else if (LsraEnd.?(points)) {
+				var index = mapVar(points.machVar.varNum);
+				live(index) = ' ';
+				if (state(index) == '|') state(index) = ' ';
+			}
+			points = points.next;
+		}
+		return points;
+	}
+	def processUses(u: LsraUse) {
+		for (i = u.useStart; i < u.useEnd; i = i + 2) {
+			state(mapVar(gen.varOfUse(i).varNum)) = '+';
+		}
+	} 
+	def processDefs(d: LsraDef) {
+		for (i = d.defStart; i < d.defEnd; i = i + 2) {
+			var machVar = gen.varOfUse(i);
+			var index = mapVar(machVar.varNum), ch = '=';
+			if (0 != (gen.uses.get(i) & gen.UNUSED_MASK)) live(index) = ' ';
+			else live(index) = '|';
+			if (machVar.reg > 0) ch = byte.!('A' + machVar.reg - 1);
+			state(index) = ch;
+		}
+	}
+	private def mapVar(v: int) -> int {
+		var index = map(v);
+		if (index == 0) index = map(v) = ++vnum;
+		return index;
+	}
+	def pointType(l: LsraPoint) -> string {
+		if (LsraStart.?(l)) return ("start");
+		if (LsraEnd.?(l)) return ("end");
+		if (LsraLive.?(l)) return ("live");
+		if (LsraKill.?(l)) return ("kill");
+		if (LsraUse.?(l)) return ("use");
+		if (LsraDef.?(l)) return ("def");
+		return "unknown";		
+	}
+}

@@ -1,0 +1,711 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Manages the mapping between V3-level program entities (classes, objects, functions) 
+// and machine-level entities (addresses and tables) and provides logic to encode
+// values into byte arrays for producing binaries.
+class MachProgram {
+	def compiler: Compiler;
+	def code: AddressSpace;
+	def data: AddressSpace;
+	def typeReps = TypeUtil.newTypeMap<MachRep>();
+	def tagType = Int.TYPE;
+	def refSize = data.refTypeCon.size;
+
+	var runtime: MachRuntime;
+	var layout: MachProgramLayout;
+	var stackAlign: int;
+	var componentFields: MachLayout; // location of component fields
+	var methods: List<IrMethod>; // queue of all methods to translate
+	var numMethods: int;
+	var typeIds: int;
+
+	new(compiler, code, data) {
+		layout = MachProgramLayout.new(this);
+		stackAlign = data.alignment;
+		compiler.prog.addLanguage(MachLanguage.new());
+		componentFields = MachLayout.new(this);
+	}
+	def build() {
+		compiler.prog.getIr().classes.apply(processIrClass);
+		for (l = methods; l != null; l = l.tail) {
+			SsaMachGen.new(compiler.prog, this, l.head).build();
+		}
+	}
+	def processIrClass(ic: IrClass) {
+		var t = ic.ctype;
+		if (V3.isClass(t)) {
+			// create the class representation
+			if (typeReps.get(t) == null) {
+				while (ic.parent != null) ic = ic.parent;
+				createClass(typeIds, null, ic);
+			}
+		} else if (V3.isComponent(t)) {
+			processComponent(ic);
+		}
+	}
+	def processComponent(ic: IrClass) {
+		queueMethods(ic);
+		var crep = Mach_V3Component.new(ic, ic.ctype, MachType.VOID);
+		typeReps.set(ic.ctype, crep);
+		for (i = 0; i < ic.fields.length; i++) {
+			// XXX: could segregate component fields into refs and nonrefs
+			var f = ic.fields(i);
+			var size = sizeOf(f.fieldType);
+			layout.dataRegion.align(size);
+			layout.fieldMap.set(f, layout.dataRegion.allocate(f, size));
+		}
+		// queue component record for processing
+		layout.recordQueue.add(getComponentRecord(ic.ctype));
+	}
+	def createClass(root: int, superClass: Mach_V3Class, ic: IrClass) {
+		var machType = data.getReferenceType(ic.ctype);
+		var mclass = Mach_V3Class.new(ic, machType, MachLayout.new(this));
+		typeReps.set(ic.ctype, mclass);
+		mclass.rootClassID = root;
+		mclass.minClassID = typeIds;
+		var fl = addFields(superClass, ic, mclass);
+		if (IrUtil.isLive(ic)) {
+			// assign an ID if live or allocated
+			if (runtime != null && runtime.gc != null && ic.checkFlag(IrUtil.C_ALLOCATED)) {
+				// compute a type refmap for objects allocated on the heap
+				runtime.gc.recordTypeRefMap(typeIds / code.addressSize, fl.alignedSize, fl.fieldRefOffsets, fl.valueRefOffsets);
+			}
+			typeIds = typeIds + code.addressSize;
+		}
+		// record the reference map for the object
+		queueMethods(ic); // add methods to list of methods to translate
+		for (l = ic.children; l != null; l = l.tail) {
+			// recursively build and number subclasses
+			createClass(root, mclass, l.head);
+		}
+		mclass.maxClassID = typeIds;
+	}
+	def addFields(superClass: Mach_V3Class, ic: IrClass, mclass: Mach_V3Class) -> MachLayout {
+		var start = 0, fl = mclass.fieldLayout;
+		if (superClass == null) {
+			// 1. if this is a root class add the type tag
+			fl.addType(tagType);
+		} else {
+			// 1. if this is not a root class, skip the members of the superclass
+			var sl = superClass.fieldLayout;
+			fl.size = sl.size;
+			// inherit reference offsets
+			fl.fieldRefOffsets = sl.fieldRefOffsets;
+			fl.valueRefOffsets = sl.valueRefOffsets;
+			start = superClass.ic.fields.length;
+		}
+		// add new fields to layout
+		var rtgc = runtime != null && runtime.gc != null;
+		for (i = start; i < ic.fields.length; i++) {
+			var f = ic.fields(i);
+			f.offset = fl.addType(f.fieldType);
+			if (isRefType(f.fieldType) && rtgc) {
+				// record that a reference is at this offset
+				if (f.checkFlag(IrUtil.F_CONST | IrUtil.F_VALUE)) fl.valueRefOffsets = List.new(f.offset, fl.valueRefOffsets);
+				else fl.fieldRefOffsets = List.new(f.offset, fl.fieldRefOffsets);
+			}
+		}
+		fl.alignedSize = data.align(fl.size);
+		return fl;
+	}
+	def queueMethods(ic: IrClass) {
+		for (i = 0; i < ic.methods.length; i++) {
+			var m = ic.methods(i);
+			if (m != null && m.container == ic && !m.checkFlag(IrUtil.M_ABSTRACT)) {
+				methods = List.new(m, methods);
+				numMethods++;
+			}
+		}
+	}
+	def makeMachArray(utype: Type) -> Mach_V3Array {
+		var marray = Mach_V3Array.new(utype, data.getReferenceType(utype));
+		var layout = MachLayout.new(this);
+		// 1. compute the layout for the array header
+		layout.addType(tagType);
+		marray.lengthOffset = layout.addType(Int.TYPE);
+		marray.headerSize = data.align(layout.size);
+		// 2. compute the scale for elements
+		var elemType = V3Array.elementType(utype);
+		marray.elemScale = sizeOf(elemType); // XXX: round up to a power of two if necessary
+		// 3. compute the type tag for the array
+		var tag = if(isRefType(elemType), 3, 1);
+		marray.typeTag = Int.box((marray.elemScale #<< 2) | tag);
+		return marray;
+	}
+	def machType(t: Type) -> Type {
+		match (t.typeCon.kind) {
+			V3Kind.VOID: return MachType.VOID;
+			V3Kind.BOOL: return MachType.BOOL;
+			V3Kind.BYTE: return MachType.BYTE;
+			V3Kind.INT:  return MachType.INT;
+			MachType.MACH_INTEGRAL,
+			MachType.MACH_REFERENCE,
+			MachType.MACH_POINTER,
+			MachType.MACH_DERIVED: return t;
+		}
+		var r = typeReps.get(t);
+		if (r == null) typeReps.set(t, r = makeMachRep(t));
+		return r.machType;
+	}
+	def funcType(m: IrSpec) -> Type {
+		// XXX: more efficient mapping of IrSpec -> Ptr<FuncType>
+		return machType(Function.funcRefType(m.getUnboundType()));
+	}
+	private def makeMachRep(t: Type) -> MachRep {
+		match (t.typeCon.kind) {
+			V3Kind.ARRAY: return makeMachArray(t);
+			V3Kind.COMPONENT: return MachRep.new(t, MachType.VOID);
+			V3Kind.CLASS: return MachRep.new(t, data.getReferenceType(t));
+			V3Kind.FUNCREF: {
+				// recursively create function type
+				var ptypes = Lists.map(t.nested, machType);
+				var ftype = Function.FUNCREF.create(t.open, ptypes);
+				return MachRep.new(t, code.getPointerType(ftype));
+			}
+			V3Kind.TUPLE: {
+				// recursively create tuple type
+				return MachRep.new(t, Tuple.newType(Lists.map(t.nested, machType))); // recursively get tuple type
+			}
+		}
+		return unexpectedType(t, null);
+	}
+	def machVal(val: Val, t: Type) -> Val {
+		if (val == null) return null;
+		match (t.typeCon.kind) {
+			V3Kind.BOOL, V3Kind.BYTE, V3Kind.INT: return val;
+			V3Kind.VOID, V3Kind.COMPONENT: return null;
+			V3Kind.ARRAY, V3Kind.CLASS: return layout.mapRecord(Record.!(val));
+			V3Kind.FUNCREF: return layout.addrOfMethod(FuncVal.!(val).memberRef.asMethod());
+			V3Kind.TUPLE: {
+				// deconstruct the tuple and reconstruct it
+				var i = 0;
+				var ov = (Tuple_Value.!(val)).values;
+				var nt = t.nested;
+				var nv = Array<Val>.new(ov.length);
+				while (i < ov.length) {
+					nv(i) = machVal(ov(i), nt.head);
+					i++;
+					nt = nt.tail;
+				}
+				return Tuple_Value.new(nv);
+			}
+		} else {
+			if (Addr.?(val)) return val;
+		}
+		return unexpectedType(t, Values.BOTTOM);
+	}
+	def getCodeAddress(methodRef: IrSpec) -> Val {
+		return layout.addrOfMethod(methodRef.asMethod());
+	}
+	def getArrayLengthOffset(arrayType: Type) -> int {
+		return arrayRep(arrayType).lengthOffset;
+	}
+	def getArrayElemScale(arrayType: Type) -> int {
+		return arrayRep(arrayType).elemScale;
+	}
+	def getArrayElemOffset(arrayType: Type) -> int {
+		return arrayRep(arrayType).headerSize;
+	}
+	def getObjectSize(t: Type, r: Record) -> int {
+		if (V3.isClass(t)) return classRep(t).fieldLayout.alignedSize; // return the size of the object
+		if (V3.isArray(t)) return data.align(arrayRep(t).getObjectSize(r)); // return the size of the header only
+		return unexpectedType(t, 0);
+	}
+	def alignTo(i: int, a: int) -> int {
+		// XXX: use masks for powers of two
+		if (a > 1) return (i + a - 1) / a * a;
+		return i;
+	}
+	def classRep(t: Type) -> Mach_V3Class {
+		return Mach_V3Class.!(typeReps.get(t));
+	}
+	private def arrayRep(t: Type) -> Mach_V3Array {
+		var ar = Mach_V3Array.!(typeReps.get(t));
+		if (ar == null) typeReps.set(t, ar = makeMachArray(t)); // create array representation
+		return ar;
+	}
+	def classIdRange(t: Type) -> (int, int) {
+		var r = classRep(t);
+		return (r.minClassID, r.maxClassID);
+	}
+	def componentFieldPtr(f: IrSpec) -> Val {
+		return layout.fieldMap.get(f.asField());
+	}
+	def classFieldOffset(f: IrSpec) -> int {
+		return f.asField().offset;
+	}
+	def methodTable(m: IrMethod) -> Val {
+		var mtable = layout.mtableMap.get(m);
+		if (mtable == null) {
+			// build the method table for the method
+			var root = m.container;
+			while (root.parent != null) {
+				if (root.parent.methods.length > m.index) root = root.parent;
+				else break;
+			}
+			var cr = classRep(root.ctype);
+			var mtable = layout.allocMTable(root.methods(m.index), cr.maxClassID - cr.minClassID);
+			var mtaddr = mtable.add(0 - cr.minClassID); // adjust for root class ID
+			addToMethodTable(root, cr.minClassID, m.index, mtable.val, mtaddr);
+			return mtaddr;
+		}
+		return mtable;
+	}
+	def addToMethodTable(ic: IrClass, rootId: int, index: int, mtable: Array<IrMethod>, mtaddr: Addr) {
+		// add this class's method implementation to the table
+		var m = ic.methods(index), cr = classRep(ic.ctype);
+		layout.mtableMap.set(m, mtaddr);
+		if (IrUtil.isLive(ic)) mtable((cr.minClassID - rootId) / code.addressSize) = m;
+		for (l = ic.children; l != null; l = l.tail) addToMethodTable(l.head, rootId, index, mtable, mtaddr);
+	}
+	def unexpectedType<T>(t: Type, v: T) -> T {
+		return compiler.ERROR.unexpectedType(t, v);
+	}
+	def objectTag(t: Type) -> Val {
+		if (V3.isClass(t)) return Int.box(classRep(t).minClassID);
+		if (V3.isArray(t)) return arrayRep(t).typeTag;
+		return unexpectedType(t, null);
+	}
+	def sizeOf(t: Type) -> int {
+		match(t.typeCon.kind) {
+			V3Kind.VOID: return 0;
+			V3Kind.INT: return 4;
+			V3Kind.BYTE, V3Kind.BOOL: return 1;
+			V3Kind.CLASS, V3Kind.ARRAY: return refSize;
+			V3Kind.FUNCREF: return code.addressSize;
+			MachType.MACH_INTEGRAL,
+			MachType.MACH_REFERENCE,
+			MachType.MACH_POINTER,
+			MachType.MACH_DERIVED: return Mach_TypeCon.!(t.typeCon).size;
+		}
+		return unexpectedType(t, 0);
+	}
+	private def getComponentRecord(t: Type) -> Record {
+		return compiler.prog.dynamic.getComponentRecord(V3.asComponent(t).componentDecl);
+	}
+	def encodeData(region: Region, u: DataEncoder, a: Addr) {
+		if (a.is<Record>()) encodeRecord(u, a.get<Record>());
+		else if (a.is<Array<IrMethod>>()) encodeMtable(u, a.get<Array<IrMethod>>());
+		else if (a.is<IrField>()) encodeField(u, a.get<IrField>());
+		else if (a.is<Addr>()) encodeAddr(u, a.get<Addr>());
+		else return compiler.ERROR.fail("unexpected data item in region");
+	}
+	def encodeField(u: DataEncoder, f: IrField) {
+		// encode a component's field at the address
+		var r = getComponentRecord(f.container.ctype);
+		encodeVal(u, r.values(f.index), f.fieldType);
+	}
+	def encodeRecord(u: DataEncoder, r: Record) {
+		var v = r.values;
+		var start = u.pos;
+		if (V3.isArray(r.rtype)) {
+			// encode an array
+			var rep = arrayRep(r.rtype);
+			u.i4(Int.unbox(rep.typeTag));
+			u.at(start + rep.lengthOffset).i4(v.length);
+			if (rep.elemScale == 0) return; // don't encode zero-length elements
+			var et = V3Array.elementType(r.rtype);
+			for (i = 0; i < v.length; i++) {
+				// XXX: special case Array<byte>, Array<Record>, Array<int> for performance
+				encodeVal(u.at(start + i * rep.elemScale + rep.headerSize), v(i), et);
+			}
+		} else if (V3.isClass(r.rtype)) {
+			// encode a class
+			var rep = classRep(r.rtype), f = rep.ic.fields;
+			u.i4(rep.minClassID);
+			for (i = 0; i < v.length; i++) {
+				encodeVal(u.at(start + f(i).offset), v(i), f(i).fieldType);
+			}
+		} else {
+			return unexpectedType(r.rtype, ());
+		}
+	}
+	def encodeMtable(u: DataEncoder, mtable: Array<IrMethod>) {
+		for (i = 0; i < mtable.length; i++) {
+			encodeAddr(u, layout.addrOfMethod(mtable(i)));
+		}
+	}
+	def encodeVal(u: DataEncoder, v: Val, t: Type) {
+		v = machVal(v, t);
+		match (t.typeCon.kind) {
+			V3Kind.BOOL: u.i1(Bool.toInt(Bool.unbox(v)));
+			V3Kind.BYTE: u.i1(Byte.unbox(v));
+			V3Kind.INT: u.i4(Int.unbox(v));
+			V3Kind.CLASS,
+			V3Kind.ARRAY,
+			MachType.MACH_POINTER,
+			MachType.MACH_DERIVED,
+			MachType.MACH_REFERENCE,
+			V3Kind.FUNCREF: encodeAddr(u, Addr.!(v));
+		} else {
+			unexpectedType(t, ());
+		}
+	}
+	def encodeAddr(u: DataEncoder, addr: Addr) {
+		var abs = layout.absolute(addr);
+		if (Aeneas.PRINT_MACH.get()) {
+			var buf = compiler.prog.renderResult(addr, null, Strings.toBuffer("encode "));
+			Terminal.putb(buf.puts(" = 0x").putx(abs).format1(" @ %1\n", u.pos));
+		}
+		u.i4(abs);
+	}
+	def fail(msg: string) {
+		compiler.ERROR.fail(msg);
+	}
+	def hashVstMethod(m: VstMethod) -> int {
+		return Strings.hash(m.name()) + Strings.hash(m.container.name());
+	}
+	def hashVstCompound(c: VstCompound) -> int {
+		return Strings.hash(c.name());
+	}
+	def isRefType(t: Type) -> bool {
+		var kind = t.typeCon.kind;
+		return kind == V3Kind.CLASS || kind == V3Kind.ARRAY || kind == MachType.MACH_REFERENCE;
+	}
+}
+// Machine representation of a type.
+class MachRep {
+	def origType: Type;
+	def machType: Type;
+	new(origType, machType) { }
+}
+// Machine representation of class, including the minimum and maximum type ID and the
+// offset of each of its fields.
+class Mach_V3Class extends MachRep {
+	def ic: IrClass;
+	def fieldLayout: MachLayout;
+	var rootClassID: int;
+	var minClassID: int;
+	var maxClassID: int;
+
+	new(ic, machType: Type, fieldLayout) : super(ic.ctype, machType) { }
+	def getObjectSize(r: Record) -> int {
+		return fieldLayout.size;
+	}
+}
+// Machine representation of a component
+class Mach_V3Component extends MachRep {
+	def ic: IrClass;
+	new(ic, componentType: Type, machType: Type) : super(componentType, machType) { }
+}
+// Machine representation of an array.
+class Mach_V3Array extends MachRep {
+	var lengthOffset: int;
+	var headerSize: int;
+	var elemScale: int;
+	var typeTag: Box<int>;
+	new(arrayType: Type, machType: Type) : super(arrayType, machType) { }
+	def getObjectSize(r: Record) -> int {
+		if (r == null) return headerSize;
+		return headerSize + r.values.length * elemScale;
+	}
+}
+// A layout is used for adding fields sequentially to a memory area, aligning fields
+// as necessary and recording which offsets contain references.
+class MachLayout {
+	def mach: MachProgram;
+	var fieldRefOffsets: List<int>;
+	var valueRefOffsets: List<int>;
+	var size: int;
+	var alignedSize: int;
+	new(mach) { }
+	def addType(t: Type) -> int {
+		var s = mach.sizeOf(t);
+		var offset = mach.alignTo(size, s);
+		size = offset + s;
+		return offset;
+	}
+}
+// Manages the program regions and maps objects and code in those regions.
+// Guarantees that each item has a unique Address object representing it.
+class MachProgramLayout {
+	def mach: MachProgram;
+	def codeRegion    = Region.new("code", mach.code);
+	def metaRegion    = Region.new("meta", mach.code);
+	def runtimeRegion = Region.new("runtime", mach.code);
+	def dataRegion    = Region.new("data", mach.data);
+	def mtableMap     = IrUtil.newIrMethodMap<Addr>();
+	def methodMap     = IrUtil.newIrMethodMap<Address<IrMethod>>();
+	def fieldMap      = IrUtil.newIrFieldMap<Address<IrField>>();
+	def recordMap     = V3.newRecordMap<Address<Record>>();
+	var recordQueue   = Sequence<Record>.new();
+
+	new(mach) { }
+
+	def addrOfMethod(m: IrMethod) -> Address<IrMethod> {
+		var a = methodMap.get(m);
+		if (a == null) methodMap.set(m, a = Address.new(codeRegion, m));
+		return a;
+	}
+	def allocMTable(m: IrMethod, size: int) -> Address<Array<IrMethod>> {
+		var mtable = Array<IrMethod>.new(size / mach.code.addressSize);
+		return metaRegion.allocate(mtable, size);
+	}
+	def absolute(a: Addr) -> int {
+		if (a == null) return 0;
+		if (a.base != null) return absolute(a.base) + a.offset;
+		if (a.absolute == -1) error(a);
+		return a.absolute;
+	}
+	def error(a: Addr) {
+		var buf = Strings.toBuffer("address ");
+		mach.compiler.prog.renderResult(a, null, buf);
+		buf.puts(" not fixed");
+		mach.fail(buf.toString());
+	}
+	// compile each method into the encoder at its final address
+	def layoutCode(u: MachDataEncoder, genCode: (IrMethod, MachDataEncoder) -> void) {
+		u.atEnd();
+		for (l = mach.methods; l != null; l = l.tail) {
+			u.atEnd().align(mach.code.alignment);
+			addrOfMethod(l.head).absolute = u.endAddr();
+			genCode(l.head, u);
+		}
+	}
+	// layout the method tables
+	def layoutMeta(u: MachDataEncoder) {
+		u.atEnd().align(mach.data.addressSize);
+		metaRegion.layout(u.endAddr());
+		encodeRegion(metaRegion, u);
+	}
+	// layout all runtime datastructures
+	def layoutRuntime(u: MachDataEncoder) {
+		// have to finish laying out the data section to know its size
+		u.atEnd().align(mach.data.addressSize);
+		Sequences.drain(recordQueue, 0, layoutRecord);
+		if (mach.runtime.gc != null) {
+			// record the data size and the locations of mutable refs
+			mach.runtime.gc.recordDataSize(dataRegion.mark);
+			dataRegion.apply(recordDataRefs);
+		}
+		mach.runtime.encode(u);
+	}
+	// layout all records into the data region
+	def layoutData(u: MachDataEncoder) {
+		// compute addresses for all objects in the data region
+		dataRegion.layout(u.endAddr());
+		// encode all records into the encoder
+		encodeRegion(dataRegion, u);
+	}
+	private def recordDataRefs(a: Addr, off: int, size: int) {
+		if (a.is<IrField>()) {
+			// a global field in the data section
+			var f = a.get<IrField>();
+			if (!f.checkFlag(IrUtil.F_CONST | IrUtil.F_VALUE)) {
+				if (mach.isRefType(f.fieldType)) mach.runtime.gc.recordRootRef(off);
+			}
+		} else if (a.is<Record>()) {
+			// an object in the data section
+			var r = a.get<Record>(), gc = mach.runtime.gc;
+			if (V3.isArray(r.rtype)) {
+				var elem = V3Array.elementType(r.rtype);
+				if (mach.isRefType(elem)) {
+					var start = off + mach.getArrayElemOffset(r.rtype);
+					gc.recordRootRefRange(start, start + r.values.length * mach.refSize);
+				}
+			} else if (V3.isClass(r.rtype)) {
+				var rep = mach.classRep(r.rtype);
+				for (l = rep.fieldLayout.fieldRefOffsets; l != null; l = l.tail) {
+					gc.recordRootRef(off + l.head); // only record mutable field refs
+				}
+			}
+		}
+	}
+	private def layoutRecord(r: Record) {
+		for (i = 0; i < r.values.length; i++) layoutVal(r.values(i));
+	}
+	private def layoutVal(val: Val) {
+		if (Record.?(val)) mapRecord(Record.!(val));
+		else if (Delegate.?(val)) layoutVal(Delegate.!(val).val);
+		else if (Tuple_Value.?(val)) for(e in Tuple_Value.!(val).values) layoutVal(e);
+	}
+	private def encodeRegion(region: Region, u: MachDataEncoder) {
+		// encode region contents at the end of this encoder
+		var start = u.atEnd().pos;
+		u.skipN(region.mark);
+		var c = region.contents;
+		for (i = 0; i < c.length; i++) {
+			var t = c.get(i);
+			mach.encodeData(region, u.at(start + t.1), t.0);
+		}
+	}
+	def isValid(addr: Addr) -> bool {
+		// XXX: return true for all invalid addresses
+		if (addr == null) return false;
+		if (addr.equals(null)) return false;
+		return true;
+	}
+	def mapRecord(r: Record) -> Val {
+		var addr = recordMap.get(r);
+		if (addr == null) {
+			// allocate space in the data region
+			dataRegion.align(mach.data.alignment);
+			addr = dataRegion.allocate(r, mach.getObjectSize(r.rtype, r));
+			recordMap.set(r, addr);
+			// queue for later processing
+			recordQueue.add(r);
+		}
+		return addr;
+	}
+}
+// Represents all runtime data structures exposed to the Virgil runtime code.
+class MachRuntime {
+	def mach: MachProgram;
+	def codePageSize = 4096;
+	def codePageMask = 4095;
+	def codePageShift = 12;
+	def codeRegion = mach.layout.codeRegion;
+	def metaRegion = mach.layout.metaRegion;
+	def dataRegion = mach.layout.dataRegion;
+	def runtimeRegion = mach.layout.runtimeRegion;
+	def typeCon = MachRuntime_TypeCon.new(MachModule.PTR_32.ptrType);
+
+	def rt_heap_start     = typeCon.addr(dataRegion, "HEAP_START");
+	def rt_heap_end       = typeCon.addr(dataRegion, "HEAP_END");
+	def rt_code_start     = typeCon.addr(codeRegion, "CODE_START");
+	def rt_code_end       = typeCon.addr(codeRegion, "CODE_END");
+	def rt_data_start     = typeCon.addr(codeRegion, "DATA_START");
+	def rt_data_end       = typeCon.addr(codeRegion, "DATA_END");
+	def rt_handle_signal  = typeCon.addr(codeRegion, "signalStub");
+	def rt_heap_cur_loc   = typeCon.addr(dataRegion, "heapCurLoc");
+	def rt_heap_end_loc   = typeCon.addr(dataRegion, "heapEndLoc");
+	
+	var ri_init: RmaRoot;
+	var ri_gc: RmaRoot;
+	var ri_signal: RmaRoot;
+
+	var src: MachRtSrcTables;
+	var gc: MachRtGcTables;
+
+	var heapSize = Aeneas.HEAP_SIZE.get();
+	var debug = Aeneas.PRINT_RT.get();
+
+	new(mach) {
+		typeCon.runtime = this;
+		if (Aeneas.RT_STTABLES.get()) src = MachRtSrcTables.new(mach, this);
+		if (Aeneas.RT_GCTABLES.get()) gc = MachRtGcTables.new(mach, this);
+	}
+
+	def recordCodeStart(addr: int) {
+		rt_code_start.absolute = addr;
+		if (debug) debugAddr("codestart", rt_code_start);
+	}
+	def recordCodeEnd(addr: int) {
+		rt_code_end.absolute = addr;
+		if (debug) {
+			debugAddr("codeend", rt_code_end);
+			Terminal.print1("@codepages = %1\n", codePages());
+		}
+	}
+	def recordDataStart(addr: int) {
+		rt_data_start.absolute = addr;
+		if (debug) debugAddr("datastart", rt_data_start);
+	}
+	def recordDataEnd(addr: int) {
+		rt_data_end.absolute = addr;
+		if (debug) debugAddr("dataend", rt_code_end);
+	}
+	def getExceptionDest(off: int, ex: string, source: Source) -> Addr;
+	def addHeapPointers(u: MachDataEncoder) {
+		u.atEnd().align(mach.data.addressSize);
+		var start = u.endAddr(), heapStart = start + 8;
+		// add a pointer to the start of the heap
+		rt_heap_cur_loc.absolute = start;
+		u.i4(heapStart); // TODO: 32-bit specific
+		// add a pointer to the end of the heap
+		rt_heap_end_loc.absolute = start + 4;
+		u.i4(heapStart + heapSize); // TODO: 32-bit specific
+		// expose the start of the heap and end of the heap as constants
+		rt_heap_start.absolute = heapStart;
+		rt_heap_end.absolute = heapStart + heapSize;
+
+		if (debug) {
+			debugAddr("heapstart", rt_heap_start);
+			debugAddr("heapend", rt_heap_end);
+		}
+	}
+	def codePages() -> int {
+		if (rt_code_end.absolute == -1) mach.compiler.ERROR.fail("code end not set yet");
+		return (rt_code_end.absolute - rt_code_start.absolute + codePageSize - 1) / codePageSize;
+	}
+	def encode(u: MachDataEncoder) {
+		if (gc != null) gc.encode(u);
+		if (src != null) src.encode(u);
+	}
+	def addr(region: Region, name: string) -> Addr {
+		return typeCon.addr(region, name);
+	}
+	def debugAddr(name: string, addr: Addr) {
+		Terminal.putbln(StringBuffer.new().format1("@%1 = ", name).putx(addr.absolute));
+	}
+	def genAlloc(gen: MachCodeGen, i: SsaApplyOp, mv: MachVar);
+	def genSystemOp(gen: MachCodeGen, i: SsaApplyOp, mv: MachVar);
+	def getFatalAddress(ex: string) -> Addr;
+}
+// A utility to encode sorted, page-indexed tables such as for stackmaps and sourcepoints.
+class MachRtPageTable {
+	def pageTable: Addr;
+	def table: Addr;
+	def end: Addr;
+	def wide: bool; // 8-byte entries
+	def entries = Sequence<(int, int, int)>.new();
+	new(pageTable, table, end, wide) {}
+	def encode(rt: MachRuntime, u: MachDataEncoder) {
+		pageTable.absolute = u.endAddr();
+		var maxPage = rt.codePages(), maxEntry = entries.length;
+		var tableAddr = pageTable.absolute + 4 * (maxPage + 1), tableEndAddr = tableAddr + maxEntry * 4;
+		table.absolute = tableAddr;
+		// encode the page table pointers
+		var lastPage = -1;
+		for (i = 0; i < maxEntry; i++) {
+			var page = entries.get(i).0 / rt.codePageSize;
+			if (page != lastPage) {
+				// first entry on new page, fill intervening pages
+				var entryAddr = tableAddr + i * 4;
+				for (j = lastPage; j < page; j++) u.i4(entryAddr);
+				lastPage = page;
+			}
+		}
+		// encode the last entries of the table
+		for (j = lastPage; j < maxPage; j++) u.i4(tableEndAddr);
+		// encode the table entries
+		for (i = 0; i < maxEntry; i++) {
+			var entry = entries.get(i);
+			u.i4((entry.0 & rt.codePageMask) | (entry.1 #<< rt.codePageShift));
+		}
+		if (!wide) return;
+		// encode the wide part of the table
+		if (end != null) end.absolute = u.endAddr();
+		for (i = 0; i < maxEntry; i++) {
+			u.i4(entries.get(i).2);
+		}
+	}
+	def add(offset: int, e0: int, e1: int) {
+		entries.add(offset, e0, e1);
+	}
+	def grow(len: int) -> MachRtPageTable {
+		entries.grow(len);
+		return this;
+	}
+}
+// The "CiRuntime" component exposes addresses of (readonly) data structures to the
+// "RiRuntime" code, which implements GC, stack walking, stack traces, etc.
+class MachRuntime_TypeCon extends Member_TypeCon {
+	def ptrType: Type;
+	def addresses = Strings.newMap<Val>();
+	var runtime: MachRuntime;
+
+	new(ptrType) : super("CiRuntime", V3Kind.VOID, 0) { }
+	def lookupMember(t: Type, name: string, instance: bool, verifier: Verifier) -> Member {
+		if (instance) return null;
+		var val = addresses.get(name);
+		if (val == null) return null;
+		return Members.valMember(ptrType, val, false);
+	}
+	def addr(region: Region, name: string) -> Addr {
+		var a = Address.new(region, name);
+		addresses.set(name, a);
+		return a;
+	}
+}
