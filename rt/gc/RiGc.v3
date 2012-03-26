@@ -1,0 +1,248 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Shared logic of the GC, including logic to compute object sizes and scan 
+// objects, stacks, and globals
+component RiGc {
+	def CTRL_DEFAULT = "\x1B[1;00m"; // XXX: move to Terminal
+	def CTRL_GREEN   = "\x1B[0;32m";
+	def CTRL_YELLOW  = "\x1B[1;33m";
+	def CTRL_RED     = "\x1B[0;31m";
+	def CTRL_CYAN    = "\x1B[0;36m";
+
+	def verbose   = false;
+	def debug     = false;
+	def paranoid  = false; // TODO: enable paranoid gc for tests automatically
+	def INT_SIZE  = 4;
+	def REF_SIZE  = Pointer.SIZE;
+	def OBJ_ALIGN = Pointer.SIZE;
+
+	// computes the size of an non-null object, in bytes
+	def objectSize(ref: Pointer) -> int {
+		var tid = ref.load<int>();
+		// | 32       tid            0 |
+		// | typeid:30            #0:2 | normal object
+		// | elemsize:30          #1:2 | primitive array
+		// | #refsize:30          #3:2 | reference array
+		match (tid & 3) {
+			0: { // normal object; use refmap in TYPE_TABLE
+				var typeMap = CiRuntime.GC_TYPE_TABLE.add(tid).load<int>();
+				if ((typeMap & 0x80000000) != 0) {
+					// extended entry
+					var vmap_p = CiRuntime.GC_EXTMAPS.add(INT_SIZE * (typeMap & 0x7FFFFFFF));
+					return extmapSize(vmap_p);
+				} else {
+					// normal entry
+					return refmapSize(typeMap);
+				}
+			}
+			1: { // primitive array
+				var length = ref.add(INT_SIZE).load<int>(), elemscale = tid #>> 2;
+				return alignObject(2 * INT_SIZE + elemscale * length);
+			}
+			3: { // reference array
+				var length = ref.add(INT_SIZE).load<int>();
+				return 2 * INT_SIZE + (REF_SIZE * length); // XXX: may need heap align
+			}
+		}
+		return invalidHeader(ref);
+	}
+	// compute the size of the an item based on the highest bit of a map
+	def refmapSize(vmap: int) -> int {
+		if (vmap == 0) return 0;
+		var size = 0;
+		while(vmap != 1) { // highest bit set indicates the length
+			vmap = vmap #>> 1;
+			size = size + REF_SIZE;
+		}
+		return size;
+	}
+	// compute the size of an item based on the bits of the extended map
+	def extmapSize(vmap_p: Pointer) -> int {
+		var size = 0;
+		while (true) { // iterate over words of extended map
+			var vmap = vmap_p.load<int>();
+			if ((vmap & 0x80000000) == 0) return size + refmapSize(vmap & 0x7FFFFFFF);
+			size = size + 31 * REF_SIZE;
+			vmap_p = vmap_p.add(INT_SIZE);
+		}
+		return size; // should be unreachable
+	}
+	private method alignObject(size: int) -> int {
+		return (-1 ^ (OBJ_ALIGN - 1)) & (size + OBJ_ALIGN - 1);
+	}
+	def scanObject(ref: Pointer, f: Pointer -> void) -> int {
+		var tid = ref.load<int>();
+		// | 32                      0 |
+		// | typeid:30            #0:2 | normal object
+		// | elemsize:30          #1:2 | primitive array
+		// | #refsize:30          #3:2 | reference array
+		match (tid & 3) {
+			0: { // normal object; use refmap in TYPE_TABLE
+				var typeMap = CiRuntime.GC_TYPE_TABLE.add(tid).load<int>();
+				if ((typeMap & 0x80000000) != 0) {
+					// extended entry
+					var vmap_p = CiRuntime.GC_EXTMAPS.add(INT_SIZE * (typeMap & 0x7FFFFFFF));
+					return scanExtMap(vmap_p, ref, f); // should be aligned to OBJ_SIZE
+				} else {
+					// normal entry
+					return scanRefMap(typeMap, ref, f); // should be aligned to OBJ_SIZE
+				}
+			}
+			1: { // primitive array
+				var length = ref.add(INT_SIZE).load<int>(), elemscale = tid #>> 2;
+				return alignObject(2 * INT_SIZE + elemscale * length);
+			}
+			3: { // reference array
+				var length = ref.add(INT_SIZE).load<int>();
+				var size = 2 * INT_SIZE + (REF_SIZE * length), end = ref.add(size);
+				for (p = ref.add(INT_SIZE * 2); p.lt(end); p = p.add(REF_SIZE)) f(p);
+				return size; // XXX: heap alignment may be necessary
+			}
+		}
+		return invalidHeader(ref);
+	}
+	def invalidHeader(ref: Pointer) -> int {
+		System.error("GcError", "Invalid object header");
+		return 0;
+	}
+	// scan all the global roots in the program
+	def scanGlobals(f: Pointer -> void) {
+		var p = CiRuntime.GC_ROOTS_START;
+		if (debug) System.err.puts(CTRL_DEFAULT).puts("Beginning globals scan...\n");
+		while (p.lt(CiRuntime.GC_ROOTS_END)) {
+			// for each (offset, refmap) pair
+			var offset = p.load<int>();
+			var addr = CiRuntime.DATA_START.add(offset);
+			var bits = p.add(INT_SIZE).load<int>();
+			if (debug) {
+				System.err.puts("rootMap @ data + ").puti(offset);
+				System.err.puts(" = ").putp(Pointer.NULL.add(bits)).ln();
+			}
+			for (map = bits; map != 0; map = map #>> 1) {
+				// for each set bit, call the scan function
+				if ((map & 1) != 0) {
+					if (debug) System.err.puts("@rootref data + ").puti(addr.sub(CiRuntime.DATA_START)).ln();
+					f(addr);
+				}
+				addr = addr.add(REF_SIZE);
+			}
+			p = p.add(INT_SIZE + INT_SIZE);
+		}
+		if (debug) System.err.puts("Ended globals scan.\n");
+	}
+	// scan the stack, walking frames up to the main method
+	def scanStack(ip: Pointer, sp: Pointer, f: Pointer -> void) {
+		while (true) {
+			var frameWords = 0;
+			if (debug) {
+				System.err.puts(CTRL_DEFAULT)
+					  .puts("\nscanStack @ ip = ").putp(ip).puts(" +")
+					  .puti(ip.sub(CiRuntime.CODE_START))
+					  .puts(", sp = ").putp(sp).putc('\n');
+				System.err.puts(CTRL_CYAN);
+				frameWords = RiStackWalker.printLoc(ip);
+				System.err.puts(CTRL_DEFAULT);
+			}
+			var stackmapEntry = findStackMap(ip);
+			if (stackmapEntry == Pointer.NULL) {
+				if (debug) {
+					System.err.puts("(no stackmap information)\n");
+					if (frameWords == 0) return;
+					var t = RiX86Darwin.callerFrame(ip, sp, frameWords);
+					ip = t.0; sp = t.1;
+					continue;
+				}
+				return;
+			}
+			var frameSize = scanStackFrame(sp, stackmapEntry, f);
+			if (debug && frameSize != frameWords * REF_SIZE) {
+				System.err.puts("\n\n!GcError: mismatch between source frame size ")
+					  .puti(frameWords * REF_SIZE)
+					  .puts(" and stackmap size of ")
+					  .puti(frameSize)
+					  .ln();
+				Darwin.exit(255);
+			}
+			var t = RiX86Darwin.callerFrame(ip, sp, frameSize / REF_SIZE);
+			ip = t.0; sp = t.1;
+		}
+	}
+	def findStackMap(ip: Pointer) -> Pointer {
+		return RiTables.exactMatch(RiTables.searchTable(CiRuntime.GC_STACKMAP_PAGES, CiRuntime.GC_STACKMAP_TABLE, ip));
+	}
+	// scan a single stack frame
+	def scanStackFrame(sp: Pointer, stackmapEntry: Pointer, f: Pointer -> void) -> int {
+		var stackMap = stackmapEntry.load<int>() #>> RiTables.PAGE_SHIFT;
+		if ((stackMap & 0x80000) != 0) {
+			// extended entry
+			var vmap_p = CiRuntime.GC_EXTMAPS.add(INT_SIZE * (stackMap & 0x7FFFF));
+			return scanExtMap(vmap_p, sp, f);
+		} else {
+			// normal entry
+			return scanRefMap(stackMap, sp, f);
+		}
+	}
+	// scan the references at the given start address, returning the size
+	def scanRefMap(vmap: int, start: Pointer, f: Pointer -> void) -> int {
+		if (debug) System.err.puts("scanRefMap = ").putp(Pointer.NULL.add(vmap)).ln();
+		if (vmap == 0) return 0;
+		var size = 0;
+		while(vmap != 1) { // highest bit set indicates the length
+			if ((vmap & 1) != 0) f(start.add(size));
+			vmap = vmap #>> 1;
+			size = size + REF_SIZE;
+		}
+		return size;
+	}
+	// scan an extended map: an array of vmaps, delimited by a high 0 bit
+	def scanExtMap(vmap_p: Pointer, start: Pointer, f: Pointer -> void) -> int {
+		var size = 0;
+		while (true) { // iterate over words of extended map
+			var vmap = vmap_p.load<int>();
+			if (debug) System.err.puts("scanExtMap = ").putp(Pointer.NULL.add(vmap)).ln();
+			var s = scanRefMap(vmap, start, f);
+			size = size + s;
+			if (s < 31 * REF_SIZE) break; // last entry is < 31 words
+			start = start.add(s);
+			vmap_p = vmap_p.add(INT_SIZE);
+		}
+		if (debug) System.err.puts("extmapsize = ").puti(size).ln();
+		return size;
+	}
+	// scan the references at the given start address, printing them to the console
+	def debugScanMap(vmap: int, start: Pointer) {
+		// TODO: handle extended entries in printing debugging information
+		var o = System.err.puts("stackMap ").putp(Pointer.NULL.add(vmap)).ln();
+		if (vmap == 0) return;
+		for (p = start; vmap != 1; p = p.add(REF_SIZE)) {
+			var marked = (vmap & 1) != 0;
+			var val = p.load<Pointer>();
+			o.puts("@ ").putp(p).puts(" ").putc(if(marked, '*', ' ')).puts(" | ");
+
+			if (val == Pointer.NULL) o.putp(val).puts(" |\n");
+			else if (val.gteq(CiRuntime.HEAP_START) && val.lt(CiRuntime.HEAP_END)) debugScanRef(val, if(marked, CTRL_GREEN, CTRL_YELLOW), "heap");
+			else if (val.gteq(CiRuntime.DATA_START) && val.lt(CiRuntime.DATA_END)) debugScanRef(val, if(marked, CTRL_GREEN, CTRL_YELLOW), "data");
+			else if (marked) debugScanRef(val, CTRL_RED, "");
+			else o.putp(val).puts(" |\n");
+
+			vmap = vmap #>> 1;
+		}
+	}
+	def debugScanRef(val: Pointer, color: string, region: string) {
+		System.err.puts(color).putp(val).puts(CTRL_DEFAULT).puts(" | ").puts(region).ln();
+	}
+	def memClear(ptr: Pointer, end: Pointer) {
+		for (p = ptr; p.lt(end); p = p.add(Pointer.SIZE)) {
+			p.store(Pointer.NULL);
+		}
+	}
+	def memCopy(dest: Pointer, src: Pointer, size: int) {
+		var end = src.add(size);
+		while (src.lt(end)) {
+			dest.store(src.load<Pointer>());
+			src = src.add(Pointer.SIZE);
+			dest = dest.add(Pointer.SIZE);
+		}
+	}
+}

@@ -1,0 +1,116 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A simple semispace copying collector.
+component Semispace {
+	var toSpace_start: Pointer;	// start of to-space region
+	var toSpace_end: Pointer;	// end of to-space region
+	var toSpace_alloc: Pointer;	// allocation point in to-space region
+	var fromSpace_start: Pointer;	// start of from-space region
+	var fromSpace_end: Pointer;	// end of frame-space region
+	var gc_count: int;
+
+	new() {
+		// install initialization and collection with runtime
+		RiRuntime.gcInit = init;
+		RiRuntime.gcCollect = collect;
+	}
+	// initialize the garbage collection spaces for runtime
+	def init() {
+		var heapSize = CiRuntime.HEAP_END.sub(CiRuntime.HEAP_START);
+		var heapMid = CiRuntime.HEAP_START.add((heapSize / 2) & 0xFFFFFFF0);
+		fromSpace_start = CiRuntime.HEAP_START;
+		fromSpace_end = heapMid;
+		toSpace_start = heapMid;
+		toSpace_alloc = heapMid;
+		toSpace_end = CiRuntime.HEAP_END;
+		CiRuntime.heapCurLoc.store(fromSpace_start);
+		CiRuntime.heapEndLoc.store(fromSpace_end);
+	}
+	// swap "from" and "to" spaces
+	def swapSpaces() {
+		var tmp = (toSpace_start, toSpace_end);
+
+		toSpace_start = fromSpace_start;
+		toSpace_end = fromSpace_end;
+		toSpace_alloc = toSpace_start;
+
+		fromSpace_start = tmp.0;
+		fromSpace_end = tmp.1;
+	}
+	// relocate a reference
+	def relocObject(ref_loc: Pointer) {
+		var ref = ref_loc.load<Pointer>();
+		if (ref == Pointer.NULL) return;
+		if (ref.lt(fromSpace_end)) {
+			if (ref.gteq(fromSpace_start)) {
+				// ref lies in from-space, relocate
+				var newref = ref.load<Pointer>(); // read forwarding pointer
+				if (newref.gteq(toSpace_start) && newref.lt(toSpace_alloc)) {
+					// object has already been moved
+					if (newref != ref) ref_loc.store(newref);
+				} else {
+					// object hasn't been moved, copy it to to-space
+					var size = RiGc.objectSize(ref);
+					newref = toSpace_alloc;
+//					if (RiGc.debug) {
+//						System.err.puts("Copying ").putp(ref).puts(" to ").putp(newref).puts(", ").puti(size).puts(" bytes\n");
+//					}
+					toSpace_alloc = toSpace_alloc.add(size);
+					RiGc.memCopy(newref, ref, size);
+					ref_loc.store(newref);
+					ref.store(newref); // write forwarding pointer
+				}
+				return;
+			}
+		}
+		if (ref.lt(CiRuntime.DATA_END) && ref.gteq(CiRuntime.DATA_START)) return;
+		System.err.puts("!GcError: invalid reference @ ").putp(ref_loc).puts(" -> ").putp(ref);
+		System.error("GcError", "fatal");
+	}
+	// perform a collection
+	def collect(size: int, ip: Pointer, sp: Pointer) -> Pointer {
+		// scan global and stack roots
+		var before: int;
+		if (RiGc.debug || RiGc.verbose) {
+			System.err.puts("Begin GC, ").puti(fromSpaceUsed() / 1024).puts("K\n");
+			before = System.ticksUs();
+		}
+		RiGc.scanGlobals(relocObject);
+		RiGc.scanStack(ip, sp, relocObject);
+		// scan the objects copied from roots
+		var scan = toSpace_start;
+		while (scan.lt(toSpace_alloc)) {
+			scan = scan.add(RiGc.scanObject(scan, relocObject));
+		}
+		gc_count++;
+		if (gc_count > 1) {
+			// zero the remaining portion of the to-space, since it was used previously
+			// XXX: incrementally zero to-space to avoid blowing the cache
+			RiGc.memClear(toSpace_alloc, toSpace_end);
+		}
+		swapSpaces();
+		if (RiGc.paranoid) {
+			// overwrite the old from-space with garbage to catch errors
+			var end = CiRuntime.heapCurLoc.load<Pointer>();
+			for (p = toSpace_start; p.lt(end); p = p.add(4)) p.store(0xDEADBEEF);
+		}
+		// check to see if enough space remains
+		if (fromSpace_end.sub(scan) < size) {
+			RiRuntime.fatalException("HeapOverflow", "insufficient space after GC", ip, sp);
+			return Pointer.NULL;
+		}
+		CiRuntime.heapCurLoc.store(scan.add(size));
+		CiRuntime.heapEndLoc.store(fromSpace_end);
+		if (RiGc.debug || RiGc.verbose) {
+			var diff = System.ticksUs() - before;
+			System.err.puts("End GC, ").puti(fromSpaceUsed() / 1024).puts("K (").puti(diff).puts(" us)\n");
+		}
+		// return address of free space
+		return scan;
+	}
+	def fromSpaceUsed() -> int {
+		return CiRuntime.heapCurLoc.load<Pointer>().sub(fromSpace_start);
+	}
+}
+
