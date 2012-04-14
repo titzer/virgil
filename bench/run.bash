@@ -44,7 +44,25 @@ for p in $programs; do
 
 	args=$(cat $p/args-$size)
 	for e in $engines; do
-		echo "Running ($e) $p ($size=$args)..."
-		$TMP/btime $TMP/$p-$e 5 ./target-$e $p $args
+		printf "$p ($size): "
+
+		flags=""
+		if [ -f $p/flags-$e ]; then
+			flags=$(cat $p/flags-$e)
+		fi
+
+		files="Common.v3 $p/$p.v3"
+		if [ -x "$p/$p.bash" ]; then
+			files=$($p/$p.bash $TMP)
+		fi
+
+		COMMAND=$(./target-$e $TMP "$p" "$flags" "$files")
+
+		if [ $? = 0 ]; then
+			printf "$COMMAND $args\n"
+			$TMP/btime $TMP/$p-$e $COUNT $COMMAND $args
+		else
+			echo "  Failed compiling ($e) $p"
+		fi
 	done
 done

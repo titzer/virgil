@@ -9,8 +9,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <math.h>
 
 char **global_envp;
+double *times;
 
 // print timeval and rusage
 void print_time(struct timeval *elapsed, struct rusage *usage) {
@@ -87,6 +89,8 @@ int run(int run, int numruns, char *tmp, char *argv[]) {
   close(nstdout);
   close(nstderr);
 
+  times[run] = ((double) elapsed.tv_sec) + ((double) elapsed.tv_usec) / 1000000.0;
+
   if (numruns > 1) {
     // print each time on the same row
     printf(" %5ld.%06d", elapsed.tv_sec, elapsed.tv_usec);
@@ -97,6 +101,20 @@ int run(int run, int numruns, char *tmp, char *argv[]) {
     print_time(&elapsed, &usage);
   }
   return 0;
+}
+
+void print_stats(int runs) {
+  double total = 0;
+  int i = 0;
+  for (i = 0; i < runs; i++) {
+    total += times[i];
+  }
+  double average = total / runs, dev = 0;
+  for (i = 0; i < runs; i++) {
+    dev += (times[i] - average) * (times[i] - average);
+  }
+  double stddev = sqrt(dev / (runs - 1));
+  printf("  avg=%.6lf  stddev=%.6lf", average, stddev);
 }
 
 int main(int argc, char *argv[], char *envp[]) {
@@ -111,12 +129,18 @@ int main(int argc, char *argv[], char *envp[]) {
     // could have specified the number of runs
     char *num = argv[2];
     if (num[0] >= '0' && num[0] <= '9') {
-      int runs = atoi(num), i = 0;
-      for(i = 0; i < runs; i++) {
-	run(i, runs, tmp, &argv[3]);
+      int runs = atoi(num);
+      if (runs > 1) {
+	int i = 0, failed = 0;
+        times = (double *) malloc(runs * sizeof(double));
+        for(i = 0; i < runs; i++) {
+  	  if (failed) printf(" %12s", "--");
+	  else failed = (run(i, runs, tmp, &argv[3]) != 0);
+        }
+        print_stats(runs);
+        printf("\n");
+        return 0;
       }
-      printf("\n");
-      return 0;
     }
   }
   return run(0, 1, tmp, &argv[2]);
