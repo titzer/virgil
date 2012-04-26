@@ -1,7 +1,7 @@
 // Copyright 2011 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Information about a var variable, including whether it is written (i.e. non-SSA),
+// Information about a local variable, including whether it is written (i.e. non-SSA),
 // and all loops in which it is written
 class VstSsaVar {
 	var instr: SsaInstr;
@@ -37,10 +37,11 @@ class VstSsaVar {
 // XXX: LVN and GVN
 // XXX: make all null checks and bounds checks explicit
 // XXX: iterative constant folding / control flow simplification
+// XXX: fold Call(#null) to Throw(!NullCheckException)
 class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	def prog: Program;			// the program
 	def meth: VstMethod;			// the method
-	var region: SsaRegion;		// the code region
+	var region: SsaRegion;			// the code region
 	var localOpt: SsaLocalOptimizer;	// var optimizer
 	var pir: IrPortion;			// the IR portion of the program
 	var thisType: Type;
@@ -458,6 +459,21 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			// this an array get element
 			var ssaArgs = Arrays.prepend(env.genExpr(f), Arrays.map(args, env.genExpr));
 			return env.addApply(exprSource(expr), V3Op.newArrayGetElem(ftype), ssaArgs);
+		} else if (expr.partial != null) {
+			// this is a partial application
+			var bound = Sequence<SsaInstr>.new(), indexMap = Sequence<int>.new();
+			var ssaFunc = env.genExpr(f);
+			bound.add(ssaFunc);
+			indexMap.add(0);
+			for (i = 0; i < args.length; i++) {
+				var arg = args(i);
+				if (ParamExpr.?(arg)) continue;
+				bound.add(env.genExpr(arg));
+				indexMap.add(i + 1);
+			}
+			// XXX: optimize C.m(... _ ...) and o.m(... _ ...) and <val>(... _ ...)
+			var i = SsaInstOp.new(V3Op.newCallDelegate(f.exactType), indexMap.extract(), bound.extract());
+			return env.addInstr(i);
 		} else if (VarExpr.?(f)) {
 			// this could be a member call
 			var func = VarExpr.!(f);
@@ -680,6 +696,7 @@ class SsaGen extends Gen<SsaInstr> {
 	def genApplyOp(op: Operator, args: Array<SsaInstr>) -> SsaInstr { return env.addApply(source(), op, args); }
 	def genCall(args: Array<SsaInstr>) -> SsaInstr { return env.addCall(source(), args(0).getType(), args); }
 	def genInstOp(op: Operator, args: Array<SsaInstr>, indexMap: Array<int>) -> SsaInstr {
+		// XXX: fold/optimize instantiations of operators
 		return env.addInstr(SsaInstOp.new(op, indexMap, args));
 	}
 	def genOp(op: Operator) -> SsaInstr { return env.addOp(op); }
@@ -790,11 +807,11 @@ class VstSsaEnv extends SsaBlockBuilder {
 			-1: { // non-apply
 				if (SsaInstOp.?(func)) {
 					// convert instantiate + call into apply
-					return addCallInst(source, SsaInstOp.!(func), args);
+					return addCallInst(source, SsaInstOp.!(func), Arrays.range(args, 1, args.length));
 				} else if (SsaValue.?(func)) {
 					// convert call of closure value into apply
 					var val = SsaValue.!(func).val;
-					if (OpClosure.?(val)) return addCallClosure(source, OpClosure.!(val), args);
+					if (OpClosure.?(val)) return addCallClosure(source, OpClosure.!(val), Arrays.range(args, 1, args.length));
 				}
 			}
 		}
@@ -803,25 +820,59 @@ class VstSsaEnv extends SsaBlockBuilder {
 		return addInstr(SsaApplyOp.new(source, op, args));
 	}
 	private def addCallInst(source: Source, inst: SsaInstOp, args: Array<SsaInstr>) -> SsaInstr {
-		return addApply(source, inst.op, expandArgs(inst.op, inst.indexMap, inst.inputs, args));
+		// Call(InstOp[op](inputs), args) -> Apply[op](inputs <+> args)
+		var indexMap = inst.indexMap, op = inst.op;
+		if (indexMap.length == 0) return addApply(source, op, args);
+		var bound = Arrays.map<SsaDfEdge, SsaInstr>(inst.inputs, SsaDfEdge.dest);
+		return addClosureCall(source, op, bound, indexMap, args);
 	}
 	private def addCallClosure(source: Source, opcl: OpClosure, args: Array<SsaInstr>) -> SsaInstr {
-		return addApply(source, opcl.op, expandArgs(opcl.op, opcl.indexMap, opcl.vals, args));
+		// Call(Val(OpClosure[op]{inputs}), args) -> Apply[op](inputs <+> args)
+		var indexMap = opcl.indexMap, op = opcl.op;
+		if (indexMap.length == 0) return addApply(source, op, args);
+		var bound = Array<SsaInstr>.new(indexMap.length);
+		for (i = 0; i < indexMap.length; i++) {
+			bound(i) = addVal(op.paramTypes(i), opcl.vals(i));
+		}
+		return addClosureCall(source, op, bound, indexMap, args);
 	}
-	// expand either bound instructions or bound values (T in {SsaDfEdge, Val})
-	private def expandArgs<T>(op: Operator, indexMap: Array<int>, bound: Array<T>, args: Array<SsaInstr>) -> Array<SsaInstr> {
-		if (indexMap.length == 0) return Arrays.range(args, 1, args.length);
-		// expand arguments for closure call
-		var r = Array<SsaInstr>.new(op.paramTypes.length), ia = 1, iv = 0;
+	private def addClosureCall(source: Source, op: Operator, bound: Array<SsaInstr>, indexMap: Array<int>, args: Array<SsaInstr>) -> SsaInstr {
+		// mix bound and unbound parameters into a single parameter list
+		var numArgs = args.length, expected = op.paramTypes.length - bound.length;
+		if (expected == 0) {
+			args = SsaUtil.NO_INSTRS;
+		} else if (expected > numArgs) {
+			// need to expand 0 or 1 arg to be multiple arguments
+			if (numArgs == 0) args = [addVal(Void.TYPE, null)];
+			else if (numArgs == 1) args = expandArgs(op.getResidualParamTypeList(indexMap), args);
+			else gen.error(null, Strings.format2("expected %1 op closure arguments, got %2", expected, numArgs));
+		} else if (expected < numArgs) {
+			if (expected == 1) args = contractArgs(op.getResidualParamTypeList(indexMap), args);
+			else gen.error(null, Strings.format2("expected %1 op closure arguments, got %2", expected, numArgs));
+		}
+
+		var newArgs = Array<SsaInstr>.new(op.paramTypes.length), ia = 0, iv = 0;
+		for (i = 0; i < newArgs.length; i++) {
+			if (iv < indexMap.length && indexMap(iv) == i) newArgs(i) = bound(iv++);
+			else newArgs(i) = args(ia++);
+		}
+		// optimize Apply[CallDelegate](args)
+		if (op.opcode == V3Opcode.CallDelegate) return addCall(source, op.typeArgs(0), newArgs);
+		else return addApply(source, op, newArgs);
+	}
+	private def expandArgs(list: List<Type>, args: Array<SsaInstr>) -> Array<SsaInstr> {
+		// expand a single argument to multiple arguments by getting each element
+		var r = Array<SsaInstr>.new(Lists.length(list));
+		var tt = Tuple.TYPECON.create(list);
 		for (i = 0; i < r.length; i++) {
-			if (indexMap(iv) == i) {
-				var b = bound(iv++);
-				r(i) = if(SsaDfEdge.?(b), SsaDfEdge.!(b).dest, addVal(op.paramTypes(iv-1), Val.!(b)));
-			} else {
-				r(i) = args(ia++);
-			}
+			r(i) = addApply(null, V3Op.newTupleGetElem(tt, i), args);
 		}
 		return r;
+	}
+	private def contractArgs(list: List<Type>, args: Array<SsaInstr>) -> Array<SsaInstr> {
+		// collapse multiple arguments into a single argument by creating a tuple
+		var tt = list.head;
+		return [addApply(null, V3Op.newTupleCreate(tt), args)];
 	}
 	private def addCallClass(virtual: bool, source: Source, args: Array<SsaInstr>) -> SsaInstr {
 		var func = args(0), irSpec = V3Op.extractIrSpec(SsaApplyOp.!(func).op);
