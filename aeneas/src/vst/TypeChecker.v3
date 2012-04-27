@@ -223,8 +223,8 @@ class TypeChecker extends VstVisitor<Type, Type> {
 		return e.exactType;
 	}
 	def visitParamExpr(expr: ParamExpr, outer: Type) -> Type {
-		if (outer == null) TypeInferError(expr.range(), "cannot infer param expr type");
-		return expr.vtype = outer;
+		ParamExprError(expr.range(), "param expression can only be function call argument");
+		return if(outer == null, getErrorType(), outer);
 	}
 	def visitAutoExpr(expr: AutoExpr, outer: Type) -> Type {
 		typeCheckExpr(expr.expr, Int.TYPE, "auto expression");
@@ -317,13 +317,13 @@ class TypeChecker extends VstVisitor<Type, Type> {
 	}
 	def visitApp(expr: AppExpr, outer: Type) -> Type {
 		// infer an open type for the function or array
-		var exactType = inferType(expr.func);
-		if (V3.isArray(exactType)) {
-			return typeCheckArrayAccess(expr, exactType, outer);
-		} else if (V3.isFunction(exactType)) {
-			return typeCheckMethodApp(expr, exactType, outer);
+		var funcType = inferType(expr.func);
+		if (V3.isArray(funcType)) {
+			return typeCheckArrayAccess(expr, funcType, outer);
+		} else if (V3.isFunction(funcType)) {
+			return typeCheckMethodApp(expr, funcType, outer);
 		}
-		TypeError(expr.func.range(), getErrorFunctionType(), exactType, "application");
+		TypeError(expr.func.range(), getErrorFunctionType(), funcType, "application");
 		return getErrorType();
 	}
 	def typeCheckArrayAccess(expr: AppExpr, arrayType: Type, outer: Type) -> Type {
@@ -333,42 +333,69 @@ class TypeChecker extends VstVisitor<Type, Type> {
 		return V3Array.elementType(arrayType);
 	}
 	def typeCheckMethodApp(expr: AppExpr, funcType: Type, outer: Type) -> Type {
-		// 1. get the parameter and return types of the function
-		var returnType = Function.getReturnType(funcType);
+		def op = "function application";
+		// get the parameter type and parameter type list
 		var paramType = Function.getParamType(funcType);
+		var argList = expr.args.exprs.list, ptlist: List<Type>;
+		if (argList == null || argList.tail != null) ptlist = Tuple.toTypeList(paramType);
+		else ptlist = List.new(paramType, null); // one arg -> use tuple type
 
-		// 2. unify return type with the outer type if necessary
-		if (outer != null) TypeSystem.unifyWiden(returnType, outer);
-
-		// 3. unify the parameter and argument types
-		var args = expr.args.exprs.asArray();
-		if (args.length == 1) {
-			// only one argument passed, unify with (tuple) param type
-			TypeSystem.unifyWiden(paramType, inferClosedType(args(0)));
+		// infer argument expressions' types, including parameter expressions '_'
+		var checkList: List<(Expr, Type)>, partialIndex = 0, tl = ptlist;
+		for (el = argList; el != null; el = el.tail) {
+			var arg = el.head;
+			if (tl == null) {
+				// too many parameters
+				inferClosedType(arg);
+				ArityMismatch(arg.range(), op, Lists.length(ptlist), expr.args.exprs.length());
+				continue;
+			}
+			var paramType = tl.head;
+			if (ParamExpr.?(arg)) {
+				var param = ParamExpr.!(arg);
+				param.ptype = paramType;
+				param.index = partialIndex++;
+				expr.partial = List.new(param, expr.partial);
+			} else if (paramType.hasTypeVars()) {
+				// parameter type has type variables
+				TypeSystem.unifyWiden(paramType, inferClosedType(arg));
+				checkList = List.new((arg, paramType), checkList);
+			} else {
+				// no type variables; use parameter type to help infer inner types
+				typeCheckExpr(arg, paramType, op);
+			}
+			tl = tl.tail;
+		}
+		if (tl != null) {
+			// too few parameters
+			// TODO: use a point that refers to the ')'
+			ArityMismatch(expr.args.exprs.range(), op, Lists.length(ptlist), expr.args.exprs.length());
+		}
+		// unify return type with outer
+		var returnType = Function.getReturnType(funcType);
+		var resultType: Type;
+		if (expr.partial != null) {
+			// this is a partial application, and its result is a function
+			var plist: List<Type>;
+			for (l = expr.partial; l != null; l = l.tail) {
+				plist = List.new(l.head.ptype, plist);
+			}
+			resultType = Function.newType(Tuple.newType(plist), returnType);
+			if (outer != null) TypeSystem.unifyWiden(resultType, outer);
 		} else {
-			// zero or more than one argument passed
-			var paramTypes = Lists.toArray(Function.getParamTypeList(funcType));
-			for (i = 0; i < args.length; i++) {
-				var argType = inferClosedType(args(i));
-				if (i < paramTypes.length) TypeSystem.unifyWiden(paramTypes(i), argType);
-			}		
+			// this is a complete application, its result is the return type
+			if (outer != null) TypeSystem.unifyWiden(returnType, outer);
+			resultType = returnType;
 		}
 
-		// 4. eliminate type variables in the return type and parameter types
-		returnType = elim(returnType);
-		paramType = elim(paramType);
-
-		// 5. check that each argument is assignable to the solved type
-		if (args.length == 1) {
-			typeCheckExpr(args(0), paramType, "function application");
-		} else {
-			var paramTypeList = Tuple.toTypeList(paramType);
-			typeCheckExprs(expr.args, paramTypeList, "function application");
+		// typecheck remaining expressions against the inferred (closed) type
+		tl = ptlist;
+		for (cl = checkList; cl != null; cl = cl.tail) {
+			typeCheckExpr(cl.head.0, elim(cl.head.1), "function application");
 		}
 
-		// 6. set the exact type of the function		
-		expr.func.exactType = Function.newType(paramType, returnType);
-		return returnType;
+		expr.func.exactType = elim(funcType);
+		return elim(resultType);
 	}
 	def visitNot(expr: NotExpr, outer: Type) -> Type {
 		typeCheckExpr(expr.expr, Bool.TYPE, "boolean not operator");
@@ -577,6 +604,9 @@ class TypeChecker extends VstVisitor<Type, Type> {
 	}
 	def LoopError(point: FilePoint, msg: string) {
 		error(point.rangeOf(0), "LoopError", msg);
+	}
+	def ParamExprError(point: FilePoint, msg: string) {
+		error(point.rangeOf(0), "ParamExprError", msg);
 	}
 	def ArityMismatch(range: FileRange, op: string, expect: int, found: int) {
 		if (expect == 1) error(range, "TypeError", Strings.format2("%1 requires 1 argument and found %2", op, found));
