@@ -4,6 +4,7 @@
 // Creates methods to wrap operators so they can be used as delegates
 class IrOpMethodBuilder {
 	def prog: Program;
+	var closures: Array<IrClass>;
 	new(prog) {}
 	def buildOpMethod(op: Operator) -> IrSpec {
 		// XXX: cache Operator -> IrSpec
@@ -16,20 +17,21 @@ class IrOpMethodBuilder {
 		// build SSA params and types
 		def container = prog.globalType(); // receiver is never used
 		var paramTypes = op.paramTypes, numParams = paramTypes.length;
-		var params = Sequence<SsaParam>.new().grow(numParams + 1);
-		var args = Sequence<SsaInstr>.new().grow(numParams);
-		params.add(SsaParam.new(0, container));
+		var params = Array<SsaParam>.new(numParams + 1);
+		var args = Array<SsaInstr>.new(numParams);
+		params(0) = SsaParam.new(0, container);
 		for (i = 0; i < numParams; i++) {
-			var param = SsaParam.new(params.length, paramTypes(i));
-			params.add(param);
-			args.add(param);
+			var param = SsaParam.new(i + 1, paramTypes(i));
+			params(i + 1) = param;
+			args(i) = param;
 		}
 		// build IrMethod
 		var meth = IrMethod.new(typeArgs, paramTypes, op.resultType);
-		meth.ssa = SsaRegion.new(params.extract(), op.resultType);
+		meth.setFlag(IrUtil.M_INLINE | IrUtil.M_OPERATOR);
+		meth.ssa = SsaRegion.new(params, op.resultType);
 		// build block
 		var block = SsaBlockBuilder.new(meth.ssa.startBlock);
-		var apply = block.addApply(null, op, args.extract());
+		var apply = block.addApply(null, op, args);
 		block.addReturn([apply]);
 		if (Aeneas.PRINT_SSA.get()) {
 			Terminal.print1("Generated SSA for: %1\n", V3Op.renderOp(op));
@@ -39,8 +41,122 @@ class IrOpMethodBuilder {
 		var ta = if(typeArgs != null, Arrays.prepend(container, typeArgs.types), [container]);
 		return IrSpec.new(container, ta, meth);
 	}
-}
+	// build an operator capable of creating a closure for the given operator and args
+	def buildOpClosure(ssa: SsaBlockBuilder, op: Operator, args: Array<SsaInstr>, indexMap: Array<int>) -> SsaInstr {
+		// get the closure type
+		var ic = createClosureClass(indexMap.length);
+		var closureType = getClosureType(ic, op, indexMap);
+		var newSpec = IrSpec.new(closureType, [closureType], ic.methods(0));
+		// create the closure object
+		// XXX: fold the closure creation if possible
+		var closure = ssa.addApply(null, V3Op.newClassAlloc(newSpec), args);
+		closure.setFact(SsaFacts.O_PURE);
+		// create the closure method
+		var abstracter = TypeParamAbstracter.new(prog);
+		var meth = createClosureMethod(ic, op, abstracter, indexMap);
+		var spec = IrSpec.new(prog.globalType(), Lists.toArray(List.new(closureType, abstracter.oldTypeParams)), meth);
+		// XXX: fold creation of delegate if possible
+		return ssa.addApply(null, V3Op.newCreateDelegate(spec, closureType), [closure]);
+	}
+	private def getClosureType(ic: IrClass, op: Operator, indexMap: Array<int>) -> Type {
+		var boundTypes: List<Type>;
+		for (i = indexMap.length - 1; i >= 0; i--) {
+			boundTypes = List.new(op.paramTypes(indexMap(i)), boundTypes);
+		}
+		return ic.ctype.typeCon.create(boundTypes);
+	}
+	private def createClosureMethod(ic: IrClass, op: Operator, abstracter: TypeParamAbstracter, indexMap: Array<int>) -> IrMethod {
+		// create parameters and method
+		op = op.subst(abstracter.substitute);
+		var paramTypes = Lists.toArray(op.getResidualParamTypeList(indexMap));
+		var meth = IrMethod.new(abstracter.getDefaultTypeArgs(), paramTypes, op.resultType);
+		meth.setFlag(IrUtil.M_INLINE);
+		prog.getIr().methods.add(meth);
 
+		// build the body of the method
+		var closureType = getClosureType(ic, op, indexMap);
+		var block = createSsa(closureType, meth);
+		var receiver: SsaInstr = meth.ssa.params(0);
+		var args = Array<SsaInstr>.new(op.paramTypes.length);
+		var ia = 0, ip = 1;
+		for (i = 0; i < op.paramTypes.length; i++) {
+			if (ia < indexMap.length && i == indexMap(ia)) {
+				// the argument is bound in the closure
+				var spec = IrSpec.new(closureType, [closureType], ic.fields(ia));
+				var load = block.addApply(null, V3Op.newClassGetField(spec), [receiver]);
+				load.setFact(SsaFacts.O_PURE | SsaFacts.O_NO_NULL_CHECK);
+				args(i) = load;
+				ia++;
+			} else {
+				// the argument is a parameter to this method
+				args(i) = meth.ssa.params(ip++);
+			}
+		}
+		var app = block.addApply(null, op, args);
+		block.addReturn([app]);
+		if (Aeneas.PRINT_SSA.get()) {
+			Terminal.print1("Generated SSA for: %1\n", meth.render);
+			SsaPrinter.new(prog).printRegion(meth.ssa);
+		}
+		return meth;
+	}
+	private def createClosureClass(numBound: int) -> IrClass {
+		if (closures == null) closures = Array.new(numBound + 3);
+		if (numBound >= closures.length) closures = Arrays.grow(closures, closures.length + numBound);
+		if (closures(numBound) != null) return closures(numBound);
+
+		// create the VST-level class type
+		var name = Strings.toBuffer(prog.name()).puts("$closure").puti(numBound).toString();
+		var typeParams: List<TypeParam>;
+		for (i = 0; i < numBound; i++) {
+			typeParams = List.new(TypeUtil.newTypeParam(null, prog.typeCache), typeParams);
+		}
+		var decl = VstClass.new(Token.new("<generated>", name, 0, 0), typeParams, null, null);
+		decl.typeEnv = TypeEnv.new(null, typeParams);
+		decl.typeCon = V3Class_TypeCon.new(decl, prog.typeCache);
+		var classType = decl.getDeclaredType();
+
+		// add a constructor that initializes the fields
+		var builder = IrClassBuilder.new(classType, null);
+		var paramTypes = Array<Type>.new(numBound);
+		var i = 0;
+		for (l = typeParams; l != null; (l = l.tail, i++)) {
+			var f = IrField.new(l.head);
+			f.index = i;
+			f.setFlag(IrUtil.F_VALUE);
+			builder.addIrField(f); // add a field
+			paramTypes(i) = l.head; // and a parameter type
+		}
+		var meth = IrMethod.new(null, paramTypes, classType);
+		meth.setFlag(IrUtil.M_NEW | IrUtil.M_INLINE);
+		builder.addIrMethod(meth);
+
+		// build the body of the constructor
+		var block = createSsa(classType, meth), params = meth.ssa.params;
+		var receiver: SsaInstr = params(0);
+		for (i = 0; i < numBound; i++) {
+			var spec = IrSpec.new(classType, [classType], builder.fields.get(i));
+			block.addApply(null, V3Op.newClassSetField(spec), [receiver, params(i + 1)]);
+		}
+		block.addReturn([receiver]);
+		if (Aeneas.PRINT_SSA.get()) {
+			Terminal.print1("Generated SSA for: %1\n", classType.render);
+			SsaPrinter.new(prog).printRegion(meth.ssa);
+		}
+		var ic = closures(numBound) = builder.build();
+		prog.getIr().setIrClass(ic.ctype, ic);
+		return ic;
+	}
+	private def createSsa(receiver: Type, meth: IrMethod) -> SsaBlockBuilder {
+		var params = Array<SsaParam>.new(meth.paramTypes.length + 1);
+		params(0) = SsaParam.new(0, receiver);
+		for (i = 1; i < params.length; i++) {
+			params(i) = SsaParam.new(i, meth.paramTypes(i - 1));
+		}
+		meth.ssa = SsaRegion.new(params, meth.returnType);
+		return SsaBlockBuilder.new(meth.ssa.startBlock);
+	}
+}
 // Abstracts any type parameters in a type with a new type parameter
 class TypeParamAbstracter extends TypeSubst {
 	def prog: Program;
@@ -63,5 +179,9 @@ class TypeParamAbstracter extends TypeSubst {
 		if (oldTypeParams == null) return null;
 		var typeEnv = TypeEnv.new(null, newTypeParams);
 		return TypeArgs.new(typeEnv, Lists.toArray(oldTypeParams));
+	}
+	def getDefaultTypeArgs() -> TypeArgs {
+		if (oldTypeParams == null) return null;
+		return TypeEnv.new(null, newTypeParams).getDefaultTypeArgs();
 	}
 }
