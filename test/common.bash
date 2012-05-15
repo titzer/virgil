@@ -16,7 +16,7 @@ UNAME=$(uname -sm)
 if [ "$UNAME" == "Darwin i386" ]; then
 	HOST_PLATFORM="x86-darwin"
 	TEST_TARGET=${TEST_TARGET:="x86-darwin"}
-elif [[ "$UNAME" == "Linux i686" || "$UNAME" == "Linux i386" ]]; then
+elif [[ "$UNAME" == "Linux i686" || "$UNAME" == "Linux i386" || "$UNAME" == "Linux x86_64" ]]; then
 	HOST_PLATFORM="x86-linux"
 	TEST_TARGET=${TEST_TARGET:="jar"}
 else
