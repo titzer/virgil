@@ -8,21 +8,23 @@ mkdir -p $T
 
 # TODO: reduce duplication between stacktrace and system
 function do_test() {
-	params="$2"
-	exp="$3"
-	local expect=$T/$1.expect
-	local out=$T/$1.out
-	rm -f $out $expect
-	if [ "$exp" = "" ]; then touch $expect
-	else printf "$exp" > $expect
-	fi
-	if [ $compiled = 1 ]; then
+        if [[ "$TESTS" == *"$1"* ]]; then
+	    params="$2"
+	    exp="$3"
+	    local expect=$T/$1.expect
+	    local out=$T/$1.out
+	    rm -f $out $expect
+	    if [ "$exp" = "" ]; then touch $expect
+	    else printf "$exp" > $expect
+	    fi
+	    if [ $compiled = 1 ]; then
 		run_io_test $target "${1%*.*}" "$params" "$expect" 
-	else
+	    else
 		printf "  Running   (int) %s..." $1
 		run_v3c "" -run $1 $params > $out
 		diff $expect $out > /dev/null
 		check $?
+	    fi
 	fi
 }
 
@@ -63,10 +65,16 @@ do_test Params02.v3 "a b c" ""
 
 }
 
+if [ $# -gt 0 ]; then
+  TESTS=$*
+else
+  TESTS=*.v3
+fi
+
 compiled=0
 do_tests
 
-for b in *.v3; do
+for b in $TESTS; do
   out=$T/$1.compile.out
   printf "  Compiling ($target) $b..."
   run_v3c $target -output=$T $b &> $out
