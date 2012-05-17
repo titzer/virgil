@@ -33,7 +33,7 @@ fi
 printf "  Compiling ($target) gc tests..."
 for f in $TESTS; do
   # TODO: compile multiple tests at once with aeneas (no need for Aeneas-fast)
-  $AENEAS_FAST -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -heap-size=10k $f $VIRGIL_LOC/rt/*/*.v3 >> $C
+  $AENEAS_FAST -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -heap-size=10k $f $VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/darwin/*.v3 $VIRGIL_LOC/rt/gc/*.v3  >> $C
 done
 
 check_no_red $? $C
