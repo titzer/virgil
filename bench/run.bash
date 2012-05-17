@@ -34,7 +34,7 @@ mkdir -p $TMP
 
 if [ ! -x $TMP/btime ]; then
 	echo Compiling btime.c...
-	gcc -O2 -o $TMP/btime btime.c
+	gcc -m32 -lm -O2 -o $TMP/btime btime.c
 fi
 
 for p in $programs; do

@@ -4,6 +4,7 @@
 
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <sys/fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,9 +23,9 @@ void print_time(struct timeval *elapsed, struct rusage *usage) {
     printf(" %12s", "user");
     printf(" %12s", "sys");
   } else {
-    printf(" %5ld.%06d", elapsed->tv_sec, elapsed->tv_usec);
-    printf(" %5ld.%06d", usage->ru_utime.tv_sec, usage->ru_utime.tv_usec);
-    printf(" %5ld.%06d", usage->ru_stime.tv_sec, usage->ru_stime.tv_usec);
+    printf(" %5ld.%06d", elapsed->tv_sec, (int)elapsed->tv_usec);
+    printf(" %5ld.%06d", usage->ru_utime.tv_sec, (int)usage->ru_utime.tv_usec);
+    printf(" %5ld.%06d", usage->ru_stime.tv_sec, (int)usage->ru_stime.tv_usec);
   }
   printf("\n");
 }
@@ -93,7 +94,7 @@ int run(int run, int numruns, char *tmp, char *argv[]) {
 
   if (numruns > 1) {
     // print each time on the same row
-    printf(" %5ld.%06d", elapsed.tv_sec, elapsed.tv_usec);
+    printf(" %5ld.%06d", elapsed.tv_sec, (int)elapsed.tv_usec);
     fflush(stdout);
   } else {
     // print one row with multiple times
