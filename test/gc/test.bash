@@ -2,10 +2,15 @@
 
 . ../common.bash gc
 
+target=$TEST_TARGET
 # TODO: run GC tests on all native platforms
-target="x86-darwin"
-if [ "$TEST_TARGET" != $target ]; then
-	exit 0
+if [ "$target" == x86-darwin ]; then 
+    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/darwin/*.v3 $VIRGIL_LOC/rt/gc/*.v3"
+elif [ "$target" == x86-linux ]; then
+    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/linux/*.v3 $VIRGIL_LOC/rt/gc/*.v3"
+else
+    echo "  GC tests not supported for $target"
+    exit 0
 fi
 
 if [ $# -gt 0 ]; then
@@ -26,14 +31,10 @@ check_no_red $? $T/Aeneas.compile
 C=$T/$target-test.compile.out
 rm -f $C
 
-if [ "$HOST_PLATFORM" != $target ]; then
-	exit 0
-fi
-
 printf "  Compiling ($target) gc tests..."
 for f in $TESTS; do
   # TODO: compile multiple tests at once with aeneas (no need for Aeneas-fast)
-  $AENEAS_FAST -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -heap-size=10k $f $VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/darwin/*.v3 $VIRGIL_LOC/rt/gc/*.v3  >> $C
+  $AENEAS_FAST -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -heap-size=10k $f $RT_SOURCES >> $C
 done
 
 check_no_red $? $C

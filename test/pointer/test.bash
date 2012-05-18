@@ -2,9 +2,10 @@
 
 . ../common.bash pointer
 
-target="x86-darwin"
-if [ "$TEST_TARGET" != $target ]; then
-	exit 0
+target=$TEST_TARGET
+if [[ "$target" != x86-darwin && "$target" != x86-linux ]]; then
+    echo "  Pointer tests not supported on $target"
+    exit 0
 fi
 
 if [ $# == 0 ]; then
