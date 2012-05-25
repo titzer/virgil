@@ -81,7 +81,7 @@ function run_native() {
 		printf "  Running   ($target)...\n"
 		$TESTER ${VIRGIL_TEST_OUT}/$test/$target $TESTS | tee ${VIRGIL_TEST_OUT}/$test/$target/run.out
 	else
-		echo "  Running   ($HOST_PLATFORM)...${YELLOW}skipped${NORM}"
+		echo "  Skipping  ($target/$HOST_PLATFORM)...${YELLOW}ok${NORM}"
 	fi
 }
 
@@ -98,7 +98,7 @@ function run_io_test() {
 		diff $expected $P > $OUT/$target/$test.diff
 		check $?
 	else
-		echo "  Running   ($HOST_PLATFORM)...${YELLOW}skipped${NORM}"
+		echo "  Skipping  ($target/$HOST_PLATFORM)...${YELLOW}ok${NORM}"
 	fi
 }
 
