@@ -46,6 +46,12 @@ do_test st_del01.v3 "a" "!DivideByZeroException
 do_test st_del01.v3 "a a" "!DivideByZeroException
 	in st_del01.del2() [st_del01.v3 @ 11:26]
 	in st_del01.main() [st_del01.v3 @ 5:25]\n\n"
+do_test st_del03.v3 "a" "!DivideByZeroException
+	in st_del03.del1() [st_del03.v3 @ 8:26]
+	in st_del03.main() [st_del03.v3 @ 5:25]\n\n"
+do_test st_del03.v3 "a a" "!DivideByZeroException
+	in st_del03.del2() [st_del03.v3 @ 11:26]
+	in st_del03.main() [st_del03.v3 @ 5:25]\n\n"
 do_test st_del02.v3 "a" "Hello"
 do_test st_del02.v3 "" "!NullCheckException
 	in st_del02.main() [st_del02.v3 @ 4:18]\n\n"
