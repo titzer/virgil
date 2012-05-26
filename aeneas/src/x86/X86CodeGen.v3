@@ -134,8 +134,8 @@ class X86CodeGen extends MachCodeGen {
 		match (i.op.opcode) {
 			V3Opcode.IntAdd:		genAdd(i, mv);
 			V3Opcode.IntMul:		genMul(i, mv);
-			V3Opcode.IntDiv:		root = genDiv(i, mv, true);
-			V3Opcode.IntMod:		root = genDiv(i, mv, false);
+			V3Opcode.IntDiv:		root = genDiv(i, mv);
+			V3Opcode.IntMod:		root = genMod(i, mv);
 			V3Opcode.IntAnd,		// fall through
 			V3Opcode.BoolAnd:		genOp2("and", i, mv, X86Assembler.and);
 			V3Opcode.IntOr,			// fall through
@@ -323,23 +323,21 @@ class X86CodeGen extends MachCodeGen {
 		gen_storex(size, x, scale, disp, val, nullCheck, i.source);
 		return true;
 	}
-	def genDiv(i: SsaApplyOp, mv: MachVar, div: bool) -> bool {
-		var a = i.inputs(0).dest, b = i.inputs(1).dest;
-		var zeroCheck = !i.checkFact(Facts.O_NO_ZERO_CHECK);
-		if (div) {
-			dfnAt(mv, X86MachRegs.EAX);
-			kill(X86MachRegs.EDX);
-			useFixed(a, X86MachRegs.EAX);
-			var bu = useFixed(b, X86MachRegs.NOT_EDX);
-			gen("idiv", asm_idiv, (bu, zeroCheck, i.source));
-		} else {
-			dfnAt(mv, X86MachRegs.EDX);
-			kill(X86MachRegs.EAX);
-			useFixed(a, X86MachRegs.EAX);
-			var bu = useFixed(b, X86MachRegs.NOT_EDX);
-			gen("imod", asm_idiv, (bu, zeroCheck, i.source));
-		}
-		return zeroCheck;
+	def genDiv(i: SsaApplyOp, mv: MachVar) -> bool {
+		dfnAt(mv, X86MachRegs.EAX);
+		kill(X86MachRegs.EDX);
+		useFixed(i.inputs(0).dest, X86MachRegs.EAX);
+		var bu = useFixed(i.inputs(1).dest, X86MachRegs.NOT_EDX);
+		gen("idiv", asm_idiv, (bu, i.facts, true, i.source));
+		return !i.checkFact(Facts.O_NO_ZERO_CHECK); // pure if no zero check
+	}
+	def genMod(i: SsaApplyOp, mv: MachVar) -> bool {
+		dfnAt(mv, X86MachRegs.EDX);
+		kill(X86MachRegs.EAX);
+		useFixed(i.inputs(0).dest, X86MachRegs.EAX);
+		var bu = useFixed(i.inputs(1).dest, X86MachRegs.NOT_EDX);
+		gen("imod", asm_idiv, (bu, i.facts, false, i.source));
+		return !i.checkFact(Facts.O_NO_ZERO_CHECK); // pure if no zero check
 	}
 	def genCondThrow(i: SsaApplyOp, mv: MachVar) -> bool {
 		// generate a branch to the throw function
@@ -655,8 +653,8 @@ class X86CodeGen extends MachCodeGen {
 	def gen_op2_i(name: string, m: X86Assembler -> X86Op2, dest: MachVar, a: SsaInstr, imm: Val) {
 		if (imm == null || Box<int>.?(imm)) gen(name, asm_op2_i, (m, dfn(dest), use(a), Int.unbox(imm), hint(a, dest)));
 		else if (Addr.?(imm)) gen(name, asm_op2_a, (m, dfn(dest), use(a), Addr.!(imm), hint(a, dest)));
-		else mach.compiler.ERROR.fail("not a valid immediate");
-
+		else if (Box<bool>.?(imm)) gen(name, asm_op2_i, (m, dfn(dest), use(a), Bool.toInt(Bool.unbox(imm)), hint(a, dest)));
+		else mach.compiler.ERROR.fail(Strings.format1("not a valid immediate: %1", V3.renderResult(imm, StringBuffer.new()).toString()));
 	}
 	def gen_add_i(dest: MachVar, a: SsaInstr, imm: int) {
 		gen("add_i", asm_add_i, (dfn(dest), use(a), imm, hint(a, dest)));
@@ -807,11 +805,25 @@ class X86CodeGen extends MachCodeGen {
 		if (dest != a) asm_movd_l_l(a, dest);
 		asm.imul_r_i(loc_r(dest), imm);
 	}
-	def asm_idiv(b: int, zeroCheck: bool, source: Source) {
+	def asm_idiv(b: int, facts: int, div: bool, source: Source) {
+		var brm = rm(b), jpatch = -1;
+		if (0 == (facts & Facts.O_NO_DIV_CHECK)) {
+			asm.cmp.rm_i(brm, -1);
+			asm.jnz(4); // if b != -1, branch to division (both cases are 4 bytes of code)
+			if (div) asm.neg(X86Regs.EAX); // a / -1 == 0 - a
+			else asm.xor.rm_r(X86Regs.EDX, X86Regs.EDX); // a % -1 == 0
+			asm.jmp(0); // jump past division to end
+			jpatch = asm.pos() - 1;
+		}
 		asm.cdq();
 		var off = codeOffset();
-		asm.idiv(rm(b));
-		if (zeroCheck && rtsrc != null) rtsrc.recordSource(off, source);
+		asm.idiv(brm);
+		if (jpatch >= 0) {
+			var offset = asm.pos() - jpatch - 1; // patch branch above
+			asm.encoder.at(jpatch).i1(offset);
+			asm.encoder.atEnd();
+		}
+		if (0 == (facts & Facts.O_NO_ZERO_CHECK) && rtsrc != null) rtsrc.recordSource(off, source);
 	}
 	def gen_set(cond: X86Cond, a: MachVar) {
 		gen("set", asm_set, (cond, dfnAt(a, X86MachRegs.BYTE)));
@@ -887,7 +899,8 @@ class X86CodeGen extends MachCodeGen {
 				}
 			}
 		}
-		if (refSlots == null) computeRefSlots(); // lazily compute reference slots
+		// lazily compute the reference slot index for each live MachVar
+		if (varRefSlotIndex == null) computeVarRefSlotIndex();
 		var width = lsra.livemap.width, start = width * lp;
 		var bits = lsra.livemap.bits;
 		// for each live variable, set the appropriate bit (if any) in the stackmap
@@ -895,7 +908,7 @@ class X86CodeGen extends MachCodeGen {
 			var vnum = i * 32;
 			for (b = bits(i + start); b != 0; b = b #>> 1) {
 				if ((b & 1) != 0) { // variable is live
-					var refSlot = refSlots(vnum);
+					var refSlot = varRefSlotIndex(vnum);
 					if (refSlot > 0) builder.setRefMap(refSlot - 1 + frame.spillArgs);
 				}
 				vnum++;
@@ -904,16 +917,16 @@ class X86CodeGen extends MachCodeGen {
 		return builder.finishRefMap();
 	}
 	// compute the reference slot index for each (not dead) MachVar
-	def computeRefSlots() {
+	def computeVarRefSlotIndex() {
 		// XXX: pull this code up to MachCodeGen--currently depends on frame layout
-		refSlots = Array<int>.new(vars.length);
+		varRefSlotIndex = Array<int>.new(vars.length);
 		var regSet = frame.conv.regSet;
-		for (i = 0; i < refSlots.length; i++) {
+		for (i = 0; i < varRefSlotIndex.length; i++) {
 			var machVar = vars.get(i);
 			if (machVar.live && machVar.ssa != null && mach.isRefType(machVar.ssa.getType())) {
 				var spill = machVar.spill;
 				if (spill >= regSet.spillStart && spill < regSet.callerStart) {
-					refSlots(i) = 1 + spill - regSet.spillStart;
+					varRefSlotIndex(i) = 1 + spill - regSet.spillStart;
 				}
 			}
 		}

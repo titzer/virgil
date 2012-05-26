@@ -42,18 +42,17 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	def prog: Program;			// the program
 	def meth: VstMethod;			// the method
 	def opBuilder: IrOpMethodBuilder;	// builder for IrOpMethods
+	def options: SsaOptSettings;		// compiler optimization settings
 	var region: SsaRegion;			// the code region
-	var localOpt: SsaLocalOptimizer;	// var optimizer
 	var pir: IrPortion;			// the IR portion of the program
 	var thisType: Type;
 	var nonSsaVars: Array<VarDecl>;
 	var branchOpt: bool;
 	var ssaGen: SsaGen;
 
-	new(prog, meth, opBuilder, options: SsaOptSettings) {
+	new(prog, meth, opBuilder, options) {
 		region = genRegion();
 		branchOpt = options.VstBranchOpt;
-		if (options.VstLocalOpt) localOpt = SsaLocalOptimizer.new(prog, region, options, fieldConst);
 		pir = prog.getIr();
 		thisType = meth.container.getDeclaredType();
 		if (meth != null) nonSsaVars = Array.new(meth.numNonSsa);
@@ -112,10 +111,9 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 				var memberRef = pir.fromVstMember(member);
 				var op = V3Op.newClassSetField(memberRef);
 				var param: SsaInstr = region.params(plist.head.index);
-				// check if implicit conversion is necessary
 				var it = member.getType(), xt = plist.head.vtype;
-				var exp = if(xt != it, env.addApply(null, env.conversionOp(xt, it), [param]), param);
-				env.addApply(tokenSource(plist.head.token), op, [getThisParam(), exp]);
+				var exp = env.at(null).opTypeSubsume(xt, it, param); // implicit conversion if necessary
+				env.at(tokenSource(plist.head.token)).opClassSetField(memberRef, getThisParam(), exp);
 			}
 			plist = plist.tail;
 		}
@@ -125,15 +123,17 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			var superType = V3.getSuperType(thisType);
 			var superRef = pir.fromVstMemberAndType(superType, sclause.constructor);
 			var na = sclause.args.exprs.mapArray(env.genExpr);
-			env.addApply(tokenSource(sclause.point), V3Op.newCallClassMethod(superRef), Arrays.prepend(getThisParam(), na));
+			env.at(tokenSource(sclause.point)).opCallClassMethod(superRef, Arrays.prepend(getThisParam(), na));
 		}
 	}
 	def appendFieldInits(list: List<VstField>, env: VstSsaEnv) {
 		var isClass = V3.isClass(thisType);
 		for (l = list; l != null; l = l.tail) {
 			var member = l.head, memberRef = pir.fromVstMember(member);
-			var op = if(isClass, V3Op.newClassSetField(memberRef), V3Op.newComponentSetField(memberRef));
-			env.addApply(exprSource(member.init), op, [getThisParam(), env.genExpr(member.init)]);
+			var r = getThisParam(), v = env.genExpr(member.init);
+			env.at(exprSource(member.init));
+			if (isClass) env.opClassSetField(memberRef, r, v);
+			else env.opComponentSetField(memberRef, r, v);
 		}
 	}
 	def setInitialParam(p: ParamDecl, env: VstSsaEnv) {
@@ -257,7 +257,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		nonSsaVars(stmt.loopVar.index) = varDecl;
 		var arrayExpr = env.genExpr(stmt.expr), arrayType = stmt.expr.exactType;
 		if (env.end) return null; // expression generated a throw
-		var lengthExpr = env.addApply(exprSource(stmt.expr), V3Op.newArrayGetLength(arrayType), [arrayExpr]);
+		var lengthExpr = env.at(exprSource(stmt.expr)).opArrayGetLength(arrayType, arrayExpr);
 		// XXX: simplify loops with 0 and 1 iterations
 
 		var loopCond = VstSsaMerge.new(this);   // merge point for start of loop
@@ -268,19 +268,18 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		loopEnv.loopStart = loopUpdate;
 		loopEnv.loopEnd = loopEnd;
 		// add the loop control expression
-		var cond = loopEnv.addApply(null, V3Op.opIntLt, [loopEnv.get(stmt.loopVar), lengthExpr]);
+		var cond = loopEnv.at(null).opLt(loopEnv.get(stmt.loopVar), lengthExpr);
 
 		var bodyEnv = loopEnv.split();
 		loopEnv.addIf(cond, bodyEnv.block, loopEnv.loopEnd.block);
 		loopEnd.mergeIncoming(loopEnv);
 		// generate the array access to define the element variable
-		var elem = bodyEnv.addApply(null, V3Op.newArrayGetElem(arrayType), [arrayExpr, loopEnv.get(stmt.loopVar)]);
+		var elem = bodyEnv.at(null).opArrayGetElem(arrayType, Facts.O_SAFE_BOUNDS, arrayExpr, loopEnv.get(stmt.loopVar));
 		var elemType = V3Array.elementType(arrayType);
 		if (elemType != stmt.varDecl.vtype) {
 			// insert a coercion
-			elem = bodyEnv.addApply(null, bodyEnv.conversionOp(elemType, stmt.varDecl.vtype), [elem]);
+			elem = bodyEnv.at(null).opTypeSubsume(elemType, stmt.varDecl.vtype, elem);
 		}
-		elem.setFact(Facts.O_NO_NULL_CHECK | Facts.O_NO_BOUNDS_CHECK); // checks would be redundant
 		bodyEnv.set(stmt.varDecl.ssa, elem);
 		// generate the body
 		bodyEnv.genStmt(stmt.body);
@@ -289,7 +288,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		if (loopUpdate.reachable()) {
 			// add the update to the loop control variable
 			var env = loopUpdate.toEnv(loopEnv);
-			var update = env.addApply(null, V3Op.opIntAdd, [env.get(stmt.loopVar), region.intConst(1)]);
+			var update = env.at(null).opIntAdd(env.get(stmt.loopVar), region.intConst(1));
 			env.set(stmt.loopVar, update);
 			loopCond.merge(env);
 		}
@@ -397,7 +396,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		var len = expr.exprs.length();
 		if (len == 0) return region.nop();
 		if (len == 1) return env.genExpr(expr.exprs.list.head);
-		return env.addApply(exprSource(expr), V3Op.newTupleCreate(expr.exactType), expr.exprs.mapArray(env.genExpr));
+		return env.at(exprSource(expr)).opTupleCreate(expr.exactType, expr.exprs.mapArray(env.genExpr));
 	}
 	def visitAutoExpr(expr: AutoExpr, env: VstSsaEnv) -> SsaInstr {
 		// XXX: factor common code out of visitAssign() and here
@@ -409,10 +408,9 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			var array = env.genExpr(app.func);
 			var index = env.genExpr(app.args.exprs.asList().head);
 			var source = exprSource(expr), arrayType = pir.elimTypeVars(app.func.exactType);
-			pre = env.addApply(source, V3Op.newArrayGetElem(arrayType), [array, index]);
+			pre = env.at(source).opArrayGetElem(arrayType, 0, array, index);
 			post = env.addApply(source, expr.op, [pre, one]);
-			var store = env.addApply(source, V3Op.newArraySetElem(arrayType), [array, index, post]);
-			store.setFact(Facts.O_NO_BOUNDS_CHECK);
+			var store = env.at(source).opArraySetElem(arrayType, Facts.O_SAFE_BOUNDS, array, index, post);
 		} else if (VarExpr.?(t)) {
 			var varDecl = VarExpr.!(t), binding = varDecl.binding;
 			if (LocalBinding.?(binding)) {
@@ -439,7 +437,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	}
 	def visitArray(expr: ArrayExpr, env: VstSsaEnv) -> SsaInstr {
 		// generate code for an array initializer
-		return env.addApply(exprSource(expr), V3Op.newArrayInit(expr.exactType, expr.exprs.length()), expr.exprs.mapArray(env.genExpr));
+		return env.at(exprSource(expr)).opArrayInit(expr.exactType, expr.exprs.mapArray(env.genExpr));
 	}
 	def visitVar(expr: VarExpr, env: VstSsaEnv) -> SsaInstr {
 		// var expression should be bound and the appropriate binding method called
@@ -458,8 +456,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		var ftype = pir.elimTypeVars(f.exactType);
 		if (V3.isArray(ftype)) {
 			// this an array get element
-			var ssaArgs = Arrays.prepend(env.genExpr(f), Arrays.map(args, env.genExpr));
-			return env.addApply(exprSource(expr), V3Op.newArrayGetElem(ftype), ssaArgs);
+			return env.at(exprSource(expr)).opArrayGetElem(ftype, 0, env.genExpr(f), env.genExpr(args(0)));
 		} else if (expr.partial != null) {
 			// this is a partial application
 			var bound = Sequence<SsaInstr>.new(), indexMap = Sequence<int>.new();
@@ -484,7 +481,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 					// XXX: adding a null check here for special case of o.m(args)
 					receiver = env.genExpr(b.thisExpr);
 					if (V3.isClass(b.thisExpr.exactType)) {
-						env.addNullCheck(exprSource(expr), null, receiver);
+						env.at(exprSource(expr)).opNullCheck(b.thisExpr.exactType, receiver);
 						noNullCheck = true;
 					}
 				}
@@ -500,7 +497,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	}
 	def visitNot(expr: NotExpr, env: VstSsaEnv) -> SsaInstr {
 		// generate a boolean inversion
-		return env.addApply(exprSource(expr), V3Op.opBoolNot, [env.genExpr(expr.expr)]);
+		return env.at(exprSource(expr)).opBoolNot(env.genExpr(expr.expr));
 	}
 	def visitAssign(expr: AssignExpr, env: VstSsaEnv) -> SsaInstr {
 		var t = expr.target;
@@ -528,7 +525,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			var array = env.genExpr(app.func);
 			var index = env.genExpr(app.args.exprs.asList().head);
 			var val = env.genExpr(expr.expr);
-			env.addApply(exprSource(expr), V3Op.newArraySetElem(pir.elimTypeVars(app.func.exactType)), [array, index, val]);
+			env.at(exprSource(expr)).opArraySetElem(pir.elimTypeVars(app.func.exactType), 0, array, index, val);
 			return val;
 		}
 		return error(expr, "invalid expression as target of assignment");
@@ -690,7 +687,6 @@ class SsaGen extends Gen<SsaInstr> {
 	var container: Type;
 	new(gen) { }
 	def source() -> Source { return gen.exprSource(expr); }
-	def getReceiverType() -> Type { return container; }
 	def getIr() -> IrPortion { return gen.prog.getIr(); }
 	def genVal(t: Type, v: Val) -> SsaInstr { return gen.region.valConst(t, v); }
 	def genApplyOp(op: Operator, args: Array<SsaInstr>) -> SsaInstr { return env.addApply(source(), op, args); }
@@ -710,7 +706,7 @@ class SsaGen extends Gen<SsaInstr> {
 }
 // An environment for generating code, including the current block and the current
 // variable map, which maps locals to the SSA instructions that produced them
-class VstSsaEnv extends SsaBlockBuilder {
+class VstSsaEnv extends V3SsaBuilder {
 	def gen: VstSsaGen;
 	def parent: VstSsaEnv;
 	var varMap: Array<SsaInstr>;
@@ -718,7 +714,7 @@ class VstSsaEnv extends SsaBlockBuilder {
 	var loopStart: VstSsaMerge;
 	var loopEnd: VstSsaMerge;
 
-	new(size: int, gen, parent, block: SsaBlock) : super(block) {
+	new(size: int, gen, parent, block: SsaBlock) : super(gen.options, gen.prog.getIr(), gen.region, block) {
 		if (parent == null) varMap = Array.new(size);
 		else varMap = parent.varMap;
 	}
@@ -739,7 +735,7 @@ class VstSsaEnv extends SsaBlockBuilder {
 		}
 	}
 	def addVal(t: Type, val: Val) -> SsaInstr {
-		return gen.region.valConst(t, val);
+		return region.valConst(t, val);
 	}
 	def addOp(op: Operator) -> SsaInstr {
 		// XXX: perform LVN and GVN
@@ -747,11 +743,11 @@ class VstSsaEnv extends SsaBlockBuilder {
 		var spec = gen.opBuilder.buildOpMethod(op);
 		var any = AnyObject.TYPE;
 		if (spec.isPolymorphic()) {
-			var const: SsaInstr = gen.region.nullConst(any);
-			return addApply(null, V3Op.newCreateDelegate(spec, any), [const]);
+			var const: SsaInstr = region.nullConst(any);
+			return at(null).opCreateDelegate(spec, const);
 		}
 		// return a delegate value
-		return gen.region.valConst(op.getFunctionType(), Delegate.new(null, spec));
+		return region.valConst(op.getFunctionType(), Delegate.new(null, spec));
 	}
 	def addClosureCreate(op: Operator, args: Array<SsaInstr>, indexMap: Array<int>) -> SsaInstr {
 		return gen.opBuilder.buildOpClosure(this, op, args, indexMap);
@@ -759,12 +755,6 @@ class VstSsaEnv extends SsaBlockBuilder {
 	def addApply(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
 		var i = SsaApplyOp.new(source, op, args);
 		i.facts = Operators.facts(op.opcode);
-		if (gen.localOpt != null && args.length == op.numParams) {
-			// XXX: be less conservative, expand or contract tuples for var opt
-			var n = gen.localOpt.optimize(i, this);
-			if (i == n) addInstr(n);
-			return n;
-		}
 		return addInstr(i);
 	}
 	def addIf(e: SsaInstr, trueBlock: SsaBlock, falseBlock: SsaBlock) {
@@ -785,7 +775,7 @@ class VstSsaEnv extends SsaBlockBuilder {
 		if (v.ssa.index >= 0) gen.nonSsaVars(v.ssa.index) = v;
 		if (!end) {
 			if (v.init != null) set(v.ssa, genExpr(v.init));
-			else set(v.ssa, gen.region.nullConst(v.vtype));
+			else set(v.ssa, region.nullConst(v.vtype));
 		}
 	}
 	def genStmt(s: Stmt) {
@@ -800,38 +790,13 @@ class VstSsaEnv extends SsaBlockBuilder {
 			xt = gen.pir.elimTypeVars(xt);
 			if (it == xt) return i;
 			// conversion is necessary
-			return addApply(gen.exprSource(e), conversionOp(xt, it), [i]);
+			return at(gen.exprSource(e)).opTypeSubsume(xt, it, i);
 		}
-		return gen.region.nop();
-	}
-	def conversionOp(xt: Type, it: Type) -> Operator {
-		match (it.typeCon.kind) {
-			V3Kind.CLASS, V3Kind.ARRAY, V3Kind.DELEGATE: return V3Op.newTypeSubsume(xt, it);
-		}
-		return V3Op.newTypeCast(xt, it);
+		return region.nop();
 	}
 	def addCall(source: Source, ftype: Type, args: Array<SsaInstr>) -> SsaInstr {
 		if (end) return null;
-		var func = args(0);
-		match (func.opcode()) {
-			// XXX: V3Opcode.ClosureCreate
-			V3Opcode.ClassGetVirtual: return addCallClass(true, source, args);
-			V3Opcode.ClassGetMethod: return addCallClass(false, source, args);
-			-1: { // non-apply
-				if (SsaValue.?(func)) {
-					// XXX: Delegates, especially M_OPERATOR methods
-				}
-			}
-		}
-		var op = V3Op.newCallDelegate(ftype);
-		if (op.paramTypes.length == 1) args = [func]; // special case of explicit void argument
-		return addInstr(SsaApplyOp.new(source, op, args));
-	}
-	private def addCallClass(virtual: bool, source: Source, args: Array<SsaInstr>) -> SsaInstr {
-		var func = args(0), irSpec = V3Op.extractIrSpec(SsaApplyOp.!(func).op);
-		args(0) = func.inputs(0).dest;
-		if (virtual) return addApply(source, V3Op.newCallClassVirtual(irSpec), args);
-		else return addApply(source, V3Op.newCallClassMethod(irSpec), args);
+		return at(source).opCallDelegate(ftype, args);
 	}
 }
 // handles all merges in the control flow
