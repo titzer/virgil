@@ -48,7 +48,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	var region: SsaRegion;			// the SSA region
 	var nonSsaVars: Array<VarDecl>;		// variables that are assigned more than once
 	var branchOpt: bool;			// true if branch folding should be performed
-	var ssaGen: SsaGen;			// provided interface to MemberBinding
+	var ssaGen: SsaGen;			// provided interface to OtherBinding
 
 	new(compiler, meth, opBuilder, options) {
 		region = genRegion();
@@ -425,9 +425,16 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 				post = env.addApply(null, expr.op, [pre, one]);
 				env.set(lb.decl.ssa, post);
 			} else if (MemberBinding.?(binding)) {
-				var ref = MemberBinding.!(binding);
+				// read-modify-write of member binding
+				var receiver = genReceiver(binding.receiver, env);
+				env.source = exprSource(t);
+				pre = genRead(receiver, binding, env);
+				post = env.addApply(exprSource(expr), expr.op, [pre, one]);
+				genWrite(receiver, binding, post, env);
+			} else if (OtherBinding.?(binding)) {
+				var ref = OtherBinding.!(binding);
 				// generate receiver expression
-				var receiver = genReceiver(ref.thisExpr, env);
+				var receiver = genReceiver(ref.receiver, env);
 				var source = exprSource(expr), gen = genOf(expr, ref.container, env);
 				pre = ref.member.genRead(gen, receiver);
 				post = env.addApply(source, expr.op, [pre, one]);
@@ -436,6 +443,98 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		} else return error(expr, "invalid expression as target of auto expression");
 		if (expr.post) return pre;
 		else return post;
+	}
+	def genRead(receiver: SsaInstr, binding: Binding, env: VstSsaEnv) -> SsaInstr {
+		// binding appears as an expression such as "receiver.binding"
+		match (binding.kind) {
+			VstBinding.LOCAL: return env.get(LocalBinding.!(binding).decl.ssa);
+			VstBinding.VALUE: return env.addVal(binding.boundType, ValueBinding.!(binding).val);
+			VstBinding.OBJECT_METHOD: return env.opClassGetVirtual(specOf(binding), receiver);
+			VstBinding.OBJECT_FIELD: return env.opClassGetField(specOf(binding), receiver);
+			VstBinding.CLASS_METHOD: {
+				var spec = specOf(binding); // XXX: optimize in V3SsaBuilder/V3Op?
+				var virtual = spec.member.checkFact(Facts.M_OVERRIDDEN);
+				if (virtual) return env.addOp(V3Op.newCallClassVirtual(spec));
+				else return env.addOp(V3Op.newCallClassMethod(spec));
+			}
+			VstBinding.CLASS_FIELD: return env.addOp(V3Op.newClassGetField(specOf(binding)));
+			VstBinding.CLASS_NEW: return env.addOp(V3Op.newClassAlloc(specOf(binding)));
+			VstBinding.COMPONENT_METHOD: {
+				var spec = specOf(binding);
+				if (receiver == null) receiver = initOf(binding, env);
+				return env.opComponentGetMethod(spec, receiver);
+			}
+			VstBinding.COMPONENT_FIELD: {
+				var spec = specOf(binding);
+				if (receiver == null) receiver = initOf(binding, env);
+				return env.opComponentGetField(spec, receiver);
+			}
+			VstBinding.OTHER: return OtherBinding.!(binding).genRead(receiver, env);
+		}
+		compiler.ERROR.fail("invalid binding in read");
+		return env.region.nop();
+	}
+	def genWrite(receiver: SsaInstr, binding: Binding, val: SsaInstr, env: VstSsaEnv) -> SsaInstr {
+		// binding appears as a write such as "receiver.binding = val"
+		match (binding.kind) {
+			VstBinding.LOCAL: env.set(LocalBinding.!(binding).decl.ssa, val);
+			VstBinding.OBJECT_FIELD: env.opClassSetField(specOf(binding), receiver, val);
+			VstBinding.COMPONENT_FIELD: {
+				var spec = specOf(binding);
+				if (receiver == null) receiver = initOf(binding, env);
+				env.opComponentSetField(spec, receiver, val);
+			}
+			VstBinding.OTHER: OtherBinding.!(binding).genWrite(receiver, val, env);
+		} else {
+			compiler.ERROR.fail("invalid binding in write");
+		}
+		return val;
+	}
+	def genApply(receiver: SsaInstr, binding: Binding, env: VstSsaEnv, args: Array<Expr>) -> SsaInstr {
+		// binding appears as a call such as "receiver.binding(args)"
+		match (binding.kind) {
+			VstBinding.OBJECT_METHOD: {
+				env.opNullCheck(receiver.getType(), receiver);
+				var x = env.genExprs(receiver, args);
+				return env.opCallClassVirtual(specOf(binding), x);
+			}
+			VstBinding.CLASS_METHOD: {
+				return env.opCallClassVirtual(specOf(binding), env.genExprs(null, args));
+			}
+			VstBinding.CLASS_NEW: {
+				return env.opClassAlloc(specOf(binding), env.genExprs(null, args));
+			}
+			VstBinding.COMPONENT_METHOD: {
+				if (receiver == null) initOf(binding, env);
+				return env.opCallComponentMethod(specOf(binding), env.genExprs(null, args));
+			}
+			VstBinding.OTHER: return OtherBinding.!(binding).genApply(receiver, env, env.genExprs(null, args));
+		} else {
+			var del = genRead(receiver, binding, env);
+			var ftype = del.getType();
+			return env.opCallDelegate(ftype, env.genExprs(del, args));
+		}
+	}
+	def specOf(binding: Binding) -> IrSpec {
+		var mb = MemberBinding.!(binding);
+		var container = ir.elimTypeVars(mb.container), newTa = [container];
+		if (VstField.?(mb.member)) {
+			// type args to fields are just the container
+			return IrSpec.new(container, newTa, ir.makeIrField(VstField.!(mb.member)));
+		} else if (mb.typeArgs != null) {
+			// add method type parameters to the type arguments array
+			var oldTa = mb.typeArgs.types;
+			newTa = Array<Type>.new(1 + oldTa.length);
+			newTa(0) = container;
+			for (i = 0; i < oldTa.length; i++) {
+				newTa(i + 1) = ir.elimTypeVars(oldTa(i));
+			}
+		}
+		return IrSpec.new(container, newTa, ir.makeIrMethod(VstMethod.!(mb.member)));
+	}
+	def initOf(binding: Binding, env: VstSsaEnv) -> SsaInstr {
+		var componentDecl = VstComponent.!(MemberBinding.!(binding).member.container);
+		return env.opComponentInit(ir.fromVstMember(componentDecl.constructor));
 	}
 	def genReceiver(expr: Expr, env: VstSsaEnv) -> SsaInstr {
 		return if (expr == null, null, env.genExpr(expr));
@@ -461,7 +560,8 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		var ftype = ir.elimTypeVars(f.exactType);
 		if (V3.isArray(ftype)) {
 			// this an array get element
-			return env.at(exprSource(expr)).opArrayGetElem(ftype, 0, env.genExpr(f), env.genExpr(args(0)));
+			var array = env.genExpr(f), index = env.genExpr(args(0));
+			return env.at(exprSource(expr)).opArrayGetElem(ftype, 0, array, index);
 		} else if (expr.partial != null) {
 			// this is a partial application
 			var bound = Sequence<SsaInstr>.new(), indexMap = Sequence<int>.new();
@@ -480,24 +580,19 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			// this could be a member call
 			var func = VarExpr.!(f);
 			if (MemberBinding.?(func.binding)) {
-				var b = MemberBinding.!(func.binding);
-				var receiver: SsaInstr, noNullCheck = false;
-				if(b.thisExpr != null) {
-					// XXX: adding a null check here for special case of o.m(args)
-					receiver = env.genExpr(b.thisExpr);
-					if (V3.isClass(b.thisExpr.exactType)) {
-						env.at(exprSource(expr)).opNullCheck(b.thisExpr.exactType, receiver);
-						noNullCheck = true;
-					}
-				}
+				var receiver = genReceiver(MemberBinding.!(func.binding).receiver, env);
+				env.source = exprSource(expr);
+				return genApply(receiver, func.binding, env, args);
+			}
+			if (OtherBinding.?(func.binding)) {
+				var b = OtherBinding.!(func.binding);
+				var receiver = genReceiver(b.receiver, env);
 				var args = Arrays.map(args, env.genExpr);
-				var result = b.member.genApply(genOf(expr, b.container, env), receiver, args);
-				if (noNullCheck) result.setFact(Facts.O_NO_NULL_CHECK);
-				return result;
+				return b.member.genApply(genOf(expr, b.container, env), receiver, args);
 			}
 		}
 		// generate a regular delegate call
-		var ssaArgs = Arrays.prepend(env.genExpr(f), Arrays.map(args, env.genExpr));
+		var ssaArgs = env.genExprs(env.genExpr(f), args);
 		return env.addCall(exprSource(expr), ftype, ssaArgs);
 	}
 	def visitNot(expr: NotExpr, env: VstSsaEnv) -> SsaInstr {
@@ -514,11 +609,14 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 				var val = env.genExpr(expr.expr);
 				env.set(lb.decl.ssa, val);
 				return val;
-			}
-			if (MemberBinding.?(binding)) {
-				var ref = MemberBinding.!(binding);
+			} else if (MemberBinding.?(binding)) {
 				// apply the operator to the receiver expression
-				var ne = genReceiver(ref.thisExpr, env);
+				var receiver = genReceiver(binding.receiver, env);
+				return genWrite(receiver, binding, env.genExpr(expr.expr), env);
+			} else if (OtherBinding.?(binding)) {
+				var ref = OtherBinding.!(binding);
+				// apply the operator to the receiver expression
+				var ne = genReceiver(ref.receiver, env);
 				var ve = env.genExpr(expr.expr);
 				ref.member.genWrite(genOf(expr, ref.container, env), ne, ve);
 				return ve;
@@ -654,7 +752,13 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		return error(expr, "type binding used as expression");
 	}
 	def visitMemberBinding(expr: VarExpr, ref: MemberBinding, env: VstSsaEnv) -> SsaInstr {
-		var receiver = genReceiver(ref.thisExpr, env);
+		// type should not be used as expression
+		var receiver = genReceiver(ref.receiver, env);
+		env.source = exprSource(expr);
+		return genRead(receiver, ref, env);
+	}
+	def visitOtherBinding(expr: VarExpr, ref: OtherBinding, env: VstSsaEnv) -> SsaInstr {
+		var receiver = genReceiver(ref.receiver, env);
 		return ref.member.genRead(genOf(expr, ref.container, env), receiver);
 	}
 	// -- Utility methods ------------------------------------------------------
@@ -799,6 +903,18 @@ class VstSsaEnv extends V3SsaBuilder {
 			return at(gen.exprSource(e)).opTypeSubsume(xt, it, i);
 		}
 		return region.nop();
+	}
+	def genExprs(receiver: SsaInstr, a: Array<Expr>) -> Array<SsaInstr> {
+		if (receiver != null) {
+			var r = Array<SsaInstr>.new(1 + a.length);
+			r(0) = receiver;
+			for (i = 0; i < a.length; i++) r(i + 1) = genExpr(a(i));
+			return r;
+		} else { // XXX: inlined Arrays.map
+			var r = Array<SsaInstr>.new(a.length);
+			for (i = 0; i < a.length; i++) r(i) = genExpr(a(i));
+			return r;
+		}
 	}
 	def addCall(source: Source, ftype: Type, args: Array<SsaInstr>) -> SsaInstr {
 		if (end) return null;
