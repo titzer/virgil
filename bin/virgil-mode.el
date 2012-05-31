@@ -47,3 +47,5 @@
   (setq mode-name "Virgil mode")
 )
 
+(define-key virgil-mode-map (kbd "TAB") 'self-insert-command)
+
