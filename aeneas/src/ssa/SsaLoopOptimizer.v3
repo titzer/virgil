@@ -1,0 +1,193 @@
+// Copyright 2012 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Performs a number of simple optimizations on loops, including:
+// 1. XXX eliminate redundant null and bounds checks
+// 2. XXX loop rotation (move loop test condition to end of loop)
+// 3. XXX loop-invariant code motion (move code out of loops)
+// 4. XXX loop peeling (copy first iteration of loop)
+// 5. XXX induction variable simplifcations
+class SsaLoopOptimizer {
+	def prog: Program;
+	def region: SsaRegion;
+	def header: SsaBlock;	// start of loop (ends with loop condition)
+	def loopBody: SsaBlock; // first block of loop body
+	def loopEnd: SsaBlock;  // first block outside of loop
+	def headerMark = ++region.markGen;
+	def bodyMark = ++region.markGen;
+	var printer: SsaPrinter = SsaPrinter.new(prog);
+	new(prog, region, header, loopBody, loopEnd) {}
+	def optimize() {
+//		Terminal.put3("optimizeLoop #%1 #%2 #%3\n", header.uid, loopBody.uid, loopEnd.uid);
+		// XXX: optimize phis in header first
+		// XXX: pull loop-invariant code out of header
+		var c = findLoopControl(), cond = c.0, condVal = c.1;
+		if (cond != null) {
+//			Terminal.put1("control for loop #%1 = ", header.uid);
+//			Terminal.put2("@%1 == %2\n", cond.uid, V3.renderResult(condVal, StringBuffer.new()).toString());
+		}
+		var ivs = findLinearIvs();
+		for (l = ivs; l != null; l = l.tail) {
+			var iv = l.head;
+//			Terminal.put1("iv in loop #%1 = ", header.uid);
+//			printer.printInstr(iv.phi);
+//			Terminal.put("(");
+//			printer.printInstr(iv.init);
+//			Terminal.put1(" + %1)\n", iv.step);
+			if (cond != null) tryBoundingIv(iv, cond, condVal);
+			if (iv.boundOp != null) {
+//				Terminal.put1("  bound %1 ", V3Op.renderOp(iv.boundOp));
+//				printer.printInstr(iv.bound);
+//				Terminal.ln();
+				optBoundedIv(iv);
+			}
+		}
+	}
+	def tryBoundingIv(iv: SsaLinearIv, cond: SsaInstr, condVal: Val) {
+		match (cond.opcode()) {
+			V3Opcode.IntLt, V3Opcode.IntLteq, V3Opcode.IntGt, V3Opcode.IntGteq: {
+				if (cond.inputs(0).dest == iv.phi) boundIvInequality(iv, SsaApplyOp.!(cond).op, condVal, cond.inputs(1).dest);
+				if (cond.inputs(1).dest == iv.phi) boundIvInequality(iv, V3Op.commute(SsaApplyOp.!(cond).op), condVal, cond.inputs(0).dest);
+			}
+		}
+	}
+	def boundIvInequality(iv: SsaLinearIv, op: Operator, condVal: Val, bound: SsaInstr) {
+		if (Bool.unbox(condVal)) iv.boundOp = op;
+		else iv.boundOp = V3Op.inverse(op);
+		iv.bound = bound;
+	}
+	// identify the control condition of the loop
+	def findLoopControl() -> (SsaInstr, Val) {
+		var e = header.end;
+		if (SsaSwitch.?(e)) {
+			var succ = e.block.succ;
+			for (i = 0; i < succ.length; i++) {
+				var s = succ(i);
+				if (s.dest == loopBody && s.isOnlyEdge()) {
+					var cond = e.inputs(0).dest, vals = SsaSwitch.!(e).vals;
+					return (cond, if(i == vals.length, null, vals(i)));
+				}				
+			}
+		}
+		return (null, null);
+	}
+	// find simple induction variables of the form v = phi(x, v + N, v + N)
+	def findLinearIvs() -> List<SsaLinearIv> {
+		var list: List<SsaLinearIv>;
+		if (header.phis == null) return null;
+		var phis = header.phis.phiInstrs;
+		for (i = 0; i < phis.length; i++) {
+			list = matchIv(phis.get(i), list);
+		}
+		return list;
+	}
+	// find a linear induction variable
+	def matchIv(phi: SsaPhi, prev: List<SsaLinearIv>) -> List<SsaLinearIv> {
+		var init: SsaInstr, step: Box<int>;
+		for (j = 0; j < phi.inputs.length; j++) {
+			var pi = phi.inputs(j).dest;
+			if (hasInput(pi, phi)) {
+				// check increment matches in each induction
+				var n = matchInc(pi);
+				if (n == null) step = null;
+				else if (step == null) step = n;
+				else if (step.val != n.val) return prev;
+			} else if (init != null) {
+				if (pi != null) return prev;
+			} else {
+				init = pi;
+			}
+		}
+		if (init == null || step == null) return prev;
+		return List.new(SsaLinearIv.new(phi, init, step.val), prev);
+	}
+	// match an add(x, K), add(K, x) or sub(x, K) and return K
+	def matchInc(e: SsaInstr) -> Box<int> {
+		if (e.opcode() == V3Opcode.IntAdd) {
+			if (SsaValue.?(e.inputs(0).dest)) return Box<int>.!(SsaValue.!(e.inputs(0).dest).val);
+			if (SsaValue.?(e.inputs(1).dest)) return Box<int>.!(SsaValue.!(e.inputs(1).dest).val);
+		} else if (e.opcode() == V3Opcode.IntSub) {
+			if (SsaValue.?(e.inputs(1).dest)) return Int.box(0 - Int.unbox(SsaValue.!(e.inputs(1).dest).val));
+		}
+		return null;
+	}
+	// check whether x has i as one of its inputs
+	def hasInput(x: SsaInstr, i: SsaInstr) -> bool {
+		var xi = x.inputs;
+		for (j = 0; j < xi.length; j++) {
+			if (xi(j).dest == i) return true;
+		}
+		return false;
+	}
+	// optimize uses of a bounded linear induction variable
+	def optBoundedIv(iv: SsaLinearIv) {
+		if (iv.step > 0) {
+			// XXX: what about uses before the condition is checked?
+			iv.phi.setFact(iv.init.facts & iv.bound.facts & Facts.V_NON_NEGATIVE);
+		}
+		markHeader(headerMark); // XXX: only mark header once?
+		for (u: SsaEdge<SsaInstr> = iv.phi.useList; u != null; u = u.next) {
+			var use = u.src;
+//			Terminal.put("  used by ");
+//			printer.printInstr(use);
+			if (use.mark != headerMark) optBoundedIvUse(iv, use);
+//			Terminal.ln();
+		}
+		markHeader(-1);
+	}
+	def optBoundedIvUse(iv: SsaLinearIv, use: SsaInstr) {
+		match (use.opcode()) {
+			V3Opcode.BoundsCheck,
+			V3Opcode.ArrayGetElem,
+			V3Opcode.ArraySetElem: {
+				if (use.inputs(1).dest == iv.phi) optBoundsCheck(iv, use, use.inputs(0).dest);
+			}
+		}
+	}
+	def optBoundsCheck(iv: SsaLinearIv, use: SsaInstr, array: SsaInstr) {
+		if (iv.phi.checkFact(Facts.V_NON_NEGATIVE) && iv.boundOp.opcode == V3Opcode.IntLt) {
+			// XXX: check more cases, e.g. constant length, length * 2, length + 1, etc
+			if (iv.bound.opcode() == V3Opcode.ArrayGetLength && iv.bound.inputs(0).dest == array) {
+				use.setFact(Facts.O_NO_BOUNDS_CHECK | Facts.O_NO_NULL_CHECK);
+			}
+		}
+	}
+	// mark instructions in header, not in body or after loop end
+	def markHeader(mark: int) {
+		markBlocks(header, [loopBody, loopEnd], mark);
+	}
+	// mark instructions in body, not in header or after loop end
+	def markBody(mark: int) {
+		markBlocks(loopBody, [header, loopEnd], mark);
+	}
+	// mark all the blocks up to but not including [end] with the given mark
+	def markBlocks(block: SsaBlock, end: Array<SsaBlock>, mark: int) {
+		for (e in end) if (block == e) return; // reached an end block
+		if (block.mark == mark) return; // already marked
+		block.mark = mark;
+		markBlockInstrs(block, mark); // mark phis and instructions block
+		for (s in block.succ) markBlocks(s.dest, end, mark); // recursively mark successors
+	}
+	// mark all the instructions in a block with a given mark
+	def markBlockInstrs(block: SsaBlock, mark: int) {
+		var instrs = block.instrs;
+		for (i = 0; i < instrs.length; i++) {
+			instrs.get(i).mark = mark;
+		}
+		if (block.phis == null) return;
+		var phis = block.phis.phiInstrs;
+		for (i = 0; i < phis.length; i++) {
+			phis.get(i).mark = mark;
+		}
+	}
+}
+// an induction variable "x = V + N * i" with optional bound of the form
+// x <op> Expr, such as x < a.length, x >= 3, etc
+class SsaLinearIv {
+	def phi: SsaPhi;	// x
+	def init: SsaInstr;	// V
+	def step: int;		// N
+	var boundOp: Operator;	// operator of bound (e.g. V3Op.opIntLt)
+	var bound: SsaInstr;	// value of bound
+	new(phi, init, step) {}
+}
