@@ -26,6 +26,15 @@ fi
 
 HOST_JAVA=$(which java)
 
+if [ -z "$AENEAS_TEST" ]; then
+    AENEAS_TEST=$VIRGIL_LOC/bin/stable/jar/Aeneas
+fi
+
+if [ ! -x "$AENEAS_TEST" ]; then
+    echo $AENEAS_TEST: not found or not executable
+    exit 1
+fi
+
 function check() {
 	if [ "$1" = 0 ]; then
 		printf "${GREEN}ok${NORM}\n"
@@ -106,8 +115,8 @@ function run_v3c() {
 	local target=$1
 	shift
 	if [ -z "$target" ]; then
-		$VIRGIL_LOC/bin/v3c "$@"
+		$AENEAS_TEST "$@"
 	else
-		$VIRGIL_LOC/bin/v3c-$target "$@"
+		V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target "$@"
 	fi
 }
