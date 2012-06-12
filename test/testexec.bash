@@ -43,11 +43,6 @@ else
 	check_red $P
 fi
 
-printf "  Compiling (m32)..."
-P=$OUT/test.execute.comp.m32
-run_v3c "" -verbose=1 -multiple -target=m32 -output=$OUT $TESTS > $P
-check_red $P
-
 function do_native_test() {
 	target=$1
 	testtarget=$2
