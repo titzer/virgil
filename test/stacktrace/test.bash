@@ -84,6 +84,12 @@ do_test st_deep00.v3 "a b" "!NullCheckException
 compiled=0
 do_tests
 
+target=$TEST_TARGET
+if [[ "$target" != x86-darwin && "$target" != x86-linux ]]; then
+    echo "  Skipping  ($target/$HOST_PLATFORM)...${YELLOW}ok${NORM}"
+    exit 0
+fi
+
 AENEAS_RT="$VIRGIL_LOC/rt/darwin/*.v3 $VIRGIL_LOC/rt/native/*.v3"
 
 tests=$(ls *.v3)

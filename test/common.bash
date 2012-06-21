@@ -27,7 +27,7 @@ fi
 HOST_JAVA=$(which java)
 
 if [ -z "$AENEAS_TEST" ]; then
-    AENEAS_TEST=$VIRGIL_LOC/bin/stable/jar/Aeneas
+    AENEAS_TEST=$VIRGIL_LOC/bin/v3c
 fi
 
 if [ ! -x "$AENEAS_TEST" ]; then
