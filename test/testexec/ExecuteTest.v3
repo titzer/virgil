@@ -1,0 +1,367 @@
+// Copyright 2012 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+
+def NORM  = "\x1B[0;00m";
+def GREEN = "\x1B[0;32m";
+def YELLOW = "\x1B[0;33m";
+def RED   = "\x1B[0;31m";
+def CLEAR_LINE = "\r\x1B[K";
+//def CLEAR_LINE = "\n";
+def BUF_SIZE = 256;
+def TIMEOUT = 5;
+
+// a run of a test
+class Run {
+	var num: int;		// run number, starting from 0
+	var specStart: int;	// start index of input/output spec
+	var specEnd: int;	// end index of input/output spec
+	var val: int;		// expected return value
+	var exStart: int;	// start index of exception result in spec
+	var exEnd: int;		// end index of exception result in spec
+	var failure: string;	// explanation of failure
+}
+// the output of a run, including its stdout and stderr streams
+class RunOutput {
+	var status: int;				// status from wait()
+	def pipe_stdout = Array<int>.new(2);		// stdout pipe file descriptors
+	def pipe_stderr = Array<int>.new(2);		// stderr pipe file descriptors
+	def data_stdout = Array<byte>.new(BUF_SIZE);	// first BUF_SIZE bytes of stdout
+	def data_stderr = Array<byte>.new(BUF_SIZE);	// first BUF_SIZE bytes of stderr
+	var len_stdout: int;				// bytes read from stdout
+	var len_stderr: int;				// bytes read from stderr
+}
+// Runs tests one at a time
+class Tester {
+	def spec = Array<byte>.new(BUF_SIZE);	// input/output spec buffer
+	def exeBuf = Array<byte>.new(BUF_SIZE);	// executable name buffer
+	var exeDirEnd: int;			// end position of executable directory
+	def output = RunOutput.new();		// output of a run
+	var test: string;			// name of current test
+	var testNum: int;			// current test number
+	var testsPassed: int;			// number of tests that passed
+	var testsFailed: int;			// number of tests that failed
+	var testMax: int;			// total number of tests
+	var current = Run.new();		// current run
+	var failed: bool;			// status for current run
+	var pos: int;				// position in spec
+	var max: int;				// number of bytes in spec
+	new(exeDir: string) {
+		exeDirEnd = exeDir.length;
+		for (i = 0; i < exeDirEnd; i++) {
+			exeBuf(i) = exeDir(i);
+		}
+		if (exeBuf(exeDirEnd - 1) != '/') exeBuf(exeDirEnd++) = '/';
+	}
+
+	def run(test: string) {
+		this.test = test;
+		this.failed = false;
+		if (runTest()) {
+			testsPassed++;
+		} else {
+			Terminal.ln();
+			testsFailed++;
+		}
+	}
+	def runTest() -> bool {
+		Terminal.puts(CLEAR_LINE).puti(++testNum).puts(" of ").puti(testMax);
+		Terminal.puts(" [").puts(GREEN).puti(testsPassed).puts(NORM).putc('/');
+		if (testsFailed != 0) Terminal.puts(RED);
+		Terminal.puti(testsFailed).puts(NORM).puts("]: ").puts(test).puts("...");
+		start(0);
+		checkBinary();
+		if (failed) return false;
+		readSpec();
+		if (failed) return false;
+		skipSpecStart();
+		if (failed) return false;
+		var num = 0;
+		while (pos < max) {
+			start(num);
+			parseRun();
+			if (failed) return false;
+			doRun();
+			if (failed) return false;
+			num++;
+		}
+		return true;
+	}
+	def start(num: int) {
+		current.failure = null;
+		current.num = num;
+		current.val = 0;
+		current.exStart = 0;
+		current.exEnd = 0;
+		current.specStart = 0;
+		current.specEnd = 0;
+	}
+	def parseRun() {
+		skip(" \t");
+		var s = pos;
+		current.specStart = s;
+		while (pos < max) {
+			var c = spec(pos);
+			if (c == '\'') { // skip a character literal
+				while (pos < max - 1) {
+					var c = spec(++pos);
+					if (c == '\'') break;
+					if (c == '\\') pos++;
+				}
+				if (pos == max) break;
+			} else if (c == ';') { // reached end of current run
+				current.specEnd = pos++;
+				return;
+			} else if (c == '\n') { // reached end of line
+				current.specEnd = pos;
+				pos = max;
+				return;
+			}
+			pos++;
+		}
+		current.specEnd = pos;
+	}
+
+	def doRun() {
+		parseResult(current.specStart, current.specEnd);
+		if (failed) return;
+
+		if (OS.pipe(output.pipe_stdout) != 0) return fail("couldn\'t pipe stdout");
+		if (OS.pipe(output.pipe_stderr) != 0) return fail("couldn\'t pipe stderr");
+
+		var pid = OS.fork();
+		if (pid == 0) {
+			// child process; redirect output to pipes
+			OS.dup2(output.pipe_stdout(1), OS.STDOUT); // redirect stdout
+			OS.dup2(output.pipe_stderr(1), OS.STDERR); // redirect stderr
+			// close read end of pipe in child
+			OS.close(output.pipe_stdout(0));
+			OS.close(output.pipe_stderr(0));
+			// exec test binary
+			execRun();
+		} else {
+			// in parent process
+			// close write end of pipe in parent
+			OS.close(output.pipe_stdout(1));
+			OS.close(output.pipe_stderr(1));
+
+			// wait for signal / exit
+			test_timeout = TIMEOUT;
+			test_pid = pid;
+			output.status = OS.wait(pid);
+
+			// read stdout into buffer
+			output.len_stdout = OS.read(output.pipe_stdout(0), output.data_stdout, BUF_SIZE);
+			// read stderr into buffer
+			output.len_stderr = OS.read(output.pipe_stderr(0), output.data_stderr, BUF_SIZE);
+
+			// close all pipe files
+			OS.close(output.pipe_stdout(0));
+			OS.close(output.pipe_stderr(0));
+
+			// check the result
+			checkResult();
+		}
+	}
+	def execRun() {
+		OS.execN(exeBuf, current.num);
+		OS.exit(2);
+	}
+	def checkResult() {
+		// TODO: check current.status
+		var exlen = current.exEnd - current.exStart;
+		if (exlen > 0) {
+			// expecting an exception
+			if (output.len_stderr < exlen) return fail("expected exception output");
+			for (i = 0; i < exlen; i++) {
+				if (spec(current.exStart + i) != output.data_stderr(i)) return fail("wrong stderr output");
+			}
+		} else {
+			if (output.len_stdout < 4) return fail("expected 4 bytes to stdout");
+			var d = output.data_stdout;
+			var r = d(0) | (d(1) #<< 8) | (d(2) #<< 16) | (d(3) #<< 24);
+			if (r != current.val) {
+				fail("return value");
+				Terminal.puts(" ").puti(r).puts(" != ").puti(current.val);
+				return;
+			}
+		}
+	}
+	def readSpec() {
+		pos = 0;
+		var fd = OS.open(test);
+		if (fd < 0) return fail("could not open test file");
+		max = OS.read(fd, spec, BUF_SIZE);
+		if (max <= 0) { OS.close(fd); return fail("could not read input spec"); }
+		OS.close(fd);
+	}
+	def skipSpecStart() {
+		var expected = "//@execute";
+		for (c in expected) {
+			if (spec(pos++) != c) return fail("invalid start of test specification");
+		}
+	}
+	def skip(charSet: string) {
+		while (eat(charSet)) ;
+	}
+	def eat(charSet: string) -> bool {
+		var x = spec(pos);
+		for (c in charSet) {
+			if (c == x) {
+				pos++;
+				return true;
+			} 
+		}
+		return false;
+	}
+	def fail(msg: string) {
+		failed = true;
+		Terminal.puts(CLEAR_LINE).puts(RED).puts(test).puts(NORM);
+		Terminal.puts(" ").puti(current.num).puts(": ");
+		Terminal.putr(spec, current.specStart, current.specEnd);
+		if (current.specEnd > current.specStart) Terminal.puts(", ");
+		Terminal.puts(msg);
+		current.failure = msg;
+	}
+	def checkBinary() {
+		var start = 0, end = test.length;
+		for (j = end - 1; j >= 0; j--) {
+			var c = test(j);
+			if (c == '.') end = j;
+			if (c == '/') { start = j + 1; break; }
+		}
+		var p = exeDirEnd; // copy filename to end of exe dir path
+		for (i = start; i < end; i++) {
+			exeBuf(p++) = test(i);
+		}
+		exeBuf(p) = '\x00'; // zero terminate
+		if (OS.chmod(exeBuf, 484) != 0) {
+			max = 0;
+			fail("could not chmod +x ");
+			Terminal.putr(exeBuf, 0, p);
+		}
+	}
+	def parseResult(start: int, end: int) {
+		var i = start;
+		while (i < end) {
+			if (spec(i++) == '=') break;
+		}
+		while (spec(i) == ' ') i++; // skip spaces
+		match (spec(i)) {
+			'\'': parseChar(i);
+			't': parseTrue(i);
+			'f': parseFalse(i);
+			'0', '1', '2', '3', '4', '5', '6', '7', '8', '9': parsePosDecimal(i);
+			'-': parseNegDecimal(i);
+			'!': parseException(i);
+		} else {
+			fail("invalid result specification");
+			Terminal.puts(" @ ").puti(i);
+		}
+	}
+	def parseTrue(i: int) {
+		for (c in "true") if (spec(i++) != c) parseError(i - 1, "expected true");
+		setVal(1);
+	}
+	def parseFalse(i: int) {
+		for (c in "false") if (spec(i++) != c) parseError(i - 1, "expected false");
+		setVal(0);
+	}
+	def parseChar(i: int) {
+		var c = spec(i + 1);
+		if (c != '\\') return setVal(c);
+		match (spec(i + 2)) {
+			'n': setVal('\n');
+			'r': setVal('\r');
+			't': setVal('\t');
+			'\'': setVal('\'');
+			'\"': setVal('\"');
+			'\\': setVal('\\');
+			'x': {
+				var a = hex(spec(i + 3)), b = hex(spec(i + 4));
+				setVal(a #<< 4 | b);
+			}
+		} else {
+			parseError(i, "invalid character literal");
+		}
+	}
+	def parseException(i: int) {
+		var start = i;
+		while (i < max) {
+			var c = spec(i);
+			if (!(c == '!' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z')) break;
+			i++;
+		}
+		current.exStart = start;
+		current.exEnd = i;
+	}
+	def parseError(i: int, msg: string) {
+		fail(msg);
+		Terminal.puts(" @ ").puti(i);
+	}
+	def hex(a: byte) -> int {
+		if ('0' <= a && a <= '9') return a - '0';
+		if ('a' <= a && a <= 'f') return 10 + a - 'a';
+		if ('A' <= a && a <= 'F') return 10 + a - 'A';
+		parseError(pos, "invalid hex result");
+		return -1;
+	}
+	def parsePosDecimal(pos: int) {
+		var v0 = spec(pos);
+		if (v0 == '0') {
+			var p1 = pos + 1;
+			if (spec(p1) < '0' || spec(p1) > '9') return setVal(0);
+			else return fail("invalid octal constant");
+		}
+		var accum = v0 - int.!('0'), i = pos + 1;
+		while (i < max) {
+			var d = spec(i) - '0';
+			if (d < 0 || d > 9) return setVal(accum);
+			accum = accum * 10 + d;
+			if (accum < 0) return fail("integer constant overflow");
+			i++;
+		}
+		return setVal(accum);
+	}
+	def parseNegDecimal(pos: int) {
+		var p1 = pos + 1, passed = true;
+		var v1 = spec(p1);
+		if (v1 == '0') return fail("invalid negative zero");
+		else if (v1 < '1' || v1 > '9') return fail("invalid negative constant");
+
+		var accum = int.!('0') - v1, i = pos + 2;
+		while (i < max) {
+			var d = spec(i) - '0';
+			if (d < 0 || d > 9) return setVal(accum);
+			accum = accum * 10 - d;
+			if (accum >= 0) return fail("integer constant underflow");
+			i++;
+		}
+		return setVal(accum);
+	}
+	def setVal(val: int) {
+		current.val = val;
+	}
+}
+
+// global variables for current test
+var test_timeout: int;
+var test_pid: int;
+
+def main(args: Array<string>) -> int {
+	if (args.length < 2) {
+		Terminal.puts("Usage: <exe_dir> <test1> ...\n");
+		return 1;
+	}
+	// TODO: implement timeout thread
+	// TODO: implement -v (verbose) for debugging the tester itself
+	var tester = Tester.new(args(0));
+	tester.testMax = args.length - 1;
+	for (i = 1; i < args.length; i++) {
+		tester.run(args(i));
+	}
+	Terminal.puts(CLEAR_LINE).puti(tester.testsPassed).puts(" of ").puti(tester.testMax);
+	Terminal.puts(if(tester.testsPassed == tester.testMax, GREEN, YELLOW));
+	Terminal.puts(" ok").puts(NORM).ln();
+	return if(tester.testsFailed > 0, 1, 0);
+}
