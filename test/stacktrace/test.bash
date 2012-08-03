@@ -141,5 +141,4 @@ for f in $ST_TESTS; do
 done
 check_no_red $? $C
 
-# TODO: enable stacktrace native tests when all pass
-# run_native stacktrace $target $ST_TESTS
+run_native stacktrace $target $ST_TESTS

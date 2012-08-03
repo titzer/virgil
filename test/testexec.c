@@ -10,6 +10,8 @@
 #include <signal.h>
 #include <stdarg.h>
 
+#define STDOUT_BUF_SIZE 100
+#define STDERR_BUF_SIZE 412
 #define SPEC_BUF_SIZE 16384
 
 #define NORM "[0;00m"
@@ -34,9 +36,9 @@ typedef struct run_output {
   int status;			// status from waitpid()
   int pipe_stdout[2];		// pipe for stdout
   int pipe_stderr[2];		// pipe for stderr
-  char data_stdout[256];	// first 256 bytes of stdout
+  char data_stdout[STDOUT_BUF_SIZE];	// first 100 bytes of stdout
   int len_stdout;		// num bytes read from stdout
-  char data_stderr[256];	// first 256 bytes of stderr
+  char data_stderr[STDERR_BUF_SIZE];	// first 500 bytes of stderr
   int len_stderr;		// num bytes read from stderr
 } run_output;
 
@@ -420,9 +422,9 @@ int execute_test(v3_test *test) {
       waitpid(pid, &result.status, 0);
 
       // read stdout into buffer
-      result.len_stdout = read(result.pipe_stdout[0], result.data_stdout, 256);
+      result.len_stdout = read(result.pipe_stdout[0], result.data_stdout, STDOUT_BUF_SIZE);
       // read stderr into buffer
-      result.len_stderr = read(result.pipe_stderr[0], result.data_stderr, 256);
+      result.len_stderr = read(result.pipe_stderr[0], result.data_stderr, STDERR_BUF_SIZE);
 
       // close all pipe files
       close(result.pipe_stdout[0]);
