@@ -102,3 +102,44 @@ done
 
 compiled=1
 do_tests
+
+if [ $# -gt 0 ]; then
+  TESTS="$*"
+else
+  TESTS=$(ls ../execute/*.v3)
+fi
+
+AENEAS_FAST=$T/Aeneas
+
+C=$T/$target-test.compile.out
+rm -f $C
+
+if [ "$target" == x86-darwin ]; then
+    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/darwin/*.v3"
+elif [ "$target" == x86-linux ]; then
+    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/linux/*.v3"
+else
+    echo "  Stacktrace tests not supported for $target"
+    exit 0
+fi
+
+printf "  Compiling ($target) Aeneas..."
+run_v3c "$target" -output=$T -heap-size=500m $AENEAS_SOURCES > $T/Aeneas.compile
+check_no_red $? $T/Aeneas.compile
+
+rm -f $T/*.st
+printf "  Gathering stack traces (int)..."
+run_v3c "" -test -test.st -output=$T $TESTS $> $T/test
+check_red $T/test
+
+printf "  Compiling ($target)..."
+ST_TESTS=$(ls $T/*.st)
+for f in $ST_TESTS; do
+  # TODO: compile multiple tests at once with aeneas (no need for Aeneas-fast)
+  fname="../execute/$(basename -s .st $f).v3"
+  $AENEAS_FAST -output=$T -target=$target-test -rt.sttables $fname $RT_SOURCES >> $C
+done
+check_no_red $? $C
+
+# TODO: enable stacktrace native tests when all pass
+# run_native stacktrace $target $ST_TESTS

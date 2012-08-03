@@ -10,7 +10,7 @@
 #include <signal.h>
 #include <stdarg.h>
 
-#define SPEC_BUF_SIZE 256
+#define SPEC_BUF_SIZE 16384
 
 #define NORM "[0;00m"
 #define GREEN "[0;32m"
@@ -43,7 +43,6 @@ typedef struct run_output {
 typedef struct {
   char *testFile;
   char *exeDir;
-  char spec[SPEC_BUF_SIZE];
   char *end;
   char *failure;
   v3_run *runs;
@@ -59,8 +58,9 @@ int tests_passed;
 int tests_failed;
 
 v3_run *failList;
+char spec[SPEC_BUF_SIZE]; // global specification buffer
 
-void parse(v3_test *test, char *end);
+int parse(v3_test *test, int size);
 void *trimFirstLine(char *p, int size);
 int execute_test(v3_test *test);
 void begin_test(v3_test *test);
@@ -154,14 +154,14 @@ int run_test(v3_test *test) {
     test->failure = "cannot open";
     return 0;
   }
-  size = read(fd, test->spec, SPEC_BUF_SIZE);
+  size = read(fd, spec, SPEC_BUF_SIZE);
   if (size <= 0) {
     test->failure = "cannot read";
     return 0;
   }
+  spec[size] = 0;
   close(fd);
-  parse(test, trimFirstLine(test->spec, size));
-  return execute_test(test);
+  return parse(test, size) && execute_test(test);
 }
 
 void *trimFirstLine(char *p, int size) {
@@ -182,26 +182,24 @@ void *addResult(v3_test *test, char *p, int result, char *except) {
   v3_run *run = (v3_run *) malloc(sizeof(v3_run));
   run->result = result;
   run->exception = except;
-  run->next = NULL;
   run->failure = NULL;
-  if (test->runs != NULL) {
-    run->next = test->runs;
-  }
-
+  run->next = test->runs;
   test->runs = run;
   return p;
 }
 
 void parseError(v3_test *test, char *p) {
-  printf("invalid input spec @ %d\n", (int)(p - test->spec));
+  printf("invalid input spec @ %d\n", (int)(p - spec));
   exit(5);
 }
 
 char *strextract(char *p, char *c) {
-    char *q = p + strspn(p, c);
-    char *x = (char *) malloc((int)(q - p));
-    strncpy(x, p, (int)(q - p));
-    return x;
+  int size = strspn(p, c);
+  char *q = p + size;
+  char *x = (char *) malloc(size);
+  strncpy(x, p, size);
+  x[size] = 0;
+  return x;
 }
 
 int hex(v3_test *test, char *p, char a) {
@@ -213,7 +211,7 @@ int hex(v3_test *test, char *p, char a) {
 }
 
 void *parseResult(v3_test *test, char *p, char *end) {
-  char *q;
+  char *q, *endptr;
   while (p < end && (*p == ' ' || *p == '\t')) p++; // skip whitespace
   switch (*p) {
   case 't':
@@ -232,9 +230,8 @@ void *parseResult(v3_test *test, char *p, char *end) {
   case '7':
   case '8':
   case '9':
-    return addResult(test, p, atoi(strextract(p, "0123456789")), NULL);
   case '-':
-    return addResult(test, p, atoi(strextract(p, "-0123456789")), NULL);
+    return addResult(test, p, strtol(p, &endptr, 10), NULL);
   case '!':
     return addResult(test, p, 0, strextract(p, "!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
   case '\'': {
@@ -262,18 +259,47 @@ void *parseResult(v3_test *test, char *p, char *end) {
   return p;
 }
 
-void parse(v3_test *test, char *end) {
-  char *start = test->spec;
-  char *p = end - 1;
-  if (strncmp(start, "//@execute ", 11) != 0) {
-    printf("invalid test case spec", test->testFile);
-    exit(5);
-  }
-  while (p > start) {
-    if (*p == '=') {
-      parseResult(test, p + 1, end);
+int parse(v3_test *test, int size) {
+  char *start = spec;
+  if (strncmp(start, "//@execute ", 11) == 0) {
+    // parse a normal execution test
+    char *end = trimFirstLine(spec, size);
+    char *p = end;
+    while (p > start) {
+      if (*p == '=') {
+        parseResult(test, p + 1, end);
+      }
+      p--;
     }
-    p--;
+    return 1;
+  } else if (strncmp(start, "//@stacktrace", 13) == 0) {
+    // parse a stacktrace test
+    char *end = start + size;
+    char *p = end, *prev = end;
+    while (p >= start) {
+      if (*p == '/' && (strncmp(p, "//@stacktrace", 13) == 0)) {
+	char *q = p + 13;
+	if (*q == '=') { // normal result
+	  parseResult(test, q + 1, prev);
+          prev = p;
+	} else if (*q == '\n') { // stacktrace follows
+	  int size = prev - q - 1;
+          char *stacktrace = malloc(size + 1);
+	  strncpy(stacktrace, q + 1, size);
+	  stacktrace[size] = 0;
+	  addResult(test, q + 1, 0, stacktrace);
+          prev = p;
+        } else {
+          test->failure = "invalid test case spec";
+          return 0;
+        }
+      }
+      p--;
+    }
+    return 1;
+  } else {
+    test->failure = "invalid test case spec";
+    return 0;
   }
 }
 
@@ -324,8 +350,8 @@ int check_result(v3_run *run, run_output *result) {
 	  && errlen >= strlen(run->exception)
 	  && strncmp(run->exception, result->data_stderr, strlen(run->exception)) == 0) return 1;
       if (outlen == 4 && errlen == 0) return error(run, "run %d: expected %s, got %d", run->num, run->exception, retval);
-      if (outlen == 0) return error(run, "run %d: expected %s, got \"%s\"", run->num, run->exception, result->data_stderr);
-      return error(run, "run %d: expected %s, got %d (%d bytes), \"%s\"", run->num, run->exception, retval, outlen, result->data_stderr);
+      if (outlen == 0) return error(run, "run %d: expected \"%s\" = %ld, got \"%s\"", run->num, run->exception, strlen(run->exception), result->data_stderr);
+      return error(run, "run %d: expected \"%s\", got %d (%d bytes), \"%s\"", run->num, run->exception, retval, outlen, result->data_stderr);
     } else {
       // expected successful return
       if (outlen == 4 

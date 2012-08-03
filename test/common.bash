@@ -83,12 +83,13 @@ function compile_native_runner() {
 
 function run_native() {
 	test=$1
-	local target=$2
+	shift
+	local target=$1
 	shift
 	if [ "$HOST_PLATFORM" == "$target" ]; then
 		TESTER=$(compile_native_runner $target)
 		printf "  Running   ($target)...\n"
-		$TESTER ${VIRGIL_TEST_OUT}/$test/$target $TESTS | tee ${VIRGIL_TEST_OUT}/$test/$target/run.out
+		$TESTER ${VIRGIL_TEST_OUT}/$test/$target $* | tee ${VIRGIL_TEST_OUT}/$test/$target/run.out
 	else
 		echo "  Skipping  ($target/$HOST_PLATFORM)...${YELLOW}ok${NORM}"
 	fi
