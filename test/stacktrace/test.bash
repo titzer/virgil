@@ -136,7 +136,8 @@ printf "  Compiling ($target)..."
 ST_TESTS=$(ls $T/*.st)
 for f in $ST_TESTS; do
   # TODO: compile multiple tests at once with aeneas (no need for Aeneas-fast)
-  fname="../execute/$(basename -s .st $f).v3"
+  fname="../execute/$(basename $f)"
+  fname="${fname%*.*}.v3"
   $AENEAS_FAST -output=$T -target=$target-test -rt.sttables $fname $RT_SOURCES >> $C
 done
 check_no_red $? $C
