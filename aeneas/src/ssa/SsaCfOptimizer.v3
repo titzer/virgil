@@ -26,11 +26,15 @@ class SsaCfOptimizer {
 	}
 	def optBlock(block: SsaBlock) {
 		if (block.end == null || block.end.checkFact(Facts.O_KILLED)) return;
+		if (block.phis != null) {
+			optPhis(block);
+		}
 		for (s in block.succ) {
 			while (optEdge(s)) ; // optimize each edge
 		}
-		if (SsaSwitch.?(block.end)) optDoubleDiamond(SsaSwitch.!(block.end));
-		if (block.phis != null) optPhis(block);
+		if (SsaSwitch.?(block.end)) {
+			optSwitch(SsaSwitch.!(block.end));
+		}
 		for (s in block.succ) {
 			if (s.dest != null) queueBlock(s.dest);
 		}
@@ -68,6 +72,31 @@ class SsaCfOptimizer {
 			phi.setFact(facts); // phi facts are the intersection of all input facts
 			return false;
 		}
+	}
+	def optSwitch(sw: SsaSwitch) {
+		var kind = sw.vtype.typeCon.kind;
+		var v = sw.inputs(0).dest;
+		if (kind == V3Kind.CLASS || kind == V3Kind.ARRAY) {
+			// comparison of object or array reference; propagate non-null
+			// information to successor blocks
+			var hasNull = false;
+			for (i = 0; i < sw.vals.length; i++) {
+				if (hasNull || sw.vals(i) != null) propagateNonNull(v, sw, i);
+				else hasNull = true;
+			}
+			if (hasNull) propagateNonNull(v, sw, sw.block.succ.length - 1);
+		}
+		if (kind == V3Kind.BOOL && v.opcode() == V3Opcode.TypeQuery) {
+			// propagate successful type query information
+			var hasFalse = false;
+			for (i = 0; i < sw.vals.length; i++) {
+				if (Bool.unbox(sw.vals(i))) propagateTrueTypeQuery(v, sw, i);
+				else hasFalse = true;
+			}
+			if (hasFalse) propagateTrueTypeQuery(v, sw, sw.block.succ.length - 1);
+		}
+		// finally try to optimize double-diamond patterns
+		optDoubleDiamond(sw);
 	}
 	def optDoubleDiamond(sw: SsaSwitch) {
 		// match and simplify a control flow pattern where the input to a switch
@@ -249,5 +278,67 @@ class SsaCfOptimizer {
 			}
 			block.phis = null;
 		}
+	}
+	// propagate the fact that the given type query "v" is true to the given successor
+	def propagateTrueTypeQuery(v: SsaInstr, sw: SsaSwitch, index: int) {
+		var obj = v.inputs(0).dest, queryTypes = SsaApplyOp.!(v).op.typeArgs;
+		applyDominatorOptForInput0(obj, sw.block.succ(index), optFoldCast(_, queryTypes));
+	}
+	// propagate the fact that the given object "obj" is non-null to the given successor
+	def propagateNonNull(obj: SsaInstr, sw: SsaSwitch, index: int) {
+		applyDominatorOptForInput0(obj, sw.block.succ(index), optNullCheck);
+	}
+	// fold away a type cast if dominated by a type query that evaluates to true
+	def optFoldCast(i: SsaInstr, queryTypes: Array<Type>) -> SsaInstr {
+		if (i.opcode() == V3Opcode.TypeCast) {
+			// fold away a type cast
+			var cast = SsaApplyOp.!(i), castTypes = cast.op.typeArgs;
+			if (TypeSystem.isSubtype(queryTypes(1), castTypes(1))) {
+				return SsaApplyOp.new(cast.source, V3Op.newTypeSubsume(castTypes(0), castTypes(1)), [i.inputs(0).dest]);
+			} else {
+				i.setFact(Facts.O_NO_NULL_CHECK);
+			}
+		}
+		return optNullCheck(i);
+	}
+	// eliminate a null check on this instruction
+	def optNullCheck(i: SsaInstr) -> SsaInstr {
+		match (i.opcode()) {
+			V3Opcode.NullCheck,
+			V3Opcode.BoundsCheck,
+			V3Opcode.ArrayGetElem,
+			V3Opcode.ArraySetElem,
+			V3Opcode.ArrayGetLength,
+			V3Opcode.TypeCast,
+			V3Opcode.TypeQuery,
+			V3Opcode.ClassGetMethod,
+			V3Opcode.ClassGetVirtual,
+			V3Opcode.CallClassMethod,
+			V3Opcode.CallClassVirtual,
+			V3Opcode.ClassGetField,
+			V3Opcode.ClassSetField: {
+				i.setFact(Facts.O_NO_NULL_CHECK);
+			}
+		}
+		return i;
+	}
+	// apply the function "f" to every dominated instruction i where i.inputs(0).dest == obj
+	def applyDominatorOptForInput0(obj: SsaInstr, edge: SsaCfEdge, f: SsaInstr -> SsaInstr) {
+		if (!edge.isOnlyEdge()) return;
+		var instrs = edge.dest.instrs;
+		// search this block for instructions to optimize
+		// XXX: employ useList and domination numbers to only inspect instructions
+		// that use this value
+		for (j = 0; j < instrs.length; j++) {
+			var i = instrs.get(j);
+			if (i.inputs.length < 1) continue; // instr doesn't involve obj
+			if (i.inputs(0).dest != obj) continue; // instr doesn't involve obj
+			var ni = f(i);
+			if (ni != i) {
+				instrs.set(j, ni);
+				i.replace(ni);
+			}
+		}
+		// XXX: propagate the fact to blocks dominated by this block
 	}
 }
