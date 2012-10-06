@@ -18,11 +18,12 @@ def singleton(t: Type) -> RmaType {
 
 // Performs reachable members analysis and builds a new version of the program
 // which includes only the live fields, methods, and objects.
-class RMAnalyzer {
+class RmAnalyzer {
 	def compiler: Compiler;
 	def prog: Program = compiler.prog;
-	def analyzeMethod: (RMAnalyzer, RmaMember) -> void;
+	def genSsa: IrSpec -> SsaRegion;
 
+	def opMap = HashMap<IrItem, List<Operator>>.new(IrItem.uid, IrItem.==);
 	def typeMap = TypeUtil.newTypeMap<RmaType>();
 	def memberMap = IrUtil.newIrSpecMap<RmaMember>();
 	var liveMethods: List<RmaMethod>;
@@ -34,18 +35,18 @@ class RMAnalyzer {
 	var listTail: Unit;
 	var roots: List<RmaRoot>;
 
-	new(compiler, analyzeMethod) {
+	new(compiler, genSsa) {
 		oldIr = prog.ir;
 		newIr = IrPortion.new(prog);
 		norm = V3ProgramNormalizer.new(compiler, prog, this);
 	}
-	def analyze() -> RMAnalyzer {
+	def analyze() -> RmAnalyzer {
 		var unit: Unit;
 		while ((unit = dequeue()) != null) unit.analyze();
 		if (Aeneas.PRINT_RMA.get()) RMPrinter.print(this);
 		return this;
 	}
-	def transform() -> RMAnalyzer {
+	def transform() -> RmAnalyzer {
 		// normalize and specialize all class representations
 		typeMap.apply(norm.normalizeIrClass);
 		// normalize root methods
@@ -215,7 +216,7 @@ class RMAnalyzer {
 		if (Tuple_Value.?(val)) for (e in Tuple_Value.!(val).values) deferValue(e);
 		defer(analyzeValue, val, null);
 	}
-	def analyzeValue(val: Val, context: IrSpec) {
+	def analyzeValue(val: Val, unused: IrSpec) {
 		if (Record.?(val)) {
 			var record = Record.!(val);
 			var rmaType = getRmaType(record.rtype);
@@ -223,13 +224,77 @@ class RMAnalyzer {
 		} else if (Delegate.?(val)) {
 			var delegate = Delegate.!(val);
 			var record = Record.!(delegate.val);
-			analyzeValue(record, context);
+			analyzeValue(record, null);
 			var rmaType = getRmaType(delegate.memberRef.container);
 			var rmaMember = getRmaMember(delegate.memberRef);
 			rmaMember.getMethod();
 		} else if (Tuple_Value.?(val)) {
-			for(e in (Tuple_Value.!(val)).values) analyzeValue(e, context);
+			for(e in (Tuple_Value.!(val)).values) analyzeValue(e, null);
 		}
+	}
+	def analyzeMethod(rma: RmAnalyzer, memberInfo: RmaMember) {
+		var m = memberInfo.origMember;
+		if (!m.isMethod()) return;
+		// already been analyzed with a different instantiation?
+		if (opMap.has(m.member)) {
+			// re-analyze polymorphic operators
+			for (l = opMap.get(m.member); l != null; l = l.tail) {
+				analyzeOperator(l.head, m);
+			}
+			return;
+		}
+		var region = m.asMethod().ssa;
+		if (region == null) region = genSsa(m);
+		// XXX: don't use bfBlocks(), just iterate directly
+		var blocks = region.bfBlocks(), polyOps: List<Operator>;
+		for (b in blocks) {
+			var instrs = b.instrs;
+			for (j = 0; j < instrs.length; j++) {
+				var instr = instrs.get(j);
+				if (SsaApplyOp.?(instr)) {
+					polyOps = analyzeOp(SsaApplyOp.!(instr).op, polyOps, m);
+				}
+			}
+		}
+		opMap.set(m.member, polyOps);
+		region.applyVals(analyzeVal);
+	}
+	def analyzeOperator(exp: Operator, env: IrSpec) {
+		if (env != null) exp = exp.subst(env.instantiateType);
+		var ta = exp.typeArgs;
+		for (t in ta) getRmaType(t);
+		match (exp.opcode) {
+			V3Opcode.ArrayAlloc,
+			V3Opcode.ArrayInit: getRmaType(ta(0)).becomeAllocated();
+			V3Opcode.ClassAlloc: {
+				var spec = env.instantiateIrSpec(V3Op.extractIrSpec(exp));
+				getRmaType(spec.container).becomeAllocated();
+				if (spec.member != null) getRmaMember(spec).getMethod();
+			}
+			V3Opcode.ClassGetVirtual,
+			V3Opcode.CallClassVirtual: memberOf(exp, env).getVirtual();
+			V3Opcode.ClassGetMethod,
+			V3Opcode.ComponentGetMethod,
+			V3Opcode.CallClassMethod,
+			V3Opcode.CreateDelegate,
+			V3Opcode.CallComponentMethod: memberOf(exp, env).getMethod();
+			V3Opcode.ClassGetField,
+			V3Opcode.ComponentGetField: memberOf(exp, env).getField();
+			V3Opcode.ClassSetField,
+			V3Opcode.ComponentSetField: memberOf(exp, env).setField();
+		}
+	}
+	def memberOf(exp: Operator, env: IrSpec) -> RmaMember {
+		return getRmaMemberIn(V3Op.extractIrSpec(exp), env);
+	}
+	// analyze an operator and add it to the list of polymorphic operators
+	private def analyzeOp(op: Operator, polyOps: List<Operator>, member: IrSpec) -> List<Operator> {
+		analyzeOperator(op, member);
+		if (op.isPolymorphic()) return List.new(op, polyOps);
+		return polyOps;
+	}
+	private def analyzeVal(a: (Type, Val), i: SsaValue) {
+		analyzeValue(a.1, null);
 	}
 }
 // represents a root method, i.e. an entrypoint. Updated to point to normalized code after RMA.
@@ -253,7 +318,7 @@ class RMClosure<A, B> extends Unit {
 }
 // Information about a type for RMA and for normalization
 class RmaType {
-	def rma: RMAnalyzer;		// containing analyzer
+	def rma: RmAnalyzer;		// containing analyzer
 	def oldType: Type;		// original type
 	var newType: Type;		// new (normalized) type
 	def oldClass: IrClass;		// old IrClass
