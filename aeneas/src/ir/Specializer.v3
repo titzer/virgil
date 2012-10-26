@@ -1,0 +1,279 @@
+// Copyright 2012 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A customized datastructure that divides a set of arrays of keys into sets of 
+// equivalent arrays of keys. This can be used to organize specializations of 
+// polymorphic classes or methods into sets of equivalent specializations based 
+// on a polymorphic "signature" which is represented by an array of integers.
+class KeyArrayMultiSet<K, T> {
+	var list: List<T>;
+	var keys = Sequence<K>.new();
+	var splits: Sequence<List<KeyArrayMultiSet<K, T>>>;
+	var cursor: int;
+	// start the current key
+	def start() {
+		cursor = 0;
+	}
+	// add one key to the current array
+	def add(key: K) -> KeyArrayMultiSet<K, T> {
+		if (list == null) {
+			// no elements in the set yet, just add the key
+			keys.add(key);
+			return this;
+		}
+		// reached the end of the keys?
+		if (cursor == keys.length) return split(key);
+		// doesn't match the current key?
+		if (keys.get(cursor) != key) return split(key);
+		cursor++;
+		// matches the current key, everything is fine
+		return this;
+	}
+	def split(key: K) -> KeyArrayMultiSet<K, T> {
+		if (splits == null) {
+			// no splits yet
+			splits = Sequence.new();
+		}
+		if (splits.length < cursor + 1) {
+			// splits don't extend to cover this position
+			splits.grow(cursor + 1);
+			splits.length = cursor + 1;
+		}
+		for (l = splits.get(cursor); l != null; l = l.tail) {
+			// search for an existing split with a matching key
+			if (l.head.keys.get(cursor) == key) {
+				l.head.cursor = cursor + 1;
+				return l.head;
+			}
+		}
+		// no existing split found, create a new one
+		var set = KeyArrayMultiSet<K, T>.new(), nkeys = Sequence<K>.new();
+		set.keys = nkeys.grow(keys.length);
+		for (i = 0; i < cursor; i++) {
+			nkeys.add(keys.get(i));
+		}
+		nkeys.add(key);
+		set.cursor = cursor + 1;
+		// insert new split into the list
+		splits.set(cursor, List.new(set, splits.get(cursor)));
+		return set;
+	}
+	// finish the current array and associate it with the given item
+	def finish(item: T) {
+		list = List.new(item, list);
+	}
+	// visit all the collected sets of items
+	def apply(f: List<T> -> void) {
+		if (list != null) f(list);
+		if (splits != null) {
+			for (i = 0; i < splits.length; i++) {
+				for (l = splits.get(i); l != null; l = l.tail) {
+					l.head.apply(f);
+				}
+			}
+		}
+	}
+}
+// Analyzes polymorphic methods and specializes them according to the polymorphic
+// operations they perform.
+class Specializer {
+	def polyMap = HashMap<IrMethod, IrSet>.new(IrItem.uid, IrItem.==);
+	var rma: RmAnalyzer;
+	var env: IrSpec;
+	var keyset: KeyArrayMultiSet<int, IrSpec>;
+	def analyze(spec: IrSpec, method: IrMethod, region: SsaRegion) {
+		// already been analyzed with a different instantiation?
+		var poly = polyMap.get(method);
+		if (poly != null) {
+			// re-analyze polymorphic operators
+			poly.add(spec);
+			for (l = poly.polyOps; l != null; l = l.tail) {
+				rma.analyzeOp(l.head, spec);
+			}
+			return;
+		}
+		// XXX: don't use bfBlocks(), just iterate directly
+		region.applyVals(rma.analyzeVal);
+		var blocks = region.bfBlocks(), polyOps: List<Operator>;
+		for (b in blocks) {
+			var instrs = b.instrs;
+			for (j = 0; j < instrs.length; j++) {
+				var instr = instrs.get(j);
+				if (SsaApplyOp.?(instr)) {
+					polyOps = analyzePolyOp(SsaApplyOp.!(instr).op, polyOps, spec);
+				}
+			}
+		}
+		poly = IrSet.new(method, polyOps);
+		poly.add(spec);
+		polyMap.set(method, poly);
+	}
+	// analyze an operator and add it to the list of polymorphic operators
+	def analyzePolyOp(op: Operator, polyOps: List<Operator>, member: IrSpec) -> List<Operator> {
+		rma.analyzeOp(op, member);
+		if (op.isPolymorphic()) return List.new(op, polyOps);
+		return polyOps;
+	}
+	def specialize(poly: IrSet) -> KeyArrayMultiSet<int, IrSpec> {
+		var root = KeyArrayMultiSet<int, IrSpec>.new();
+		// XXX: if there is only one instantiation, return it
+		for (l = poly.instantiations; l != null; l = l.tail) {
+			// visit each instantiation
+			keyset = root;
+			keyset.start();
+			env = l.head;
+			// TODO: visit parameters and return type of method
+			for (op = poly.polyOps; op != null; op = op.tail) {
+				// visit each polymorphic operator
+				polySignature(op.head);
+			}
+			keyset.finish(l.head);
+		}
+		return root;
+	}
+	def polySignature(exp: Operator) {
+		// add any polymorphic keys to the current key array
+		var t0: Type;
+		if (exp.typeArgs.length > 0) t0 = normType(exp.typeArgs(0));
+		match (exp.opcode) {
+			V3Opcode.Equal,
+			V3Opcode.NotEqual: {
+				if (V3.isTuple(t0)) {
+					for (l = Tuple.toTypeList(t0); l != null; l = l.tail) add(equality(l.head));
+				} else {
+					add(equality(t0));
+				}
+			}
+			V3Opcode.TypeCast,
+			V3Opcode.TypeQuery,
+			V3Opcode.TypeSubsume: {
+				add(t0.hash);
+				add(normType(exp.typeArgs(1)).hash);
+			}
+			V3Opcode.ArrayAlloc,
+			V3Opcode.ArrayInit,
+			V3Opcode.ArrayGetElem,
+			V3Opcode.ArraySetElem: {
+				if (V3.isArray(t0)) {
+					// simple array
+					add(machSizeRef(V3Array.elementType(t0)));
+				} else {
+					// complex tuple array
+					for (l = Tuple.toTypeList(t0); l != null; l = l.tail) {
+						add(machSizeRef(V3Array.elementType(l.head)));
+					}
+				}
+			}
+			V3Opcode.NullCheck,
+			V3Opcode.BoundsCheck,
+			V3Opcode.ArrayGetLength: {
+				add(Tuple.length(t0));
+			}
+			V3Opcode.ClassAlloc: {
+				// XXX: could be improved if the class representation is known
+				add(t0.hash);
+			}
+			V3Opcode.ClassGetField,
+			V3Opcode.ClassInitField,
+			V3Opcode.ClassSetField: {
+				// TODO: tuple fields
+				var spec = V3Op.extractIrSpec(exp.subst(env.instantiateType));
+				add(fieldOffset(spec));
+				addAllMachSizeRef(spec.getFieldType());
+			}
+			V3Opcode.ClassGetVirtual: {
+				addVirtual(V3Op.extractIrSpec(exp.subst(env.instantiateType)));
+			}
+			V3Opcode.ClassGetMethod,
+			V3Opcode.ComponentGetMethod: {
+				addMethod(V3Op.extractIrSpec(exp.subst(env.instantiateType)));
+			}
+			V3Opcode.TupleCreate: {
+				add(Tuple.length(t0));
+			}
+			V3Opcode.TupleGetElem: {
+				add(Tuple.length(t0)); // TODO: actual offset range in tuple
+			}
+			V3Opcode.CallClassVirtual: {
+				addVirtual(V3Op.extractIrSpec(exp.subst(env.instantiateType)));
+				addCallConv(exp.paramTypes, exp.resultType);
+			}
+			V3Opcode.CallClassMethod,
+			V3Opcode.CallComponentMethod: {
+				addMethod(V3Op.extractIrSpec(exp.subst(env.instantiateType)));
+				addCallConv(exp.paramTypes, exp.resultType);
+			}
+			V3Opcode.CallDelegate: {
+				var paramTypes = Arrays.range(exp.paramTypes, 1, exp.paramTypes.length);
+				addCallConv(paramTypes, exp.resultType);
+			}
+			V3Opcode.SystemOp: {
+				add(t0.hash); // full specialization
+			}
+		}
+	}
+	def machSize(t: Type) -> int {
+		// TODO: this is not portable
+		match (t.typeCon.kind) {
+			V3Kind.BOOL: return 1;
+			V3Kind.BYTE: return 1;
+			V3Kind.INT: return 4;
+			V3Kind.ARRAY: return 4;
+			V3Kind.COMPONENT: return 0;
+			V3Kind.CLASS: return 4;
+			V3Kind.DELEGATE: return 8;
+			V3Kind.FUNCREF: return 4;
+		}
+		return 0;
+	}
+	def machSizeRef(t: Type) -> int {
+		var size = machSize(t) #<< 1;
+		if (V3.isClass(t) || V3.isArray(t)) size = 1 | size;
+		return size;
+	}
+	def normType(t: Type) -> Type {
+		return rma.norm.normalizeType(env.instantiateType(t)).getType();
+	}
+	def fieldOffset(f: IrSpec) -> int {
+		return f.member.index; // TODO: real field offset
+	}
+	def addMethod(f: IrSpec) {
+		// TODO: add the method to a list of dependencies
+	}
+	def addVirtual(f: IrSpec) {
+		// TODO: add the method to a list of dependencies
+	}
+	def addCallConv(paramTypes: Array<Type>, retType: Type) {
+		// TODO: should use actual calling convention from backend
+		for (i = 0; i < paramTypes.length; i++) {
+			addAllMachSizeRef(paramTypes(i));
+		}
+		addAllMachSizeRef(retType);
+	}
+	def addAllMachSizeRef(t: Type) {
+		var tn = rma.norm.normalizeType(t);
+		for (j = 0; j < tn.size; j++) {
+			add(machSizeRef(tn.sub(j)));
+		}
+	}
+	def equality(t: Type) -> int {
+		// XXX: function type comparisons, immutable array comparisons will be different
+		return machSize(t);
+	}
+	def add(i: int) {
+		keyset = keyset.add(i);
+	}
+}
+// information about a polymorphic method and its instantiations
+class IrSet {
+	def method: IrMethod;
+	def polyOps: List<Operator>;
+	var instantiations: List<IrSpec>;
+	new(method, polyOps) {}
+	def add(spec: IrSpec) {
+		instantiations = List.new(spec, instantiations);
+	}
+	def enum(spec: Specializer, f: List<IrSpec> -> void) {
+		spec.specialize(this).apply(f);
+	}
+}
