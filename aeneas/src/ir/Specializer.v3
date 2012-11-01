@@ -1,6 +1,311 @@
 // Copyright 2012 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// Analyzes polymorphic methods and specializes them according to the polymorphic
+// operations they perform.
+class Specializer {
+	def polyMap = HashMap<IrMethod, RmaPolyMethod>.new(IrItem.uid, IrItem.==);
+	var rma: RmAnalyzer;
+	var env: IrSpec;
+	var keyset: KeyArrayMultiSet<int, RmaMethod>;
+	var calls = Sequence<IrSpec>.new();
+	def queue = Sequence<RmaPolyMethod>.new();
+
+	// analyze an instantiation for reachability and record polymorphic operators
+	def analyze(rmaMethod: RmaMethod, method: IrMethod, region: SsaRegion) {
+		var poly = polyMap.get(method), spec = rmaMethod.origMember;
+		if (poly != null) {
+			// already been analyzed with a different instantiation;
+			// re-analyze polymorphic operators
+			poly.add(rmaMethod);
+			for (l = poly.polyOps; l != null; l = l.tail) {
+				rma.analyzeOp(l.head, spec);
+			}
+			return;
+		}
+		// first instantiation; extract polymorphic operators
+		region.applyVals(rma.analyzeVal);
+		var polyOps: List<Operator>;
+		for (b in region.bfBlocks()) {
+			var instrs = b.instrs;
+			for (j = 0; j < instrs.length; j++) {
+				var instr = instrs.get(j);
+				if (SsaApplyOp.?(instr)) {
+					var op = SsaApplyOp.!(instr).op;
+					rma.analyzeOp(op, spec);
+					if (op.isPolymorphic()) polyOps = List.new(op, polyOps);
+				}
+			}
+		}
+		poly = RmaPolyMethod.new(rma.uid++, method, polyOps);
+		poly.add(rmaMethod);
+		polyMap.set(method, poly);
+	}
+	def splitBasedOnOperators(poly: RmaPolyMethod) -> KeyArrayMultiSet<int, RmaMethod> {
+		var root = KeyArrayMultiSet<int, RmaMethod>.new();
+		var first = true;
+		for (l = poly.instantiations; l != null; l = l.tail) {
+			// visit each instantiation
+			this.env = l.head.origMember;
+			keyset = root;
+			keyset.start();
+			// TODO: visit parameters and return type of method
+			for (op = poly.polyOps; op != null; op = op.tail) {
+				// visit each polymorphic operator
+				polySignature(op.head, first);
+			}
+			keyset.finish(l.head);
+			first = false;
+		}
+		poly.setCalls(calls.extract());
+		return root;
+	}
+	def polySignature(exp: Operator, first: bool) {
+		// add any polymorphic keys to the current key array
+		var t0: Type;
+		if (exp.typeArgs.length > 0) t0 = normType(exp.typeArgs(0));
+		match (exp.opcode) {
+			V3Opcode.Equal,
+			V3Opcode.NotEqual: {
+				if (V3.isTuple(t0)) {
+					for (l = Tuple.toTypeList(t0); l != null; l = l.tail) add(equality(l.head));
+				} else {
+					add(equality(t0));
+				}
+			}
+			V3Opcode.TypeCast,
+			V3Opcode.TypeQuery,
+			V3Opcode.TypeSubsume: {
+				add(t0.hash);
+				add(normType(exp.typeArgs(1)).hash);
+			}
+			V3Opcode.ArrayAlloc,
+			V3Opcode.ArrayInit,
+			V3Opcode.ArrayGetElem,
+			V3Opcode.ArraySetElem: {
+				if (V3.isArray(t0)) {
+					// simple array
+					add(machSizeRef(V3Array.elementType(t0)));
+				} else {
+					// complex tuple array
+					for (l = Tuple.toTypeList(t0); l != null; l = l.tail) {
+						add(machSizeRef(V3Array.elementType(l.head)));
+					}
+				}
+			}
+			V3Opcode.NullCheck,
+			V3Opcode.BoundsCheck,
+			V3Opcode.ArrayGetLength: {
+				add(Tuple.length(t0));
+			}
+			V3Opcode.ClassAlloc: {
+				// XXX: could be improved if the class representation is known
+				add(t0.hash);
+			}
+			V3Opcode.ClassGetField,
+			V3Opcode.ClassInitField,
+			V3Opcode.ClassSetField: {
+				var spec = V3Op.extractIrSpec(exp.subst(env.instantiateType));
+				add(fieldOffset(spec));
+				addAllMachSizeRef(spec.getFieldType());
+			}
+			V3Opcode.ClassGetVirtual: {
+				if (first) addVirtual(V3Op.extractIrSpec(exp));
+			}
+			V3Opcode.ClassGetMethod,
+			V3Opcode.ComponentGetMethod: {
+				if (first) calls.add(V3Op.extractIrSpec(exp));
+			}
+			V3Opcode.TupleCreate: {
+				add(Tuple.length(t0));
+			}
+			V3Opcode.TupleGetElem: {
+				add(Tuple.length(t0)); // TODO: actual offset range in tuple
+			}
+			V3Opcode.CallClassVirtual: {
+				if (first) addVirtual(V3Op.extractIrSpec(exp));
+				addCallConv(exp.paramTypes, exp.resultType);
+			}
+			V3Opcode.CallClassMethod,
+			V3Opcode.CallComponentMethod: {
+				if (first) calls.add(V3Op.extractIrSpec(exp));
+				addCallConv(exp.paramTypes, exp.resultType);
+			}
+			V3Opcode.CallDelegate: {
+				var paramTypes = Arrays.range(exp.paramTypes, 1, exp.paramTypes.length);
+				addCallConv(paramTypes, exp.resultType);
+			}
+			V3Opcode.SystemOp: {
+				add(t0.hash); // full specialization
+			}
+		}
+	}
+	def machSize(t: Type) -> int {
+		// TODO: this is not portable
+		match (t.typeCon.kind) {
+			V3Kind.BOOL: return 1;
+			V3Kind.BYTE: return 1;
+			V3Kind.INT: return 4;
+			V3Kind.ARRAY: return 4;
+			V3Kind.COMPONENT: return 0;
+			V3Kind.CLASS: return 4;
+			V3Kind.DELEGATE: return 8;
+			V3Kind.FUNCREF: return 4;
+		}
+		return 0;
+	}
+	def machSizeRef(t: Type) -> int {
+		var size = machSize(t) #<< 1;
+		if (V3.isClass(t) || V3.isArray(t)) size = 1 | size;
+		return size;
+	}
+	def normType(t: Type) -> Type {
+		return rma.norm.normalizeType(env.instantiateType(t)).getType();
+	}
+	def fieldOffset(f: IrSpec) -> int {
+		return f.member.index; // TODO: real field offset
+	}
+	def addVirtual(f: IrSpec) {
+		// TODO: add the method to a list of dependencies
+	}
+	def addCallConv(paramTypes: Array<Type>, retType: Type) {
+		// TODO: should use actual calling convention from backend
+		for (i = 0; i < paramTypes.length; i++) {
+			addAllMachSizeRef(paramTypes(i));
+		}
+		addAllMachSizeRef(retType);
+	}
+	def addAllMachSizeRef(t: Type) {
+		var tn = rma.norm.normalizeType(t);
+		for (j = 0; j < tn.size; j++) {
+			add(machSizeRef(tn.sub(j)));
+		}
+	}
+	def equality(t: Type) -> int {
+		// XXX: function type comparisons, immutable array comparisons will be different
+		return machSize(t);
+	}
+	def add(i: int) {
+		keyset = keyset.add(i);
+	}
+	def specializeAll() {
+		// compute initial specialization sets based on operators
+		polyMap.apply(initialSplitBasedOnOperators);
+		// repeatedly process calls between specialization sets
+		Sequences.drain(queue, 0, splitBasedOnCalls);
+	}
+	def splitBasedOnCalls(poly: RmaPolyMethod) {
+		poly.queued = false;
+		if (poly.split) return;
+		var set = KeyArrayMultiSet<int, RmaMethod>.new();
+		for (lm = poly.instantiations; lm != null; lm = lm.tail) {
+			processCalls(set, poly, lm.head);
+		}
+		if (set.splits != null) {
+			set.apply(splitRmaPolyMethod(poly, false, _));
+		}
+	}
+	def initialSplitBasedOnOperators(unused: IrMethod, all: RmaPolyMethod) {
+		var list = all.instantiations;
+		if (list.tail == null) return; // only a single instantiation
+		var set = splitBasedOnOperators(all);
+		if (set.splits != null) {
+			// this set needs to be split into subsets
+			set.apply(splitRmaPolyMethod(all, true, _));
+		} else {
+			// this set doesn't need to be split
+			all.attachToRmaMethods();
+			queueMethod(all);
+			all.dirtyAll();
+		}
+		initialRmaMethodCalls(all.calls, list);
+	}
+	// set up initial call edges between RmaMethods involved in RmaPolyMethods
+	def initialRmaMethodCalls(calls: Array<IrSpec>, list: List<RmaMethod>) {
+		if (calls.length == 0) return;
+		for (l = list; l != null; l = l.tail) {
+			var meth = l.head;
+			if (meth.polyMethod == null) continue;
+			meth.calls = Array<RmaMethodUseEdge>.new(calls.length);
+			for (i = 0; i < meth.calls.length; i++) {
+				var d = meth.origMember.instantiateIrSpec(calls(i));
+				var dest = RmaMethod.!(rma.getRmaMember(d));
+				meth.calls(i) = RmaMethodUseEdge.new(i, meth, dest);
+			}
+		}
+	}
+	// split a RmaPolyMethod into a new subset that only includes the given list
+	def splitRmaPolyMethod(orig: RmaPolyMethod, dirty: bool, list: List<RmaMethod>) {
+		orig.split = true;
+		Lists.apply(list, dirtyIncomingEdges);
+		if (list.tail == null) {
+			list.head.polyMethod = null; // only a single instantiation
+			return;
+		}
+		var poly = RmaPolyMethod.new(rma.uid++, orig.method, orig.polyOps);
+		poly.instantiations = list;
+		poly.setCalls(orig.calls);
+		poly.attachToRmaMethods();
+		if (dirty) {
+			queueMethod(poly);
+			poly.dirtyAll();
+		}
+	}
+	def dirtyIncomingEdges(dst: RmaMethod) {
+		for (edge = dst.useList; edge != null; edge = RmaMethodUseEdge.!(edge.next)) {
+			var src = edge.src.polyMethod;
+			if (src != null) {
+				src.dirty(edge.index) = true;
+				queueMethod(src);
+			}
+		}
+	}
+	def processCalls(set: KeyArrayMultiSet<int, RmaMethod>, poly: RmaPolyMethod, src: RmaMethod) {
+		for (i = 0; i < poly.calls.length; i++) {
+			if (!poly.dirty(i)) continue;
+			poly.dirty(i) = false;
+			var meth = src.calls(i).dest;
+			set.add(if(meth.polyMethod == null, meth.uid, meth.polyMethod.uid));
+		}
+		set.finish(src);
+	}
+	def queueMethod(poly: RmaPolyMethod) {
+		if (!poly.queued && poly.calls.length > 0) {
+			poly.queued = true;
+			queue.add(poly);
+		}
+	}
+}
+// A set of polymorphic instantiations of a method. Contains the polymorphic operators
+// in a method and also serves as a node in a call graph between polymorphic methods.
+class RmaPolyMethod {
+	def uid: int;				// UID for quick disambiguation
+	def method: IrMethod;			// original method
+	def polyOps: List<Operator>;		// polymorphic operators
+	var instantiations: List<RmaMethod>;	// instantiations of the method
+	var calls: Array<IrSpec>;		// direct calls
+	var dirty: Array<bool>;			// which outgoing call edges are dirty
+	var queued: bool;			// currently on the queue
+	var split: bool;			// for debugging; this set has been split
+	new(uid, method, polyOps) {}
+	def add(meth: RmaMethod) {
+		instantiations = List.new(meth, instantiations);
+	}
+	def enum(spec: Specializer, f: List<RmaMethod> -> void) {
+		spec.splitBasedOnOperators(this).apply(f);
+	}
+	def setCalls(a: Array<IrSpec>) {
+		calls = a;
+		dirty = Array<bool>.new(a.length);
+	}
+	def attachToRmaMethods() {
+		for (l = instantiations; l != null; l = l.tail) l.head.polyMethod = this;
+	}
+	def dirtyAll() {
+		if (dirty == null) return;
+		for (i = 0; i < dirty.length; i++) dirty(i) = true;
+	}
+}
 // A customized datastructure that divides a set of arrays of keys into sets of 
 // equivalent arrays of keys. This can be used to organize specializations of 
 // polymorphic classes or methods into sets of equivalent specializations based 
@@ -72,208 +377,5 @@ class KeyArrayMultiSet<K, T> {
 				}
 			}
 		}
-	}
-}
-// Analyzes polymorphic methods and specializes them according to the polymorphic
-// operations they perform.
-class Specializer {
-	def polyMap = HashMap<IrMethod, IrSet>.new(IrItem.uid, IrItem.==);
-	var rma: RmAnalyzer;
-	var env: IrSpec;
-	var keyset: KeyArrayMultiSet<int, IrSpec>;
-	def analyze(spec: IrSpec, method: IrMethod, region: SsaRegion) {
-		// already been analyzed with a different instantiation?
-		var poly = polyMap.get(method);
-		if (poly != null) {
-			// re-analyze polymorphic operators
-			poly.add(spec);
-			for (l = poly.polyOps; l != null; l = l.tail) {
-				rma.analyzeOp(l.head, spec);
-			}
-			return;
-		}
-		// XXX: don't use bfBlocks(), just iterate directly
-		region.applyVals(rma.analyzeVal);
-		var blocks = region.bfBlocks(), polyOps: List<Operator>;
-		for (b in blocks) {
-			var instrs = b.instrs;
-			for (j = 0; j < instrs.length; j++) {
-				var instr = instrs.get(j);
-				if (SsaApplyOp.?(instr)) {
-					polyOps = analyzePolyOp(SsaApplyOp.!(instr).op, polyOps, spec);
-				}
-			}
-		}
-		poly = IrSet.new(method, polyOps);
-		poly.add(spec);
-		polyMap.set(method, poly);
-	}
-	// analyze an operator and add it to the list of polymorphic operators
-	def analyzePolyOp(op: Operator, polyOps: List<Operator>, member: IrSpec) -> List<Operator> {
-		rma.analyzeOp(op, member);
-		if (op.isPolymorphic()) return List.new(op, polyOps);
-		return polyOps;
-	}
-	def specialize(poly: IrSet) -> KeyArrayMultiSet<int, IrSpec> {
-		var root = KeyArrayMultiSet<int, IrSpec>.new();
-		// XXX: if there is only one instantiation, return it
-		for (l = poly.instantiations; l != null; l = l.tail) {
-			// visit each instantiation
-			keyset = root;
-			keyset.start();
-			env = l.head;
-			// TODO: visit parameters and return type of method
-			for (op = poly.polyOps; op != null; op = op.tail) {
-				// visit each polymorphic operator
-				polySignature(op.head);
-			}
-			keyset.finish(l.head);
-		}
-		return root;
-	}
-	def polySignature(exp: Operator) {
-		// add any polymorphic keys to the current key array
-		var t0: Type;
-		if (exp.typeArgs.length > 0) t0 = normType(exp.typeArgs(0));
-		match (exp.opcode) {
-			V3Opcode.Equal,
-			V3Opcode.NotEqual: {
-				if (V3.isTuple(t0)) {
-					for (l = Tuple.toTypeList(t0); l != null; l = l.tail) add(equality(l.head));
-				} else {
-					add(equality(t0));
-				}
-			}
-			V3Opcode.TypeCast,
-			V3Opcode.TypeQuery,
-			V3Opcode.TypeSubsume: {
-				add(t0.hash);
-				add(normType(exp.typeArgs(1)).hash);
-			}
-			V3Opcode.ArrayAlloc,
-			V3Opcode.ArrayInit,
-			V3Opcode.ArrayGetElem,
-			V3Opcode.ArraySetElem: {
-				if (V3.isArray(t0)) {
-					// simple array
-					add(machSizeRef(V3Array.elementType(t0)));
-				} else {
-					// complex tuple array
-					for (l = Tuple.toTypeList(t0); l != null; l = l.tail) {
-						add(machSizeRef(V3Array.elementType(l.head)));
-					}
-				}
-			}
-			V3Opcode.NullCheck,
-			V3Opcode.BoundsCheck,
-			V3Opcode.ArrayGetLength: {
-				add(Tuple.length(t0));
-			}
-			V3Opcode.ClassAlloc: {
-				// XXX: could be improved if the class representation is known
-				add(t0.hash);
-			}
-			V3Opcode.ClassGetField,
-			V3Opcode.ClassInitField,
-			V3Opcode.ClassSetField: {
-				// TODO: tuple fields
-				var spec = V3Op.extractIrSpec(exp.subst(env.instantiateType));
-				add(fieldOffset(spec));
-				addAllMachSizeRef(spec.getFieldType());
-			}
-			V3Opcode.ClassGetVirtual: {
-				addVirtual(V3Op.extractIrSpec(exp.subst(env.instantiateType)));
-			}
-			V3Opcode.ClassGetMethod,
-			V3Opcode.ComponentGetMethod: {
-				addMethod(V3Op.extractIrSpec(exp.subst(env.instantiateType)));
-			}
-			V3Opcode.TupleCreate: {
-				add(Tuple.length(t0));
-			}
-			V3Opcode.TupleGetElem: {
-				add(Tuple.length(t0)); // TODO: actual offset range in tuple
-			}
-			V3Opcode.CallClassVirtual: {
-				addVirtual(V3Op.extractIrSpec(exp.subst(env.instantiateType)));
-				addCallConv(exp.paramTypes, exp.resultType);
-			}
-			V3Opcode.CallClassMethod,
-			V3Opcode.CallComponentMethod: {
-				addMethod(V3Op.extractIrSpec(exp.subst(env.instantiateType)));
-				addCallConv(exp.paramTypes, exp.resultType);
-			}
-			V3Opcode.CallDelegate: {
-				var paramTypes = Arrays.range(exp.paramTypes, 1, exp.paramTypes.length);
-				addCallConv(paramTypes, exp.resultType);
-			}
-			V3Opcode.SystemOp: {
-				add(t0.hash); // full specialization
-			}
-		}
-	}
-	def machSize(t: Type) -> int {
-		// TODO: this is not portable
-		match (t.typeCon.kind) {
-			V3Kind.BOOL: return 1;
-			V3Kind.BYTE: return 1;
-			V3Kind.INT: return 4;
-			V3Kind.ARRAY: return 4;
-			V3Kind.COMPONENT: return 0;
-			V3Kind.CLASS: return 4;
-			V3Kind.DELEGATE: return 8;
-			V3Kind.FUNCREF: return 4;
-		}
-		return 0;
-	}
-	def machSizeRef(t: Type) -> int {
-		var size = machSize(t) #<< 1;
-		if (V3.isClass(t) || V3.isArray(t)) size = 1 | size;
-		return size;
-	}
-	def normType(t: Type) -> Type {
-		return rma.norm.normalizeType(env.instantiateType(t)).getType();
-	}
-	def fieldOffset(f: IrSpec) -> int {
-		return f.member.index; // TODO: real field offset
-	}
-	def addMethod(f: IrSpec) {
-		// TODO: add the method to a list of dependencies
-	}
-	def addVirtual(f: IrSpec) {
-		// TODO: add the method to a list of dependencies
-	}
-	def addCallConv(paramTypes: Array<Type>, retType: Type) {
-		// TODO: should use actual calling convention from backend
-		for (i = 0; i < paramTypes.length; i++) {
-			addAllMachSizeRef(paramTypes(i));
-		}
-		addAllMachSizeRef(retType);
-	}
-	def addAllMachSizeRef(t: Type) {
-		var tn = rma.norm.normalizeType(t);
-		for (j = 0; j < tn.size; j++) {
-			add(machSizeRef(tn.sub(j)));
-		}
-	}
-	def equality(t: Type) -> int {
-		// XXX: function type comparisons, immutable array comparisons will be different
-		return machSize(t);
-	}
-	def add(i: int) {
-		keyset = keyset.add(i);
-	}
-}
-// information about a polymorphic method and its instantiations
-class IrSet {
-	def method: IrMethod;
-	def polyOps: List<Operator>;
-	var instantiations: List<IrSpec>;
-	new(method, polyOps) {}
-	def add(spec: IrSpec) {
-		instantiations = List.new(spec, instantiations);
-	}
-	def enum(spec: Specializer, f: List<IrSpec> -> void) {
-		spec.specialize(this).apply(f);
 	}
 }
