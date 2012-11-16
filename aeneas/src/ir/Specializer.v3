@@ -1,6 +1,11 @@
 // Copyright 2012 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// tokens used to distinguish the ends of one polymorphic part from another
+def TUPLE_END = -111;
+def RETURN = -112;
+def EQUAL = -113;
+
 // Analyzes polymorphic methods and specializes them according to the polymorphic
 // operations they perform.
 class Specializer {
@@ -62,16 +67,14 @@ class Specializer {
 	}
 	def polySignature(exp: Operator, first: bool) {
 		// add any polymorphic keys to the current key array
+//		Terminal.put1("op %1: ", V3Op.renderInto(exp, _));
 		var t0: Type;
 		if (exp.typeArgs.length > 0) t0 = normType(exp.typeArgs(0));
 		match (exp.opcode) {
 			V3Opcode.Equal,
 			V3Opcode.NotEqual: {
-				if (V3.isTuple(t0)) {
-					for (l = Tuple.toTypeList(t0); l != null; l = l.tail) add(equality(l.head));
-				} else {
-					add(equality(t0));
-				}
+				addParam(t0);
+				add(EQUAL);
 			}
 			V3Opcode.TypeCast,
 			V3Opcode.TypeQuery,
@@ -83,15 +86,8 @@ class Specializer {
 			V3Opcode.ArrayInit,
 			V3Opcode.ArrayGetElem,
 			V3Opcode.ArraySetElem: {
-				if (V3.isArray(t0)) {
-					// simple array
-					add(machSizeRef(V3Array.elementType(t0)));
-				} else {
-					// complex tuple array
-					for (l = Tuple.toTypeList(t0); l != null; l = l.tail) {
-						add(machSizeRef(V3Array.elementType(l.head)));
-					}
-				}
+				var elemType = normType(V3Array.elementType(exp.typeArgs(0)));
+				addMemory(elemType);
 			}
 			V3Opcode.NullCheck,
 			V3Opcode.BoundsCheck,
@@ -101,13 +97,17 @@ class Specializer {
 			V3Opcode.ClassAlloc: {
 				// XXX: could be improved if the class representation is known
 				add(t0.hash);
+				if (first) {
+					var spec = V3Op.extractIrSpec(exp);
+					if (spec.member != null) calls.add(spec);
+				}
 			}
 			V3Opcode.ClassGetField,
 			V3Opcode.ClassInitField,
 			V3Opcode.ClassSetField: {
 				var spec = V3Op.extractIrSpec(exp.subst(env.instantiateType));
 				add(fieldOffset(spec));
-				addAllMachSizeRef(spec.getFieldType());
+				addMemory(spec.getFieldType());
 			}
 			V3Opcode.ClassGetVirtual: {
 				if (first) addVirtual(V3Op.extractIrSpec(exp));
@@ -139,25 +139,39 @@ class Specializer {
 				add(t0.hash); // full specialization
 			}
 		}
+//		Terminal.ln();
 	}
-	def machSize(t: Type) -> int {
-		// TODO: this is not portable
+	def addMemory(t: Type) {
 		match (t.typeCon.kind) {
-			V3Kind.BOOL: return 1;
-			V3Kind.BYTE: return 1;
-			V3Kind.INT: return 4;
-			V3Kind.ARRAY: return 4;
-			V3Kind.COMPONENT: return 0;
-			V3Kind.CLASS: return 4;
-			V3Kind.DELEGATE: return 8;
-			V3Kind.FUNCREF: return 4;
+			V3Kind.BOOL: add(1);
+			V3Kind.BYTE: add(1);
+			V3Kind.INT: add(4);
+			V3Kind.ARRAY: add(5);
+			V3Kind.CLASS: add(5);
+			V3Kind.DELEGATE: add(8);
+			V3Kind.FUNCREF: add(4); // TODO: == int?
+			V3Kind.COMPONENT,
+			V3Kind.VOID: add(0);
+			V3Kind.TUPLE: {
+				add(TUPLE_END);
+				Lists.apply(Tuple.toTypeList(t), addMemory);
+				add(TUPLE_END);
+			}
 		}
-		return 0;
 	}
-	def machSizeRef(t: Type) -> int {
-		var size = machSize(t) #<< 1;
-		if (V3.isClass(t) || V3.isArray(t)) size = 1 | size;
-		return size;
+	def addParam(t: Type) {
+		match (t.typeCon.kind) {
+			V3Kind.BOOL: add(4);
+			V3Kind.BYTE: add(4);
+			V3Kind.INT: add(4);
+			V3Kind.ARRAY: add(5);
+			V3Kind.CLASS: add(5);
+			V3Kind.DELEGATE: add(8);
+			V3Kind.FUNCREF: add(4);
+			V3Kind.TUPLE: {
+				Lists.apply(Tuple.toTypeList(t), addParam);
+			}
+		}
 	}
 	def normType(t: Type) -> Type {
 		return rma.norm.normalizeType(env.instantiateType(t)).getType();
@@ -171,19 +185,10 @@ class Specializer {
 	def addCallConv(paramTypes: Array<Type>, retType: Type) {
 		// TODO: should use actual calling convention from backend
 		for (i = 0; i < paramTypes.length; i++) {
-			addAllMachSizeRef(paramTypes(i));
+			addParam(normType(paramTypes(i)));
 		}
-		addAllMachSizeRef(retType);
-	}
-	def addAllMachSizeRef(t: Type) {
-		var tn = rma.norm.normalizeType(t);
-		for (j = 0; j < tn.size; j++) {
-			add(machSizeRef(tn.sub(j)));
-		}
-	}
-	def equality(t: Type) -> int {
-		// XXX: function type comparisons, immutable array comparisons will be different
-		return machSize(t);
+		add(RETURN);
+		addParam(retType);
 	}
 	def add(i: int) {
 		keyset = keyset.add(i);
@@ -193,6 +198,15 @@ class Specializer {
 		polyMap.apply(initialSplitBasedOnOperators);
 		// repeatedly process calls between specialization sets
 		Sequences.drain(queue, 0, splitBasedOnCalls);
+		var typeCon = TypeCon.new("<set>", V3Kind.SET, -1, rma.compiler.prog.typeCache);
+		rma.memberMap.apply(buildPolyIrSpec(_, _, typeCon));
+	}
+	def buildPolyIrSpec(old: IrSpec, rmaMember: RmaMember, set: TypeCon) {
+		if (!RmaMethod.?(rmaMember)) return;
+		var meth = RmaMethod.!(rmaMember);
+		if (meth.polyMethod != null && meth.polyMethod.newSpec == null) {
+			meth.polyMethod.buildNewIrSpec(set);
+		}
 	}
 	def splitBasedOnCalls(poly: RmaPolyMethod) {
 		poly.queued = false;
@@ -201,6 +215,7 @@ class Specializer {
 		for (lm = poly.instantiations; lm != null; lm = lm.tail) {
 			processCalls(set, poly, lm.head);
 		}
+		poly.clean();
 		if (set.splits != null) {
 			set.apply(splitRmaPolyMethod(poly, false, _));
 		}
@@ -231,6 +246,7 @@ class Specializer {
 				var d = meth.origMember.instantiateIrSpec(calls(i));
 				var dest = RmaMethod.!(rma.getRmaMember(d));
 				meth.calls(i) = RmaMethodUseEdge.new(i, meth, dest);
+//				Terminal.put2("edge %1 -> %2\n", meth.origMember.render, dest.origMember.render);
 			}
 		}
 	}
@@ -261,11 +277,12 @@ class Specializer {
 		}
 	}
 	def processCalls(set: KeyArrayMultiSet<int, RmaMethod>, poly: RmaPolyMethod, src: RmaMethod) {
+		set.start();
 		for (i = 0; i < poly.calls.length; i++) {
 			if (!poly.dirty(i)) continue;
-			poly.dirty(i) = false;
 			var meth = src.calls(i).dest;
-			set.add(if(meth.polyMethod == null, meth.uid, meth.polyMethod.uid));
+			var uid = if(meth.polyMethod == null, meth.uid, meth.polyMethod.uid);
+			set = set.add(uid);
 		}
 		set.finish(src);
 	}
@@ -282,6 +299,7 @@ class RmaPolyMethod {
 	def uid: int;				// UID for quick disambiguation
 	def method: IrMethod;			// original method
 	def polyOps: List<Operator>;		// polymorphic operators
+	var newSpec: IrSpec;			// new IrSpec
 	var instantiations: List<RmaMethod>;	// instantiations of the method
 	var calls: Array<IrSpec>;		// direct calls
 	var dirty: Array<bool>;			// which outgoing call edges are dirty
@@ -304,6 +322,50 @@ class RmaPolyMethod {
 	def dirtyAll() {
 		if (dirty == null) return;
 		for (i = 0; i < dirty.length; i++) dirty(i) = true;
+	}
+	def clean() {
+		if (dirty == null) return;
+		for (i = 0; i < dirty.length; i++) dirty(i) = false;
+	}
+	def buildNewIrSpec(set: TypeCon) {
+		// gather two lists of type args from the instantiations
+		var l1: List<TypeArgs>, l2: List<TypeArgs>;
+		for (l = instantiations; l != null; l = l.tail) {
+			var tt = l.head.origMember.getTypes().typeArgsList;
+			l1 = List.new(tt.head, l1);
+			if (tt.tail != null) l2 = List.new(tt.tail.head, l2);
+		}
+		var typeArgsList = List.new(buildNewTypeArgs(l1, set), null);
+		if (l2 != null) typeArgsList = List.new(buildNewTypeArgs(l2, set), typeArgsList);
+		var methodTypeArgs: TypeArgs;
+		var typeArgs: Array<Type>;
+		// find the one with method type arguments (if any)
+		if (method.typeArgs != null) {
+			for (l = typeArgsList; l != null; l = l.tail) {
+				if (method.typeArgs.typeEnv == l.head.typeEnv) methodTypeArgs = l.head;
+			}
+			typeArgs = Array<Type>.new(1 + methodTypeArgs.types.length);
+			Arrays.copyInto(methodTypeArgs.types, typeArgs, 1);
+		} else {
+			typeArgs = Array<Type>.new(1);
+		}
+		// instantiate IrSpecTypes
+		var types = IrSpecTypes.new(typeArgsList, methodTypeArgs);
+		if (method.container != null) typeArgs(0) = types.instantiateType(method.container.ctype);
+		else typeArgs(0) = Void.TYPE;
+		// instantiate IrSpec
+		newSpec = IrSpec.new(typeArgs(0), typeArgs, method);
+		newSpec.types = types; // no need to rebuild IrSpecTypes next time
+	}
+	def buildNewTypeArgs(list: List<TypeArgs>, typeCon: TypeCon) -> TypeArgs {
+		var max = list.head.types.length, typeParams = list.head.typeEnv.paramArray;
+		var types = Array<Type>.new(max);
+		for (i = 0; i < max; i++) {
+			var typeSet = TypeSet.new(TypeParam.!(typeParams(i)));
+			for (l = list; l != null; l = l.tail) typeSet.add(l.head.types(i));
+			types(i) = typeSet.getType(typeCon);
+		}
+		return TypeArgs.new(list.head.typeEnv, types);
 	}
 }
 // A customized datastructure that divides a set of arrays of keys into sets of 
@@ -377,5 +439,51 @@ class KeyArrayMultiSet<K, T> {
 				}
 			}
 		}
+	}
+}
+// a set of types
+class TypeSet {
+	def typeParam: TypeParam;
+	var types = Array<Type>.new(5);
+	var length: int;
+	new(typeParam) {}
+	def add(t: Type) {
+		var a = types;
+		for (i = 0; i < a.length; i++) {
+			if (i == length) break;
+			var e = a(i);
+			if (e == t) return;
+			if (e.hash > t.hash) {
+				// insert into array
+				a = grow();
+				for (j = length; j >= i; j--) {
+					a(j + 1) = a(j);
+				}
+				a(i) = t;
+				length++;
+				return;
+			}
+		}
+		grow()(length++) = t;
+		// XXX: switch to a hashmap if the number types gets too large
+	}
+	def grow() -> Array<Type> {
+		if (length == types.length - 1) types = Arrays.grow(types, length * 3);
+		return types;
+	}
+	def render(buf: StringBuffer) -> StringBuffer {
+		typeParam.render(buf).puts("={");
+		for (i = 0; i < length; i++) {
+			if (i > 0) buf.putc(',');
+			types(i).render(buf);
+		}
+		return buf.putc('}');
+	}
+	def getType(setTypeCon: TypeCon) -> Type {
+		if (length == 0) return V3.fail("no types in type set");
+		if (length == 1) return types(0);
+		var l: List<Type>;
+		for (i = 0; i < length; i++) l = List.new(types(i), l);
+		return setTypeCon.create(l);
 	}
 }
