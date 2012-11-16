@@ -27,6 +27,7 @@ function run_test() {
 
 run_test "int"
 run_test "int-rma" -rma
+run_test "int-rma-partial" "-rma -rma-partial"
 
 printf "  Compiling (jvm)..."
 mkdir -p $OUT/jvm
