@@ -16,7 +16,7 @@ fi
 if [ $# -gt 0 ]; then
   TESTS="$*"
 else
-  TESTS=$(egrep '\[|[.]new' ../execute/*.v3 ../large/*.v3 | cut -d: -f1 | uniq)
+  TESTS=$(cat execute.gc large.gc)
 fi
 
 T=$OUT/$target
