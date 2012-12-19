@@ -67,27 +67,13 @@ function check_no_red() {
 	fi
 }
 
-function compile_native_runner() {
-	local target=$1
-	T=${VIRGIL_TEST_OUT}/$target-testexec
-
-	if [ ! -e $T ]; then
-		gcc -lpthread -o $T $VIRGIL_LOC/test/testexec.c
-		if [ $? != 0 ]; then
-			echo "gcc-testexec-failed"
-			exit 1
-		fi
-	fi
-	echo $T
-}
-
 function run_native() {
 	test=$1
 	shift
 	local target=$1
 	shift
 	if [ "$HOST_PLATFORM" == "$target" ]; then
-		TESTER=$(compile_native_runner $target)
+		TESTER=$VIRGIL_LOC/test/testexec-$target
 		printf "  Running   ($target)...\n"
 		$TESTER ${VIRGIL_TEST_OUT}/$test/$target $* | tee ${VIRGIL_TEST_OUT}/$test/$target/run.out
 	else
