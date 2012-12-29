@@ -27,7 +27,7 @@ function run_test() {
 
 run_test "int"
 run_test "int-rma" -rma
-run_test "int-rma-partial" "-rma -rma-partial"
+#run_test "int-rma-partial" "-rma -rma-partial"
 
 printf "  Compiling (jvm)..."
 mkdir -p $OUT/jvm
@@ -47,16 +47,23 @@ fi
 function do_native_test() {
 	target=$1
 	testtarget=$2
+	extra="$3"
 	mkdir -p $OUT/$target
 	C=$OUT/$target/test.compile.out
 	R=$OUT/$target/test.run.out
 
-	printf "  Compiling ($target)..."
-	run_v3c "" -multiple -set-exec=false -target=$testtarget -output=$OUT/$target $TESTS &> $C
+	if [ -z "$extra" ]; then
+		printf "  Compiling ($target)..."
+	else
+		printf "  Compiling ($target $extra)..."
+	fi
+	run_v3c "" $extra -multiple -set-exec=false -target=$testtarget -output=$OUT/$target $TESTS &> $C
 	check_red $C
 
 	run_native $test $target $TESTS
 }
 
-do_native_test x86-darwin x86-darwin-test
-do_native_test x86-linux x86-linux-test
+do_native_test x86-darwin x86-darwin-test ""
+#do_native_test x86-darwin x86-darwin-test "-rma-partial"
+do_native_test x86-linux x86-linux-test ""
+#do_native_test x86-linux x86-linux-test "-rma-partial"
