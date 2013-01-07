@@ -1,0 +1,178 @@
+// Copyright 2013 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def RMA_NORMALIZED = 0x40000000;
+def RMA_READ       = 0x20000000;
+def RMA_WRITTEN    = 0x10000000;
+def RMA_INIT       = 0x08000000;
+def RMA_VALUE      = 0x04000000;
+def RMA_TO_NORM    = 0x02000000;
+
+class ReachabilityAnalyzer {
+	def typeMap = TypeUtil.newTypeMap<RaType>();
+
+	// a quick check to see if a type is the same as its normalization
+	def isNormalType(t: Type) -> bool {
+		match(t.typeCon.kind) {
+			V3Kind.BOOL, V3Kind.BYTE, V3Kind.INT, V3Kind.CLASS: return true;
+			V3Kind.ARRAY: return isNormalType(V3Array.elementType(t));
+		}
+		return false;
+	}
+	def getField(op: SsaApplyOp, rf: RaField, index: int) {
+		if ((rf.rmaFacts & RMA_READ) == 0) {
+			rf.rmaFacts = rf.rmaFacts | RMA_READ;
+			// TODO: deferGetField(rf.container, index);
+		}
+	}
+	def setField(op: SsaApplyOp, rf: RaField) {
+		rf.rmaFacts = rf.rmaFacts | RMA_WRITTEN;
+		var val = op.inputs(0).dest;
+		rf.writeFacts = rf.writeFacts & val.facts;
+	}
+	def initField(op: SsaApplyOp, rf: RaField) {
+		rf.rmaFacts = rf.rmaFacts | RMA_INIT;
+		var val = op.inputs(0).dest;
+		rf.initFacts = val.facts & Facts.V_FACTS;
+		if (SsaValue.?(val)) {
+			rf.val = SsaValue.!(val).val;
+			rf.rmaFacts = rf.rmaFacts | RMA_VALUE;
+		}
+	}
+	def makeField(op: SsaApplyOp, context: IrSpec) -> RaField {
+		var f = IrField.!(op.op.attr<IrMember>()), rf = f.raField;
+		if (rf != null) return rf;
+		if (!f.container.open()) {
+			if (isNormalType(f.fieldType)) {
+				// the field is a simple, monomorphic, normalized field
+				return f.raField = RaField.new(f.container, f.fieldType, null);
+			}
+		}
+		var container = mono(op.op.typeArgs(0), context), rmaType = makeClass(container);
+		rf = rmaType.fields(f.index);
+		if (rf == null) {
+			// create the RmField from the normalized type
+			var typeArgs = V3.asClass(container).getTypeArgs(container);
+			var fieldTypes = makeType(f.fieldType.substitute(typeArgs));
+			var fields = Arrays.map(fieldTypes.sub, IrField.new(container, _));
+			rf = rmaType.makeField(f.index, fieldTypes.newType, fields);
+		}
+		return rf;
+	}
+	def makeMethod(op: SsaApplyOp, context: IrSpec) -> RaMethod {
+		var m = IrMethod.!(op.op.attr<IrMember>()), rm = m.raMethod;
+		if (rm != null) return rm; // method already seen
+		var typeArgs = op.op.typeArgs;
+		if (!m.container.open() && op.op.typeArgs.length == 1) {
+			// monomorphic, potentially reusable method
+			return makeMonoMethod(m);
+		}
+		var rmaType = makeClass(mono(typeArgs(0), context));
+		if (typeArgs.length == 1) {
+			// method is not parameterized
+			rm = rmaType.mmethods(m.index);
+			if (rm != null) return rm; // method already seen
+			var spec = V3Op.extractIrSpec(op.op.subst(context.instantiateType));
+			rm = RaMethod.new(rmaType.oldType, m, spec);
+			rmaType.mmethods(m.index) = rm;
+		} else {
+			// method is parameterized
+			var spec = V3Op.extractIrSpec(op.op.subst(context.instantiateType));
+			if (rmaType.pmethods != null) {
+				for (l = rmaType.pmethods(m.index); l != null; l = l.tail) {
+					if (spec.equals(l.head.spec)) return l.head;
+				}
+			} else {
+				rmaType.pmethods = Array.new(rmaType.oldClass.methods.length);
+			}
+			rm = RaMethod.new(rmaType.oldType, m, spec);
+			rmaType.pmethods(m.index) = List.new(rm, rmaType.pmethods(m.index));
+		}
+		return rm;
+	}
+	private def makeMonoMethod(m: IrMethod) -> RaMethod {
+		// check for non-normal parameter or return types
+		for (t in m.paramTypes) {
+			if (!isNormalType(t)) return makeNormMethod(m);
+		}
+		if (!isNormalType(m.returnType)) return makeNormMethod(m);
+		// all are normal; reuse the same method
+		var rm = RaMethod.new(m.container, m, null);
+		rm.rmaFacts = RMA_NORMALIZED;
+		return m.raMethod = rm;
+	}
+	private def makeNormMethod(m: IrMethod) -> RaMethod {
+		// normalize the parameter and return types of a method
+		var seq = Sequence<Type>.new().grow(m.paramTypes.length);
+		for (p in m.paramTypes) {
+			var rt = makeType(p);
+			if (rt.sub != null) seq.addN(rt.sub);
+			else seq.add(rt.newType);
+		}
+		var rm = RaMethod.new(m.container, m, null);
+		// create a new IrMethod that will hold the normalized code
+		rm.norm = IrMethod.new(m.container, null, seq.extract(), norm(m.returnType));
+		return m.raMethod = rm;
+	}
+	def makeClass(t: Type) -> RaClass {
+		return RaClass.!(makeType(t));
+	}
+	def makeType(t: Type) -> RaType {
+		var r = typeMap.get(t);
+		if (r == null) {
+			r = null; // TODO
+			typeMap.set(t, r);
+		}
+		return r;
+	}
+	def norm(t: Type) -> Type {
+		if (isNormalType(t)) return t;
+		return makeType(t).newType;
+	}
+	def mono(t: Type, spec: IrSpec) -> Type {
+		if (spec != null) t = spec.instantiateType(t);
+		return norm(t);
+	}
+}
+// Representation of a type during RMA and normalization.
+class RaType(
+	oldType: Type,
+	newType: Type,
+	sub: Array<Type>,
+	nested: Array<RaType>,
+	offsets: Array<int>) {
+
+	def size = if(sub == null, 1, sub.length);
+}
+// Representation of a class type during RMA and normalization, which adds
+// representations of the fields and methods of the class
+class RaClass extends RaType {
+	def oldClass: IrClass;
+	def fields = Array<RaField>.new(oldClass.fields.length);
+	var mmethods = Array<RaMethod>.new(oldClass.methods.length);
+	var pmethods: Array<List<RaMethod>>; // lazily allocated polymorphic methods
+	var instances: List<Record>;
+
+	new(classType: Type, oldClass) : super(classType, classType, null, null, null) { }
+
+	def makeField(index: int, fieldType: Type, fields: Array<IrField>) -> RaField {
+		return this.fields(index) = RaField.new(oldType, fieldType, fields);
+	}
+}
+// Information about a field, including whether it is initialized, written, read,
+// and facts about each of the values written to the field
+class RaField(container: Type, fieldType: Type, norm: Array<IrField>) {
+	var rmaFacts: int;
+	var val: Val;
+	var initFacts = Facts.V_ZERO | Facts.V_NON_NEGATIVE;
+	var writeFacts = Facts.V_FACTS;
+	def facts() -> int {
+		return initFacts & writeFacts;
+	}
+}
+// Information about a method, including any specialization, whether it is reusable
+// across normalization, etc.
+class RaMethod(container: Type, orig: IrMethod, spec: IrSpec) {
+	var rmaFacts: int;
+	var norm: IrMethod;
+}
