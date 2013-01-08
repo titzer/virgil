@@ -11,9 +11,22 @@ def RM_LIVE       = 0x040;
 def RC_ALLOC      = 0x080;
 def RC_LIVE       = 0x100;
 
+def VOID = RaType.new(Void.TYPE, Void.TYPE, TypeUtil.NO_TYPES);
+def BOOL = singleton(Bool.TYPE, Bool.TYPE);
+def BYTE = singleton(Byte.TYPE, Byte.TYPE);
+def INT  = singleton(Int.TYPE, Int.TYPE);
+
+def singleton(oldType: Type, newType: Type) -> RaType {
+	return RaType.new(oldType, newType, null);
+}
+def tuple(oldType: Type, ta: Array<Type>) -> RaType {
+	return RaType.new(oldType, Tuple.newType(Lists.fromArray(ta)), ta);
+}
+
 class ReachabilityAnalyzer {
 	def compiler: Compiler;
 	def prog: Program = compiler.prog;
+	def oldIr = prog.ir;
 	def typeMap = TypeUtil.newTypeMap<RaType>();
 	var liveMethods: List<RaMethod>;
 
@@ -30,6 +43,11 @@ class ReachabilityAnalyzer {
 	// analyze a value
 	def analyzeVal(a: (Type, Val), i: SsaValue) {
 		analyzeValue(a.1);
+	}
+	// defer analysis of a value
+	def deferValue(val: Val) {
+		if (val == null) return;
+		if (Record.?(val) || Delegate.?(val) || Tuple_Value.?(val)) defer(analyzeValue, val);
 	}
 	// analyze a value such as a record, delegate, or tuple
 	def analyzeValue(val: Val) {
@@ -59,9 +77,7 @@ class ReachabilityAnalyzer {
 			// analyze an array's elements
 			var ra = RaArray.!(raType);
 			if (ra.primitive) return;
-			for (v in record.values) {
-				if (v != null) defer(analyzeValue, v);
-			}
+			for (v in record.values) deferValue(v);
 		}
 	}
 	// analyze a class that just became live
@@ -119,6 +135,14 @@ class ReachabilityAnalyzer {
 			V3Opcode.ComponentSetField: setField(op, makeField(op, context));
 		}
 	}
+	// analyze an access of a field
+	def analyzeGetField(container: RaClass, index: int) {
+		for (t = container.subtypes; t != null; t = t.tail) { // for all live subtypes
+			for (l = t.head.instances; l != null; l = l.tail) { // for all instances
+				analyzeValue(l.head.values(index));
+			}
+		}
+	}
 	def allocation(raType: RaType) {
 		if (!RaClass.?(raType)) return;
 		var rc = RaClass.!(raType), oldFacts = rc.raFacts;
@@ -139,7 +163,7 @@ class ReachabilityAnalyzer {
 	}
 	def getField(op: SsaApplyOp, rf: RaField, index: int) {
 		if (rf.setFact(RF_READ)) return;
-		// TODO: defer analyzeGetField(rf.container, index);
+		defer(analyzeGetField, (makeClass(rf.container), index));
 	}
 	def setField(op: SsaApplyOp, rf: RaField) {
 		rf.raFacts = rf.raFacts | RF_WRITTEN;
@@ -164,14 +188,14 @@ class ReachabilityAnalyzer {
 				return f.raField = RaField.new(f.container, f.fieldType, null);
 			}
 		}
-		var container = mono(op.op.typeArgs(0), context), rmaType = makeClass(container);
-		rf = rmaType.fields(f.index);
+		var container = mono(op.op.typeArgs(0), context), raType = makeClass(container);
+		rf = raType.fields(f.index);
 		if (rf == null) {
 			// create the RmField from the normalized type
 			var typeArgs = V3.asClass(container).getTypeArgs(container);
 			var fieldTypes = makeType(f.fieldType.substitute(typeArgs));
 			var fields = Arrays.map(fieldTypes.sub, IrField.new(container, _));
-			rf = rmaType.makeField(f.index, fieldTypes.newType, fields);
+			rf = raType.makeField(f.index, fieldTypes.newType, fields);
 		}
 		return rf;
 	}
@@ -187,28 +211,28 @@ class ReachabilityAnalyzer {
 			// monomorphic, potentially reusable method
 			return makeMonoMethod(m);
 		}
-		var rmaType = makeClass(mono(typeArgs(0), context));
+		var raType = makeClass(mono(typeArgs(0), context));
 		if (typeArgs.length == 1) {
 			// method is not parameterized
-			rm = rmaType.mmethods(m.index);
+			rm = raType.mmethods(m.index);
 			if (rm != null) return rm; // method already seen
 			if (context != null) typeArgs = context.instantiateTypes(typeArgs);
 			var spec = IrSpec.new(typeArgs(0), typeArgs, m);
-			rm = RaMethod.new(rmaType.oldType, m, spec);
-			rmaType.mmethods(m.index) = rm;
+			rm = RaMethod.new(raType.oldType, m, spec);
+			raType.mmethods(m.index) = rm;
 		} else {
 			// method is parameterized
 			if (context != null) typeArgs = context.instantiateTypes(typeArgs);
 			var spec = IrSpec.new(typeArgs(0), typeArgs, m);
-			if (rmaType.pmethods != null) {
-				for (l = rmaType.pmethods(m.index); l != null; l = l.tail) {
+			if (raType.pmethods != null) {
+				for (l = raType.pmethods(m.index); l != null; l = l.tail) {
 					if (spec.equals(l.head.spec)) return l.head;
 				}
 			} else {
-				rmaType.pmethods = Array.new(rmaType.orig.methods.length);
+				raType.pmethods = Array.new(raType.orig.methods.length);
 			}
-			rm = RaMethod.new(rmaType.oldType, m, spec);
-			rmaType.pmethods(m.index) = List.new(rm, rmaType.pmethods(m.index));
+			rm = RaMethod.new(raType.oldType, m, spec);
+			raType.pmethods(m.index) = List.new(rm, raType.pmethods(m.index));
 		}
 		return rm;
 	}
@@ -240,12 +264,89 @@ class ReachabilityAnalyzer {
 		return RaClass.!(makeType(t));
 	}
 	def makeType(t: Type) -> RaType {
-		var r = typeMap.get(t);
-		if (r == null) {
-			r = null; // TODO
-			typeMap.set(t, r);
+		// first check for primitive types
+		match (t.typeCon.kind) {
+			V3Kind.VOID: return VOID;
+			V3Kind.BOOL: return BOOL;
+			V3Kind.BYTE: return BYTE;
+			V3Kind.INT: return INT;
 		}
-		return r;
+		// now check the hashmap
+		var raType = typeMap.get(t);
+		if (raType != null) return raType;
+		// not in the hashmap, build appropriately
+		match (t.typeCon.kind) {
+			V3Kind.COMPONENT: {
+				var compDecl = V3.asComponent(t).componentDecl;
+				deferValue(prog.getComponentRecord(compDecl));
+				raType = RaClass.new(t, Void.TYPE, TypeUtil.NO_TYPES, oldIr.makeIrClass(t), null);
+			}
+			V3Kind.ARRAY: {
+				// normalize element type
+				var enorm = makeType(V3Array.elementType(t));
+				if (enorm.size == 0) {
+					raType = singleton(t, V3.voidArrayType);
+				} else if (enorm.size == 1) {
+					raType = singleton(t, V3Array.newType(enorm.newType));
+				} else {
+					raType = tuple(t, Arrays.map(enorm.sub, V3Array.newType));
+				}
+			}
+			V3Kind.CLASS: {
+				var superType = V3.getSuperType(t);
+				var superClass = if(superType != null, makeClass(superType));
+				raType = RaClass.new(t, t, null, oldIr.makeIrClass(t), superClass);
+			}
+			V3Kind.DELEGATE: {
+				// normalize parameter and return types independently
+				var pt = norm(Function.getParamType(t));
+				var rt = norm(Function.getReturnType(t));
+				// translate delegate into (funcref, object) pair
+				var ft = Function.FUNCREF.create(Lists.cons2(pt, rt));
+				raType = tuple(t, [ft, AnyObject.TYPE]);
+			}
+			V3Kind.TUPLE: {
+				// flatten tuples
+				var seqT = Sequence<Type>.new();
+				var seqO = Sequence<int>.new();
+				var seqN = Sequence<RaType>.new();
+				for (p = t.nested; p != null; p = p.tail) {
+					var n = makeType(p.head);
+					seqO.add(seqT.length);
+					seqN.add(n);
+					n.addTo(seqT);
+				}
+				var ta = seqT.extract();
+				raType = RaTuple.new(t, Tuple.newType(Lists.fromArray(ta)), ta, seqN.extract(), seqO.extract());
+			}
+			V3Kind.SET: {
+				// normalize members, flatten if sizes match
+				if (t.nested == null) {
+					raType = singleton(t, t); // no members
+				} else {
+					var nested = Lists.map(t.nested, makeType);
+					var size = nested.head.size, array = Array<List<Type>>.new(size);
+					for (l = nested; l != null; l = l.tail) {
+						var tn = l.head;
+						if (tn.size != size) {
+							array = null;
+							break; // size mismatch
+						}
+						for (i = 0; i < size; i++) {
+							var t = if (tn.sub == null, tn.newType, tn.sub(i));
+							array(i) = List.new(t, array(i));
+						}
+					}
+					if (array == null) array = [Lists.map(nested, RaType.newType)];
+					var ta = Arrays.map(array, createSetType);
+					raType = RaType.new(t, Tuple.newType(Lists.fromArray(ta)), ta);
+				}
+			}
+		} else {
+			raType = singleton(t, t);
+		}
+		typeMap.set(t, raType);
+		return raType;
 	}
 	def norm(t: Type) -> Type {
 		if (isNormalType(t)) return t;
@@ -256,6 +357,7 @@ class ReachabilityAnalyzer {
 		return norm(t);
 	}
 	def defer<T>(f: T -> void, p: T); // TODO
+	def createSetType(t: List<Type>) -> Type; // TODO
 }
 // Base class which contains facts for all types of entities during analysis
 class RaItem {
@@ -271,14 +373,19 @@ class RaItem {
 }
 
 // Representation of a type during RMA and normalization.
-class RaType(
-	oldType: Type,
-	newType: Type,
-	sub: Array<Type>,
-	nested: Array<RaType>,
-	offsets: Array<int>) extends RaItem {
-
+class RaType(oldType: Type, newType: Type, sub: Array<Type>) extends RaItem {
 	def size = if(sub == null, 1, sub.length);
+	def addTo(seq: Sequence<Type>) {
+		if (sub == null) seq.add(newType);
+		if (sub.length > 0) seq.addN(sub);
+	}
+}
+// Representation of a tuple
+class RaTuple extends RaType {
+	def nested: Array<RaType>;
+	def offsets: Array<int>;
+	new(oldType: Type, newType: Type, sub: Array<Type>, nested, offsets)
+		super(oldType, newType, sub) { }
 }
 // Representation of a class type during RMA and normalization, which adds
 // representations of the fields and methods of the class
@@ -291,7 +398,7 @@ class RaClass extends RaType {
 	var instances: List<Record>;		// list of live records
 	var subtypes: List<RaClass>;		// list of live subtypes
 
-	new(classType: Type, orig, superClass) super(classType, classType, null, null, null) { }
+	new(oldType: Type, newType: Type, sub: Array<Type>, orig, superClass) super(oldType, newType, sub) { }
 
 	def makeField(index: int, fieldType: Type, fields: Array<IrField>) -> RaField {
 		return this.fields(index) = RaField.new(oldType, fieldType, fields);
@@ -309,8 +416,7 @@ class RaClass extends RaType {
 class RaArray extends RaType {
 	var primitive: bool;
 	var instances: List<Record>;
-	new(oldType: Type, newType: Type, sub: Array<Type>, nested: Array<RaType>, offsets: Array<int>)
-		super(oldType, newType, sub, nested, offsets) {
+	new(oldType: Type, newType: Type, sub: Array<Type>) super(oldType, newType, sub) {
 		primitive = V3.isPrimitiveArray(oldType);
 	}
 }
