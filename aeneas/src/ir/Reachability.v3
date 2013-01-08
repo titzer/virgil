@@ -1,16 +1,23 @@
 // Copyright 2013 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-def RF_NORMALIZED = 0x01;
-def RF_READ       = 0x02;
-def RF_WRITTEN    = 0x04;
-def RF_INIT       = 0x08;
-def RF_VALUE      = 0x10;
-def RM_VIRTUAL    = 0x20;
-def RM_LIVE       = 0x40;
+def RF_NORMALIZED = 0x001;
+def RF_READ       = 0x002;
+def RF_WRITTEN    = 0x004;
+def RF_INIT       = 0x008;
+def RF_VALUE      = 0x010;
+def RM_VIRTUAL    = 0x020;
+def RM_LIVE       = 0x040;
+def RC_ALLOC      = 0x080;
+def RC_LIVE       = 0x100;
 
 class ReachabilityAnalyzer {
+	def compiler: Compiler;
+	def prog: Program = compiler.prog;
 	def typeMap = TypeUtil.newTypeMap<RaType>();
+	var liveMethods: List<RaMethod>;
+
+	new(compiler) { }
 
 	// a quick check to see if a type is the same as its normalization
 	def isNormalType(t: Type) -> bool {
@@ -20,13 +27,61 @@ class ReachabilityAnalyzer {
 		}
 		return false;
 	}
+	// analyze a value
 	def analyzeVal(a: (Type, Val), i: SsaValue) {
 		analyzeValue(a.1);
 	}
-	def analyzeValue(v: Val); // TODO
-	// analyze a method
+	// analyze a value such as a record, delegate, or tuple
+	def analyzeValue(val: Val) {
+		if (Record.?(val)) {
+			// analyze a simple record
+			analyzeRecord(Record.!(val));
+		} else if (Delegate.?(val)) {
+			// analyze a record + method delegate pair
+			var delegate = Delegate.!(val), spec = delegate.memberRef;
+			getMethod(null, makeMethodWithTypeArgs(spec.typeArgs, IrMethod.!(spec.member), null));
+			analyzeRecord(Record.!(delegate.val));
+		} else if (Tuple_Value.?(val)) {
+			// recursively analyze tuple values
+			for(e in (Tuple_Value.!(val)).values) analyzeValue(e);
+		}
+	}
+	// analyze a record
+	def analyzeRecord(record: Record) {
+		var raType = makeType(record.rtype);
+		if (RaClass.?(raType)) {
+			// analyze a class object's fields and methods
+			var rc = RaClass.!(raType), oldFacts = rc.raFacts;
+			rc.raFacts = rc.raFacts | RC_LIVE;
+			if ((oldFacts & (RC_LIVE | RC_ALLOC)) == 0) analyzeLiveClass(rc);
+			// TODO: analyze fields
+		} else if (RaArray.?(raType)) {
+			// analyze an array's elements
+			var ra = RaArray.!(raType);
+			if (ra.primitive) return;
+			for (v in record.values) {
+				if (v != null) defer(analyzeValue, v);
+			}
+		}
+	}
+	// analyze a class that just became live
+	def analyzeLiveClass(rc: RaClass) {
+		for (c = rc; c != null; c = c.superClass) {
+			c.subtypes = List.new(rc, c.subtypes);
+			c.applyMethods(analyzeVirtual(rc, _));
+		}
+	}
+	// analyze a possible virtual dispatch of the given method on the given type
+	def analyzeVirtual(rc: RaClass, rm: RaMethod) {
+		if ((rm.raFacts & RM_VIRTUAL) == 0) return;
+		var spec = rm.getSpec();
+		var impl = compiler.prog.ir.resolveMethodImpl(rc.oldType, spec);
+		getMethod(null, makeMethodWithTypeArgs(impl.typeArgs, IrMethod.!(impl.member), null));
+	}
+	// analyze a method's code
 	def analyzeMethod(rm: RaMethod) {
 		var region = rm.orig.ssa;
+		if (region == null) region = compiler.genSsa(rm.getSpec());
 		// XXX: if (rm.spec != null) return analyzePolyMethod(rm);
 		region.applyVals(analyzeVal);
 		for (b in region.bfBlocks()) { // XXX: iterate over blocks directly
@@ -37,7 +92,7 @@ class ReachabilityAnalyzer {
 			}
 		}
 	}
-	// analyze an operator in a monomorphic method (may reference polymorphic methods)
+	// analyze an operator
 	def analyzeOp(op: SsaApplyOp, context: IrSpec) {
 		match (op.op.opcode) {
 			V3Opcode.ArrayAlloc,
@@ -64,37 +119,40 @@ class ReachabilityAnalyzer {
 			V3Opcode.ComponentSetField: setField(op, makeField(op, context));
 		}
 	}
-	def allocation(raType: RaType); // TODO
+	def allocation(raType: RaType) {
+		if (!RaClass.?(raType)) return;
+		var rc = RaClass.!(raType), oldFacts = rc.raFacts;
+		rc.raFacts = rc.raFacts | RC_ALLOC;
+		if ((oldFacts & (RC_LIVE | RC_ALLOC)) == 0) analyzeLiveClass(rc);
+	}
 	def getVirtual(op: SsaApplyOp, rm: RaMethod) {
-		if ((rm.rmaFacts & RM_VIRTUAL) == 0) {
-			rm.rmaFacts = rm.rmaFacts | RM_VIRTUAL;
-			// TODO: deferGetVirtual(rm);
+		if (rm.setFact(RM_VIRTUAL)) return;
+		var rc = makeClass(rm.container);
+		for (l = rc.subtypes; l != null; l = l.tail) {
+			defer(analyzeVirtual, (l.head, rm));
 		}
 	}
 	def getMethod(op: SsaApplyOp, rm: RaMethod) {
-		if ((rm.rmaFacts & RM_LIVE) == 0) {
-			rm.rmaFacts = rm.rmaFacts | RM_LIVE;
-			// TODO: deferGetMethod(rm);
-		}
+		if (rm.setFact(RM_LIVE)) return;
+		liveMethods = List.new(rm, liveMethods);
+		defer(analyzeMethod, rm);
 	}
 	def getField(op: SsaApplyOp, rf: RaField, index: int) {
-		if ((rf.rmaFacts & RF_READ) == 0) {
-			rf.rmaFacts = rf.rmaFacts | RF_READ;
-			// TODO: deferGetField(rf.container, index);
-		}
+		if (rf.setFact(RF_READ)) return;
+		// TODO: defer analyzeGetField(rf.container, index);
 	}
 	def setField(op: SsaApplyOp, rf: RaField) {
-		rf.rmaFacts = rf.rmaFacts | RF_WRITTEN;
+		rf.raFacts = rf.raFacts | RF_WRITTEN;
 		var val = op.inputs(0).dest;
 		rf.writeFacts = rf.writeFacts & val.facts;
 	}
 	def initField(op: SsaApplyOp, rf: RaField) {
-		rf.rmaFacts = rf.rmaFacts | RF_INIT;
+		rf.raFacts = rf.raFacts | RF_INIT;
 		var val = op.inputs(0).dest;
 		rf.initFacts = val.facts & Facts.V_FACTS;
 		if (SsaValue.?(val)) {
 			rf.val = SsaValue.!(val).val;
-			rf.rmaFacts = rf.rmaFacts | RF_VALUE;
+			rf.raFacts = rf.raFacts | RF_VALUE;
 		}
 	}
 	def makeField(op: SsaApplyOp, context: IrSpec) -> RaField {
@@ -119,11 +177,13 @@ class ReachabilityAnalyzer {
 	}
 	def makeMethod(op: SsaApplyOp, context: IrSpec) -> RaMethod {
 		var m = IrMethod.!(op.op.attr<IrMember>());
-		if (m == null) return null; // no member associated with this operation
+		if (m == null) return null;
+		return makeMethodWithTypeArgs(op.op.typeArgs, m, context);
+	}
+	private def makeMethodWithTypeArgs(typeArgs: Array<Type>, m: IrMethod, context: IrSpec) -> RaMethod {
 		var rm = m.raMethod;
 		if (rm != null) return rm; // method already seen
-		var typeArgs = op.op.typeArgs;
-		if (!m.container.open() && op.op.typeArgs.length == 1) {
+		if (!m.container.open() && typeArgs.length == 1) {
 			// monomorphic, potentially reusable method
 			return makeMonoMethod(m);
 		}
@@ -132,18 +192,20 @@ class ReachabilityAnalyzer {
 			// method is not parameterized
 			rm = rmaType.mmethods(m.index);
 			if (rm != null) return rm; // method already seen
-			var spec = V3Op.extractIrSpec(op.op.subst(context.instantiateType));
+			if (context != null) typeArgs = context.instantiateTypes(typeArgs);
+			var spec = IrSpec.new(typeArgs(0), typeArgs, m);
 			rm = RaMethod.new(rmaType.oldType, m, spec);
 			rmaType.mmethods(m.index) = rm;
 		} else {
 			// method is parameterized
-			var spec = V3Op.extractIrSpec(op.op.subst(context.instantiateType));
+			if (context != null) typeArgs = context.instantiateTypes(typeArgs);
+			var spec = IrSpec.new(typeArgs(0), typeArgs, m);
 			if (rmaType.pmethods != null) {
 				for (l = rmaType.pmethods(m.index); l != null; l = l.tail) {
 					if (spec.equals(l.head.spec)) return l.head;
 				}
 			} else {
-				rmaType.pmethods = Array.new(rmaType.oldClass.methods.length);
+				rmaType.pmethods = Array.new(rmaType.orig.methods.length);
 			}
 			rm = RaMethod.new(rmaType.oldType, m, spec);
 			rmaType.pmethods(m.index) = List.new(rm, rmaType.pmethods(m.index));
@@ -158,7 +220,7 @@ class ReachabilityAnalyzer {
 		if (!isNormalType(m.returnType)) return makeNormMethod(m);
 		// all are normal; reuse the same method
 		var rm = RaMethod.new(m.container, m, null);
-		rm.rmaFacts = RF_NORMALIZED;
+		rm.raFacts = RF_NORMALIZED;
 		return m.raMethod = rm;
 	}
 	private def makeNormMethod(m: IrMethod) -> RaMethod {
@@ -193,36 +255,68 @@ class ReachabilityAnalyzer {
 		if (spec != null) t = spec.instantiateType(t);
 		return norm(t);
 	}
+	def defer<T>(f: T -> void, p: T); // TODO
 }
+// Base class which contains facts for all types of entities during analysis
+class RaItem {
+	var raFacts: int;
+	// sets the given fact bit; returns true if the fact was already set
+	def setFact(fact: int) -> bool {
+		if ((raFacts & fact) == 0) {
+			raFacts = raFacts | fact;
+			return false;
+		}
+		return true;
+	}
+}
+
 // Representation of a type during RMA and normalization.
 class RaType(
 	oldType: Type,
 	newType: Type,
 	sub: Array<Type>,
 	nested: Array<RaType>,
-	offsets: Array<int>) {
+	offsets: Array<int>) extends RaItem {
 
 	def size = if(sub == null, 1, sub.length);
 }
 // Representation of a class type during RMA and normalization, which adds
 // representations of the fields and methods of the class
 class RaClass extends RaType {
-	def oldClass: IrClass;
-	def fields = Array<RaField>.new(oldClass.fields.length);
-	var mmethods = Array<RaMethod>.new(oldClass.methods.length);
-	var pmethods: Array<List<RaMethod>>; // lazily allocated polymorphic methods
-	var instances: List<Record>;
+	def orig: IrClass;
+	def superClass: RaClass;
+	def fields = Array<RaField>.new(orig.fields.length);
+	var mmethods = Array<RaMethod>.new(orig.methods.length);
+	var pmethods: Array<List<RaMethod>>; 	// lazily allocated polymorphic methods
+	var instances: List<Record>;		// list of live records
+	var subtypes: List<RaClass>;		// list of live subtypes
 
-	new(classType: Type, oldClass) : super(classType, classType, null, null, null) { }
+	new(classType: Type, orig, superClass) super(classType, classType, null, null, null) { }
 
 	def makeField(index: int, fieldType: Type, fields: Array<IrField>) -> RaField {
 		return this.fields(index) = RaField.new(oldType, fieldType, fields);
 	}
+	def applyMethods(f: RaMethod -> void) {
+		for (m in orig.methods) if (m != null && m.raMethod != null) f(m.raMethod);
+		for (rm in mmethods) if (rm != null) f(rm);
+		if (pmethods == null) return;
+		for (rl in pmethods) {
+			for (l = rl; l != null; l = l.tail) f(l.head);
+		}
+	}
+}
+// Information about an array, including its live instances
+class RaArray extends RaType {
+	var primitive: bool;
+	var instances: List<Record>;
+	new(oldType: Type, newType: Type, sub: Array<Type>, nested: Array<RaType>, offsets: Array<int>)
+		super(oldType, newType, sub, nested, offsets) {
+		primitive = V3.isPrimitiveArray(oldType);
+	}
 }
 // Information about a field, including whether it is initialized, written, read,
 // and facts about each of the values written to the field
-class RaField(container: Type, fieldType: Type, norm: Array<IrField>) {
-	var rmaFacts: int;
+class RaField(container: Type, fieldType: Type, norm: Array<IrField>) extends RaItem {
 	var val: Val;
 	var initFacts = Facts.V_ZERO | Facts.V_NON_NEGATIVE;
 	var writeFacts = Facts.V_FACTS;
@@ -232,7 +326,12 @@ class RaField(container: Type, fieldType: Type, norm: Array<IrField>) {
 }
 // Information about a method, including any specialization, whether it is reusable
 // across normalization, etc.
-class RaMethod(container: Type, orig: IrMethod, spec: IrSpec) {
-	var rmaFacts: int;
+class RaMethod(container: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
 	var norm: IrMethod;
+	private var cachedSpec: IrSpec;
+	def getSpec() -> IrSpec {
+		if (cachedSpec != null) return cachedSpec;
+		if (spec != null) return cachedSpec = spec;
+		return cachedSpec = IrSpec.new(container, [container], orig);
+	}
 }
