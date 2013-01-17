@@ -5,11 +5,13 @@ def RF_NORMALIZED = 0x001;
 def RF_READ       = 0x002;
 def RF_WRITTEN    = 0x004;
 def RF_INIT       = 0x008;
-def RF_VALUE      = 0x010;
-def RM_VIRTUAL    = 0x020;
-def RM_LIVE       = 0x040;
-def RC_ALLOC      = 0x080;
-def RC_LIVE       = 0x100;
+def RF_VAL_ONE    = 0x010;
+def RF_VAL_MANY   = 0x020;
+def RF_VALS       = RF_VAL_ONE | RF_VAL_MANY;
+def RM_VIRTUAL    = 0x040;
+def RM_LIVE       = 0x080;
+def RC_ALLOC      = 0x100;
+def RC_LIVE       = 0x200;
 
 def VOID = RaType.new(Void.TYPE, Void.TYPE, TypeUtil.NO_TYPES);
 def BOOL = singleton(Bool.TYPE, Bool.TYPE);
@@ -43,8 +45,54 @@ class ReachabilityAnalyzer {
 		while ((unit = dequeue()) != null) unit.analyze();
 		return this;
 	}
+	def dump() {
+		typeMap.apply(dumpType);
+		specMap.apply(dumpMethod);
+		records.apply(dumpRecord);
+	}
+	def dumpMethod(spec: IrSpec, rm: RaMethod) {
+		if (rm == null) return;
+		Terminal.put1("%1", if (rm.spec != null, rm.spec.render, rm.orig.renderLong));
+		dumpFacts(rm.raFacts);
+	}
+	def dumpField(container: Type, f: IrField, rf: RaField) {
+		if (rf == null) return;
+		Terminal.put2("%1.%2", container.render, f.render);
+		dumpFacts(rf.raFacts);
+	}
+	def dumpType(t: Type, rt: RaType) {
+		Terminal.put1("%1", t.render);
+		dumpFacts(rt.raFacts);
+		if (RaClass.?(rt)) {
+			var rc = RaClass.!(rt);
+			for (f in rc.orig.fields) {
+				if (!rc.orig.inherits(f)) dumpField(t, f, f.raField);
+			}
+			for (i = 0; i < rc.fields.length; i++) {
+				dumpField(t, rc.orig.fields(i), rc.fields(i));
+			}
+			for (m in rc.orig.methods) {
+				if (m != null && !rc.orig.inherits(m)) dumpMethod(null, m.raMethod);
+			}
+		}
+	}
+	def dumpRecord(r: Record, x: Record) {
+		Terminal.put2("%1 #%2\n", r.rtype.render, r.id);
+	}
+	def dumpFacts(facts: int) {
+		if ((facts & RF_READ) != 0) Terminal.put(" r");
+		if ((facts & RF_WRITTEN) != 0) Terminal.put(" w");
+		if ((facts & RF_INIT) != 0) Terminal.put(" i");
+		if ((facts & RF_VAL_ONE) != 0) Terminal.put(" v");
+		if ((facts & RM_LIVE) != 0) Terminal.put(" l");
+		if ((facts & RM_VIRTUAL) != 0) Terminal.put(" v");
+		if ((facts & RC_LIVE) != 0) Terminal.put(" l");
+		if ((facts & RC_ALLOC) != 0) Terminal.put(" a");
+		Terminal.ln();
+	}
 	def addRootMethod(meth: IrSpec) -> RmaRoot {
 		getMethod(null, makeMethodWithTypeArgs(meth.typeArgs, meth.asMethod(), null));
+		makeType(meth.container);
 		var root = RmaRoot.new(meth);
 		roots = List.new(root, roots);
 		return root;
@@ -89,12 +137,15 @@ class ReachabilityAnalyzer {
 		if (RaClass.?(raType)) {
 			// analyze a class object's fields and methods
 			var rc = RaClass.!(raType), oldFacts = rc.raFacts;
+			rc.instances = List.new(record, rc.instances);
 			rc.raFacts = rc.raFacts | RC_LIVE;
 			if ((oldFacts & (RC_LIVE | RC_ALLOC)) == 0) analyzeLiveClass(rc);
 			analyzeFields(rc, record);
 		} else if (RaArray.?(raType)) {
 			// analyze an array's elements
 			var ra = RaArray.!(raType);
+			ra.instances = List.new(record, ra.instances);
+			ra.raFacts = ra.raFacts | RC_LIVE;
 			if (ra.primitive) return;
 			for (v in record.values) deferValue(v);
 		}
@@ -110,8 +161,9 @@ class ReachabilityAnalyzer {
 	}
 	def analyzeField(record: Record, rf: RaField, index: int) {
 		if (rf != null && ((rf.raFacts & RF_READ) != 0)) {
-			// XXX: record the value of the field in the field
-			deferValue(record.values(index));
+			var v = record.values(index);
+			rf.addValue(v);
+			deferValue(v);
 		}
 	}
 	// analyze a class that just became live
@@ -178,10 +230,12 @@ class ReachabilityAnalyzer {
 		}
 	}
 	def allocation(raType: RaType) {
-		if (!RaClass.?(raType)) return;
-		var rc = RaClass.!(raType), oldFacts = rc.raFacts;
-		rc.raFacts = rc.raFacts | RC_ALLOC;
-		if ((oldFacts & (RC_LIVE | RC_ALLOC)) == 0) analyzeLiveClass(rc);
+		var oldFacts = raType.raFacts;
+		raType.raFacts = raType.raFacts | RC_ALLOC;
+		if (RaClass.?(raType) && (oldFacts & (RC_LIVE | RC_ALLOC)) == 0) {
+			// process a newly-live class
+			analyzeLiveClass(RaClass.!(raType));
+		}
 	}
 	def getVirtual(op: SsaApplyOp, rm: RaMethod) {
 		if (rm.setFact(RM_VIRTUAL)) return;
@@ -203,15 +257,15 @@ class ReachabilityAnalyzer {
 		rf.raFacts = rf.raFacts | RF_WRITTEN;
 		var val = op.inputs(0).dest;
 		rf.writeFacts = rf.writeFacts & val.facts;
+		if (SsaValue.?(val)) rf.addValue(SsaValue.!(val).val);
+		else rf.setFact(RF_VAL_MANY);
 	}
 	def initField(op: SsaApplyOp, rf: RaField) {
 		rf.raFacts = rf.raFacts | RF_INIT;
 		var val = op.inputs(0).dest;
 		rf.initFacts = val.facts & Facts.V_FACTS;
-		if (SsaValue.?(val)) {
-			rf.val = SsaValue.!(val).val;
-			rf.raFacts = rf.raFacts | RF_VALUE;
-		}
+		if (SsaValue.?(val)) rf.addValue(SsaValue.!(val).val);
+		else rf.setFact(RF_VAL_MANY);
 	}
 	def makeField(op: SsaApplyOp, context: IrSpec) -> RaField {
 		var f = IrField.!(op.op.attr<IrMember>()), rf = f.raField;
@@ -307,11 +361,12 @@ class ReachabilityAnalyzer {
 				// normalize element type
 				var enorm = makeType(V3Array.elementType(t));
 				if (enorm.size == 0) {
-					raType = singleton(t, V3.voidArrayType);
+					raType = RaArray.new(t, V3.voidArrayType, null);
 				} else if (enorm.size == 1) {
-					raType = singleton(t, V3Array.newType(enorm.newType));
+					raType = RaArray.new(t, V3Array.newType(enorm.newType), null);
 				} else {
-					raType = tuple(t, Arrays.map(enorm.sub, V3Array.newType));
+					var et = Arrays.map(enorm.sub, V3Array.newType);
+					raType = RaArray.new(t, Tuple.newType(Lists.fromArray(et)), et);
 				}
 			}
 			V3Kind.CLASS: {
@@ -430,6 +485,23 @@ class RaField(container: Type, fieldType: Type, norm: Array<IrField>) extends Ra
 	var writeFacts = Facts.V_FACTS;
 	def facts() -> int {
 		return initFacts & writeFacts;
+	}
+	def addValue(v: Val) {
+		// add a value to the set for this field
+		var facts = (raFacts & RF_VALS);
+		if (facts == RF_VAL_ONE) {
+			if (!Values.equal(val, v)) raFacts = raFacts | RF_VAL_MANY;
+		} else if (facts == 0) {
+			raFacts = raFacts | RF_VAL_ONE;
+			val = v;
+		}
+		// also set the facts that are true for all values and writes
+		facts = 0;
+		if (v == null) facts = Facts.V_ZERO;
+		else if (Box<int>.?(v)) facts = Facts.intFacts(Int.unbox(v));
+		else if (Box<bool>.?(v)) facts = if(Bool.unbox(v), Facts.V_NON_ZERO, Facts.V_ZERO);
+		else facts = Facts.V_NON_ZERO;
+		writeFacts = writeFacts & facts;
 	}
 }
 // Information about a method, including any specialization, whether it is reusable
