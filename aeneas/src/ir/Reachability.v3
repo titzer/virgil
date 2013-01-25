@@ -1,17 +1,19 @@
 // Copyright 2013 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-def RF_NORMALIZED = 0x001;
-def RF_READ       = 0x002;
-def RF_WRITTEN    = 0x004;
-def RF_INIT       = 0x008;
-def RF_VAL_ONE    = 0x010;
-def RF_VAL_MANY   = 0x020;
+def RM_REQ_NORM   = 0x001;
+def RM_LIVE       = 0x002;
+def RM_VIRTUAL    = 0x004;
+def RM_NORMALIZED = 0x008;
+def RF_NORMALIZED = 0x008;
+def RF_READ       = 0x010;
+def RF_WRITTEN    = 0x020;
+def RF_INIT       = 0x040;
+def RF_VAL_ONE    = 0x080;
+def RF_VAL_MANY   = 0x100;
 def RF_VALS       = RF_VAL_ONE | RF_VAL_MANY;
-def RM_VIRTUAL    = 0x040;
-def RM_LIVE       = 0x080;
-def RC_ALLOC      = 0x100;
-def RC_LIVE       = 0x200;
+def RC_ALLOC      = 0x200;
+def RC_LIVE       = 0x400;
 
 def VOID = RaType.new(Void.TYPE, Void.TYPE, TypeUtil.NO_TYPES);
 def BOOL = singleton(Bool.TYPE, Bool.TYPE);
@@ -32,6 +34,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	var listTail: Unit;
 	var liveMethods: List<RaMethod>;
 	var roots: List<RmaRoot>;
+	var current: RaMethod;
 
 	// perform the analysis, starting from the roots
 	def analyze() {
@@ -90,6 +93,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		if ((facts & RM_VIRTUAL) != 0) Terminal.put(" v");
 		if ((facts & RC_LIVE) != 0) Terminal.put(" l");
 		if ((facts & RC_ALLOC) != 0) Terminal.put(" a");
+		if ((facts & RM_REQ_NORM) != 0) Terminal.put(" n");
 		Terminal.ln();
 	}
 	def addRootMethod(meth: IrSpec) -> RmaRoot {
@@ -184,6 +188,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	}
 	// analyze a method's code
 	def analyzeMethod(rm: RaMethod) {
+		current = rm;
 		var region = rm.orig.ssa;
 		if (region == null) region = compiler.genSsa(rm.getSpec());
 		// XXX: if (rm.spec != null) return analyzePolyMethod(rm);
@@ -195,10 +200,18 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 				if (SsaApplyOp.?(instr)) analyzeOp(SsaApplyOp.!(instr), rm.spec);
 			}
 		}
+		current = null;
 	}
 	// analyze an operator
 	def analyzeOp(op: SsaApplyOp, context: IrSpec) {
 		match (op.op.opcode) {
+			V3Opcode.Equal,
+			V3Opcode.NotEqual,
+			V3Opcode.NullCheck,
+			V3Opcode.BoundsCheck,
+			V3Opcode.ArrayGetElem,
+			V3Opcode.ArraySetElem,
+			V3Opcode.ArrayGetLength: reqNormForType(mono(op.op.typeArgs(0), context));
 			V3Opcode.ArrayAlloc,
 			V3Opcode.ArrayInit: allocation(makeType(mono(op.op.typeArgs(0), context)));
 			V3Opcode.ClassAlloc: {
@@ -221,7 +234,10 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 			V3Opcode.ClassInitField: initField(op, makeField(op, context));
 			V3Opcode.ClassSetField,
 			V3Opcode.ComponentSetField: setField(op, makeField(op, context));
+			V3Opcode.TupleCreate,
+			V3Opcode.TupleGetElem: current.reqNorm();
 		}
+		// TODO: system operators, pointer operators, etc
 	}
 	// analyze an access of a field
 	def analyzeGetField(container: RaClass, index: int) {
@@ -232,6 +248,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		}
 	}
 	def allocation(raType: RaType) {
+		reqNormForRaType(raType);
 		var oldFacts = raType.raFacts;
 		raType.raFacts = raType.raFacts | RC_ALLOC;
 		if (RaClass.?(raType) && (oldFacts & (RC_LIVE | RC_ALLOC)) == 0) {
@@ -240,6 +257,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		}
 	}
 	def getVirtual(op: SsaApplyOp, rm: RaMethod) {
+		reqNormForMethod(rm, true);
 		if (rm.setFact(RM_VIRTUAL)) return;
 		var rc = makeClass(rm.container);
 		for (l = rc.subtypes; l != null; l = l.tail) {
@@ -247,15 +265,18 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		}
 	}
 	def getMethod(op: SsaApplyOp, rm: RaMethod) {
+		if (op != null) reqNormForMethod(rm, false);
 		if (rm.setFact(RM_LIVE)) return;
 		liveMethods = List.new(rm, liveMethods);
 		defer(analyzeMethod, rm);
 	}
 	def getField(op: SsaApplyOp, rf: RaField, index: int) {
+		reqNormForField(rf);
 		if (rf.setFact(RF_READ)) return;
 		defer(analyzeGetField, (makeClass(rf.container), index));
 	}
 	def setField(op: SsaApplyOp, rf: RaField) {
+		reqNormForField(rf);
 		rf.raFacts = rf.raFacts | RF_WRITTEN;
 		var val = op.inputs(0).dest;
 		rf.writeFacts = rf.writeFacts & val.facts;
@@ -263,6 +284,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		else rf.setFact(RF_VAL_MANY);
 	}
 	def initField(op: SsaApplyOp, rf: RaField) {
+		reqNormForField(rf);
 		rf.raFacts = rf.raFacts | RF_INIT;
 		var val = op.inputs(0).dest;
 		rf.initFacts = val.facts & Facts.V_FACTS;
@@ -275,7 +297,9 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		if (!f.container.open()) {
 			if (isNormalType(f.fieldType)) {
 				// the field is a simple, monomorphic, normalized field
-				return f.raField = RaField.new(f.container, f.fieldType, null);
+				f.raField = RaField.new(f.container, f.fieldType, null);
+				f.raField.raFacts = RF_NORMALIZED;
+				return f.raField;
 			}
 		}
 		var container = mono(op.op.typeArgs(0), context), raType = makeClass(container);
@@ -287,7 +311,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 				fieldType = fieldType.substitute(V3.asClass(container).getTypeArgs(container));
 			}
 			var fn = makeType(fieldType);
-			var fields = Arrays.map(fn.sub, IrField.new(container, _));
+			var fields = Arrays.map(fn.sub, IrField.new(container, _)); // TODO: source
 			rf = raType.makeField(f.index, fn.newType, fields);
 		}
 		return rf;
@@ -320,7 +344,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		for (t in m.paramTypes) {
 			if (!isNormalType(t)) return makeNormMethod(m);
 		}
-		if (!isNormalType(m.returnType)) return makeNormMethod(m);
+		if (m.returnType != Void.TYPE && !isNormalType(m.returnType)) return makeNormMethod(m);
 		// all are normal; reuse the same method
 		var rm = RaMethod.new(m.container, m, null);
 		rm.raFacts = RF_NORMALIZED;
@@ -337,6 +361,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		var rm = RaMethod.new(m.container, m, null);
 		// create a new IrMethod that will hold the normalized code
 		rm.norm = IrMethod.new(m.container, null, seq.extract(), norm(m.returnType));
+		rm.norm.source = m.source;
 		return m.raMethod = rm;
 	}
 	def makeClass(t: Type) -> RaClass {
@@ -423,6 +448,23 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		if (listHead == null) listHead = unit;
 		else listTail.next = unit;
 		listTail = unit;
+	}
+	def reqNormForType(t: Type) {
+		if ((current.raFacts & RM_REQ_NORM) != 0) return;
+		if (!isNormalType(t)) current.reqNorm();
+	}
+	def reqNormForRaType(raType: RaType) {
+		if (raType.oldType != raType.newType) current.reqNorm();
+	}
+	def reqNormForField(rf: RaField) {
+		if ((current.raFacts & RM_REQ_NORM) != 0) return;
+		if ((rf.raFacts & RF_NORMALIZED) == 0) current.reqNorm();
+		else ; // TODO: add to a list of field references for the method
+	}
+	def reqNormForMethod(rm: RaMethod, virtual: bool) {
+		if ((current.raFacts & RM_REQ_NORM) != 0) return;
+		if ((rm.raFacts & RF_NORMALIZED) == 0) current.reqNorm();
+		else if (virtual) ; // TODO: add to a list of virtual invocations
 	}
 }
 // Base class which contains facts for all types of entities during analysis
@@ -517,5 +559,8 @@ class RaMethod(container: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
 		if (cachedSpec != null) return cachedSpec;
 		if (spec != null) return cachedSpec = spec;
 		return cachedSpec = IrSpec.new(container, [container], orig);
+	}
+	def reqNorm() {
+		raFacts = raFacts | RM_REQ_NORM;
 	}
 }
