@@ -35,15 +35,27 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	var liveMethods: List<RaMethod>;
 	var roots: List<RmaRoot>;
 	var current: RaMethod;
+	var heapNorm: HeapNormalizer;
 
 	// perform the analysis, starting from the roots
 	def analyze() {
 		var start = System.ticksUs();
-		var unit: Unit;
-		while ((unit = dequeue()) != null) unit.analyze();
+		doWork();
 		if (Aeneas.TIME_RMA.get()) {
 			Terminal.put1("(RA: %1 us)", (System.ticksUs() - start));
 		}
+	}
+	def transform() {
+		// transform the heap
+		heapNorm = HeapNormalizer.new(this);
+		heapNorm.normalize();
+		// TODO: analyze the polymorphic specializations
+		// TODO: layout virtual/method tables
+		// TODO: transform code
+	}
+	def doWork() {
+		var unit: Unit;
+		while ((unit = dequeue()) != null) unit.analyze();
 	}
 	def dump() {
 		for (l = liveMethods; l != null; l = l.tail) {
@@ -333,20 +345,24 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		if (!f.container.open()) {
 			if (isNormalType(f.fieldType)) {
 				// the field is a simple, monomorphic, normalized field
-				var rf = RaField.new(f.container, f.fieldType);
+				var rf = RaField.new(f.container);
 				return f.raField = rf;
 			}
 		}
 		var container = mono(op.op.typeArgs(0), context), raType = makeClass(container);
 		rf = if (raType.fields != null, raType.fields(f.index));
 		if (rf == null) {
-			// create the RmField from the normalized type
+			// create the RaField from the normalized type
 			var fieldType = f.fieldType;
 			if (f.container.open()) {
 				fieldType = fieldType.substitute(V3.asClass(container).getTypeArgs(container));
 			}
 			var fn = makeType(fieldType);
-			rf = raType.makeField(f.index, fn.newType);
+			rf = raType.makeField(f.index, fn);
+			// create new IrFields
+			if (fn.size == 1) rf.norm = [IrField.new(raType.newType, fieldType)];
+			else rf.norm = Arrays.map(fn.sub, IrField.new(raType.newType, _));
+			for (nf in rf.norm) nf.source = f.source;
 		}
 		return rf;
 	}
@@ -493,12 +509,38 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	def reqNormForField(rf: RaField) {
 		if ((current.raFacts & RA_REQ_NORM) != 0) return;
 		if ((rf.raFacts & RF_NORMALIZED) == 0) current.reqNorm();
-		else ; // TODO: add to a list of field references for the method
+		else ; // XXX: add to a list of field references for the method
 	}
 	def reqNormForMethod(rm: RaMethod, virtual: bool) {
 		if ((current.raFacts & RA_REQ_NORM) != 0) return;
 		if ((rm.raFacts & RF_NORMALIZED) == 0) current.reqNorm();
-		else if (virtual) ; // TODO: add to a list of virtual invocations
+		else if (virtual) ; // XXX: add to a list of virtual invocations
+	}
+	def normValIntoArray(v: Val, raType: RaType, array: Array<Val>, index: int) {
+		if (v == null) return;
+		if (Record.?(v)) {
+			heapNorm.normRecordIntoArray(Record.!(v), array, index);
+		} else if (Delegate.?(v)) {
+			// delegate: normalize record and method
+			var del = Delegate.!(v);
+			// normalize delegate value as (funcval, object) pair
+			array(index) = FuncVal.new(normalizeMethodRef(del.memberRef));
+			if (del.val != null) array(index + 1) = heapNorm.normSimpleVal(del.val);
+		} else if (Tuple_Value.?(v)) {
+			// tuple: recursively normalize all of the sub
+			var tv = Tuple_Value.!(v);
+			var tnn = RaTuple.!(raType).nested;
+			for (i = 0; i < tnn.length; i++) {
+				normValIntoArray(tv.values(i), tnn(i), array, index);
+				index = index + tnn(i).size;
+			}
+		} else {
+			array(index) = v;
+		}
+	}
+	def normalizeMethodRef(spec: IrSpec) -> IrSpec {
+		// TODO: normalize an ir spec
+		return spec;
 	}
 }
 // Base class which contains facts for all types of entities during analysis
@@ -550,10 +592,11 @@ class RaClass extends RaType {
 	new(oldType: Type, newType: Type, sub: Array<Type>, orig, superClass) super(oldType, newType, sub) {
 		if (superClass != null) superClass.children = List.new(this, superClass.children);
 	}
-	def makeField(index: int, fieldType: Type) -> RaField {
+	def makeField(index: int, fieldType: RaType) -> RaField {
 		if (fields == null) fields = Array.new(orig.fields.length);
-		var rf = RaField.new(oldType, fieldType);
+		var rf = RaField.new(oldType);
 		rf.reqNorm();
+		rf.fieldType = fieldType;
 		return fields(index) = rf;
 	}
 	def applyMethods(f: RaMethod -> void) {
@@ -571,12 +614,13 @@ class RaArray extends RaType {
 }
 // Information about a field, including whether it is initialized, written, read,
 // and facts about each of the values written to the field
-class RaField(container: Type, fieldType: Type) extends RaItem {
+class RaField(container: Type) extends RaItem {
 	var val: Val;
 	var initFacts = Facts.V_DEFAULT;
 	var writeFacts = Facts.V_FACTS;
 	var norm: Array<IrField>;
-	var normIndex: int;
+	var fieldType: RaType;
+	var normIndex = -1;
 	def facts() -> int {
 		return initFacts & writeFacts;
 	}
@@ -619,18 +663,52 @@ class RaPoly(orig: IrMethod) {
 		instantiations = List.new(rm, instantiations);
 	}
 }
-// Builds a new representation of the program after reachability analysis by
-// normalizing and optimizing fields
-class Normalizer(ra: ReachabilityAnalyzer) {
+// Builds a new representation of the program heap after reachability analysis by
+// normalizing and optimizing fields of all components, classes, and arrays.
+class HeapNormalizer(ra: ReachabilityAnalyzer) {
 	var liveTypes = Sequence<RaType>.new();
+	var recordMap = V3.newRecordMap<Record>();
+	var complexRecordMap = V3.newRecordMap<Array<Record>>();
 	var newIr: IrPortion;
+	// visit the reachable members and compute a new heap layout and normalized records
+	def normalize() {
+		newIr = IrPortion.new(ra.prog);
+		ra.typeMap.apply(visitType);
+		ra.doWork();
+	}
+	// visit a type in the map, computing new field layouts of classes and arrays
 	def visitType(t: Type, raType: RaType) {
 		if (RaClass.?(raType)) {
 			var rc = RaClass.!(raType);
-			if (rc.norm != null) return;
+			if (rc.normFields != null) return; // already processed this type
 			while (rc.superClass != null) rc = rc.superClass;
 			layoutFields(rc);
+			if (rc.instances == null) return; // no heap instances to normalize
+			ra.defer(normClassRecords, rc);
+			for (l = rc.instances; l != null; l = l.tail) {
+				// create new records to be normalized
+				recordMap.set(l.head, ra.prog.newRecord(rc.newType, rc.normFields.length));
+			}
+		} else if (RaArray.?(raType)) {
+			var rt = RaArray.!(raType);
+			if (rt.instances == null) return; // no heap instances to normalize
+			if (rt.oldType != rt.newType) {
+				// map complex arrays to arrays of records
+				ra.defer(normComplexArrayRecords, rt);
+				Lists.apply(rt.instances, createComplexArrayRecord(_, Tuple.toTypeArray(rt.newType), rt)); 
+			} else if (!rt.primitive) {
+				// normalize simple arrays that are not primitive
+				ra.defer(normSimpleArrayRecords, rt);
+			}
 		}
+	}
+	// map a complex array to an array of records
+	def createComplexArrayRecord(r: Record, types: Array<Type>, rt: RaArray) {
+		var complex = Array<Record>.new(rt.size);
+		for (i = 0; i < complex.length; i++) {
+			complex(i) = ra.prog.newRecord(types(i), r.values.length);
+		}
+		complexRecordMap.set(r, complex);
 	}
 	// layout fields for classes and components
 	def layoutFields(rc: RaClass) {
@@ -674,7 +752,77 @@ class Normalizer(ra: ReachabilityAnalyzer) {
 	// add a field to the builder
 	def addField(f: IrField, rf: RaField, b: Sequence<IrField>) {
 		rf.normIndex = b.length;
-		if (f != null) b.add(f); // field is already normalized
-		else ; // TODO: create/add normalized fields
+		if (f != null) b.add(f);
+		else b.addN(rf.norm);
+	}
+	// normalize the live instances of a class
+	def normClassRecords(rc: RaClass) {
+		for (l = rc.instances; l != null; l = l.tail) {
+			var oldRecord = l.head, newRecord = recordMap.get(oldRecord);
+			for (f in rc.orig.fields) {
+				var rf = f.raField;
+				if (rf != null && rf.normIndex >= 0) {
+					newRecord.values(rf.normIndex) = normSimpleVal(oldRecord.values(f.index));
+				}
+			}
+			var rfs = rc.fields;
+			if (rfs != null) {
+				for (i = 0; i < rfs.length; i++) {
+					var rf = rfs(i);
+					if (rf != null && rf.normIndex >= 0) {
+						ra.normValIntoArray(oldRecord.values(i), rf.fieldType, newRecord.values, rf.normIndex);
+					}
+				}
+			}
+		}
+	}
+	// normalize the live instances of a simple (i.e. size-1 element) array type
+	def normSimpleArrayRecords(rt: RaArray) {
+		for (l = rt.instances; l != null; l = l.tail) {
+			var record = l.head, old = record.values;
+			for (i = 0; i < old.length; i++) {
+				record.values(i) = normSimpleVal(old(i));
+			}
+		}
+	}
+	// normalize the live instances of a complex (i.e. size-N element) array type
+	def normComplexArrayRecords(rt: RaArray) {
+		var size = Tuple.length(rt.newType), temp = Array<Val>.new(size);
+		var tn = ra.makeType(V3Array.elementType(rt.oldType));
+		for (l = rt.instances; l != null; l = l.tail) {
+			var oldRecord = l.head, newRecords = complexRecordMap.get(oldRecord);
+			var old = oldRecord.values;
+			for (i = 0; i < old.length; i++) {
+				ra.normValIntoArray(old(i), tn, temp, 0);
+				for (j = 0; j < size; j++) {
+					newRecords(j).values(i) = temp(j);
+				}
+			}
+		}
+	}
+	// normalize a record value into 1 or more records into the given array
+	def normRecordIntoArray(r: Record, array: Array<Val>, index: int) {
+		var simple = recordMap.get(r);
+		if (simple != null) { // simple mapping
+			array(index) = simple;
+			return;
+		}
+		var complex = complexRecordMap.get(r);
+		if (complex != null) { // complex mapping
+			for (i = 0; i < complex.length; i++) {
+				array(index + i) = complex(i);
+			}
+			return;
+		}
+		array(index) = r;
+	}
+	// map a record 1-1
+	def normSimpleVal(v: Val) -> Val {
+		if (Record.?(v)) {
+			// assume that a record without an entry is mapped to itself
+			var r = recordMap.get(Record.!(v));
+			return if(r == null, v, r);
+		}
+		return v; // assume all other values can be reused
 	}
 }
