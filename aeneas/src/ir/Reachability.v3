@@ -1,6 +1,7 @@
 // Copyright 2013 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// Constants representing flags for reachability analysis
 def RA_REQ_NORM   = 0x001;
 def RM_LIVE       = 0x002;
 def RM_VIRTUAL    = 0x004;
@@ -14,14 +15,12 @@ def RF_VALS       = RF_VAL_ONE | RF_VAL_MANY;
 def RC_ALLOC      = 0x200;
 def RC_LIVE       = 0x400;
 
+// global reachability information for primitive types, accessed frequently
 def VOID = RaType.new(Void.TYPE, Void.TYPE, TypeUtil.NO_TYPES);
-def BOOL = singleton(Bool.TYPE, Bool.TYPE);
-def BYTE = singleton(Byte.TYPE, Byte.TYPE);
-def INT  = singleton(Int.TYPE, Int.TYPE);
+def BOOL = RaType.new(Bool.TYPE, Bool.TYPE, null);
+def BYTE = RaType.new(Byte.TYPE, Byte.TYPE, null);
+def INT  = RaType.new(Int.TYPE, Int.TYPE, null);
 
-def singleton(oldType: Type, newType: Type) -> RaType {
-	return RaType.new(oldType, newType, null);
-}
 // Performs polymorphic reachability analysis over a program.
 class ReachabilityAnalyzer(compiler: Compiler) {
 	def prog: Program = compiler.prog;
@@ -41,14 +40,14 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	def analyze() {
 		var start = System.ticksUs();
 		doWork();
-		if (Aeneas.TIME_RMA.get()) {
-			Terminal.put1("(RA: %1 us)", (System.ticksUs() - start));
-		}
+		if (Aeneas.TIME_RMA.get()) Terminal.put1("(RA: %1 us)", (System.ticksUs() - start));
 	}
 	def transform() {
-		// transform the heap
+		// compute new object layouts and transform the heap
 		heapNorm = HeapNormalizer.new(this);
 		heapNorm.normalize();
+		var vtableNorm = VtableNormalizer.new(this, heapNorm.allClasses);
+		vtableNorm.normalize();
 		// TODO: analyze the polymorphic specializations
 		// TODO: layout virtual/method tables
 		// TODO: transform code
@@ -476,7 +475,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 				raType = RaTuple.new(t, Tuple.newType(Lists.fromArray(ta)), ta, seqN.extract(), seqO.extract());
 			}
 		} else {
-			raType = singleton(t, t);
+			raType = RaType.new(t, t, null);
 		}
 		typeMap.set(t, raType);
 		return raType;
@@ -577,17 +576,18 @@ class RaTuple extends RaType {
 // Representation of a class type during RMA and normalization, which adds
 // representations of the fields and methods of the class
 class RaClass extends RaType {
-	def orig: IrClass;		// original, polymorphic IrClass
-	def superClass: RaClass;	// super class, if any
-	var fields: Array<RaField>;	// specialized fields
-	var methods: List<RaMethod>;	// list of methods
-	var instances: List<Record>;	// list of live records
-	var children: List<RaClass>;	// list of all child classes
-	var subtypes: List<RaClass>;	// list of live subtypes
-	var norm: IrClass;		// normalized, monomorphic IrClass
-	var normFields: Array<IrField>; // normalized fields in order
-	var minClassID: int;
-	var maxClassID: int;
+	def orig: IrClass;			// original, polymorphic IrClass
+	def superClass: RaClass;		// super class, if any
+	var fields: Array<RaField>;		// specialized fields
+	var methods: List<RaMethod>;		// list of methods
+	var instances: List<Record>;		// list of live records
+	var children: List<RaClass>;		// list of all child classes
+	var subtypes: List<RaClass>;		// list of live subtypes
+	var normClass: IrClass;			// normalized class
+	var normFields: Array<IrField>;		// normalized fields
+	var normMethods: Array<IrMethod>;	// normalized methods
+	var minClassID: int;			// minimum class ID
+	var maxClassID: int;			// maximum class ID
 
 	new(oldType: Type, newType: Type, sub: Array<Type>, orig, superClass) super(oldType, newType, sub) {
 		if (superClass != null) superClass.children = List.new(this, superClass.children);
@@ -647,6 +647,7 @@ class RaField(container: Type) extends RaItem {
 class RaMethod(container: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
 	var norm: IrMethod;
 	var poly: RaPoly;
+	var normIndex: int;
 	private var cachedSpec: IrSpec;
 	def getSpec() -> IrSpec {
 		if (cachedSpec != null) return cachedSpec;
@@ -667,6 +668,7 @@ class RaPoly(orig: IrMethod) {
 // normalizing and optimizing fields of all components, classes, and arrays.
 class HeapNormalizer(ra: ReachabilityAnalyzer) {
 	var liveTypes = Sequence<RaType>.new();
+	var allClasses = Sequence<RaClass>.new();
 	var recordMap = V3.newRecordMap<Record>();
 	var complexRecordMap = V3.newRecordMap<Array<Record>>();
 	var newIr: IrPortion;
@@ -712,8 +714,9 @@ class HeapNormalizer(ra: ReachabilityAnalyzer) {
 	}
 	// layout fields for classes and components
 	def layoutFields(rc: RaClass) {
+		allClasses.add(rc);
 		var b = Sequence<IrField>.new();
-		if(rc.superClass != null) b.addN(rc.normFields);
+		if (rc.superClass != null) b.addN(rc.normFields);
 		rc.minClassID = liveTypes.length;
 		if ((rc.raFacts & (RC_LIVE | RC_ALLOC)) != 0 && V3.isComponent(rc.oldType)) {
 			liveTypes.add(rc);
@@ -721,7 +724,6 @@ class HeapNormalizer(ra: ReachabilityAnalyzer) {
 		addFields(rc, b);
 		for (l = rc.children; l != null; l = l.tail) layoutFields(l.head);
 		rc.normFields = b.extract();
-		newIr.classes.add(rc.norm);
 		rc.maxClassID = liveTypes.length;
 	}
 	// add fields from the given RaClass to the builder
@@ -739,7 +741,7 @@ class HeapNormalizer(ra: ReachabilityAnalyzer) {
 			var rf = nf(i);
 			if (requiresStorage(rf)) addField(null, rf, b);
 		}
-		ra.compiler.target.computeFieldOffsets(b, start);
+		if (ra.compiler.target != null) ra.compiler.target.computeFieldOffsets(b, start);
 	}
 	// check if a field can be optimized away
 	def requiresStorage(rf: RaField) -> bool {
@@ -824,5 +826,58 @@ class HeapNormalizer(ra: ReachabilityAnalyzer) {
 			return if(r == null, v, r);
 		}
 		return v; // assume all other values can be reused
+	}
+}
+// Normalizes vtables (and mtables) with the results of reachability and specialization 
+// analysis.
+class VtableNormalizer(ra: ReachabilityAnalyzer, allClasses: Sequence<RaClass>) {
+	def normalize() {
+		allClasses.apply(layoutMethods);
+	}
+	def layoutMethods(rc: RaClass) {
+		var vtable = Sequence<IrMethod>.new(), start = 0;
+		if (rc.superClass != null) {
+			// add all superclass methods first
+			vtable.addN(rc.superClass.normMethods);
+		}
+		// process monomorphic methods
+		for (m in rc.orig.methods) {
+			if (m == null) continue;
+			var rm = m.raMethod, sm: RaMethod;
+			if (rm == null) continue;
+			for (sc = rc.superClass; sc != null; sc = sc.superClass) {
+				// find super method, if any
+				if (m.index < sc.orig.methods.length) {
+					sm = sc.orig.methods(m.index).raMethod;
+					if (sm != null) break;
+				}
+			}
+			setMethod(vtable, rm, sm);
+		}
+		// process polymorphic methods
+		for (l = rc.methods; l != null; l = l.tail) {
+			var rm = l.head, spec = rm.getSpec(), m = spec.member;
+			var sm: RaMethod;
+			for (sc = rc.superClass; sc != null; sc = sc.superClass) {
+				// find super method, if any
+				var sms = sc.orig.methods;
+				if (m.index < sms.length) {
+					sm = ra.specMap.get(IrSpec.new(spec.typeArgs(0), spec.typeArgs, sms(m.index)));
+					if (sm != null) break;
+				}
+			}
+			setMethod(vtable, rm, sm);
+		}
+		rc.normMethods = vtable.extract();
+	}
+	// add a method to the vtable, or overwrite the existing entry
+	def setMethod(vtable: Sequence<IrMethod>, rm: RaMethod, sm: RaMethod) {
+		if (sm == null) {
+			rm.normIndex = vtable.length;
+			vtable.add(rm.norm);
+		} else if (sm != rm) {
+			vtable.set(sm.normIndex, rm.norm);
+			rm.normIndex = sm.normIndex;
+		}
 	}
 }
