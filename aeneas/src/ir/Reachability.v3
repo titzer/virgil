@@ -22,6 +22,7 @@ def RA_BYTE = RaType.new(Byte.TYPE, Byte.TYPE, null);
 def RA_INT  = RaType.new(Int.TYPE, Int.TYPE, null);
 
 def NO_RECORDS = Array<Record>.new(0);
+def MONO_TYPEARGS = [AnyObject.TYPE];
 
 // Performs polymorphic reachability analysis over a program.
 class ReachabilityAnalyzer(compiler: Compiler) {
@@ -169,7 +170,9 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	def analyzeLiveClass(rc: RaClass) {
 		for (c = rc; c != null; c = c.superClass) {
 			c.subtypes = List.new(rc, c.subtypes);
-			c.applyMethods(analyzeVirtual(rc, _));
+			for (ml in c.methods) {
+				for (l = ml; l != null; l = l.tail) analyzeVirtual(rc, l.head);
+			}
 		}
 	}
 	// analyze a possible virtual dispatch of the given method on the given type
@@ -358,39 +361,37 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 			return makeMonoMethod(m);
 		}
 		if (context != null) typeArgs = context.instantiateTypes(typeArgs);
-		var spec = IrSpec.new(typeArgs(0), typeArgs, m);
-		rm = specMap.get(spec);
+		var rc = makeClass(typeArgs(0));
+		rm = rc.findMethod(m.index, typeArgs);
 		if (rm == null) {
-			var raType = makeClass(spec.container);
-			rm = RaMethod.new(raType.oldType, m, spec);
+			var spec = IrSpec.new(rc.oldType, typeArgs, m);
+			rm = rc.makeMethod(m, spec);
 			rm.reqNorm();
-			raType.methods = List.new(rm, raType.methods);
-			specMap.set(spec, rm);
-			makeSpecMethod(rm); // XXX: implies full specialization
+			specializeMethod(rm); // XXX: implies full specialization
 		}
 		return rm;
 	}
 	private def makeMonoMethod(m: IrMethod) -> RaMethod {
 		// check for non-normal parameter or return types
+		var rc = makeClass(m.container);
 		for (t in m.paramTypes) {
-			if (!isNormalType(t)) return makeNormMethod(m);
+			if (!isNormalType(t)) return makeNormMethod(rc, m);
 		}
-		if (m.returnType != Void.TYPE && !isNormalType(m.returnType)) return makeNormMethod(m);
-		// all are normal; reuse the same method
-		var rm = RaMethod.new(m.container, m, null);
+		if (m.returnType != Void.TYPE && !isNormalType(m.returnType)) return makeNormMethod(rc, m);
+		// all are normal; XXX: reuse the same IrMethod
+		var rm = rc.makeMethod(m, null);
 		rm.norm = IrMethod.new(m.container, null, m.paramTypes, m.returnType);
 		rm.norm.source = m.source;
 		rm.raFacts = RF_NORMALIZED;
 		return m.raMethod = rm;
 	}
-	private def makeNormMethod(m: IrMethod) -> RaMethod {
-		var rm = RaMethod.new(m.container, m, null);
+	private def makeNormMethod(rc: RaClass, m: IrMethod) -> RaMethod {
+		var rm = rc.makeMethod(m, null);
 		rm.reqNorm();
-		makeSpecMethod(rm);
+		specializeMethod(rm);
 		return m.raMethod = rm;
 	}
-	def makeSpecMethod(rm: RaMethod) -> IrMethod {
-		if (rm.norm != null) return rm.norm;
+	def specializeMethod(rm: RaMethod) {
 		var m = rm.orig, seq = Sequence<Type>.new().grow(m.paramTypes.length);
 		// normalize the parameter types of method
 		for (p in m.paramTypes) {
@@ -402,7 +403,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		var typeParams = if(rm.spec != null, rm.spec.getTypes().methodTypeArgs);
 		rm.norm = IrMethod.new(m.container, typeParams, seq.extract(), norm(mono(m.returnType, rm.spec)));
 		rm.norm.source = m.source;
-		return rm.norm;
 	}
 	def makeClass(t: Type) -> RaClass {
 		return RaClass.!(makeType(t));
@@ -534,8 +534,8 @@ class RaTuple extends RaType {
 class RaClass extends RaType {
 	def orig: IrClass;			// original, polymorphic IrClass
 	def superClass: RaClass;		// super class, if any
-	def fields = Array<RaField>.new(orig.fields.length); // index of fields
-	var methods: List<RaMethod>;		// list of methods
+	def fields = Array<RaField>.new(orig.fields.length);          // index of fields
+	var methods = Array<List<RaMethod>>.new(orig.methods.length); // index of methods
 	var instances: List<Record>;		// list of live records
 	var children: List<RaClass>;		// list of all child classes
 	var subtypes: List<RaClass>;		// list of live subtypes
@@ -554,10 +554,6 @@ class RaClass extends RaType {
 	def makeField(f: IrField, fieldType: RaType, size: int) -> RaField {
 		return addField(RaField.new(oldType, f, fieldType, size));
 	}
-	def applyMethods(f: RaMethod -> void) {
-		for (m in orig.methods) if (m != null && m.raMethod != null) f(m.raMethod);
-		for (l = methods; l != null; l = l.tail) f(l.head);
-	}
 	private def addField(rf: RaField) -> RaField {
 		fields(rf.orig.index) = rf;
 		for (l = children; l != null; l = l.tail) l.head.addField(rf);
@@ -565,6 +561,27 @@ class RaClass extends RaType {
 	}
 	def fieldStart() -> int {
 		return if(superClass != null, superClass.fields.length);
+	}
+	def makeMethod(m: IrMethod, spec: IrSpec) -> RaMethod {
+		if (m.index >= methods.length) methods = Arrays.grow(methods, m.index + 1);
+		var rm = RaMethod.new(oldType, m, spec);
+		methods(m.index) = List.new(rm, methods(m.index));
+		return rm;
+	}
+	def findMethod(index: int, typeArgs: Array<Type>) -> RaMethod {
+		if (index >= methods.length) return null;
+		for (l = methods(index); l != null; l = l.tail) {
+			if (compareTypeArgs(l.head, typeArgs)) return l.head;
+		}
+		return null;
+	}
+	def compareTypeArgs(rm: RaMethod, typeArgs: Array<Type>) -> bool {
+		if (rm.spec == null) return typeArgs.length == 1;
+		var mtypeArgs = rm.spec.typeArgs;
+		for (i = 1; i < typeArgs.length; i++) {
+			if (mtypeArgs(i) != typeArgs(i)) return false;
+		}
+		return true;
 	}
 }
 // Information about an array, including its live instances
@@ -837,13 +854,9 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		var vtable = Sequence<IrMethod>.new();
 		if (rc.superClass != null) vtable.addN(rc.superClass.normMethods); // add superclass methods
 		else vtable.add(null); // reserve a space for constructor
-		// process monomorphic methods
-		for (m in rc.orig.methods) {
-			if (m != null && m.raMethod != null) addMethod(vtable, rc, m.raMethod);
-		}
-		// process polymorphic methods
-		for (l = rc.methods; l != null; l = l.tail) {
-			addMethod(vtable, rc, l.head);
+		// process all methods
+		for (ml in rc.methods) {
+			for (l = ml; l != null; l = l.tail) addMethod(vtable, rc, l.head);
 		}
 		rc.normMethods = vtable.extract();
 	}
@@ -857,19 +870,9 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		}
 		for (sc = rc.superClass; sc != null; sc = sc.superClass) {
 			// find super method, if any
-			var sms = sc.orig.methods;
-			if (m.index < sms.length) {
-				var s = sms(m.index), spec = rm.spec;
-				if (spec == null) {
-					sm = s.raMethod;
-				} else {
-					var superType = sc.newType, typeArgs = Arrays.dup(spec.typeArgs);
-					typeArgs(0) = superType;
-					var sspec = IrSpec.new(superType, typeArgs, s);
-					sm = ra.specMap.get(sspec);
-				}
-				if (sm != null) break;
-			}
+			if (m.index >= sc.methods.length) break;
+			sm = sc.findMethod(m.index, if(rm.spec == null, MONO_TYPEARGS, rm.spec.typeArgs));
+			if (sm != null) break;
 		}
 		if (sm == null) { // add a new method to the vtable
 			rm.normIndex = vtable.length;
