@@ -65,6 +65,6 @@ function do_native_test() {
 }
 
 do_native_test x86-darwin x86-darwin-test ""
-#do_native_test x86-darwin x86-darwin-test "-ra"
+do_native_test x86-darwin x86-darwin-test "-ra"
 do_native_test x86-linux x86-linux-test ""
 #do_native_test x86-linux x86-linux-test "-ra"
