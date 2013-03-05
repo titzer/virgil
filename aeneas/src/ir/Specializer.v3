@@ -8,274 +8,251 @@ def EQUAL = '\xFD';
 
 // Analyzes polymorphic methods and specializes them according to the polymorphic
 // operations they perform.
-class Specializer {
+class Specializer(ra: ReachabilityAnalyzer) {
 	var uid = 1;
-	var ra: ReachabilityAnalyzer;
-	var setTypeCon: TypeCon;
 	var env: IrSpec;
-	var keyset: KeyArrayMultiSet<byte, RaMethod>;
-	var calls = Sequence<IrSpec>.new();
-	def queue = Sequence<RaPolyMethod>.new();
+	var specMap = IrUtil.newIrSpecMap<SpecMethod>();
+	var virtMap = IrUtil.newIrSpecMap<SpecMethod>();
+	var specSet = IrUtil.newIrMethodMap<SpecSet>();
+	def queue = Sequence<SpecSet>.new();
 
-	def setRa(ra: ReachabilityAnalyzer) {
-		this.ra = ra;
-		this.setTypeCon = TypeSet_TypeCon.new(ra.compiler.prog.typeCache);
+	def specialize() {
+		ra.liveMethods.apply(createInitialSpec);
+		// TODO: create virtual dispatch nodes
+
+		// compute initial specialization sets based on operators
+		specSet.apply(initialSplitBasedOnOperators);
+		// repeatedly process calls between specialization sets
+		Sequences.drain(queue, 0, splitBasedOnCalls);
+
+		// create the normalized/specialized versions of the method
+		ra.liveMethods.apply(createNewIrMethod);
 	}
-	def register(raMethod: RaMethod) {
-		// TODO:
-	}
-	def splitBasedOnOperators(poly: RaPolyMethod) -> KeyArrayMultiSet<byte, RaMethod> {
-		var root = KeyArrayMultiSet<byte, RaMethod>.new();
-		var first = true;
-		for (l = poly.instantiations; l != null; l = l.tail) {
-			// visit each instantiation
-			this.env = l.head.spec;
-			keyset = root;
-			keyset.start();
-			// add calling convention of specialized method
-			addCallConv(poly.method.paramTypes, poly.method.returnType);
-			for (op = poly.polyOps; op != null; op = op.tail) {
-				// visit each polymorphic operator
-				polySignature(op.head, first);
-			}
-			keyset.finish(l.head);
-			first = false;
+	def createInitialSpec(rm: RaMethod) {
+		if (rm.spec == null) return;
+		var specMethod = SpecMethod.new(uid++, rm);
+		specMap.set(rm.spec, specMethod);
+		// create initial SpecSet and add method
+		var set = specSet.get(rm.orig);
+		if (set == null) {
+			set = SpecSet.new(uid++, rm.orig);
+			specSet.set(rm.orig, set);
 		}
-		poly.setCalls(calls.extract());
-		return root;
+		set.add(specMethod);
 	}
-	def polySignature(apply: SsaApplyOp, first: bool) {
+	def createNewIrMethod(rm: RaMethod) {
+		if (rm.spec == null) return;
+		var specMethod = specMap.get(rm.spec);
+		if (specMethod.set == null) return;
+		if (specMethod.set.newMethod != null) return;
+		specMethod.set.getNewIrSpec(ra, ra.setTypeCon);
+	}
+	def addMethod(rn: ReachabilityNormalizer, vtable: Sequence<IrMethod>, rc: RaClass, rm: RaMethod) {
+		var specMethod = specMap.get(rm.spec);
+		if (specMethod != null && specMethod.set != null) rm.norm = specMethod.set.newMethod;
+		rn.addSpecMethod(vtable, rc, rm);
+	}
+	def normCode(rn: ReachabilityNormalizer, context: SsaContext, rm: RaMethod) {
+		var spec = specMap.get(rm.spec);
+		if (spec.set != null) {
+			if (spec.set.newMethod.ssa != null) return; // already done
+			// normalize the code for the entire method set
+			context.spec = spec.set.newIrSpec;
+			var returnTn = ra.makeType(context.spec.getReturnType());
+			var n = SsaRaNormalizer.new(context, rn, returnTn);
+			n.specSet = spec.set;
+			n.build(spec.set.newMethod);
+			rn.newIr.methods.add(spec.set.newMethod);
+		} else {
+			// normalize a fully specialized method
+			return rn.normSpecCode(context, rm);
+		}
+	}
+	def polySignature(apply: SsaApplyOp, sig: SpecSignature) {
 		// add any polymorphic keys to the current key array
 //		Terminal.put1("op %1: ", V3Op.renderInto(exp, _));
-		var exp: Operator, t0: RaType;
+		var exp = apply.op, t0: RaType;
 		if (exp.typeArgs.length > 0) t0 = normType(exp.typeArgs(0));
 		match (exp.opcode) {
 			V3Opcode.Equal,
 			V3Opcode.NotEqual: {
-				addParam(t0.newType);
-				add(EQUAL);
+				sig.addParam(t0.newType);
+				sig.add(EQUAL);
 			}
 			V3Opcode.TypeCast,
 			V3Opcode.TypeQuery,
 			V3Opcode.TypeSubsume: {
-				addType(t0);
-				addType(normType(exp.typeArgs(1)));
+				sig.addType(t0);
+				sig.addType(normType(exp.typeArgs(1)));
 			}
 			V3Opcode.ArrayAlloc,
 			V3Opcode.ArrayInit,
 			V3Opcode.ArrayGetElem,
 			V3Opcode.ArraySetElem: {
-				addMemory(V3Array.elementType(t0.newType));
+				sig.addMemory(normType(V3Array.elementType(exp.typeArgs(0))).newType);
 			}
 			V3Opcode.NullCheck,
 			V3Opcode.BoundsCheck,
 			V3Opcode.ArrayGetLength: {
-				addInt(t0.size);
+				sig.addInt(t0.size);
 			}
 			V3Opcode.ClassAlloc: {
 				// XXX: could be improved if the class representation is known
-				addType(t0);
-				if (first) {
+				sig.addType(t0);
+				if (sig.first) {
 					var spec = V3Op.extractIrSpec(exp);
-					if (spec.member != null) calls.add(spec);
+					if (spec.member != null) sig.addDirectCall(spec);
 				}
 			}
 			V3Opcode.ClassGetField,
 			V3Opcode.ClassInitField,
 			V3Opcode.ClassSetField: {
 				var rf = ra.makeField(apply, env);
-				var offset = 0;
-				if (rf.norm.length != 0) offset = rf.norm(0).asField().machOffset;
-				addInt(offset);
-				addMemory(rf.fieldType.newType);
+				var offset = if(rf.norm != null && rf.norm.length > 0, rf.norm(0).asField().machOffset, -1);
+				sig.addInt(offset);
+				sig.addMemory(rf.fieldType.newType);
 			}
 			V3Opcode.ClassGetVirtual: {
-				if (first) addVirtual(apply);
+				if (sig.first) sig.addVirtualCall(V3Op.extractIrSpec(exp));
 			}
 			V3Opcode.ClassGetMethod,
 			V3Opcode.ComponentGetMethod: {
-				if (first) calls.add(V3Op.extractIrSpec(exp));
+				if (sig.first) sig.addDirectCall(V3Op.extractIrSpec(exp));
 			}
 			V3Opcode.TupleCreate: {
-				addInt(t0.size);
+				sig.addInt(t0.size);
 			}
 			V3Opcode.TupleGetElem: {
 				var tn = RaTuple.!(t0);
 				var index = exp.attr<int>();
-				addInt(tn.offsets(index)); // add offset
-				addInt(tn.nested(index).size); // add length
+				sig.addInt(tn.offsets(index)); // add offset
+				sig.addInt(tn.nested(index).size); // add length
 			}
 			V3Opcode.CallClassVirtual: {
-				if (first) addVirtual(apply);
-				addCallConv(exp.paramTypes, exp.resultType);
+				if (sig.first) sig.addVirtualCall(V3Op.extractIrSpec(exp));
+				addCallConv(sig, exp.paramTypes, exp.resultType);
 			}
 			V3Opcode.CallClassMethod,
 			V3Opcode.CallComponentMethod: {
-				if (first) calls.add(V3Op.extractIrSpec(exp));
-				addCallConv(exp.paramTypes, exp.resultType);
+				if (sig.first) sig.addDirectCall(V3Op.extractIrSpec(exp));
+				addCallConv(sig, exp.paramTypes, exp.resultType);
 			}
 			V3Opcode.CallDelegate: {
 				var paramTypes = Arrays.range(exp.paramTypes, 1, exp.paramTypes.length);
-				addCallConv(paramTypes, exp.resultType);
+				addCallConv(sig, paramTypes, exp.resultType);
 			}
 			V3Opcode.SystemOp: {
-				addType(t0); // full specialization
+				sig.addType(t0); // full specialization
 			}
 		}
 //		Terminal.ln();
 	}
-	def addMemory(t: Type) {
-		match (t.typeCon.kind) {
-			V3Kind.BOOL: add('\x01');
-			V3Kind.BYTE: add('\x01');
-			V3Kind.INT: add('\x04');
-			V3Kind.ARRAY: add('\x05');
-			V3Kind.CLASS: add('\x05');
-			V3Kind.DELEGATE: add('\x08');
-			V3Kind.FUNCREF: add('\x04'); // TODO: == int?
-			V3Kind.COMPONENT,
-			V3Kind.VOID: add('\x00');
-			V3Kind.TUPLE: {
-				add(TUPLE_MARK);
-				Lists.apply(Tuple.toTypeList(t), addMemory);
-				add(TUPLE_MARK);
-			}
+	def addCallConv(sig: SpecSignature, paramTypes: Array<Type>, retType: Type) {
+		// TODO: should use actual calling convention from backend
+		for (p in paramTypes) {
+			if (p.open()) sig.addParam(normType(p).newType);
 		}
-	}
-	def addParam(t: Type) {
-		match (t.typeCon.kind) {
-			V3Kind.BOOL: add('\x04');
-			V3Kind.BYTE: add('\x04');
-			V3Kind.INT: add('\x04');
-			V3Kind.ARRAY: add('\x05');
-			V3Kind.CLASS: add('\x05');
-			V3Kind.DELEGATE: add('\x08');
-			V3Kind.FUNCREF: add('\x04');
-			V3Kind.TUPLE: {
-				add(TUPLE_MARK);
-				Lists.apply(Tuple.toTypeList(t), addParam);
-				add(TUPLE_MARK);
-			}
+		if (retType.open()) {
+			sig.add(RETURN);
+			sig.addParam(retType);
 		}
-	}
-	def addType(t: RaType) {
-		addInt(t.newType.hash);
-	}
-	def addInt(h: int) {
-		add(byte.!(h));
-		add(byte.!(h #>> 8));
-		add(byte.!(h #>> 16));
-		add(byte.!(h #>> 24));
 	}
 	def normType(t: Type) -> RaType {
 		return ra.makeType(env.instantiateType(t));
 	}
-	def addVirtual(apply: SsaApplyOp) {
-		// XXX: conservative, full specialization for virtual dispatch
-		var root = ra.makeMethod(apply.op.typeArgs, IrMethod.!(apply.op.attr<IrMember>()), env);
-		// TODO: add vtable as a dependency
-	}
-	def addCallConv(paramTypes: Array<Type>, retType: Type) {
-		// TODO: should use actual calling convention from backend
-		for (p in paramTypes) {
-			if (p.open()) addParam(normType(p).newType);
-		}
-		if (retType.open()) {
-			add(RETURN);
-			addParam(retType);
-		}
-	}
-	def add(b: byte) {
-		keyset = keyset.add(b);
-	}
-	def specializeAll() {
-		// compute initial specialization sets based on operators
-		ra.polyMap.apply(initialSplitBasedOnOperators);
-		// repeatedly process calls between specialization sets
-		Sequences.drain(queue, 0, splitBasedOnCalls);
-	}
-	def splitBasedOnCalls(poly: RaPolyMethod) {
+	def splitBasedOnCalls(poly: SpecSet) {
 		poly.queued = false;
 		if (poly.split) return;
-		var set = KeyArrayMultiSet<byte, RaMethod>.new();
+		var sig = SpecSignature.new();
 		for (lm = poly.instantiations; lm != null; lm = lm.tail) {
-			processCalls(set, poly, lm.head);
+			processCalls(sig, poly, lm.head);
 		}
 		poly.clean();
-		if (set.splits != null) {
-			set.apply(splitRaPolyMethod(poly, false, _));
+		if (sig.root.splits != null) {
+			sig.root.apply(splitSpecSet(poly, false, _));
 		}
 	}
-	def initialSplitBasedOnOperators(m: IrMethod, polyOps: List<SsaApplyOp>) {
-		var all: RaPolyMethod; // TODO
-		var list = all.instantiations;
+	def initialSplitBasedOnOperators(m: IrMethod, poly: SpecSet) {
+		var list = poly.instantiations;
 		if (list.tail == null) return; // only a single instantiation
-		var set = splitBasedOnOperators(all);
-		if (set.splits != null) {
-			// this set needs to be split into subsets
-			set.apply(splitRaPolyMethod(all, true, _));
-		} else {
-			// this set doesn't need to be split
-			all.attachToRaMethods();
-			queueMethod(all);
-			all.dirtyAll();
+
+		// add all the polymorphic properties to the splitter
+		var sig = SpecSignature.new();
+		for (l = poly.instantiations; l != null; l = l.tail) {
+			// visit each instantiation
+			this.env = l.head.raMethod.spec;
+			// add calling convention of specialized method
+			addCallConv(sig, poly.method.paramTypes, poly.method.returnType);
+			var polyOps = ra.polyMap.get(env.asMethod());
+			for (op = polyOps; op != null; op = op.tail) {
+				// visit each polymorphic operator
+				if (op.head != null) polySignature(op.head, sig);
+			}
+			sig.finish(l.head);
 		}
-		initialRaMethodCalls(all.calls, list);
+		poly.setDirty(sig.directCalls.length);
+		if (sig.root.splits != null) {
+			// not all polymorphic signatures match; split into subsets
+			sig.root.apply(splitSpecSet(poly, true, _));
+		} else {
+			// all polymorphic signatures match; don't need to split
+			poly.attachToSpecMethods();
+			queueMethod(poly);
+			poly.dirtyAll();
+		}
+		initialSpecMethodCalls(sig.directCalls, list);
 	}
-	// set up initial call edges between RaMethods involved in RaPolyMethods
-	def initialRaMethodCalls(calls: Array<IrSpec>, list: List<RaMethod>) {
+	// set up initial call edges between SpecMethods involved in SpecSets
+	def initialSpecMethodCalls(calls: Sequence<IrSpec>, list: List<SpecMethod>) {
 		if (calls.length == 0) return;
 		for (l = list; l != null; l = l.tail) {
 			var meth = l.head;
-			if (meth.polyMethod == null) continue;
-			meth.calls = Array<RaMethodUseEdge>.new(calls.length);
+			if (meth.set == null) continue;
+			meth.calls = Array<SpecEdge>.new(calls.length);
 			for (i = 0; i < meth.calls.length; i++) {
-				var d = meth.spec.instantiateIrSpec(calls(i));
-				var dest = ra.makeMethod(d.typeArgs, d.asMethod(), null);
-				meth.calls(i) = RaMethodUseEdge.new(i, meth, dest);
+				var dest = makeMethod(meth.raMethod.spec.instantiateIrSpec(calls.get(i)));
+				meth.calls(i) = SpecEdge.new(i, meth, dest);
 //				Terminal.put2("edge %1 -> %2\n", meth.orig.render, dest.orig.render);
 			}
 		}
 	}
-	// split a RaPolyMethod into a new subset that only includes the given list
-	def splitRaPolyMethod(orig: RaPolyMethod, dirty: bool, list: List<RaMethod>) {
+	// split a SpecSet into a new subset that only includes the given list
+	def splitSpecSet(orig: SpecSet, dirty: bool, list: List<SpecMethod>) {
 		orig.split = true;
 		Lists.apply(list, dirtyIncomingEdges);
 		if (list.tail == null) {
-			list.head.polyMethod = null; // only a single instantiation
+			list.head.set = null; // only a single instantiation
 			return;
 		}
-		var poly = RaPolyMethod.new(uid++, orig.container, orig.method);
+		var poly = SpecSet.new(uid++, orig.method);
 		poly.instantiations = list;
-		poly.setCalls(orig.calls);
-		poly.attachToRaMethods();
+		poly.setDirty(orig.dirty.length);
+		poly.attachToSpecMethods();
 		if (dirty) {
 			queueMethod(poly);
 			poly.dirtyAll();
 		}
 	}
-	def dirtyIncomingEdges(dst: RaMethod) {
-		for (edge = dst.useList; edge != null; edge = RaMethodUseEdge.!(edge.next)) {
-			var src = edge.src.polyMethod;
+	def dirtyIncomingEdges(dst: SpecMethod) {
+		for (edge = dst.useList; edge != null; edge = SpecEdge.!(edge.next)) {
+			var src = edge.src.set;
 			if (src != null) {
 				src.dirty(edge.index) = true;
 				queueMethod(src);
 			}
 		}
 	}
-	def processCalls(set: KeyArrayMultiSet<byte, RaMethod>, poly: RaPolyMethod, src: RaMethod) {
-		set.start();
-		for (i = 0; i < poly.calls.length; i++) {
+	def processCalls(sig: SpecSignature, poly: SpecSet, src: SpecMethod) {
+		var calls = src.calls;
+		for (i = 0; i < calls.length; i++) {
 			if (!poly.dirty(i)) continue;
-			var meth = src.calls(i).dest;
-			// TODO: uid of method
-			var uid = if(meth.polyMethod == null, 0, meth.polyMethod.uid);
-			set = set.add(byte.!(uid)).add(byte.!(uid #>> 8)).add(byte.!(uid #>> 16)).add(byte.!(uid #>> 24));
+			var meth = calls(i).dest;
+			sig.addInt(if(meth.set == null, meth.uid, meth.set.uid));
 		}
-		set.finish(src);
+		sig.finish(src);
 	}
-	def queueMethod(poly: RaPolyMethod) {
-		if (!poly.queued && poly.calls.length > 0) {
+	def queueMethod(poly: SpecSet) {
+		if (!poly.queued && poly.dirty.length > 0) {
 			poly.queued = true;
 			queue.add(poly);
 		}
@@ -285,33 +262,41 @@ class Specializer {
 		for (l = nested; l != null; l = l.tail) {
 			set.add(l.head);
 		}
-		return set.getType(setTypeCon);
+		return set.getType(ra.setTypeCon);
+	}
+	def makeMethod(spec: IrSpec) -> SpecMethod {
+		var specMethod = specMap.get(spec);
+		if (specMethod == null) {
+			var raMethod = ra.makeMethod(spec.typeArgs, spec.asMethod(), null);
+			specMethod = SpecMethod.new(uid++, raMethod);
+			specMap.set(spec, specMethod);
+		}
+		return specMethod;
 	}
 }
-// A set of polymorphic instantiations of a method. Contains the polymorphic operators
-// in a method and also serves as a node in a call graph between polymorphic methods.
-class RaPolyMethod(uid: int, container: Type, method: IrMethod) {
-	var polyOps: List<SsaApplyOp>;		// polymorphic operators
-	var newMethod: IrMethod;		// new IrMethod
-	var polySetSpec: IrSpec;		// IrSpec with sets substituted in
-	var instantiations: List<RaMethod>;	// instantiations of the method
-	var calls: Array<IrSpec>;		// polymorphic direct calls
+// Represents a potentially specialized method, which may or may not be in a set.
+class SpecMethod(uid: int, raMethod: RaMethod) {
+	var calls: Array<SpecEdge>;
+	var set: SpecSet;
+	var useList: SpecEdge;
+}
+// A set of polymorphic instantiations of a method.
+class SpecSet(uid: int, method: IrMethod) {
+	var newMethod: IrMethod;	// new IrMethod
+	var newIrSpec: IrSpec;		// IrSpec with sets substituted in
+	var instantiations: List<SpecMethod>;	// instantiations of the method
 	var dirty: Array<bool>;			// which outgoing call edges are dirty
 	var queued: bool;			// currently on the queue
 	var split: bool;			// this set has been split
 
-	def add(meth: RaMethod) {
+	def add(meth: SpecMethod) {
 		instantiations = List.new(meth, instantiations);
 	}
-	def enum(spec: Specializer, f: List<RaMethod> -> void) {
-		spec.splitBasedOnOperators(this).apply(f);
+	def setDirty(length: int) {
+		dirty = Array<bool>.new(length);
 	}
-	def setCalls(a: Array<IrSpec>) {
-		calls = a;
-		dirty = Array<bool>.new(a.length);
-	}
-	def attachToRaMethods() {
-		for (l = instantiations; l != null; l = l.tail) l.head.polyMethod = this;
+	def attachToSpecMethods() {
+		for (l = instantiations; l != null; l = l.tail) l.head.set = this;
 	}
 	def dirtyAll() {
 		if (dirty == null) return;
@@ -321,12 +306,15 @@ class RaPolyMethod(uid: int, container: Type, method: IrMethod) {
 		if (dirty == null) return;
 		for (i = 0; i < dirty.length; i++) dirty(i) = false;
 	}
-	def getNewIrMethod(ra: ReachabilityAnalyzer, set: TypeCon) -> IrMethod {
-		if (newMethod != null) return newMethod;
+	def first() -> IrSpec {
+		return instantiations.head.raMethod.spec;
+	}
+	def getNewIrSpec(ra: ReachabilityAnalyzer, set: TypeCon) -> IrSpec {
+		if (newIrSpec != null) return newIrSpec;
 		// gather two lists of type args from the instantiations
 		var l1: List<TypeArgs>, l2: List<TypeArgs>;
 		for (l = instantiations; l != null; l = l.tail) {
-			var tt = l.head.spec.getTypes().typeArgsList;
+			var tt = l.head.raMethod.spec.getTypes().typeArgsList;
 			l1 = List.new(tt.head, l1);
 			if (tt.tail != null) l2 = List.new(tt.tail.head, l2);
 		}
@@ -346,18 +334,18 @@ class RaPolyMethod(uid: int, container: Type, method: IrMethod) {
 		}
 		// instantiate IrSpecTypes
 		var types = IrSpecTypes.new(typeArgsList, methodTypeArgs);
-		var container = types.instantiateType(this.container);
+		var container = types.instantiateType(this.method.container);
 		// instantiate IrSpec
-		polySetSpec = IrSpec.new(typeArgs(0) = container, typeArgs, method);
-		polySetSpec.types = types; // no need to rebuild IrSpecTypes next time
+		newIrSpec = IrSpec.new(typeArgs(0) = container, typeArgs, method);
+		newIrSpec.types = types; // no need to rebuild IrSpecTypes next time
 
 		newMethod = IrMethod.new(container, methodTypeArgs,
-			normalizeParamTypes(ra, polySetSpec), ra.makeType(polySetSpec.getReturnType()).newType);
+			normalizeParamTypes(ra, newIrSpec), ra.makeType(newIrSpec.getReturnType()).newType);
 		newMethod.source = method.source;
 		for (l = instantiations; l != null; l = l.tail) {
-			l.head.norm = newMethod;
+			l.head.raMethod.norm = newMethod;
 		}
-		return newMethod;
+		return newIrSpec;
 	}
 	def normalizeParamTypes(ra: ReachabilityAnalyzer, memberRef: IrSpec) -> Array<Type> {
 		var pt = memberRef.getParamTypes();
@@ -380,21 +368,88 @@ class RaPolyMethod(uid: int, container: Type, method: IrMethod) {
 		return TypeArgs.new(list.head.typeEnv, types);
 	}
 }
-// A customized datastructure that divides a set of arrays of keys into sets of 
-// equivalent arrays of keys. This can be used to organize specializations of 
-// polymorphic classes or methods into sets of equivalent specializations based 
-// on a polymorphic "signature" which is represented by an array of integers.
-class KeyArrayMultiSet<K, T> {
-	var list: List<T>;
-	var keys = Sequence<K>.new();
-	var splits: Sequence<List<KeyArrayMultiSet<K, T>>>;
+// A customized datastructure that divides a set of SpecMethod's based on
+// equivalent "signatures", which are sequences of bytes representing the
+// polymorphism of the operations.
+class SpecSignature {
+	def root = SpecSigNode.new();
+	def directCalls = Sequence<IrSpec>.new();
+	def virtualCalls = Sequence<IrSpec>.new();
+	var cur = root;
+	var first = false;
+
+	def addDirectCall(spec: IrSpec) {
+		directCalls.add(spec);
+	}
+	def addVirtualCall(spec: IrSpec) {
+		virtualCalls.add(spec);
+	}
+	def add(key: byte) {
+		cur = cur.add(key);
+	}
+	// add a type to the signature
+	def addType(t: RaType) {
+		addInt(t.newType.hash);
+	}
+	// add an integer to the signature
+	def addInt(h: int) {
+		add(byte.!(h));
+		add(byte.!(h #>> 8));
+		add(byte.!(h #>> 16));
+		add(byte.!(h #>> 24));
+	}
+	// add a memory reference to the signature
+	def addMemory(t: Type) {
+		match (t.typeCon.kind) {
+			V3Kind.BOOL: add('\x01');
+			V3Kind.BYTE: add('\x01');
+			V3Kind.INT: add('\x04');
+			V3Kind.ARRAY: add('\x05');
+			V3Kind.CLASS: add('\x05');
+			V3Kind.DELEGATE: add('\x08');
+			V3Kind.FUNCREF: add('\x04'); // TODO: == int?
+			V3Kind.COMPONENT,
+			V3Kind.VOID: add('\x00');
+			V3Kind.TUPLE: {
+				add(TUPLE_MARK);
+				Lists.apply(Tuple.toTypeList(t), addMemory);
+				add(TUPLE_MARK);
+			}
+		}
+	}
+	// add a parameter type to the signature
+	def addParam(t: Type) {
+		match (t.typeCon.kind) {
+			V3Kind.BOOL: add('\x04');
+			V3Kind.BYTE: add('\x04');
+			V3Kind.INT: add('\x04');
+			V3Kind.ARRAY: add('\x05');
+			V3Kind.CLASS: add('\x05');
+			V3Kind.DELEGATE: add('\x08');
+			V3Kind.FUNCREF: add('\x04');
+			V3Kind.TUPLE: {
+				add(TUPLE_MARK);
+				Lists.apply(Tuple.toTypeList(t), addParam);
+				add(TUPLE_MARK);
+			}
+		}
+	}
+	// finish the current array and associate it with the given item
+	def finish(item: SpecMethod) {
+		cur.finish(item);
+		first = false;
+		cur = root;
+		cur.cursor = 0;
+	}
+}
+class SpecSigNode {
+	var list: List<SpecMethod>;
+	var keys = Sequence<byte>.new();
+	var splits: Sequence<List<SpecSigNode>>;
 	var cursor: int;
 	// start the current key
-	def start() {
-		cursor = 0;
-	}
 	// add one key to the current array
-	def add(key: K) -> KeyArrayMultiSet<K, T> {
+	def add(key: byte) -> SpecSigNode {
 		if (list == null) {
 			// no elements in the set yet, just add the key
 			keys.add(key);
@@ -408,7 +463,7 @@ class KeyArrayMultiSet<K, T> {
 		// matches the current key, everything is fine
 		return this;
 	}
-	def split(key: K) -> KeyArrayMultiSet<K, T> {
+	def split(key: byte) -> SpecSigNode {
 		if (splits == null) {
 			// no splits yet
 			splits = Sequence.new();
@@ -426,7 +481,7 @@ class KeyArrayMultiSet<K, T> {
 			}
 		}
 		// no existing split found, create a new one
-		var set = KeyArrayMultiSet<K, T>.new(), nkeys = Sequence<K>.new();
+		var set = SpecSigNode.new(), nkeys = Sequence<byte>.new();
 		set.keys = nkeys.grow(keys.length);
 		for (i = 0; i < cursor; i++) {
 			nkeys.add(keys.get(i));
@@ -438,12 +493,12 @@ class KeyArrayMultiSet<K, T> {
 		return set;
 	}
 	// finish the current array and associate it with the given item
-	def finish(item: T) {
+	def finish(item: SpecMethod) {
 		// TODO: check against the length
 		list = List.new(item, list);
 	}
 	// visit all the collected sets of items
-	def apply(f: List<T> -> void) {
+	def apply(f: List<SpecMethod> -> void) {
 		if (list != null) f(list);
 		if (splits != null) {
 			for (i = 0; i < splits.length; i++) {
@@ -521,9 +576,9 @@ class TypeSet_TypeCon extends TypeCon {
 	}
 }
 // An edge representing a direct use (e.g. a Call*Method or Get*Method) between methods.
-class RaMethodUseEdge extends Edge<RaMethod> {
+class SpecEdge extends Edge<SpecMethod> {
 	def index: int;
-	new(index, src: RaMethod, dst: RaMethod) : super(src, dst) { }
-	def getListHead(dest: RaMethod) -> RaMethodUseEdge { return dest.useList; }
-	def setListHead(dest: RaMethod, e: Edge<RaMethod>) { dest.useList = RaMethodUseEdge.!(e); }
+	new(index, src: SpecMethod, dst: SpecMethod) : super(src, dst) { }
+	def getListHead(dest: SpecMethod) -> SpecEdge { return dest.useList; }
+	def setListHead(dest: SpecMethod, e: Edge<SpecMethod>) { dest.useList = SpecEdge.!(e); }
 }

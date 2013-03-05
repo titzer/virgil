@@ -2,7 +2,6 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Constants representing flags for reachability analysis
-def RA_REQ_NORM   = 0x001;
 def RM_LIVE       = 0x002;
 def RM_VIRTUAL    = 0x004;
 def RF_NORMALIZED = 0x008;
@@ -14,6 +13,7 @@ def RF_VAL_MANY   = 0x100;
 def RF_VALS       = RF_VAL_ONE | RF_VAL_MANY;
 def RC_ALLOC      = 0x200;
 def RC_LIVE       = 0x400;
+def RC_DUMPED	  = 0x800;
 
 // global reachability information for primitive types, accessed frequently
 def RA_VOID = RaType.new(Void.TYPE, Void.TYPE, TypeUtil.NO_TYPES);
@@ -32,9 +32,10 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	def records = V3.newRecordMap<Record>();
 	def polyMap = IrUtil.newIrMethodMap<List<SsaApplyOp>>();
 	def queue = WorkQueue.new();
-	var liveMethods: List<RaMethod>;
+	def heapTypes = Sequence<RaType>.new();
+	var liveMethods = Sequence<RaMethod>.new();
 	var roots: List<RaRoot>;
-	var current: RaMethod;
+	def setTypeCon = TypeSet_TypeCon.new(prog.typeCache);
 
 	// perform the analysis, starting from the roots
 	def analyze() {
@@ -44,15 +45,14 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		ReachabilityNormalizer.new(this).normalize();
 	}
 	def dump() {
-		for (l = liveMethods; l != null; l = l.tail) {
-			dumpMethod(l.head.spec, l.head);
-		}
-		typeMap.apply(dumpType);
+		liveMethods.apply(dumpMethod);
+		heapTypes.apply(dumpType);
 		records.apply(dumpRecord);
 	}
-	def dumpMethod(spec: IrSpec, rm: RaMethod) {
-		if (rm == null) return;
-		Terminal.put1("%1", if (rm.spec != null, rm.spec.render, rm.orig.renderLong));
+	def dumpMethod(rm: RaMethod) {
+		if (rm == null || (rm.raFacts & RC_DUMPED) != 0) return;
+		rm.setFact(RC_DUMPED);
+		Terminal.put1("method %1", if (rm.spec != null, rm.spec.render, rm.orig.renderLong));
 		dumpFacts(rm.raFacts, null);
 	}
 	def dumpField(container: Type, rf: RaField) {
@@ -60,18 +60,20 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		Terminal.put2("%1.%2", container.render, rf.orig.render);
 		dumpFacts(rf.raFacts, rf.val);
 	}
-	def dumpType(t: Type, rt: RaType) {
-		if (V3.isClass(t)) {
-			Terminal.put1("%1", t.render);
+	def dumpType(rt: RaType) {
+		if ((rt.raFacts & (RC_LIVE | RC_ALLOC)) != 0) {
+			Terminal.put1("%1", rt.oldType.render);
 			dumpFacts(rt.raFacts, null);
 		}
 		if (RaClass.?(rt)) {
 			var rc = RaClass.!(rt);
-			for (m in rc.orig.methods) {
-				if (m != null && !rc.orig.inherits(m)) dumpMethod(null, m.raMethod);
+			for (list in rc.methods) {
+				for (l = list; l != null; l = l.tail) {
+					dumpMethod(l.head);
+				}
 			}
 			for (i = rc.fieldStart(); i < rc.fields.length; i++) {
-				dumpField(t, rc.fields(i));
+				dumpField(rt.oldType, rc.fields(i));
 			}
 		}
 	}
@@ -86,7 +88,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		if ((facts & RM_VIRTUAL) != 0) Terminal.put(" v");
 		if ((facts & RC_LIVE) != 0) Terminal.put(" l");
 		if ((facts & RC_ALLOC) != 0) Terminal.put(" a");
-		if ((facts & RA_REQ_NORM) != 0) Terminal.put(" n");
 		if ((facts & RF_VALS) == RF_VAL_ONE) {
 			Terminal.put(" k");
 			Terminal.put1(" = %1", prog.render(val));
@@ -137,19 +138,19 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		if (records.get(record) == record) return;
 		records.set(record, record);
 		var raType = makeType(record.rtype);
+		var newlyLive = (raType.raFacts & (RC_LIVE | RC_ALLOC)) == 0;
+		raType.raFacts = raType.raFacts | RC_LIVE;
 		if (RaClass.?(raType)) {
 			// analyze a class object's fields and methods
-			var rc = RaClass.!(raType), oldFacts = rc.raFacts;
+			var rc = RaClass.!(raType);
 			rc.instances = List.new(record, rc.instances);
-			rc.raFacts = rc.raFacts | RC_LIVE;
-			if ((oldFacts & (RC_LIVE | RC_ALLOC)) == 0) analyzeLiveClass(rc);
+			if (newlyLive) analyzeLiveClass(rc);
 			// analyze class fields
 			for (rf in rc.fields) analyzeField(record, rf);
 		} else if (RaArray.?(raType)) {
 			// analyze an array's elements
 			var ra = RaArray.!(raType);
 			ra.instances = List.new(record, ra.instances);
-			ra.raFacts = ra.raFacts | RC_LIVE;
 			if (ra.primitive) return;
 			for (v in record.values) deferValue(v);
 		}
@@ -180,7 +181,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	}
 	// analyze a method's code
 	def analyzeMethod(rm: RaMethod) {
-		current = rm;
 		var region = rm.orig.ssa;
 		if (region == null) region = compiler.genSsa(rm.getSpec());
 		if (rm.spec != null) {
@@ -192,7 +192,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 			}
 			analyzePolyMethod(rm, polyOps);
 		} else {
-			region.applyVals(analyzeVal); // XXX: iterate over uses?w
+			region.applyVals(analyzeVal); // XXX: iterate over uses?
 			// analyze a monomorphic method
 			for (b in region.bfBlocks()) { // XXX: iterate over blocks directly
 				var instrs = b.instrs;
@@ -202,7 +202,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 				}
 			}
 		}
-		current = null;
 	}
 	// gather polymorphic operators
 	def gatherPolyOps(region: SsaRegion) -> List<SsaApplyOp> {
@@ -231,13 +230,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	// analyze an operator
 	def analyzeOp(op: SsaApplyOp, context: IrSpec) {
 		match (op.op.opcode) {
-//			V3Opcode.Equal,
-//			V3Opcode.NotEqual,
-//			V3Opcode.NullCheck,
-//			V3Opcode.BoundsCheck,
-//			V3Opcode.ArrayGetElem,
-//			V3Opcode.ArraySetElem,
-//			V3Opcode.ArrayGetLength: reqNormForType(mono(op.op.typeArgs(0), context));
 			V3Opcode.ArrayAlloc,
 			V3Opcode.ArrayInit: allocation(makeType(mono(op.op.typeArgs(0), context)));
 			V3Opcode.ClassAlloc: {
@@ -261,8 +253,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 			V3Opcode.ClassInitField: initField(op, makeField(op, context));
 			V3Opcode.ClassSetField,
 			V3Opcode.ComponentSetField: setField(op, makeField(op, context));
-//			V3Opcode.TupleCreate,
-//			V3Opcode.TupleGetElem: current.reqNorm();
 		}
 		// TODO: system operators, pointer operators, etc
 	}
@@ -275,7 +265,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		}
 	}
 	def allocation(raType: RaType) {
-		reqNormForRaType(raType);
 		var oldFacts = raType.raFacts;
 		raType.raFacts = raType.raFacts | RC_ALLOC;
 		if (RaClass.?(raType) && (oldFacts & (RC_LIVE | RC_ALLOC)) == 0) {
@@ -284,7 +273,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		}
 	}
 	def getVirtual(op: SsaApplyOp, rm: RaMethod) {
-		reqNormForMethod(rm, true);
 		if (rm.setFact(RM_VIRTUAL)) return;
 		var rc = makeClass(rm.container);
 		for (l = rc.subtypes; l != null; l = l.tail) {
@@ -292,18 +280,15 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		}
 	}
 	def getMethod(op: SsaApplyOp, rm: RaMethod) {
-		if (op != null) reqNormForMethod(rm, false);
 		if (rm.setFact(RM_LIVE)) return;
-		liveMethods = List.new(rm, liveMethods);
+		liveMethods.add(rm);
 		queue.add(analyzeMethod, rm);
 	}
 	def getField(op: SsaApplyOp, rf: RaField) {
-		reqNormForField(rf);
 		if (rf.setFact(RF_READ)) return;
 		queue.add(analyzeGetField, (makeClass(rf.container), rf));
 	}
 	def setField(op: SsaApplyOp, rf: RaField) {
-		reqNormForField(rf);
 		rf.raFacts = rf.raFacts | RF_WRITTEN;
 		var val = op.inputs(1).dest;
 		rf.writeFacts = rf.writeFacts & val.facts & Facts.V_FACTS;
@@ -311,7 +296,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		else rf.setFact(RF_VAL_MANY);
 	}
 	def initField(op: SsaApplyOp, rf: RaField) {
-		reqNormForField(rf);
 		rf.raFacts = rf.raFacts | RF_INIT;
 		var val = op.inputs(1).dest;
 		rf.initFacts = val.facts & Facts.V_FACTS;
@@ -363,7 +347,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 		if (rm == null) {
 			var spec = IrSpec.new(rc.oldType, typeArgs, m);
 			rm = rc.makeMethod(m, spec);
-			rm.reqNorm();
 			specializeMethod(rc, rm); // XXX: implies full specialization
 		}
 		return rm;
@@ -384,7 +367,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	}
 	private def makeNormMethod(rc: RaClass, m: IrMethod) -> RaMethod {
 		var rm = rc.makeMethod(m, null);
-		rm.reqNorm();
 		specializeMethod(rc, rm);
 		return m.raMethod = rm;
 	}
@@ -424,7 +406,7 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 			V3Kind.COMPONENT: {
 				var compDecl = V3.asComponent(t).componentDecl;
 				deferValue(prog.getComponentRecord(compDecl));
-				raType = RaClass.new(t, Void.TYPE, TypeUtil.NO_TYPES, oldIr.makeIrClass(t), null);
+				raType = newRaClass(t, Void.TYPE, oldIr.makeIrClass(t), null);
 			}
 			V3Kind.ARRAY: {
 				// normalize element type
@@ -437,13 +419,14 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 					var et = Arrays.map(enorm.sub, V3Array.newType);
 					raType = RaArray.new(t, Tuple.newType(Lists.fromArray(et)), et);
 				}
+				heapTypes.add(raType);
 			}
 			V3Kind.CLASS: {
 				var superType = V3.getSuperType(t);
 				var superClass = if(superType != null, makeClass(superType));
 				var ic = oldIr.makeIrClass(t);
 				if (ic == null) ic = IrClass.new(t, null, null, [], []);
-				raType = RaClass.new(t, t, null, ic, superClass);
+				raType = newRaClass(t, t, ic, superClass);
 			}
 			V3Kind.DELEGATE: {
 				// normalize parameter and return types independently
@@ -468,11 +451,39 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 				var ta = seqT.extract();
 				raType = RaTuple.new(t, Tuple.newType(Lists.fromArray(ta)), ta, seqN.extract(), seqO.extract());
 			}
+			V3Kind.SET: {
+				// normalize a set of types
+				var n = Lists.map(t.nested, makeType), size = n.head.size;
+				for (l = n; l != null; l = l.tail) {
+					if (n.head.size != size) { size = 1; break; }
+				}
+				if (size < 2) {
+					// normalize the set as a set
+					var newType = setTypeCon.create(Lists.map(n, RaType.newType));
+					raType = RaType.new(t, newType, if(size == 0, [], null));
+				} else {
+					// normalize a set of same-sized tuples
+					var lists = Array<List<Type>>.new(size);
+					for (l = n; l != null; l = l.tail) {
+						for (i = 0; i < size; i++) {
+							lists(i) = List.new(l.head.sub(i), lists(i));
+						}
+					}
+					var ta = Arrays.map(lists, setTypeCon.create);
+					raType = RaTuple.new(t, Tuple.newType(Lists.fromArray(ta)), ta, null, null);
+				}
+			}
 		} else {
 			raType = RaType.new(t, t, null);
 		}
 		typeMap.set(t, raType);
 		return raType;
+	}
+	def newRaClass(oldType: Type, newType: Type, ic: IrClass, superClass: RaClass) -> RaClass {
+		var sub = if(newType == Void.TYPE, TypeUtil.NO_TYPES);
+		var rc = RaClass.new(oldType, newType, sub, ic, superClass);
+		heapTypes.add(rc);
+		return rc;
 	}
 	def norm(t: Type) -> Type {
 		if (isNormalType(t)) return t;
@@ -480,23 +491,6 @@ class ReachabilityAnalyzer(compiler: Compiler) {
 	}
 	def mono(t: Type, spec: IrSpec) -> Type {
 		return if(spec != null, spec.instantiateType(t), t);
-	}
-	def reqNormForType(t: Type) {
-		if ((current.raFacts & RA_REQ_NORM) != 0) return;
-		if (!isNormalType(t)) current.reqNorm();
-	}
-	def reqNormForRaType(raType: RaType) {
-		if (raType.oldType != raType.newType) current.reqNorm();
-	}
-	def reqNormForField(rf: RaField) {
-		if ((current.raFacts & RA_REQ_NORM) != 0) return;
-		if ((rf.raFacts & RF_NORMALIZED) == 0) current.reqNorm();
-		else ; // XXX: add to a list of field references for the method
-	}
-	def reqNormForMethod(rm: RaMethod, virtual: bool) {
-		if ((current.raFacts & RA_REQ_NORM) != 0) return;
-		if ((rm.raFacts & RF_NORMALIZED) == 0) current.reqNorm();
-		else if (virtual) ; // XXX: add to a list of virtual invocations
 	}
 }
 // represents a root method, i.e. an entrypoint. Updated to point to normalized code after RMA.
@@ -514,9 +508,6 @@ class RaItem {
 			return false;
 		}
 		return true;
-	}
-	def reqNorm() {
-		raFacts = raFacts | RA_REQ_NORM;
 	}
 }
 
@@ -647,10 +638,7 @@ class RaField(container: Type, orig: IrField, fieldType: RaType, size: int) exte
 // across normalization, etc.
 class RaMethod(container: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
 	var norm: IrMethod;
-	var polyMethod: RaPolyMethod;
-	var calls: Array<RaMethodUseEdge>;
 	var normIndex: int;
-	var useList: RaMethodUseEdge;
 	private var cachedSpec: IrSpec;
 	def getSpec() -> IrSpec {
 		if (cachedSpec != null) return cachedSpec;
@@ -660,64 +648,39 @@ class RaMethod(container: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
 }
 // Normalizes a program based on the results of reachability analysis.
 class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
-	var liveClasses = Sequence<RaType>.new();
-	var allClasses = Sequence<RaClass>.new();
+	def liveClasses = Sequence<RaClass>.new();
+	def allClasses = Sequence<RaClass>.new();
+	def context = SsaContext.new(ra.compiler);
 	var recordMap = V3.newRecordMap<Record>();
 	var complexRecordMap = V3.newRecordMap<Array<Record>>();
 	var newIr = IrPortion.new(ra.prog);
+	var specializer: Specializer;
 
 	def normalize() {
-		ra.typeMap.apply(visitType);
+		// layout fields into classes
+		ra.heapTypes.apply(visitHeapType);
+		if (Aeneas.RA_PARTIAL.get()) {
+			// if partial specialization is enabled, do specialization analysis
+			(specializer = Specializer.new(ra)).specialize();
+		}
 		allClasses.apply(layoutMethods);
 		allClasses.apply(createIrClass);
 		ra.prog.ir = newIr;
 		// do remaining work; normalize record instances
 		ra.queue.drain();
-		// TODO: perform specialization analysis
+		// update roots
 		for (l = ra.roots; l != null; l = l.tail) {
 			l.head.spec = normalizeMethodRef(l.head.spec);
 		}
-		var context = SsaContext.new(ra.compiler);
-		for (l = ra.liveMethods; l != null; l = l.tail) {
-			normCode(context, l.head);
-			newIr.methods = List.new(l.head.norm, newIr.methods);
-		}
+		ra.liveMethods.apply(normCode);
 	}
-	// visit a type in the map, computing new field layouts of classes and arrays
-	def visitType(t: Type, raType: RaType) {
-		if (RaClass.?(raType)) {
-			var rc = RaClass.!(raType);
-			if (rc.minClassID >= 0) return; // already processed this type
-			while (rc.superClass != null) rc = rc.superClass; // start at root
-			visitClass(rc);
-		} else if (RaArray.?(raType)) {
-			var rt = RaArray.!(raType);
-			if (rt.instances == null) return; // no heap instances to normalize
-			if (rt.oldType != rt.newType) {
-				// map complex arrays to arrays of records
-				var ta = Tuple.toTypeArray(rt.newType);
-				for (l = rt.instances; l != null; l = l.tail) {
-					var newRecords = createComplexArrayRecord(l.head, ta, rt);
-					ra.queue.add(normComplexArrayRecord, (rt, l.head, newRecords));
-				}
-			} else if (!rt.primitive) {
-				// normalize simple arrays that are not primitive
-				for (l = rt.instances; l != null; l = l.tail) {
-					ra.queue.add(normSimpleArrayRecord, l.head);
-				}
-			}
-		}
+	// visit a live type, deferring normalization of records
+	def visitHeapType(raType: RaType) {
+		if (RaArray.?(raType)) return visitArrayType(RaArray.!(raType));
+		if (RaClass.?(raType)) return visitClassType(RaClass.!(raType));
 	}
-	// visit a class, giving it a number and deferring record normalization work
-	def visitClass(rc: RaClass) {
-		allClasses.add(rc);
-		rc.minClassID = liveClasses.length;
-		if ((rc.raFacts & (RC_LIVE | RC_ALLOC)) != 0 && V3.isComponent(rc.oldType)) {
-			liveClasses.add(rc);
-		}
-		layoutFields(rc);
-		for (l = rc.children; l != null; l = l.tail) visitClass(l.head);
-		rc.maxClassID = liveClasses.length;
+	def visitClassType(rc: RaClass) {
+		layoutClass(rc);
 		if (V3.isComponent(rc.oldType)) {
 			var comp = V3.asComponent(rc.oldType).componentDecl, newRecord: Record;
 			if (rc.instances != null) {
@@ -736,6 +699,38 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
 			}
 		}
+	}
+	def visitArrayType(rt: RaArray) {
+		if (rt.oldType != rt.newType) {
+			// map complex arrays to arrays of records
+			var ta = Tuple.toTypeArray(rt.newType);
+			for (l = rt.instances; l != null; l = l.tail) {
+				var newRecords = createComplexArrayRecord(l.head, ta, rt);
+				ra.queue.add(normComplexArrayRecord, (rt, l.head, newRecords));
+			}
+		} else if (!rt.primitive) {
+			// normalize simple arrays that are not primitive
+			for (l = rt.instances; l != null; l = l.tail) {
+				ra.queue.add(normSimpleArrayRecord, l.head);
+			}
+		}
+	}
+	// lay out a classes' fields and number it according to liveness
+	def layoutClass(rc: RaClass) {
+		if (rc.minClassID >= 0) return; // already processed this type
+		while (rc.superClass != null) rc = rc.superClass; // start at root
+		numberClass(rc);
+	}
+	// number a class and lay out its fields, recursively visiting children
+	def numberClass(rc: RaClass) {
+		allClasses.add(rc);
+		rc.minClassID = liveClasses.length;
+		if ((rc.raFacts & (RC_LIVE | RC_ALLOC)) != 0 && V3.isComponent(rc.oldType)) {
+			liveClasses.add(rc);
+		}
+		layoutFields(rc);
+		for (l = rc.children; l != null; l = l.tail) numberClass(l.head);
+		rc.maxClassID = liveClasses.length;
 	}
 	// map a complex array to an array of records
 	def createComplexArrayRecord(r: Record, types: Array<Type>, rt: RaArray) -> Array<Record> {
@@ -863,6 +858,13 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		rc.normMethods = vtable.extract();
 	}
 	def addMethod(vtable: Sequence<IrMethod>, rc: RaClass, rm: RaMethod) {
+		if (specializer != null && rm.spec != null) {
+			// consult specializer to layout method
+			return specializer.addMethod(this, vtable, rc, rm);
+		}
+		addSpecMethod(vtable, rc, rm);
+	}
+	def addSpecMethod(vtable: Sequence<IrMethod>, rc: RaClass, rm: RaMethod) {
 		var m = rm.orig, sm: RaMethod;
 		if ((rm.raFacts & RM_LIVE) == 0) {
 			// mark methods that are abstract
@@ -872,6 +874,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		if (m.checkFact(Facts.M_NEW)) {
 			// constructors always end up at slot 0
 			vtable.set(0, rm.norm);
+			rm.norm.index = 0;
 			return;
 		}
 		for (sc = rc.superClass; sc != null; sc = sc.superClass) {
@@ -881,11 +884,11 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			if (sm != null) break;
 		}
 		if (sm == null) { // add a new method to the vtable
-			rm.normIndex = vtable.length;
+			rm.norm.index = rm.normIndex = vtable.length;
 			vtable.add(rm.norm);
 		} else if (sm != rm) { // overwrite existing vtable entry
 			vtable.set(sm.normIndex, rm.norm);
-			rm.normIndex = sm.normIndex;
+			rm.norm.index = rm.normIndex = sm.normIndex;
 			rm.norm.setFact(Facts.M_OVERRIDE);
 			sm.norm.setFact(Facts.M_OVERRIDDEN);
 		}
@@ -916,9 +919,14 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		}
 	}
 	def normalizeMethodRef(spec: IrSpec) -> IrSpec {
+		var rm = spec.asMethod().raMethod;
 		var ta = spec.typeArgs;
-		var normMethod = ra.makeMethod(ta, spec.asMethod(), null).norm;
-		return IrSpec.new(ta(0), ta, normMethod);
+		if (rm == null) {
+			var rc = ra.makeClass(spec.container);
+			rm = rc.findMethod(spec.member.index, ta);
+			if (rm == null) return V3.fail1("ReachabilityError: method %1 not found", spec.render);
+		}
+		return IrSpec.new(ta(0), ta, rm.norm);
 	}
 	def normalizeFieldRef(spec: IrSpec) -> IrSpec {
 		return spec; // TODO: normalize field ref
@@ -930,23 +938,26 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		if ((rc.raFacts & RC_LIVE) != 0) ic.setFact(Facts.C_HEAP);
 		if ((rc.raFacts & RC_ALLOC) != 0) ic.setFact(Facts.C_ALLOCATED);
 		newIr.setIrClass(rc.oldType, ic);
-		// TODO: set the index of members elsewhere
+		// TODO: set the index of fields elsewhere
 		var i = 0;
 		for (f in ic.fields) {
 			if (f != null) f.index = i;
 			i++;
 		}
-		i = 0;
-		for (m in ic.methods) {
-			if (m != null) m.index = i;
-			i++;
-		}
 	}
-	def normCode(context: SsaContext, rm: RaMethod) {
+	def normCode(rm: RaMethod) {
 		context.spec = rm.spec;
 		context.enterMethod(rm.orig);
-		var returnTn = ra.makeType(rm.getSpec().getReturnType());
-		SsaRaNormalizer.new(context, this, returnTn).build(rm.norm);
+		if (specializer != null && rm.spec != null) {
+			// use specializer to generate appropriate code for method
+			return specializer.normCode(this, context, rm);
+		}
+		return normSpecCode(context, rm);
+	}
+	def normSpecCode(context: SsaContext, rm: RaMethod) {
+		var rt = if(rm.spec == null, rm.orig.returnType, rm.spec.getReturnType());
+		SsaRaNormalizer.new(context, this, ra.makeType(rt)).build(rm.norm);
+		newIr.methods.add(rm.norm);
 	}
 }
 // A target which prints out the results of reachability analysis
@@ -967,6 +978,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 	def norm: ReachabilityNormalizer;
 	def returnTn: RaType;
 	var voidArray: Array<SsaInstr>;
+	var specSet: SpecSet;
 
 	new(context: SsaContext, norm, returnTn) : super(context) {}
 	def build(newMethod: IrMethod) {
@@ -1022,7 +1034,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 	def genApplyOp(app: SsaApplyOp) {
 		if (app.useList == null && app.checkFact(Facts.O_PURE)) return; // remove dead code
 		curBlock.at(app.source);
-		var op = app.op, args = app.inputs;
+		var orig = app.op, op = app.op, args = app.inputs;
 		if (context.spec != null) op = app.op.subst(context.spec.instantiateType);
 		match (op.opcode) {
 			V3Opcode.Equal:			normEqualOp(app, op);
@@ -1065,10 +1077,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 			V3Opcode.ClassGetMethod:{
 				var obj = genRef1(args(0));
 				addNullCheck(app, obj);
-				mapN(app, [funcRef(extractMethodRef(op)), obj]);
+				mapN(app, [funcRef(extractMethodRef(orig)), obj]);
 			}
 			V3Opcode.ClassGetVirtual: {
-				var m = extractMethodRef(op), newOp: Operator;
+				var m = extractMethodRef(orig), newOp: Operator;
 				var mono = context.opts.ChaDevirtualize && !m.member.checkFact(Facts.M_OVERRIDDEN);
 				var obj = genRef1(args(0));
 				if (mono) {
@@ -1081,7 +1093,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 			V3Opcode.ComponentInit:		map0(app);
 			V3Opcode.ComponentGetField:	normComponentGetField(app, op);
 			V3Opcode.ComponentSetField:	normComponentSetField(app, op);
-			V3Opcode.ComponentGetMethod:	normComponentGetMethod(app, op);
+			V3Opcode.ComponentGetMethod:	{
+				// map ComponentGetMethod to (funcref, null)
+				return mapN(app, [funcRef(extractMethodRef(orig)), newRegion.nullConst(AnyObject.TYPE)]);
+			}
 			V3Opcode.TupleCreate: {
 				mapN(app, genRefs(args));
 			}
@@ -1091,10 +1106,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 			V3Opcode.NullCheck:		normNullCheck(app, op);
 			V3Opcode.BoundsCheck:		normBoundsCheck(app, op);
 			// XXX: use V3SsaBuilder.opCallXXX() methods
-			V3Opcode.CallClassMethod:	normGeneralOp(app, op, V3Op.newCallClassMethod(extractMethodRef(op)));
+			V3Opcode.CallClassMethod:	normGeneralOp(app, op, V3Op.newCallClassMethod(extractMethodRef(orig)));
 			V3Opcode.CallClassVirtual: {
 				// devirtualize methods that are not overridden
-				var m = extractMethodRef(op), newOp: Operator;
+				var m = extractMethodRef(orig), newOp: Operator;
 				if (context.opts.ChaDevirtualize && !m.member.checkFact(Facts.M_OVERRIDDEN)) {
 					// devirtualized to call abstract method => no objects instantiated of that type
 					if (m.member.checkFact(Facts.M_ABSTRACT)) return map1(app, newRegion.nullConst(m.getReturnType()));
@@ -1104,7 +1119,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 				}
 				normGeneralOp(app, op, newOp);
 			}
-			V3Opcode.CallComponentMethod:	normGeneralOp(app, op, V3Op.newCallComponentMethod(extractMethodRef(op)));
+			V3Opcode.CallComponentMethod:	normGeneralOp(app, op, V3Op.newCallComponentMethod(extractMethodRef(orig)));
 			V3Opcode.CallDelegate: {
 				var tn = normTypeArg(op, 0);
 				// normalize CallDelegate into CallFunction
@@ -1112,7 +1127,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 				normGeneralOp(app, op, V3Op.newCallFunction(tn.sub(0)));
 			}
 			V3Opcode.CreateDelegate: {
-				return mapN(app, [funcRef(extractMethodRef(op)), genRef1(args(0))]);
+				return mapN(app, [funcRef(extractMethodRef(orig)), genRef1(args(0))]);
 			}
 			V3Opcode.SystemOp:		normGeneralOp(app, op, op);
 			V3Opcode.ConditionalThrow:	normGeneralOp(app, op, op);
@@ -1385,10 +1400,6 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var arrayType = if(atn.sub == null, atn.newType, atn.sub(0));
 		return map1(oldApp, curBlock.opArrayGetLength(arrayType, array(0)));
 	}
-	def normComponentGetMethod(oldApp: SsaApplyOp, op: Operator) {
-		// map ComponentGetMethod to (funcref, null)
-		return mapN(oldApp, [funcRef(extractMethodRef(op)), newRegion.nullConst(AnyObject.TYPE)]);
-	}
 	def normComponentGetField(oldApp: SsaApplyOp, op: Operator) {
 		if (oldApp.useList == null) return; // remove unused reads of fields
 		var raField = extractFieldRef(oldApp);
@@ -1446,10 +1457,6 @@ class SsaRaNormalizer extends SsaRebuilder {
 			// OPT: inline the field as a constant
 			addNullCheck(oldApp, receiver);
 			return mapV(oldApp, raField.val, normReturnType(oldApp.op));
-		} else if ((raField.raFacts & (RF_WRITTEN | RF_INIT | RF_VALS)) == 0) {
-			// OPT: no writes, inits, or live values for the field
-			addNullCheck(oldApp, receiver);
-			return mapNull(oldApp, normReturnType(oldApp.op));
 		} else if (raField.size == 1) {
 			// common case 1-1 mapping
 			var read = curBlock.opClassGetField(raField.norm(0), receiver);
@@ -1500,9 +1507,12 @@ class SsaRaNormalizer extends SsaRebuilder {
 		return mapBlockStart(edge.dest);
 	}
 	private def extractFieldRef(oldApp: SsaApplyOp) -> RaField {
-		return norm.ra.makeField(oldApp, context.spec);
+		var spec = if (specSet != null, specSet.first(), context.spec);
+		return norm.ra.makeField(oldApp, spec);
 	}
 	private def extractMethodRef(op: Operator) -> IrSpec {
+		if (specSet != null) op = op.subst(specSet.first().instantiateType);
+		else if (context.spec != null) op = op.subst(context.spec.instantiateType);
 		return norm.normalizeMethodRef(V3Op.extractIrSpec(op));
 	}
 	private def normVal(v: Val, tn: RaType) -> Val {
