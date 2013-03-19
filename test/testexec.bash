@@ -27,7 +27,9 @@ function run_test() {
 
 run_test "int"
 run_test "int-ra" -ra
-run_test "int-ra-partial" "-ra -ra-partial"
+if [ -n "$RA_PARTIAL" ]; then
+    run_test "int-ra-partial" "-ra -ra-partial"
+fi
 
 printf "  Compiling (jvm)..."
 mkdir -p $OUT/jvm
@@ -64,5 +66,11 @@ function do_native_test() {
 }
 
 do_native_test x86-darwin x86-darwin-test ""
-#do_native_test x86-darwin x86-darwin-test "-ra-partial"
+if [ -n "$RA_PARTIAL" ]; then
+    do_native_test x86-darwin x86-darwin-test "-ra-partial"
+fi
+
 do_native_test x86-linux x86-linux-test ""
+if [ -n "$RA_PARTIAL" ]; then
+    do_native_test x86-linux x86-linux-test "-ra-partial"
+fi
