@@ -13,7 +13,6 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 	var layout: MachProgramLayout;
 	var stackAlign: int;
 	var componentFields: MachLayout; // location of component fields
-	var typeIds: int;
 	var numMethods: int;
 
 	new() {
@@ -46,15 +45,23 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 	}
 	def processIrClass(ic: IrClass) {
 		var t = ic.ctype;
-		if (V3.isClass(t)) {
-			// create the class representation
-			if (typeReps.get(t) == null) {
-				while (ic.parent != null) ic = ic.parent;
-				createClass(null, ic);
-			}
-		} else if (V3.isComponent(t)) {
-			processComponent(ic);
+		if (V3.isComponent(t)) return processComponent(ic);
+		// compute size of heap objects if necessary
+		if (ic.minClassId < 0) return;
+		if (!Facts.isLive(ic)) return;
+		computeSize(ic);
+		// create GC maps for object if necessary
+		if (runtime != null && runtime.gc != null) runtime.gc.recordTypeRefMap(ic);
+	}
+	def computeSize(ic: IrClass) {
+		if (ic.fields.length == 0) { // no fields
+			ic.machSize = data.align(sizeOf(tagType));
+			return;
 		}
+		// find field at maximum offset; assume no overlapping fields
+		var maxf = ic.fields(0);
+		for (f in ic.fields) if (f.machOffset > maxf.machOffset) maxf = f;
+		ic.machSize = data.align(maxf.machOffset + sizeOf(maxf.fieldType));
 	}
 	def processComponent(ic: IrClass) {
 		var crep = Mach_V3Component.new(ic, ic.ctype, MachType.VOID);
@@ -69,55 +76,6 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 			layout.dataRegion.align(size);
 			layout.fieldMap.set(f, layout.dataRegion.allocate(f, size));
 		}
-	}
-	def createClass(superClass: Mach_V3Class, ic: IrClass) {
-		var machType = data.getReferenceType(ic.ctype);
-		var mclass = Mach_V3Class.new(ic, machType, MachLayout.new(this));
-		typeReps.set(ic.ctype, mclass);
-		mclass.minClassID = typeIds;
-		var fl = addFields(superClass, ic, mclass);
-		if (Facts.isLive(ic)) {
-			// assign an ID if live or allocated
-			if (runtime != null && runtime.gc != null && ic.checkFact(Facts.C_ALLOCATED)) {
-				// compute a type refmap for objects allocated on the heap
-				runtime.gc.recordTypeRefMap(typeIds / code.addressSize, fl.alignedSize, fl.fieldRefOffsets, fl.valueRefOffsets);
-			}
-			typeIds = typeIds + code.addressSize;
-		}
-		// record the reference map for the object
-		for (l = ic.children; l != null; l = l.tail) {
-			// recursively build and number subclasses
-			createClass(mclass, l.head);
-		}
-		mclass.maxClassID = typeIds;
-	}
-	def addFields(superClass: Mach_V3Class, ic: IrClass, mclass: Mach_V3Class) -> MachLayout {
-		var start = 0, fl = mclass.fieldLayout;
-		if (superClass == null) {
-			// 1. if this is a root class add the type tag
-			fl.addType(tagType);
-		} else {
-			// 1. if this is not a root class, skip the members of the superclass
-			var sl = superClass.fieldLayout;
-			fl.size = sl.size;
-			// inherit reference offsets
-			fl.fieldRefOffsets = sl.fieldRefOffsets;
-			fl.valueRefOffsets = sl.valueRefOffsets;
-			start = superClass.ic.fields.length;
-		}
-		// add new fields to layout
-		var rtgc = runtime != null && runtime.gc != null;
-		for (i = start; i < ic.fields.length; i++) {
-			var f = ic.fields(i);
-			f.machOffset = fl.addType(f.fieldType);
-			if (isRefType(f.fieldType) && rtgc) {
-				// record that a reference is at this offset
-				if (f.checkFact(Facts.F_VALUE)) fl.valueRefOffsets = List.new(f.machOffset, fl.valueRefOffsets);
-				else fl.fieldRefOffsets = List.new(f.machOffset, fl.fieldRefOffsets);
-			}
-		}
-		fl.alignedSize = data.align(fl.size);
-		return fl;
 	}
 	def makeMachArray(utype: Type) -> Mach_V3Array {
 		var marray = Mach_V3Array.new(utype, data.getReferenceType(utype));
@@ -213,7 +171,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 		return arrayRep(arrayType).headerSize;
 	}
 	def getObjectSize(t: Type, r: Record) -> int {
-		if (V3.isClass(t)) return classRep(t).fieldLayout.alignedSize; // return the size of the object
+		if (V3.isClass(t)) return irClass(t).machSize; // return the size of the object
 		if (V3.isArray(t)) return data.align(arrayRep(t).getObjectSize(r)); // return the size of the header only
 		return unexpectedType(t, 0);
 	}
@@ -222,8 +180,8 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 		if (a > 1) return (i + a - 1) / a * a;
 		return i;
 	}
-	def classRep(t: Type) -> Mach_V3Class {
-		return Mach_V3Class.!(typeReps.get(t));
+	def irClass(t: Type) -> IrClass {
+		return prog.ir.getIrClass(t);
 	}
 	private def arrayRep(t: Type) -> Mach_V3Array {
 		var ar = Mach_V3Array.!(typeReps.get(t));
@@ -231,9 +189,9 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 		return ar;
 	}
 	def classIdRange(t: Type) -> (int, int) {
-		var r = classRep(t);
+		var r = irClass(t);
 		if (r == null) return (0, 0);
-		return (r.minClassID, r.maxClassID);
+		return (r.minClassId * code.addressSize, r.maxClassId * code.addressSize);
 	}
 	def componentFieldPtr(f: IrSpec) -> Val {
 		return layout.fieldMap.get(f.asField());
@@ -241,36 +199,24 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 	def classFieldOffset(f: IrSpec) -> int {
 		return f.asField().machOffset;
 	}
-	def methodTable(spec: IrSpec) -> Val {
-		var m = spec.asMethod();
-		var mtable = layout.mtableMap.get(m);
-		if (mtable == null) {
-			// build the method table for the method
-			var root = prog.ir.classMap.get(spec.container);
-			while (root.parent != null) {
-				if (root.parent.methods.length > m.index) root = root.parent;
-				else break;
-			}
-			var cr = classRep(root.ctype);
-			var mtable = layout.allocMTable(root.methods(m.index), cr.maxClassID - cr.minClassID);
-			var mtaddr = mtable.add(0 - cr.minClassID); // adjust for root class ID
-			addToMethodTable(root, cr.minClassID, m.index, mtable.val, mtaddr);
-			return mtaddr;
+	def methodTable(spec: IrSpec) -> Addr {
+		var mtable = IrSelector.!(spec.member).mtable;
+		if (mtable == null) return V3.fail1("mtable is null for %1", spec.render);
+		var mtaddr = layout.mtableMap.get(mtable);
+		if (mtaddr == null) { // allocate space in method region for mtable
+			var size = mtable.table.length * code.addressSize;
+			mtaddr = layout.metaRegion.allocate(mtable, size);
+			// return a pointer to a table indexed starting from 0
+			mtaddr = mtaddr.add(0 - mtable.rootId * code.addressSize);
+			layout.mtableMap.set(mtable, mtaddr);
 		}
-		return mtable;
-	}
-	def addToMethodTable(ic: IrClass, rootId: int, index: int, mtable: Array<IrMethod>, mtaddr: Addr) {
-		// add this class's method implementation to the table
-		var m = ic.methods(index), cr = classRep(ic.ctype);
-		layout.mtableMap.set(m, mtaddr);
-		if (Facts.isLive(ic)) mtable((cr.minClassID - rootId) / code.addressSize) = m;
-		for (l = ic.children; l != null; l = l.tail) addToMethodTable(l.head, rootId, index, mtable, mtaddr);
+		return mtaddr;
 	}
 	def unexpectedType<T>(t: Type, v: T) -> T {
 		return prog.ERROR.unexpectedType(t, v);
 	}
 	def objectTag(t: Type) -> Val {
-		if (V3.isClass(t)) return Int.box(classRep(t).minClassID);
+		if (V3.isClass(t)) return Int.box(irClass(t).minClassId * code.addressSize);
 		if (V3.isArray(t)) return arrayRep(t).typeTag;
 		return unexpectedType(t, null);
 	}
@@ -294,7 +240,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 	}
 	def encodeData(region: Region, u: DataEncoder, a: Addr) {
 		if (a.is<Record>()) encodeRecord(u, a.get<Record>());
-		else if (a.is<Array<IrMethod>>()) encodeMtable(u, a.get<Array<IrMethod>>());
+		else if (a.is<IrMtable>()) encodeMtable(u, a.get<IrMtable>());
 		else if (a.is<IrField>()) encodeField(u, a.get<IrField>());
 		else return prog.ERROR.fail("unexpected data item in region");
 	}
@@ -319,8 +265,8 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 			}
 		} else if (V3.isClass(r.rtype)) {
 			// encode a class
-			var rep = classRep(r.rtype), f = rep.ic.fields;
-			u.i4(rep.minClassID);
+			var ic = irClass(r.rtype), f = ic.fields;
+			u.i4(ic.minClassId * code.addressSize);
 			for (i = 0; i < v.length; i++) {
 				encodeVal(u.at(start + f(i).machOffset), v(i), f(i).fieldType);
 			}
@@ -328,9 +274,9 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 			return unexpectedType(r.rtype, ());
 		}
 	}
-	def encodeMtable(u: DataEncoder, mtable: Array<IrMethod>) {
-		for (i = 0; i < mtable.length; i++) {
-			encodeAddr(u, layout.addrOfMethod(mtable(i)));
+	def encodeMtable(u: DataEncoder, mtable: IrMtable) {
+		for (m in mtable.table) {
+			encodeAddr(u, layout.addrOfMethod(m));
 		}
 	}
 	def encodeVal(u: DataEncoder, v: Val, t: Type) {
@@ -367,16 +313,6 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace) {
 }
 // Machine representation of a type.
 class MachRep(origType: Type, machType: Type) { }
-// Machine representation of class, including the minimum and maximum type ID and the
-// offset of each of its fields.
-class Mach_V3Class extends MachRep {
-	def ic: IrClass;
-	def fieldLayout: MachLayout;
-	var minClassID: int;
-	var maxClassID: int;
-
-	new(ic, machType: Type, fieldLayout) : super(ic.ctype, machType) { }
-}
 // Machine representation of a component
 class Mach_V3Component extends MachRep {
 	def ic: IrClass;
@@ -416,9 +352,9 @@ class MachProgramLayout(mach: MachProgram) {
 	def metaRegion    = Region.new("meta", mach.code);
 	def runtimeRegion = Region.new("runtime", mach.code);
 	def dataRegion    = Region.new("data", mach.data);
-	def mtableMap     = IrUtil.newIrMethodMap<Addr>();
-	def methodMap     = IrUtil.newIrMethodMap<Address<IrMethod>>();
-	def fieldMap      = IrUtil.newIrFieldMap<Address<IrField>>();
+	def mtableMap     = IrUtil.newIrItemMap<Addr>();
+	def methodMap     = IrUtil.newIrItemMap<Address<IrMethod>>();
+	def fieldMap      = IrUtil.newIrItemMap<Address<IrField>>();
 	def recordMap     = V3.newRecordMap<Address<Record>>();
 	var recordQueue   = Sequence<Record>.new();
 
@@ -426,10 +362,6 @@ class MachProgramLayout(mach: MachProgram) {
 		var a = methodMap.get(m);
 		if (a == null) methodMap.set(m, a = Address.new(codeRegion, m));
 		return a;
-	}
-	def allocMTable(m: IrMethod, size: int) -> Address<Array<IrMethod>> {
-		var mtable = Array<IrMethod>.new(size / mach.code.addressSize);
-		return metaRegion.allocate(mtable, size);
 	}
 	def absolute(a: Addr) -> int {
 		if (a == null) return 0;
@@ -490,19 +422,7 @@ class MachProgramLayout(mach: MachProgram) {
 			}
 		} else if (a.is<Record>()) {
 			// an object in the data section
-			var r = a.get<Record>(), gc = mach.runtime.gc;
-			if (V3.isArray(r.rtype)) {
-				var elem = V3Array.elementType(r.rtype);
-				if (mach.isRefType(elem)) {
-					var start = off + mach.getArrayElemOffset(r.rtype);
-					gc.recordRootRefRange(start, start + r.values.length * mach.refSize);
-				}
-			} else if (V3.isClass(r.rtype)) {
-				var rep = mach.classRep(r.rtype);
-				for (l = rep.fieldLayout.fieldRefOffsets; l != null; l = l.tail) {
-					gc.recordRootRef(off + l.head); // only record mutable field refs
-				}
-			}
+			mach.runtime.gc.recordRootObject(off, a.get<Record>());
 		}
 	}
 	private def layoutRecord(r: Record) {
