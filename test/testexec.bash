@@ -19,9 +19,13 @@ else
 fi
 
 function run_test() {
-	printf "  Executing ($1)..."
+	config="$1"
+	if [ -n "$V3C_OPTS" ]; then
+		config="$config $V3C_OPTS"
+	fi
+	printf "  Executing ($config)..."
 	P=$OUT/$1.run.out
-	run_v3c "" -test -expect=expect.txt $2 $TESTS > $P
+	run_v3c "" "$V3C_OPTS" -test -expect=expect.txt $2 $TESTS > $P
 	check_red $P
 }
 
@@ -31,16 +35,20 @@ if [ -n "$RA_PARTIAL" ]; then
     run_test "int-ra-partial" "-ra -ra-partial"
 fi
 
-printf "  Compiling (jvm)..."
+config="jvm"
+if [ -n "$V3C_OPTS" ]; then
+	config="$config $V3C_OPTS"
+fi
+printf "  Compiling ($config)..."
 mkdir -p $OUT/jvm
 P=$OUT/test.execute.comp.jvm
-run_v3c "" -set-exec=false -jvm.script=false -verbose=1 -multiple -target=jvm-test -output=$OUT/jvm -jvm.rt-path=../../rt/jvm/bin $TESTS > $P
+run_v3c "" "$V3C_OPTS" -set-exec=false -jvm.script=false -verbose=1 -multiple -target=jvm-test -output=$OUT/jvm -jvm.rt-path=../../rt/jvm/bin $TESTS > $P
 check_red $P
 
 if [ -z "$HOST_JAVA" ]; then
-	printf "  Running   (jvm)...${YELLOW}skipped${NORM}\n" 
+	printf "  Running   ($config)...${YELLOW}skipped${NORM}\n" 
 else
-	printf "  Running   (jvm)..." 
+	printf "  Running   ($config)..." 
 	P=$OUT/test.execute.run.jvm
 	$HOST_JAVA -cp ../../rt/jvm/bin:$OUT/jvm V3S_Tester $TESTS > $P
 	check_red $P
@@ -65,12 +73,12 @@ function do_native_test() {
 	run_native $test $target $TESTS
 }
 
-do_native_test x86-darwin x86-darwin-test ""
+do_native_test x86-darwin x86-darwin-test "$V3C_OPTS"
 if [ -n "$RA_PARTIAL" ]; then
-    do_native_test x86-darwin x86-darwin-test "-ra-partial"
+    do_native_test x86-darwin x86-darwin-test "-ra-partial $V3C_OPTS"
 fi
 
-do_native_test x86-linux x86-linux-test ""
+do_native_test x86-linux x86-linux-test "$V3C_OPTS"
 if [ -n "$RA_PARTIAL" ]; then
-    do_native_test x86-linux x86-linux-test "-ra-partial"
+    do_native_test x86-linux x86-linux-test "-ra-partial $V3C_OPTS"
 fi
