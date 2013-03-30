@@ -19,36 +19,28 @@ else
 fi
 
 function run_test() {
-	config="$1"
-	if [ -n "$V3C_OPTS" ]; then
-		config="$config $V3C_OPTS"
-	fi
-	printf "  Executing ($config)..."
+	print_status Interpreting "$2 $V3C_OPTS"
+
 	P=$OUT/$1.run.out
-	run_v3c "" "$V3C_OPTS" -test -expect=expect.txt $2 $TESTS > $P
+	run_v3c "" -test -expect=expect.txt $2 $TESTS > $P
 	check_red $P
 }
 
-run_test "int"
-run_test "int-ra" -ra
-if [ -n "$RA_PARTIAL" ]; then
-    run_test "int-ra-partial" "-ra -ra-partial"
-fi
+run_test "int" ""
+run_test "int-ra" "-ra"
 
-config="jvm"
-if [ -n "$V3C_OPTS" ]; then
-	config="$config $V3C_OPTS"
-fi
-printf "  Compiling ($config)..."
+
+print_compiling jvm
+
 mkdir -p $OUT/jvm
 P=$OUT/test.execute.comp.jvm
-run_v3c "" "$V3C_OPTS" -set-exec=false -jvm.script=false -verbose=1 -multiple -target=jvm-test -output=$OUT/jvm -jvm.rt-path=../../rt/jvm/bin $TESTS > $P
+run_v3c "" -set-exec=false -jvm.script=false -verbose=1 -multiple -target=jvm-test -output=$OUT/jvm -jvm.rt-path=../../rt/jvm/bin $TESTS > $P
 check_red $P
 
+print_status Running jvm
 if [ -z "$HOST_JAVA" ]; then
-	printf "  Running   ($config)...${YELLOW}skipped${NORM}\n" 
+	printf "${YELLOW}skipped${NORM}\n" 
 else
-	printf "  Running   ($config)..." 
 	P=$OUT/test.execute.run.jvm
 	$HOST_JAVA -cp ../../rt/jvm/bin:$OUT/jvm V3S_Tester $TESTS > $P
 	check_red $P
@@ -57,28 +49,18 @@ fi
 function do_native_test() {
 	target=$1
 	testtarget=$2
-	extra="$3"
+
 	mkdir -p $OUT/$target
 	C=$OUT/$target/test.compile.out
 	R=$OUT/$target/test.run.out
 
-	if [ -z "$extra" ]; then
-		printf "  Compiling ($target)..."
-	else
-		printf "  Compiling ($target $extra)..."
-	fi
-	run_v3c "" $extra -multiple -set-exec=false -target=$testtarget -output=$OUT/$target $TESTS &> $C
+	print_compiling $1
+
+	run_v3c "" -multiple -set-exec=false -target=$testtarget -output=$OUT/$target $TESTS &> $C
 	check_red $C
 
 	run_native $test $target $TESTS
 }
 
-do_native_test x86-darwin x86-darwin-test "$V3C_OPTS"
-if [ -n "$RA_PARTIAL" ]; then
-    do_native_test x86-darwin x86-darwin-test "-ra-partial $V3C_OPTS"
-fi
-
-do_native_test x86-linux x86-linux-test "$V3C_OPTS"
-if [ -n "$RA_PARTIAL" ]; then
-    do_native_test x86-linux x86-linux-test "-ra-partial $V3C_OPTS"
-fi
+do_native_test x86-darwin x86-darwin-test
+do_native_test x86-linux x86-linux-test

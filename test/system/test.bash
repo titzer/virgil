@@ -20,7 +20,7 @@ function do_test() {
 	    if [ $compiled = 1 ]; then
 		run_io_test $target "${1%*.*}" "$params" "$expect" 
 	    else
-		printf "  Running   (int) %s..." $1
+		print_status Running int $1
 		run_v3c "" -run $1 $params > $out
 		diff $expect $out > /dev/null
 		check $?
@@ -76,7 +76,7 @@ do_tests
 
 for b in $TESTS; do
   out=$T/$1.compile.out
-  printf "  Compiling ($target) $b..."
+  print_compiling "$target" $b
   run_v3c $target -output=$T $b &> $out
   check_no_red $? $out
 done

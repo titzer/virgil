@@ -16,24 +16,24 @@ else
     exit 0
 fi
 
-printf "  Compiling ($target) RiRuntimeTest..."
+print_compiling "$target" RiRuntimeTest
 run_v3c $target -output=$OUT $SOURCES &> $OUT/$target.compile.out
 check_no_red $? $OUT/$target.compile.out
 
-printf "  Compiling ($target-rt) RiRuntimeTest..."
+print_compiling "$target-rt" RiRuntimeTest
 run_v3c "" -target=$target -output=$OUT -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $RT/native/*.v3 &> $OUT/$target-rt.compile.out
 check_no_red $? $OUT/$target-rt.compile.out
 
-printf "  Compiling ($target-gc) RiRuntimeTest..."
+print_compiling "$target-gc" RiRuntimeTest
 run_v3c "" -target=$target -output=$OUT -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $RT/native/*.v3 $RT/gc/*.v3 &> $OUT/$target-gc.compile.out
 check_no_red $? $OUT/$target-gc.compile.out
 
-printf "  Compiling ($target) CiRuntimeApi..."
+print_compiling "$target" CiRuntimeApi
 run_v3c $target -output=$OUT CiRuntimeApi.v3 &> $OUT/$target.compile.out
 check_no_red $? $OUT/$target.compile.out
 
 if [ "$HOST_PLATFORM" == "$target" ]; then
-  printf "  Running   ($target) CiRuntimeApi..."
+  print_status Running "$target" CiRuntimeApi
   $OUT/CiRuntimeApi &> $OUT/$target.run.out
   check $?
  

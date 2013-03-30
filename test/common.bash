@@ -35,6 +35,19 @@ if [ ! -x "$AENEAS_TEST" ]; then
     exit 1
 fi
 
+function print_status() {
+	config=$(echo -n $2)
+	if [ -z "$3" ]; then
+		printf "  %-12s ($config)..." $1
+	else
+		printf "  %-12s ($config) $3..." $1
+	fi
+}
+
+function print_compiling() {
+	print_status Compiling "$1 $V3C_OPTS" $2
+}
+
 function check() {
 	if [ "$1" = 0 ]; then
 		printf "${GREEN}ok${NORM}\n"
@@ -74,10 +87,12 @@ function run_native() {
 	shift
 	if [ "$HOST_PLATFORM" == "$target" ]; then
 		TESTER=$VIRGIL_LOC/test/testexec-$target
-		printf "  Running   ($target)...\n"
+		print_status Running "$target"
+		echo
 		$TESTER ${VIRGIL_TEST_OUT}/$test/$target $* | tee ${VIRGIL_TEST_OUT}/$test/$target/run.out
 	else
-		echo "  Skipping  ($target/$HOST_PLATFORM)...${YELLOW}ok${NORM}"
+		print_status Skipping "$target/$HOST_PLATFORM"
+		echo "${YELLOW}ok${NORM}"
 	fi
 }
 
@@ -88,13 +103,14 @@ function run_io_test() {
 	local expected="$4"
 
 	if [[ "$HOST_PLATFORM" == "$target" || $target == "jar" && "$HOST_JAVA" != "" ]]; then
-		printf "  Running   ($target) $test..."
+		print_status Running "$target" "$test"
 		P=$OUT/$target/$test.out
 		$OUT/$target/$test $args &> $P
 		diff $expected $P > $OUT/$target/$test.diff
 		check $?
 	else
-		echo "  Skipping  ($target/$HOST_PLATFORM)...${YELLOW}ok${NORM}"
+		print_status Skipping "$target/$HOST_PLATFORM"
+		echo "${YELLOW}ok${NORM}"
 	fi
 }
 
@@ -102,8 +118,8 @@ function run_v3c() {
 	local target=$1
 	shift
 	if [ -z "$target" ]; then
-		$AENEAS_TEST "$@"
+		$AENEAS_TEST $V3C_OPTS "$@"
 	else
-		V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target "$@"
+		V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS "$@"
 	fi
 }

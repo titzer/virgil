@@ -9,7 +9,7 @@ if [ "$TEST_TARGET" != $target ]; then
 fi
 
 TESTS=*.v3
-printf "  Compiling ($target)..."
+print_compiling "$target"
 mkdir -p $OUT/$target
 run_v3c "" -multiple -set-exec=false -target=$target-test -output=$OUT/$target $TESTS &> $OUT/compile.out
 check_red $OUT/compile.out

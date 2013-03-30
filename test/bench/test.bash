@@ -16,7 +16,7 @@ T=$OUT/$target
 mkdir -p $T
 
 function do_benchmark() {
-  printf "  Compiling ($target) %s..." $1
+  print_compiling "$target" $1
   local out=$T/$1.compile.out
   run_v3c $target -output=$T Common.v3 $1/$1.v3 &> $out
   local ok=$?
