@@ -32,9 +32,15 @@ fi
 
 mkdir -p $TMP
 
-if [ ! -x $TMP/btime ]; then
+BTIME="./btime-$(../bin/dev/sense_host | cut -d' ' -f1)"
+if [ $? != 0 ]; then
+	echo Could not sense host platform.
+	exit 1
+fi
+
+if [ ! -x $BTIME ]; then
 	echo Compiling btime.c...
-	gcc -m32 -lm -O2 -o $TMP/btime btime.c
+	gcc -m32 -lm -O2 -o $BTIME btime.c
 fi
 
 for p in $programs; do
@@ -60,7 +66,7 @@ for p in $programs; do
 
 		if [ $? = 0 ]; then
 			printf "$COMMAND $args\n"
-			$TMP/btime $TMP/$p-$e $COUNT $COMMAND $args
+			$BTIME $TMP/$p-$e $COUNT $COMMAND $args
 		else
 			echo "  Failed compiling ($e) $p"
 		fi
