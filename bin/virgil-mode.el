@@ -3,7 +3,7 @@
   "Virgil declaration keywords.")
 
 (defvar virgil-stmts
-  '("if" "else" "while" "break" "continue" "match" "return" "for")
+  '("if" "case" "else" "while" "break" "continue" "match" "return" "for")
   "Virgil statement keywords.")
 
 (defvar virgil-builtins
