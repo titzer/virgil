@@ -1,7 +1,7 @@
 #!/bin/bash
 
 if [ $# -gt 0 ]; then
-	TEST="$@"
+	TESTS="$@"
 else
 	TESTS=*.v3
 fi
