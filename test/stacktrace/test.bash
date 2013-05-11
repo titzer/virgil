@@ -21,16 +21,29 @@ function do_test() {
   tests=$2
 
   print_compiling "$target" "$tests"
-  ST_TESTS=$(ls $T/*.st)
-  for f in $ST_TESTS; do
-    # TODO: compile multiple tests at once with aeneas
+  TESTS=$(ls $T/*.st)
+
+  C=$T/compile.out
+  ALL=$T/compile.all.out
+
+  for f in $TESTS; do
+    # TODO: compile multiple tests at once with Aeneas
     fname="${basedir}$(basename $f)"
     fname="${fname%*.*}.v3"
     run_v3c "" -output=$T -target=$target-test -rt.sttables $fname $RT_SOURCES >> $C
-  done
-  check_no_red $? $C
 
-  run_native stacktrace $target $ST_TESTS
+    grep '31m' $C > $C.error
+    if [ $? == 0 ]; then
+	printf "${RED}failed${NORM}\n"
+	cat $C.error
+	exit 1
+    fi
+    cat $C >> $ALL
+  done
+
+  printf "${GREEN}ok${NORM}\n"
+
+  run_native $target $TESTS
 }
 
 tests=$(ls *.v3)

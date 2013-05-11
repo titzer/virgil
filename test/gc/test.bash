@@ -22,24 +22,26 @@ fi
 T=$OUT/$target
 mkdir -p $T
 
-AENEAS_FAST=$T/Aeneas
+C=$T/compile.out
+ALL=$T/compile.all.out
+rm -f $ALL
 
-print_compiling "$target" Aeneas
-run_v3c "$target" -output=$T -heap-size=500m $AENEAS_SOURCES > $T/Aeneas.compile
-check_no_red $? $T/Aeneas.compile
-
-C=$T/$target-test.compile.out
-rm -f $C
-
+# TODO: compile all the tests in one invocation of the compiler
 print_compiling "$target" "gc tests"
 for f in $TESTS; do
-  # TODO: compile multiple tests at once with aeneas (no need for Aeneas-fast)
-  $AENEAS_FAST -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -heap-size=10k $f $RT_SOURCES >> $C
+  run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k $f $RT_SOURCES > $C
+  grep '31m' $C > $C.error
+  if [ $? == 0 ]; then
+	printf "${RED}failed${NORM}\n"
+	cat $C.error
+	exit 1
+  fi
+  cat $C >> $ALL
 done
 
-check_no_red $? $C
+printf "${GREEN}ok${NORM}\n"
 
-run_native gc $target $TESTS
+run_native $target
 
 HEAP='-heap-size=24m'
 print_compiling "$target $HEAP" Aeneas

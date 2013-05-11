@@ -5,8 +5,9 @@ YELLOW='[0;33m'
 RED='[0;31m'
 NORM='[0;00m'
 
+SUITE=$1
 export VIRGIL_TEST_OUT=/tmp/$USER/virgil-test
-OUT=$VIRGIL_TEST_OUT/$1
+OUT=$VIRGIL_TEST_OUT/$SUITE
 mkdir -p $OUT
 
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $(dirname ${BASH_SOURCE[0]}) && cd .. && pwd)}
@@ -81,18 +82,19 @@ function check_no_red() {
 }
 
 function run_native() {
-	test=$1
-	shift
-	local target=$1
-	shift
+	target=$1
+
+	print_status Running "$target/$HOST_PLATFORM"
 	if [ "$HOST_PLATFORM" == "$target" ]; then
 		TESTER=$VIRGIL_LOC/test/testexec-$target
-		print_status Running "$target"
-		echo
-		$TESTER ${VIRGIL_TEST_OUT}/$test/$target $* | tee ${VIRGIL_TEST_OUT}/$test/$target/run.out
+		if [ ! -x $TESTER ]; then
+			echo "${RED}no tester available${NORM}"
+		else
+			echo
+			$TESTER ${VIRGIL_TEST_OUT}/$SUITE/$target $TESTS | tee ${VIRGIL_TEST_OUT}/$SUITE/$target/run.out
+		fi
 	else
-		print_status Skipping "$target/$HOST_PLATFORM"
-		echo "${YELLOW}ok${NORM}"
+		echo "${YELLOW}skip${NORM}"
 	fi
 }
 
@@ -122,4 +124,49 @@ function run_v3c() {
 	else
 		V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS "$@"
 	fi
+}
+
+function run_int_tests() {
+	print_status Interpreting "$2 $V3C_OPTS"
+
+	P=$OUT/$1.run.out
+	run_v3c "" -test -expect=expect.txt $2 $TESTS > $P
+	check_red $P
+}
+
+function run_native_tests() {
+	target=$1
+	testtarget=$2
+
+	mkdir -p $OUT/$target
+	C=$OUT/$target/compile.out
+	R=$OUT/$target/run.out
+	print_compiling $1
+	run_v3c "" -multiple -set-exec=false -target=$testtarget -output=$OUT/$target $TESTS &> $C
+	check_red $C
+
+	run_native $target
+}
+
+function run_exec_tests() {
+	run_int_tests "int" ""
+	run_int_tests "int-ra" "-ra"
+
+	mkdir -p $OUT/jvm
+	C=$OUT/jvm/compile.out
+	R=$OUT/jvm/run.out
+	print_compiling jvm
+	run_v3c "" -set-exec=false -jvm.script=false -verbose=1 -multiple -target=jvm-test -output=$OUT/jvm -jvm.rt-path=../../rt/jvm/bin $TESTS > $C
+	check_red $C
+
+	print_status Running jvm
+	if [ -z "$HOST_JAVA" ]; then
+		printf "${YELLOW}skipped${NORM}\n" 
+	else
+		$HOST_JAVA -cp $VIRGIL_LOC/rt/jvm/bin:$OUT/jvm V3S_Tester $TESTS > $R
+		check_red $R
+	fi
+
+	run_native_tests x86-darwin x86-darwin-test
+	run_native_tests x86-linux x86-linux-test
 }
