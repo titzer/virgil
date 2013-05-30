@@ -155,4 +155,22 @@ public class V3S_System {
 	if ((b & 31) == b) return a >>> b;
 	return 0;
     }
+
+    public static int natLt(int x, int y) {
+        if (x < 0) return y < 0 ? (y > x ? 1 : 0) : 0;
+        return (y < 0 || x < y) ? 1 : 0;
+    }
+
+    public static int natLteq(int x, int y) {
+        if (x < 0) return y < 0 ? (y >= x ? 1 : 0) : 0;
+        return (y < 0 || x <= y) ? 1 : 0;
+    }
+
+    public static int natGt(int x, int y) {
+        return 1 ^ natLteq(x, y);
+    }
+
+    public static int natGteq(int x, int y) {
+        return 1 ^ natLt(x, y);
+    }
 }

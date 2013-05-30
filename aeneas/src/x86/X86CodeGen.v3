@@ -184,13 +184,13 @@ class X86CodeGen extends MachCodeGen {
 		return root;
 	}
 	def genIntConvert(i: SsaApplyOp, mv: MachVar) {
-		var ff = V3.asInt(i.op.paramTypes(0));
 		var tt = V3.asInt(i.op.resultType);
 		if (tt.width == 32) {
 			id(i, makeVar(i.inputs(0).dest));
 			// TODO: 64-bit ness
 		} else if (!tt.signed) {
-			gen_op2_i("and", X86Assembler.and, mv, i.inputs(0).dest, tt.max);
+			var a = i.inputs(0).dest;
+			gen("zext", asm_op2_i, (X86Assembler.and, dfn(mv), use(a), Int.unbox(tt.max), hint(a, mv)));
 		} else {
 			gen("sext", asm_sext, (dfn(mv), use(i.inputs(0).dest), tt.width));
 		}
@@ -264,7 +264,7 @@ class X86CodeGen extends MachCodeGen {
 			// an absolute address
 			var addr = Addr.!(val(ptr.dest));
 			if (mach.layout.isValid(addr)) { // is valid?
-				gen_loada(mv, mach.sizeOf(i.op.typeArgs(1)), addr);
+				gen_loada(mv, i.op.typeArgs(1), addr);
 				return false;
 			}
 			// invalid address, generate a throw
@@ -283,7 +283,7 @@ class X86CodeGen extends MachCodeGen {
 			if (SsaValue.?(x.dest)) {
 				// load(<addr> + y)
 				var addr = Addr.!(val(x.dest));
-				gen_loada_disp(mv, mach.sizeOf(i.op.typeArgs(1)), addr, y);
+				gen_loada_disp(mv, i.op.typeArgs(1), addr, y);
 				return !i.checkFact(Facts.O_NO_NULL_CHECK);
 			}
 		}
@@ -291,7 +291,7 @@ class X86CodeGen extends MachCodeGen {
 	}
 	def genLoadAddr(i: SsaApplyOp, mv: MachVar, x: SsaInstr, scale: int, disp: int) -> bool {
 		var nullCheck = V3Op.needsNullCheck(i, x);
-		gen_loadx(mv, mach.sizeOf(i.op.typeArgs(1)), x, scale, disp, nullCheck, i.source);
+		gen_loadx(mv, i.op.typeArgs(1), x, scale, disp, nullCheck, i.source);
 		return nullCheck;
 	}
 	def genStore(i: SsaApplyOp, mv: MachVar) -> bool {
@@ -498,10 +498,10 @@ class X86CodeGen extends MachCodeGen {
 		match (matchOpcode(i)) {
 			V3Opcode.Equal:				return newCmp2(i, X86Conds.Z);
 			V3Opcode.NotEqual:			return newCmp2(i, X86Conds.NZ);
-			V3Opcode.IntLt:				return newCmp2(i, X86Conds.L);
-			V3Opcode.IntGt:				return newCmp2(i, X86Conds.G);
-			V3Opcode.IntLteq:			return newCmp2(i, X86Conds.LE);
-			V3Opcode.IntGteq:			return newCmp2(i, X86Conds.GE);
+			V3Opcode.IntLt:				return newCmp2(i, signedCmp(i, X86Conds.L, X86Conds.C));
+			V3Opcode.IntGt:				return newCmp2(i, signedCmp(i, X86Conds.G, X86Conds.A));
+			V3Opcode.IntLteq:			return newCmp2(i, signedCmp(i, X86Conds.LE, X86Conds.NA));
+			V3Opcode.IntGteq:			return newCmp2(i, signedCmp(i, X86Conds.GE, X86Conds.NC));
 			MachOpcode.UnsignedLt:			return newCmp2(i, X86Conds.C);
 			MachOpcode.UnsignedLteq:		return newCmp2(i, X86Conds.NA);
 			MachOpcode.UnsignedGt:			return newCmp2(i, X86Conds.A);
@@ -512,6 +512,14 @@ class X86CodeGen extends MachCodeGen {
 			}
 		}
 		return X86CmpMatch.new(X86Conds.NZ, i, null, null);
+	}
+	def signedCmp(i: SsaInstr, signed: X86Cond, unsigned: X86Cond) -> X86Cond {
+		var t = SsaApplyOp.!(i).op.paramTypes(0);
+		match (t.typeCon.kind) {
+			MachType.MACH_POINTER: return unsigned;
+			V3Kind.INT: return if (V3.asInt(t).signed, signed, unsigned);
+		}
+		return signed;
 	}
 	def matchScale(e: SsaDfEdge) -> (SsaInstr, int) {
 		var i = e.dest;
@@ -578,24 +586,35 @@ class X86CodeGen extends MachCodeGen {
 	def asm_const(dest: int, val: Val) {
 		asm.movd_l_val(frame, loc(dest), val);
 	}
-	def gen_loadx(dest: MachVar, size: int, base: SsaInstr, scale: int, disp: int, canTrap: bool, source: Source) {
-		if (size == 4) gen("loadd", asm_loadx, (X86Assembler.movd_r_rm, dfngpr(dest), gpr(base), scale, disp, canTrap, source));
-		else if (size == 1) gen("loadb", asm_loadx, (X86Assembler.movbzx, dfngpr(dest), gpr(base), scale, disp, canTrap, source));
-		else if (size == 0) gen("test_i", asm_test_i, (gpr(base), scale, disp, 0, canTrap, source));
-		else if (size == 2) gen("loadw", asm_loadx, (X86Assembler.movwzx, dfngpr(dest), gpr(base), scale, disp, canTrap, source));
-		else context.fail("invalid size for load");
+	def gen_loadx(dest: MachVar, t: Type, base: SsaInstr, scale: int, disp: int, canTrap: bool, source: Source) {
+		var size = mach.sizeOf(t);
+		if (size == 0) {
+			// load produces no value; only needed for possible nullcheck
+			gen("test_i", asm_test_i, (gpr(base), scale, disp, 0, canTrap, source));
+			return;
+		}
+		var lt = matchLoad(t, size);
+		gen(lt.0, asm_loadx, (lt.1, dfngpr(dest), gpr(base), scale, disp, canTrap, source));
 	}
-	def gen_loada(dest: MachVar, size: int, addr: Addr) {
-		if (size == 4) gen("loadd", asm_loada, (X86Assembler.movd_r_rm, dfngpr(dest), addr));
-		else if (size == 1) gen("loadb", asm_loada, (X86Assembler.movbzx, dfngpr(dest), addr));
-		else if (size == 2) gen("loadw", asm_loada, (X86Assembler.movwzx, dfngpr(dest), addr));
-		else context.fail("invalid size for load");
+	def gen_loada(dest: MachVar, t: Type, addr: Addr) {
+		var lt = matchLoad(t, mach.sizeOf(t));
+		gen(lt.0, asm_loada, (lt.1, dfngpr(dest), addr));
 	}
-	def gen_loada_disp(dest: MachVar, size: int, addr: Addr, disp: SsaInstr) {
-		if (size == 4) gen("loadd", asm_loada_disp, (X86Assembler.movd_r_rm, dfngpr(dest), addr, gpr(disp)));
-		else if (size == 1) gen("loadb", asm_loada_disp, (X86Assembler.movbzx, dfngpr(dest), addr, gpr(disp)));
-		else if (size == 2) gen("loadw", asm_loada_disp, (X86Assembler.movwzx, dfngpr(dest), addr, gpr(disp)));
-		else context.fail("invalid size for load");
+	def gen_loada_disp(dest: MachVar, t: Type, addr: Addr, disp: SsaInstr) {
+		var lt = matchLoad(t, mach.sizeOf(t));
+		gen(lt.0, asm_loada_disp, (lt.1, dfngpr(dest), addr, gpr(disp)));
+	}
+	def matchLoad(t: Type, size: int) -> (string, (X86Assembler, X86Reg, X86Rm) -> void) {
+		// choose appropriate X86 load based on size and signedness
+		if (size == 4) return ("loadd", X86Assembler.movd_r_rm);
+		if (size == 1) return if(V3.isSigned(t),
+				("loadsb", X86Assembler.movbsx),
+				("loadub", X86Assembler.movbzx));
+		if (size == 2) return if(V3.isSigned(t),
+				("loadsw", X86Assembler.movwsx),
+				("loaduw", X86Assembler.movwzx));
+		context.fail("invalid size for load");
+		return ("invalid", X86Assembler.movd_r_rm);
 	}
 	def asm_loadx(m: (X86Assembler, X86Reg, X86Rm) -> void, dest: int, base: int, scale: int, disp: int, canTrap: bool, source: Source) {
 		var off = codeOffset();
