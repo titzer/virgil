@@ -79,8 +79,9 @@ public class V3S_Tester {
         int num = 1;
         for (Run run : runs) {
             try {
+		coerceInputs(testMethod.getParameterTypes(), run.inputs);
                 Object result = testMethod.invoke(null, run.inputs);
-                if (run.result == null || !run.result.equals(result)) {
+                if (run.result == null || !compare(run.result, result)) {
                     throw new Exception(run.inputs() + "=" + result + ", expected: " + run.expected());
                 }
             } catch (InvocationTargetException e) {
@@ -90,6 +91,45 @@ public class V3S_Tester {
             }
             num++;
         }
+    }
+
+    private static void coerceInputs(Class[] types, Object[] inputs) {
+	for (int i = 0; i < types.length; i++) {
+	    Class t = types[i];
+	    Object o = inputs[i];
+	    if (t == byte.class) inputs[i] = new Byte((byte) intValue(o));
+	    if (t == short.class) inputs[i] = new Short((short) intValue(o));
+	    if (t == char.class) inputs[i] = new Character((char) intValue(o));
+	}
+    }
+
+    private static boolean compare(Object o1, Object o2) {
+	if (o1 instanceof Boolean) return o1.equals(o2);
+	if (o2 instanceof Boolean) return o2.equals(o1);
+	if (isIntegral(o1) && isIntegral(o2)) {
+	  int mask = maskOf(o1) & maskOf(o2);
+	  return (intValue(o1) & mask) == (intValue(o2) & mask);
+	}
+	return o1.equals(o2);
+    }
+
+    private static int intValue(Object o) {
+	if (o == null) return 0;
+	if (o instanceof Byte) return ((Byte) o).byteValue();
+	if (o instanceof Short) return ((Short) o).shortValue();
+	if (o instanceof Character) return ((Character) o).charValue();
+	if (o instanceof Integer) return ((Integer) o).intValue();
+	throw new Error("not an integral value: " + o);
+    }
+
+    private static boolean isIntegral(Object o) {
+	return (o instanceof Integer) || (o instanceof Byte) || (o instanceof Character) || (o instanceof Short);
+    }
+
+    private static int maskOf(Object o) {
+	if (o instanceof Character || o instanceof Short) return 0xFFFF;
+	if (o instanceof Byte) return 0xFF;
+	return 0xFFFFFFFF;
     }
 
     private static Class getJavaException(String name) throws Exception {
