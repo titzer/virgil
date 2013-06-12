@@ -14,17 +14,7 @@ VIRGIL_LOC=${VIRGIL_LOC:=$(cd $(dirname ${BASH_SOURCE[0]}) && cd .. && pwd)}
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 
 UNAME=$(uname -sm)
-if [ "$UNAME" == "Darwin i386" ]; then
-	HOST_PLATFORM="x86-darwin"
-	TEST_TARGET=${TEST_TARGET:="x86-darwin"}
-elif [[ "$UNAME" == "Linux i686" || "$UNAME" == "Linux i386" || "$UNAME" == "Linux x86_64" ]]; then
-	HOST_PLATFORM="x86-linux"
-	TEST_TARGET=${TEST_TARGET:="jar"}
-else
-	HOST_PLATFORM="unknown"
-	TEST_TARGET=${TEST_TARGET:="jar"}
-fi
-
+HOST_PLATFORM=$($VIRGIL_LOC/bin/dev/sense_host | cut -d' ' -f1)
 HOST_JAVA=$(which java)
 
 if [ -z "$AENEAS_TEST" ]; then
