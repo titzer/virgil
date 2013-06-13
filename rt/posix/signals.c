@@ -8,7 +8,7 @@ typedef _STRUCT_X86_THREAD_STATE32 *x86_regs;
 
 void handler(int sig, siginfo_t *info, ucontext_t *uc) {
   void *eip = (void*) uc->uc_mcontext->__ss.__eip;
-  printf("uc = %p, esp = %p\n", uc, eip);
+  printf("uc = %p, eip = %p\n", uc, eip);
   void *esp = (void*) uc->uc_mcontext->__ss.__esp;
   printf("uc = %p, esp = %p\n", uc, esp);
 
@@ -46,7 +46,7 @@ int main() {
   printf("Offset of sa_flags = %d\n", ((char*)&sa.sa_flags - (char*)&sa));
   printf("Sizeof sigaction = %ld\n", sizeof(sa));
 
-  printf("Triggering...");
+  printf("Triggering...\n");
   fflush(stdout);
 
   *null = 0;
