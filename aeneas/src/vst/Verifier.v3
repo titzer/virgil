@@ -26,8 +26,9 @@ class Verifier(compiler: Compiler, prog: Program) {
 		apply(componentList, verifyComponent);
 		apply(classList, verifyClass);
 		apply(variantList, verifyVariant);
-		apply(componentList, typeCheckComponent);
-		apply(classList, typeCheckClass);
+		apply<VstComponent>(componentList, typeCheckVstCompound);
+		apply<VstClass>(classList, typeCheckVstCompound);
+		apply<VstVariant>(variantList, typeCheckVstCompound);
 		if (ERROR.noErrors) apply(vst.declList, buildIr);
 		prog.vst.files = null; // file contents not needed any more
 	}
@@ -110,7 +111,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 			decl.container = compound;
 		}
 		var constructor = compound.constructor;
-		if (constructor == null) {
+		if (constructor == null && !VstVariant.?(compound)) {
 			// fill in a default constructor if one wasn't declared
 			var name = Token.new(compound.token.fileName, "new", compound.token.beginLine, compound.token.beginColumn);
 			var superclause = compound.superclause;
@@ -196,34 +197,43 @@ class Verifier(compiler: Compiler, prog: Program) {
 			}
 			c.tag = tag++;
 		}
-	}
-	def typeCheckClass(decl: VstClass) {
-		typeCheckVstCompound(decl);
-	}
-	def typeCheckComponent(decl: VstComponent) {
-		typeCheckVstCompound(decl);
+		var verifier = decl.verifier;
+		if (!verifier.verified) verifier.verify();
 	}
 	def typeCheckVstCompound(compound: VstCompound) {
-		var cv = compound.verifier;
-		var tc = TypeChecker.new(ERROR, cv.file);
+		var tc = TypeChecker.new(ERROR, compound.verifier.file);
 		for (members = compound.members; members != null; members = members.tail) {
 			var m = members.head;
 			if (VstNew.?(m)) {
-				typeCheckNew(compound, VstNew.!(m), tc, cv);
+				typeCheckNew(compound, VstNew.!(m), tc);
 			} else if (VstMethod.?(m)) {
-				var mdecl = VstMethod.!(m);
+				var mdecl = VstMethod.!(m), cv = compound.verifier;
 				var env = MethodEnv.new(compound, mdecl, cv.newThisParam(), cv);
 				if (!EmptyStmt.?(mdecl.body)) {
 					tc.enterMethod(env);
 					tc.typeCheckBody(mdecl.body);
 				}
 			} else if (VstVariantCase.?(m)) {
-				// TODO: verify members of variant cases
+				typeCheckVstCase(compound, VstVariantCase.!(m), tc);
 			}
 		}
 	}
-	def typeCheckNew(compound: VstCompound, cdecl: VstNew, tc: TypeChecker, cv: VstCompoundVerifier) {
-		var thisParam = cv.newThisParam();
+	def typeCheckVstCase(compound: VstCompound, cdecl: VstVariantCase, tc: TypeChecker) {
+		for (l = cdecl.members; l != null; l = l.tail) {
+			if (!VstMethod.?(l.head)) continue;
+			var mdecl = VstMethod.!(l.head), cv = compound.verifier;
+			var env = MethodEnv.new(compound, mdecl, cv.newThisParam(), cv);
+			env.vstCase = cdecl;
+			if (EmptyStmt.?(mdecl.body)) {
+				compound.verifier.UnimplementedError(mdecl.body, "method cannot have empty body in a type case");
+			} else {
+				tc.enterMethod(env);
+				tc.typeCheckBody(mdecl.body);
+			}
+		}
+	}
+	def typeCheckNew(compound: VstCompound, cdecl: VstNew, tc: TypeChecker) {
+		var cv = compound.verifier, thisParam = cv.newThisParam();
 		var initEnv: MethodEnv;
 		if (VstClass.?(compound)) {
 			// track field initialization state for class constructors
@@ -311,6 +321,7 @@ class VstCompoundVerifier {
 	var classTypeCon: V3Class_TypeCon;
 	var superType: Type;
 	var superTypeCon: V3Class_TypeCon;
+	var vstCase: VstVariantCase;
 
 	var memberinits: List<VstField>;
 	var fields: List<VstField>;
@@ -340,7 +351,9 @@ class VstCompoundVerifier {
 	}
 	def verify() {
 		Lists.apply(compound.members, checkMember);
-		compound.constructor.memberinits = Lists.reverse(memberinits);
+		if (compound.constructor != null) {
+			compound.constructor.memberinits = Lists.reverse(memberinits);
+		}
 		verified = true;
 		if (classType != null) {
 			initMax = 1 + superInitOrder;
@@ -366,6 +379,7 @@ class VstCompoundVerifier {
 		if (VstNew.?(decl)) checkNew(VstNew.!(decl));
 		else if (VstField.?(decl)) checkField(VstField.!(decl));
 		else if (VstMethod.?(decl)) checkMethod(VstMethod.!(decl));
+		else if (VstVariantCase.?(decl)) checkVariantCase(VstVariantCase.!(decl));
 	}
 	def checkField(decl: VstField) {
 		if (decl.tref != null) {
@@ -382,8 +396,11 @@ class VstCompoundVerifier {
 		fields = List.new(decl, fields);
 		if (decl.init != null) {
 			memberinits = List.new(decl, memberinits);
-			if (verifier.isNonTrivialInitializer(decl)) compound.constructor.nontrivial = true;
+			if (verifier.isNonTrivialInitializer(decl)) {
+				if (compound.constructor != null) compound.constructor.nontrivial = true;
+			}
 		}
+		if (VstVariant.?(compound)) FieldDeclError(decl, "type cannot have fields");
 	}
 	def checkNew(decl: VstNew) {
 		typeEnv = compound.typeEnv;
@@ -405,24 +422,44 @@ class VstCompoundVerifier {
 		if (BlockStmt.!(decl.body).stmts.list != null || verifier.isNonTrivialSuperclause(decl.superclause)) {
 			decl.nontrivial = true;
 		}
+		if (VstVariant.?(compound)) ConstructorError(decl.token, "type cannot have a constructor");
 	}
 	def checkMethod(decl: VstMethod) {
 		typeEnv = compound.typeEnv;
 		if (decl.typeParams != null) typeEnv = decl.typeEnv = buildTypeEnv(typeEnv, decl.typeParams);
-		var map: Map<string, Decl> = Strings.newMap();
-		Lists.apply(decl.params, checkMethodParam(_, decl, map));
-		resolveType(decl.rettype, typeEnv);
-		if (classDecl != null && V3Class_TypeCon.?(superTypeCon)) {
-			var binding = lookupSuperMember(decl.name());
-			if (binding != null) return checkMethodOverride(decl, binding);
+		if (decl.params != null) {
+			var map = Strings.newMap<Decl>();
+			Lists.apply(decl.params, checkMethodParam(_, map));
 		}
+		resolveType(decl.rettype, typeEnv);
+		var binding = lookupSuperMember(decl.name());
+		if (binding != null) return checkMethodOverride(decl, binding);
 		decl.root = decl;
 		decl.index = compound.numMethods++;
 	}
+	def checkVariantCase(decl: VstVariantCase) {
+		typeEnv = compound.typeEnv;
+		if (decl.params != null) {
+			var map = Strings.newMap<Decl>();
+			Lists.apply(decl.params.asList(), checkMethodParam(_, map));
+		}
+		for (l = decl.members; l != null; l = l.tail) {
+			vstCase = decl;
+			checkMember(l.head);
+		}
+		vstCase = null;
+	}
 	def lookupSuperMember(name: string) -> MemberBinding {
 		// XXX: reduce duplicated code with MethodEnv.lookupClassMember
+		if (superTypeCon == null) {
+			if (vstCase != null) {
+				var member = compound.memberMap.get(name);
+				if (member == null) return null;
+				return MemberBinding.new(VstBinding.OBJECT_METHOD, thisType, null, member, member.getType(), false);
+			}
+			return null;
+		}
 		var typeCon = superTypeCon, classType = superType;
-		if (typeCon == null) return null;
 		while (true) {
 			// lookup a field or method
 			var member = typeCon.classDecl.memberMap.get(name);
@@ -493,7 +530,7 @@ class VstCompoundVerifier {
 			else param.vtype = resolveType(param.tref, compound.typeEnv);
 		}
 	}
-	def checkMethodParam(param: ParamDecl, mdecl: VstMethod, map: Map<string, Decl>) {
+	def checkMethodParam(param: ParamDecl, map: Map<string, Decl>) {
 		if (map.get(param.name()) != null) ParamDeclError(param.token, "parameter redefined");
 		map.set(param.name(), param);
 		param.vtype = resolveType(param.tref, typeEnv);
@@ -506,7 +543,8 @@ class VstCompoundVerifier {
 				tref.typeCon = ERROR.getErrorTypeCon(tref.token.image);
 			}
 		}
-		var nested = Lists.map(tref.typeRefs, resolveType(_, typeEnv));
+		var nested: List<Type>;
+		if (tref.typeRefs != null) nested = Lists.map(tref.typeRefs, resolveType(_, typeEnv));
 		var arity = tref.typeCon.arity;
 		if (arity >= 0 && arity != Lists.length(nested)) {
 			var range = tref.range().end();
@@ -551,6 +589,9 @@ class VstCompoundVerifier {
 	}
 	def FieldDeclError(f: VstField, msg: string) {
 		error(f.token.range(), "FieldDeclError", msg);
+	}
+	def UnimplementedError(body: Stmt, msg: string) {
+		error(body.range(), "UnimplementedError", msg);
 	}
 	def TypeParamArityError(point: FilePoint, kind: string, name: string, expect: int, got: int) {
 		var decl = Strings.format2("%1 \"%2\"", kind, name), msg: string;
@@ -601,7 +642,6 @@ class MethodEnv {
 	def mdecl: VstMethod;
 	def verifier: VstCompoundVerifier;
 	def thisParam: ParamDecl;
-	def typeCache = verifier.verifier.prog.typeCache;
 
 	var envStack: Array<Map<string, VarDecl>>;
 	var envDepth: int;
@@ -609,6 +649,7 @@ class MethodEnv {
 	var initField: VstField;
 	var initPrev: MethodEnv;
 	var initOrder: int;
+	var vstCase: VstVariantCase;
 
 	new(compound, mdecl, thisParam, verifier) {
 		envStack = Array<Map<string, VarDecl>>.new(3);
@@ -662,6 +703,11 @@ class MethodEnv {
 				if (binding != null) binding.receiver = objExpr(useThis, name, expr);
 				return binding;
 			}
+			V3Kind.VARIANT: {
+				var binding = lookupVariantMember(expr, true, etype, name.image);
+				if (binding != null) binding.receiver = objExpr(useThis, name, expr);
+				return binding;
+			}
 		}
 		if (Member_TypeCon.?(etype.typeCon)) {
 			var member = Member_TypeCon.!(etype.typeCon).lookupMember(etype, name.image, true);
@@ -707,6 +753,7 @@ class MethodEnv {
 		var typeCon = etype.typeCon, kind = typeCon.kind;
 		match (kind) {
 			V3Kind.CLASS: return lookupClassMember(expr, true, etype, name);
+			V3Kind.VARIANT: return lookupVariantMember(expr, false, etype, name);
 			V3Kind.COMPONENT: return lookupComponentMember(expr, etype, name);
 			V3Kind.ARRAY: {
 				if (Strings.equal("new", name)) return newOpBinding(etype, V3Op.newArrayAlloc(etype));
@@ -750,16 +797,7 @@ class MethodEnv {
 		if (member == null || isNotAccessible(member)) return lookupOpMember(expr, etype, name);
 		var memberType = inferMemberType(member);
 		if (VstMethod.?(member)) {
-			var mb = MemberBinding.new(VstBinding.COMPONENT_METHOD, etype, null, member, memberType, false);
-			var meth = VstMethod.!(member);
-			var typeArgs = abstractTypeParams("method", expr, meth.typeParams);
-			if (typeArgs != null) {
-				var t = TypeArgs.new(meth.typeEnv, Lists.toArray(typeArgs));
-				memberType = memberType.substitute(t);
-				mb = MemberBinding.new(mb.kind, etype, null, mb.member, memberType, false);
-				mb.typeArgs = t;
-			}
-			return mb;
+			return methodBinding(expr, VstBinding.COMPONENT_METHOD, etype, VstMethod.!(member), memberType);
 		}
 		if (VstField.?(member)) {
 			abstractTypeParams("field", expr, null);
@@ -796,23 +834,13 @@ class MethodEnv {
 			var newType = Function.newType(param, etype);
 			return MemberBinding.new(VstBinding.CLASS_NEW, etype, null, member, newType, false);
 		}
-		// XXX: factor common code with lookupComponentMember
 		if (VstMethod.?(member)) {
 			var kind = VstBinding.OBJECT_METHOD;
 			if (inType) {
 				kind = VstBinding.CLASS_METHOD;
 				memberType = Function.prependParamType(etype, memberType);
 			}
-			var mb = MemberBinding.new(kind, etype, null, member, memberType, false);
-			var meth = VstMethod.!(member);
-			var typeArgs = abstractTypeParams("method", expr, meth.typeParams);
-			if (typeArgs != null) {
-				var ta = TypeArgs.new(meth.typeEnv, Lists.toArray(typeArgs));
-				memberType = memberType.substitute(ta);
-				mb = MemberBinding.new(mb.kind, etype, null, mb.member, memberType, false);
-				mb.typeArgs = ta;
-			}
-			return mb;
+			return methodBinding(expr, kind, etype, VstMethod.!(member), memberType);
 		}
 		if (VstField.?(member)) {
 			abstractTypeParams("field", expr, null);
@@ -826,6 +854,48 @@ class MethodEnv {
 			return MemberBinding.new(kind, etype, null, member, memberType, writable);
 		}
 		return null;
+	}
+	def lookupVariantMember(expr: VarExpr, receiver: bool, etype: Type, name: string) -> Binding {
+		var vt = V3Variant_TypeCon.!(etype.typeCon);
+		if (Strings.equal("tag", name)) {
+			// TODO: tag access for non-enum variants
+			var op = V3Op.newTypeSubsume(vt.singleton, vt.tagType);
+			if (receiver) return newApplyOpBinding(expr, etype, op);
+			else return newOpBinding(etype, op);
+		}
+		if (Strings.equal("name", name)) {
+			if (receiver) return OtherBinding.new(expr, etype, V3Variant_NameMember.new(vt));
+			else return OtherBinding.new(null, etype, V3Variant_NameFunction.new(vt));
+		}
+		var m = vt.variantDecl.memberMap.get(name);
+		if (VstMethod.?(m)) {
+			var kind = VstBinding.OBJECT_METHOD, memberType = m.getType();
+			if (vt.variantDecl.typeParams != null) {
+				var typeArgs = TypeArgs.new(vt.variantDecl.typeEnv, Lists.toArray(etype.nested));
+				memberType = memberType.substitute(typeArgs);
+			}
+			if (!receiver) {
+				kind = VstBinding.CLASS_METHOD;
+				memberType = Function.prependParamType(etype, memberType);
+			}
+			return methodBinding(expr, kind, etype, VstMethod.!(m), memberType);
+		}
+		if (!receiver && VstVariantCase.?(m)) {
+			// TODO: constructors for cases that have parameters
+			return ValueBinding.new(expr.ident.name, Int.box(VstVariantCase.!(m).tag), etype);
+		}
+		return null;
+	}
+	def methodBinding(expr: VarExpr, kind: byte, etype: Type, meth: VstMethod, memberType: Type) -> MemberBinding {
+		var mb = MemberBinding.new(kind, etype, null, meth, memberType, false);
+		var typeArgs = abstractTypeParams("method", expr, meth.typeParams);
+		if (typeArgs != null) {
+			var ta = TypeArgs.new(meth.typeEnv, Lists.toArray(typeArgs));
+			memberType = memberType.substitute(ta);
+			mb = MemberBinding.new(mb.kind, etype, null, mb.member, memberType, false);
+			mb.typeArgs = ta;
+		}
+		return mb;
 	}
 	def lookupOpMember(expr: VarExpr, etype: Type, name: string) -> Binding {
 		// TODO: get rid of the global member map
@@ -861,17 +931,16 @@ class MethodEnv {
 		varDecl.ssa = VstSsaVar.new(); // XXX: move to VstSsaBuilder
 	}
 	def lookupVar(expr: VarExpr, nested: bool) -> Binding {
-		var token = expr.ident.name, name = token.image;
+		var i = expr.ident, token = i.name, name = token.image;
 		var binding: Binding;
-		var typeRefs = expr.ident.list();
 		// 1. lookup values such as "null", "true", and "false"
 		if ((binding = lookupValue(token)) != null) {
-			if (typeRefs != null) verifier.TypeParamArityError(expr.ident.params.range(), "value", name, 0, expr.ident.params.length());
+			if (i.parameterized()) verifier.TypeParamArityError(i.params.range(), "value", name, 0, i.params.length());
 			return binding;
 		}
 		// 2. lookup up a local variable or parameter
 		if ((binding = lookupLocal(token)) != null) {
-			if (typeRefs != null) verifier.TypeParamArityError(expr.ident.params.range(), "local", name, 0, expr.ident.params.length());
+			if (i.parameterized()) verifier.TypeParamArityError(i.params.range(), "local", name, 0, i.params.length());
 			if (initOrder > 0) {
 				if (thisParam == LocalBinding.!(binding).decl) verifier.InvalidThisUse(expr.range());
 			}
@@ -882,15 +951,20 @@ class MethodEnv {
 			if (initOrder > 0) return checkMemberInit(expr, binding);
 			return binding;
 		}
-		// 4. lookup a member in the current file
+		// 4. lookup a type case member
+		if (vstCase != null && (binding = lookupCaseMember(expr, name)) != null) {
+			return binding;
+		}
+		// 5. lookup a member in the current file
 		var synthetic = verifier.file.synthetic;
 		if (synthetic != null) {
 			var binding = lookupComponentMember(expr, synthetic.getDeclaredType(), name);
 			if (binding != null) return binding;
 		}
-		// 5. lookup a type
+		// 6. lookup a type
 		var typecon = typeEnv.lookup(name);
 		if (typecon != null) {
+			var typeRefs = expr.ident.list();
 			if (typeRefs == null) {
 				if (V3Class_TypeCon.?(typecon)) {
 					var ctycon = V3Class_TypeCon.!(typecon);
@@ -908,6 +982,20 @@ class MethodEnv {
 			var ttype = resolveType(typeRef);
 			if (!nested) verifier.TypeExprError(expr.range(), ttype);
 			return TypeBinding.new(typeRef);
+		}
+		return null;
+	}
+	def lookupCaseMember(expr: VarExpr, name: string) -> Binding {
+		// XXX: refactor this to be part of an environment
+		if (vstCase.params == null) return null;
+		for (l = vstCase.params.list; l != null; l = l.tail) { // XXX: linear search
+			var p = l.head;
+			if (Strings.equal(name, p.token.image)) {
+				if (expr.ident.params != null) verifier.TypeParamArityError(expr.ident.params.range(), "local", name, 0, expr.ident.params.length());
+				var variant = V3Variant_TypeCon.!(compound.getDeclaredType().typeCon);
+				var val = objExpr(true, expr.ident.name, expr);
+				return OtherBinding.new(val, p.vtype, V3Variant_FieldMember.new(variant, vstCase, p));
+			}
 		}
 		return null;
 	}
@@ -964,8 +1052,7 @@ class MethodEnv {
 		}
 	}
 	def newTypeVar(typeParam: TypeParam, token: Token) -> Type {
-		var typeCon = TypeVar_TypeCon.new(token, typeParam, typeCache);
-		return typeCon.create0();
+		return TypeVar_TypeCon.new(token, typeParam, verifier.verifier.prog.typeCache).create0();
 	}
 	def resolveType(tref: TypeRef) -> Type {
 		return verifier.resolveType(tref, typeEnv);
