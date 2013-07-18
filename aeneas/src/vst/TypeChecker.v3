@@ -40,7 +40,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	}
 	def visitBlock(stmt: BlockStmt, outer: Type) -> Type {
 		methodEnv.enterScope();
-		for (l = stmt.stmts.asList(); l != null; l = l.tail) typeCheckStmt(l.head);
+		for (l = stmt.stmts.list; l != null; l = l.tail) typeCheckStmt(l.head);
 		methodEnv.exitScope();
 		return Void.TYPE;
 	}
@@ -138,10 +138,16 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	}
 	def visitMatch(stmt: MatchStmt, outer: Type) -> Type {
 		var etype = inferClosedType(stmt.expr);
+		if (etype.typeCon.kind == V3Kind.VARIANT) checkVariantMatch(stmt, etype, V3Variant_TypeCon.!(etype.typeCon));
+		else checkPrimMatch(stmt, etype);
+		return Void.TYPE;
+	}
+	def checkPrimMatch(stmt: MatchStmt, etype: Type) {
+		var check = checkPrimPattern(_, etype);
 		var bf = FLOW_NONE;
 		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
 			var c = cases.head;
-			c.vals = Lists.map(c.values.list, checkCaseVal(_, etype));
+			c.vals = Lists.map(c.patterns.list, check);
 			flow = FLOW_THRU;
 			bf = mergeFlow(bf, typeCheckStmt(c.stmt));
 		}
@@ -151,48 +157,118 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		} else {
 			flow = FLOW_THRU;
 		}
-		return Void.TYPE;
 	}
-	def checkCaseVal(val: Expr, etype: Type) -> Val {
-		if (VarExpr.?(val)) {
-			var ve = VarExpr.!(val);
-			if (etype.typeCon.kind == V3Kind.VARIANT && ve.expr == null) {
-				var binding = V3Variant_TypeCon.!(etype.typeCon).lookupCase(ve.ident.name);
-				if (binding != null) {
-					ve.binding = binding;
-					return binding.val;
-				}
-			}
-			typeCheckExpr(ve, etype, "match case");
-			var binding = ve.binding, vtype = ve.exactType;
-
-			if (binding == null) return Values.BOTTOM;
-			if (ValueBinding.?(binding)) return convertValueBinding(val, ve, vtype, etype);
-			if (MemberBinding.?(ve.binding)) {
-				// check whether this is a constant field
-				var m = MemberBinding.!(ve.binding);
-				// XXX: allow class constants to be used in switches
-				if (V3.isComponent(m.container) && VstField.?(m.member)) {
-					var f = VstField.!(m.member);
-					if (VarExpr.?(f.init) && f.isReadOnly) {
-						ve = VarExpr.!(f.init);
-						if (ve.binding == null) return Values.BOTTOM;
-						if (ValueBinding.?(ve.binding)) return convertValueBinding(val, ve, vtype, etype);
-					}
+	def checkPrimPattern(val: MatchPattern, etype: Type) -> Val {
+		var ve = val.expr;
+		if (val.params != null) MatchError(val.params.range(), "match value cannot have parameters");
+		typeCheckExpr(ve, etype, "match case");
+		var binding = ve.binding, vtype = ve.exactType;
+		if (binding == null) return Values.BOTTOM;
+		if (ValueBinding.?(binding)) return convertValueBinding(ve, vtype, etype);
+		if (MemberBinding.?(ve.binding)) {
+			// check whether this is a constant field
+			var m = MemberBinding.!(ve.binding);
+			// XXX: allow class constants to be used in switches
+			if (V3.isComponent(m.container) && VstField.?(m.member)) {
+				var f = VstField.!(m.member);
+				if (VarExpr.?(f.init) && f.isReadOnly) {
+					ve = VarExpr.!(f.init);
+					if (ve.binding == null) return Values.BOTTOM;
+					if (ValueBinding.?(ve.binding)) return convertValueBinding(ve, vtype, etype);
 				}
 			}
 		}
-		typeCheckExpr(val, etype, "match case");
-		MatchError(val.range(), "match expression is not a value");
+		MatchError(ve.range(), "match expression is not a value");
 		return Values.BOTTOM;
 	}
-	def convertValueBinding(loc: Expr, ve: VarExpr, vtype: Type, etype: Type) -> Val {
+	def checkVariantMatch(stmt: MatchStmt, etype: Type, vt: V3Variant_TypeCon) {
+		var bf = FLOW_NONE;
+		var covered = Array<bool>.new(vt.variantDecl.count);
+		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
+			var c = cases.head;
+			var p = checkVariantPatterns(c.patterns.list, etype, vt, covered);
+			flow = FLOW_THRU;
+			if (p != null) {
+				methodEnv.enterScope();
+				bindVariantParams(p, etype, vt);
+			}
+			bf = mergeFlow(bf, typeCheckStmt(c.stmt));
+			if (p != null) {
+				methodEnv.exitScope();
+			}
+		}
+		if (stmt.defcase != null) {
+			flow = FLOW_THRU;
+			bf = flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
+		} else {
+			var buf: StringBuffer;
+			for (i = 0; i < covered.length; i++) {
+				if (!covered(i)) {
+					if (buf == null) buf = StringBuffer.new().format1("match on type %1 does not cover:", etype.render);
+					for (l = vt.variantDecl.cases; l != null; l = l.tail) {
+						if (l.head.tag == i) {
+							buf.puts(" ");
+							buf.puts(l.head.name());
+						}
+					}
+				}
+			}
+			if (buf != null) MatchError(stmt.range(), buf.toString());
+			flow = FLOW_THRU;
+		}
+	}
+	def bindVariantParams(p: MatchPattern, etype: Type, vt: V3Variant_TypeCon) {
+		if (p.params == null) return;
+		if (p.variantCase.params == null) {
+			var msg = Strings.format2("case %1.%2 has no declared parameters", etype.render, p.variantCase.name());
+			return MatchError(p.params.range(), msg);
+		}
+		var ll = p.params.list, pl = p.variantCase.params.list;
+		while (ll != null) {
+			if (pl == null) {
+				var msg = Strings.format2("case %1.%2", etype.render, p.variantCase.name());
+				return ArityMismatch(ll.head.token.range(), msg, Lists.length(p.variantCase.params.list), Lists.length(p.params.list));
+			}
+			ll.head.vtype = vt.substitute(etype, pl.head.vtype);
+			methodEnv.bindVar(ll.head);
+			ll = ll.tail;
+			pl = pl.tail;
+		}
+		if (pl != null) {
+			var msg = Strings.format2("case %1.%2", etype.render, p.variantCase.name());
+			return ArityMismatch(p.params.range().lastByte(), msg, Lists.length(p.variantCase.params.list), Lists.length(p.params.list));
+		}
+	}
+	def checkVariantPatterns(patterns: List<MatchPattern>, etype: Type, vt: V3Variant_TypeCon, covered: Array<bool>) -> MatchPattern {
+		var p: MatchPattern, count = 0;
+		for (l = patterns; l != null; l = l.tail) {
+			p = l.head;
+			var ve = p.expr;
+			if (ve.expr != null) {
+				var msg = Strings.format1("match on type %1 requires unqualified case", etype.render);
+				MatchError(ve.range(), msg);
+			}
+			var vc = p.variantCase = vt.lookupCase(ve.ident.name);
+			if (vc == null) {
+				var msg = Strings.format2("unresolved case %1.%2", etype.render, ve.ident.name.image);
+				MatchError(ve.range(), msg);
+				p = null;
+			} else {
+				if (covered(vc.tag)) MatchError(ve.range(), "duplicate match pattern");
+				else covered(vc.tag) = true;
+				ve.binding = ValueBinding.new(ve.ident.name, Int.box(vc.tag), etype);
+			}
+			count++;
+		}
+		return if(count == 1, p);
+	}
+	def convertValueBinding(ve: VarExpr, vtype: Type, etype: Type) -> Val {
 		// convert a value binding to a value, which might require a promotion
 		var v = ValueBinding.!(ve.binding).val;
 		if (vtype != etype) {
 			if (v == null) return v;
 			if (vtype == Byte.TYPE && etype == Int.TYPE) return v;
-			else MatchError(loc.range(), "type mismatch in match value"); // shouldn't happen
+			else MatchError(ve.range(), "type mismatch in match value"); // shouldn't happen
 		}
 		return v;
 	}
@@ -384,8 +460,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 		if (tl != null) {
 			// too few parameters
-			// TODO: use a point that refers to the ')'
-			ArityMismatch(expr.args.exprs.range(), op, Lists.length(ptlist), expr.args.exprs.length());
+			ArityMismatch(expr.args.exprs.range().lastByte(), op, Lists.length(ptlist), expr.args.exprs.length());
 		}
 		// unify return type with outer
 		var returnType = Function.getReturnType(funcType);
@@ -546,8 +621,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 				tl = tl.tail;
 			}
 		}
-		// TODO: use a point that refers to the ')'
-		if (tl != null) ArityMismatch(args.exprs.range(), op, Lists.length(types), args.exprs.length());
+		if (tl != null) ArityMismatch(args.exprs.range().lastByte(), op, Lists.length(types), args.exprs.length());
 	}
 	def inferClosedType(expr: Expr) -> Type {
 		if (expr.exactType != null) return expr.exactType;
