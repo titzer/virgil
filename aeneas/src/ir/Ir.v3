@@ -8,24 +8,18 @@ class IrItem {
 	def setFact(i: int) { facts = facts | i; }
 	def checkFact(i: int) -> bool { return (facts & i) != 0; }
 }
-// intermediate representation of classes, components, and arrays
+// intermediate representation of classes and components
 class IrClass extends IrItem {
 	def ctype: Type;			// type corresponding to this class
 	def typeArgs: TypeArgs;			// type arguments
 	def parent: IrClass;			// parent class if any
 	def fields: Array<IrField>;		// fields, including super fields
 	def methods: Array<IrMethod>;		// method dispatch table, #0 = constructor
-	var children: List<IrClass>;		// list of child classes
 	var minClassId: int;
 	var maxClassId: int;
 	var machSize: int;
 
-	new(ctype, typeArgs, parent, fields, methods) {
-		if (parent != null) {
-			// XXX: use reachability analysis for children instead
-			parent.children = List.new(this, parent.children);
-		}
-	}
+	new(ctype, typeArgs, parent, fields, methods) { }
 	def inherits(m: IrMember) -> bool {
 		var p = parent;
 		if (p == null) return false;
@@ -34,7 +28,27 @@ class IrClass extends IrItem {
 		else return p.fields.length > m.index; // assume it's a field
 	}
 }
-// represents a member of a class or a component
+// intermediate representation of a variant type
+class IrVariant extends IrItem {
+	def vtype: Type;			// type for this variant
+	def typeArgs: TypeArgs;			// type arguments, if any
+	def methods: Array<Array<IrMethod>>;	// method matrix, indexed by case tag
+	def cases: Array<IrVariantCase>;	// all cases
+	new(vtype, typeArgs, methods, cases) {
+		for (i = 0; i < cases.length; i++) {
+			var c = cases(i);
+			c.variant = this;
+			c.index = i;
+		}
+	}
+}
+// intermediate representation of a variant case
+class IrVariantCase(tag: int, fields: Array<IrField>) extends IrItem {
+	var variant: IrVariant;		// containing variant
+	var source: VstVariantCase;	// declaration that produced the case
+	var index: int;			// index into the variant case array
+}
+// represents a member of a class, component, or variant
 class IrMember(container: Type) extends IrItem {
 	var index = -1;		// index into the appropriate members list
 
@@ -44,10 +58,10 @@ class IrMember(container: Type) extends IrItem {
 		return render(buffer);
 	}
 }
-// represents a field of a class or component, or the elements of an array
+// represents a field of a class, component, or variant
 class IrField extends IrMember {
 	def fieldType: Type;	// the type of the field
-	var source: VstField;	// declaration that produced the field, if any
+	var source: Decl;	// declaration that produced the field, if any
 	var machOffset: int;	// machine-level offset
 	var raField: RaField;   // information for reachability analysis
 
@@ -236,9 +250,11 @@ component IrUtil {
 // builds polymorphic IR classes from VST declarations
 class IrPortion(prog: Program) {
 	def classMap = TypeUtil.newTypeMap<IrClass>();
+	def variantMap = TypeUtil.newTypeMap<IrVariant>();
 	def typeVarElim = TypeVarEliminator.new(null);
 	def classes = Sequence<IrClass>.new();
 	def methods = Sequence<IrMethod>.new();
+	def variants = Sequence<IrVariant>.new();
 	var mainMethod: IrSpec;
 
 	def elimTypeVars(t: Type) -> Type {
@@ -310,9 +326,23 @@ class IrPortion(prog: Program) {
 		}
 		return ic;
 	}
+	def makeIrVariant(vtype: Type) -> IrVariant {
+		if (vtype == null) return null;
+		var iv = variantMap.get(vtype);
+		if (iv == null) {
+			var vt = V3.asVariant(vtype);
+			var ptype = vt.variantDecl.getDeclaredType();
+			iv = if(ptype == vtype,
+				newIrVariant(vtype, vt.variantDecl),
+				makeIrVariant(ptype));
+			variantMap.set(vtype, iv);
+		}
+		return iv;
+	}
 	def newIrClass(ctype: Type, superClass: IrClass, decl: VstCompound) -> IrClass {
 		var builder = IrClassBuilder.new(ctype, superClass);
-		builder.grow(decl.numFields, decl.numMethods + 1);
+		builder.fields.grow(decl.numFields);
+		builder.methods.grow(decl.numMethods + 1);
 		for (list = decl.members; list != null; list = list.tail) {
 			var m = list.head;
 			if (VstField.?(m)) builder.addVstField(VstField.!(m));
@@ -322,6 +352,26 @@ class IrPortion(prog: Program) {
 		var ic = builder.build();
 		classes.add(ic);
 		return ic;
+	}
+	def newIrVariant(vtype: Type, decl: VstVariant) -> IrVariant {
+		var decl = V3.asVariant(vtype).variantDecl;
+		var typeArgs: TypeArgs;
+		if (decl.typeParams != null) typeArgs = TypeArgs.new(decl.typeEnv, null);
+		var cases = Lists.toArray(Lists.map(decl.cases, newIrVariantCase(vtype, _)));
+		return IrVariant.new(vtype, typeArgs, [], cases);
+	}
+	def newIrVariantCase(vtype: Type, vc: VstVariantCase) -> IrVariantCase {
+		var fields = IrUtil.NO_FIELDS;
+		if (vc.params != null) fields = vc.params.mapArray(newIrVariantField(vtype, _));
+		var ir = IrVariantCase.new(vc.tag, fields);
+		ir.source = vc;
+		return ir;
+	}
+	def newIrVariantField(vtype: Type, p: ParamDecl) -> IrField {
+		var ir = IrField.new(vtype, p.vtype);
+		ir.source = p;
+		ir.setFact(Facts.F_VALUE);
+		return ir;
 	}
 }
 
@@ -337,10 +387,6 @@ class IrClassBuilder(ctype: Type, parent: IrClass) {
 			methods.addN(parent.methods);
 			methods.set(0, null); // overwrite super constructor
 		}
-	}
-	def grow(numFields: int, numMethods: int) {
-		fields.grow(numFields);
-		methods.grow(numMethods);
 	}
 	def addVstField(f: VstField) {
 		var ir = IrField.new(ctype, f.getType());
@@ -364,7 +410,7 @@ class IrClassBuilder(ctype: Type, parent: IrClass) {
 	def addVstMethod(m: VstMethod) {
 		var returnType = Function.getReturnType(m.getType());
 		var typeArgs: TypeArgs;
-		if (m.typeParams != null) typeArgs = m.typeEnv.getDefaultTypeArgs();
+		if (m.typeParams != null) typeArgs = TypeArgs.new(m.typeEnv, null);
 		var ir = IrMethod.new(ctype, typeArgs, getParamTypes(m), returnType);
 		ir.source = m;
 		if (EmptyStmt.?(m.body)) ir.setFact(Facts.M_EMPTY);
@@ -391,7 +437,7 @@ class IrClassBuilder(ctype: Type, parent: IrClass) {
 		var typeArgs: TypeArgs;
 		if (V3.isPolymorphicClass(ctype)) {
 			var decl = V3.asClass(ctype).classDecl;
-			typeArgs = decl.typeEnv.getDefaultTypeArgs();
+			typeArgs = TypeArgs.new(decl.typeEnv, null);
 		}
 		return IrClass.new(ctype, typeArgs, parent, fields.extract(), methods.extract());
 	}
