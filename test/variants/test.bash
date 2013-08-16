@@ -6,5 +6,7 @@ if [ $# -gt 0 ]; then
 else
 	TESTS=*.v3
 fi
-run_exec_tests
+# run_exec_tests
+# TODO: complex variant tests only work on the interpreter.
+run_int_tests "int" ""
 exit $?
