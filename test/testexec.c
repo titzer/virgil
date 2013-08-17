@@ -11,7 +11,7 @@
 #include <stdarg.h>
 
 #define STDOUT_BUF_SIZE 100
-#define STDERR_BUF_SIZE 412
+#define STDERR_BUF_SIZE 1024
 #define SPEC_BUF_SIZE 16384
 
 #define NORM "[0;00m"
