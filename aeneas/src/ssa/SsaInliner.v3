@@ -1,0 +1,313 @@
+// Copyright 2012 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Inlines a single call into the calling method by replacing the call instruction
+// with the method body.
+// XXX: reoptimize the control flow after inlining
+// XXX: normalize tuple returns
+class SsaInliner extends SsaRebuilder {
+	def callerBlock: SsaBlock;
+	def index: int;
+	def inlinee: IrSpec;
+	def call = SsaApplyOp.!(callerBlock.instrs.get(index));
+	def contInstrs = Arrays.range(callerBlock.instrs.array, index + 1, callerBlock.instrs.length);
+	def contEnd = callerBlock.end;
+	def contSuccs = Arrays.dup(callerBlock.succ);
+	var continuation: V3SsaBuilder;
+	var continuationIndex: int;
+	var inlinedBlocks: int;
+	var inlinedInstrs: int;
+	var retVal: SsaInstr;
+	var returns: List<(SsaCfEdge, SsaInstr)>;
+
+	new(context: SsaContext, callerBlock, index, inlinee) : super(context) { }
+
+	def inline() {
+		var target = inlinee.asMethod().ssa;
+		newRegion = context.region;
+		// trim the current block to include only instructions before the call
+		curBlock = V3SsaBuilder.new(context.compiler, context.prog.ir, newRegion, callerBlock);
+		callerBlock.instrs.length = index;
+		callerBlock.end = null;
+
+		if (V3.isComponent(inlinee.container)) mapComponentParams(target.params);
+		else mapParams(target.params);
+		// determine whether a simple or a complex inline is necessary
+		var targetStart = target.startBlock;
+		if (targetStart.succ.length == 0) {
+			// inlinee has just one block, inline directly into this block
+			inlineSimple(targetStart);
+		} else {
+			// inline a method with multiple blocks
+			inlineComplex(targetStart);
+		}
+		// clear instruction mappings
+		instrMap.clear();
+	}
+	def mapComponentParams(params: Array<SsaParam>) {
+		// map parameter 0 to the null constant
+		map1(params(0), newRegion.nullConst(inlinee.container));
+		mapNonReceiverParams(Arrays.range(params, 1, params.length), call.inputs);
+	}
+	def mapParams(params: Array<SsaParam>) {
+		// map parameter 0 to argument 0
+		var receiver = call.inputs(0).dest;
+		if (V3Op.needsNullCheck(call, receiver)) {
+			curBlock.opNullCheck(inlinee.container, receiver);
+		}
+		instrMap.set(params(0), receiver); // don't transfer non-null facts
+		mapNonReceiverParams(Arrays.range(params, 1, params.length), Arrays.range(call.inputs, 1, call.inputs.length));
+	}
+	def mapNonReceiverParams(params: Array<SsaParam>, args: Array<SsaDfEdge>) {
+		// map non-receiver params, expanding or contracting parameters to deal with tuples.
+		if (params.length == 0) return; // nothing to do
+		if (params.length == args.length) {
+			// params and argument counts match
+			for (i = 0; i < params.length; i++) map1(params(i), args(i).dest);
+		} else if (args.length == 0) {
+			// pass all BOTTOMs
+			for (p in params) map1(p, newRegion.nullConst(inlinee.instantiateType(p.vtype)));
+		} else if (params.length == 1) {
+			// collapse tuple arguments into one parameter
+			var p = params(0);
+			var vt = inlinee.instantiateType(p.vtype);
+			var tupleArg = curBlock.opTupleCreate(vt, Arrays.map(args, SsaDfEdge.getDest));
+			inlinedInstrs++;
+			map1(p, tupleArg);
+		} else if (args.length == 1) {
+			// expand tuple argument into multiple parameters
+			var vt = Tuple.TYPECON.create(Lists.fromArray(Arrays.map(params, SsaParam.vtype)));
+			vt = inlinee.instantiateType(vt);
+			var nargs = Array<SsaInstr>.new(params.length);
+			var a = args(0).dest;
+			for (i = 0; i < params.length; i++) {
+				map1(params(i), curBlock.opTupleGetElem(vt, i, a));
+				inlinedInstrs++;
+			}
+		} else {
+			context.fail("expected 1 tuple argument in inlined call");
+		}
+	}
+	// inline a simple, straight-line method directly into this block
+	def inlineSimple(targetStart: SsaBlock) {
+		continuation = curBlock;
+
+		var oseq = targetStart.instrs;
+		for (j = 0; j < oseq.length; j++) {
+			// translate each instruction in the block
+			genApplyOp(SsaApplyOp.!(oseq.get(j)));
+		}
+		// translate the end of the block (should be return or throw)
+		var end = targetStart.end;
+		if (SsaThrow.?(end)) genThrow(SsaThrow.!(end));
+		if (curBlock.end) return killContinuation();
+		if (!SsaReturn.?(end)) context.fail("expected throw or return when inlining simple method");
+
+		// create the appropriate return value
+		var inputs = SsaReturn.!(end).inputs, rv: SsaInstr;
+		if (inputs.length == 0) rv = newRegion.nop();
+		else if (inputs.length == 1) rv = genRef1(inputs(0));
+		else rv = curBlock.addApply(null, V3Op.newTupleCreate(inlinee.getReturnType()), genRefs(inputs));
+
+		// replace call instruction with return value
+		call.replace(rv);
+		call.kill();
+		// copy the continuation instructions after the inlinee code
+		continuationIndex = continuation.block.instrs.length;
+		continuation.block.instrs.addN(contInstrs);
+		// reset block end back to original, if there was one
+		if (contEnd != null) {
+			continuation.end = true;
+			continuation.block.end = contEnd; // XXX: fold original end branch
+		}
+	}
+	// inline a method with more than one block into this method
+	def inlineComplex(targetStart: SsaBlock) {
+		// build a block for the continuation
+		var cb = SsaBlock.new();
+		continuation = V3SsaBuilder.new(context.compiler, context.prog.ir, newRegion, cb);
+
+		var intoBlock = callerBlock; // start inlining into the callerblock
+		if (targetStart.predList != null) {
+			// inlinee method contains an edge back to beginning, split
+			intoBlock = SsaBlock.new();
+			V3SsaBuilder.new(context.compiler, context.prog.ir, newRegion, callerBlock).addGoto(intoBlock);
+		}
+
+		// visit all the blocks
+		genMultiBlock(targetStart, intoBlock);
+
+		// gather the returns
+		var count = Lists.length(returns);
+		if (count == 0) {
+			// inlined method didn't return; previous block is now a dead end
+			return killContinuation();
+		} else if (count == 1) {
+			// return value is simply the (only) returned value
+			retVal = returns.head.1;
+		} else {
+			// return value is a phi merging all possible returns from method
+			var phis = SsaPhis.new(continuation.block);
+			var inputs = Array<SsaInstr>.new(count), i = 0;
+			for (l = returns; l != null; (l = l.tail, i++)) {
+				phis.phiEdges.add(l.head.0);
+				inputs(i) = l.head.1;
+			}
+			var phi = SsaPhi.new(inlinee.getReturnType(), cb, inputs);
+			phis.phiInstrs.add(phi);
+			retVal = phi;
+			cb.phis = phis;
+		}
+		// replace call instruction with return value
+		call.replace(retVal);
+		call.kill();
+		// copy the continuation instructions after the inlinee code
+		continuationIndex = cb.instrs.length;
+		cb.instrs.addN(contInstrs);
+		// set end of continuation to be a copy of original end
+		cb.end = contEnd; // XXX: fold original end branch
+		if (contEnd != null) {
+			// replace control flow edges from original block
+			var opt = SsaCfOptimizer.new(context);
+			for (i = 0; i < cb.succ.length; i++) {
+				var oe = cb.succ(i), ne = SsaCfEdge.new(cb, oe.dest);
+				opt.replaceEdge(oe, ne);
+				cb.succ(i) = ne;
+			}
+			continuation.end = true;
+		}
+	}
+	def killContinuation() {
+		if (contEnd != null) {
+			for (i in contInstrs) i.kill();
+			contEnd.kill();
+			var opt = SsaCfOptimizer.new(context);
+			for (s in contSuccs) opt.removeEdge(s); // XXX: delete unreachable blocks
+			continuationIndex = -1;
+		}
+	}
+	def genApplyOp(oi: SsaApplyOp) {
+		var op = oi.op.subst(inlinee.instantiateType);
+		// XXX: perform folding of the newly added instructions
+		var ni = curBlock.addApply(newSource(oi.source), op, genRefs(oi.inputs));
+		if (ni != null) {
+			// transfer facts from inlinee code to inlined code
+			ni.setFact(oi.facts);
+			map1(oi, ni);
+			inlinedInstrs++;
+		} else {
+			// block is already ended
+			var vtype = inlinee.instantiateType(oi.getType());
+			instrMap.set(oi, newRegion.nullConst(vtype));
+		}
+	}
+	def genPhi(oi: SsaPhi) {
+		map1(oi, SsaPhi.new(inlinee.instantiateType(oi.vtype), mapBlockStart(oi.block), null));
+	}
+	def genVal(oi: SsaValue) {
+		map1(oi, newRegion.valConst(inlinee.instantiateType(oi.getType()), oi.val));
+	}
+	def genReturn(oi: SsaReturn) {
+		var edge: SsaCfEdge;
+		if (curBlock.block != callerBlock) {
+			curBlock.addGoto(continuation.block);
+			edge = curBlock.block.succ(0);
+		}
+		// create return value
+		var inputs = oi.inputs, rv: SsaInstr;
+		if (inputs.length == 0) rv = newRegion.nop();
+		else if (inputs.length == 1) rv = genRef1(inputs(0));
+		else {
+			rv = curBlock.addApply(null, V3Op.newTupleCreate(inlinee.getReturnType()), genRefs(inputs));
+			inlinedInstrs++;
+		}
+		// generate an (edge, return value) pair
+		returns = List.new((edge, rv), returns);
+	}
+	def genType1(t: Type) -> Type {
+		return inlinee.instantiateType(t);
+	}
+	def genThrow(oi: SsaThrow) {
+		curBlock.addThrow(newSource(oi.source), oi.exception);
+		inlinedInstrs++;
+	}
+	def newSource(source: Source) -> Source {
+		return if(source == null, call.source, Source.new(source.mdecl, source.line, source.column, newSource(source.tail)));
+	}
+}
+// Implements the inlining strategy for early inlining, which occurs right
+// after initial SSA generation, and thus has tuning parameters appropriately set.
+class SsaEarlyInliner(context: SsaContext, gen: VstSsaGen) {
+	def MAX_EARLY_GEN_DEPTH = 5;
+	def MAX_EARLY_INLINE_SIZE = 3;
+	def MAX_EARLY_INLINE_BLOCKS = 1;
+	var inlines = 0;
+	def inline(genDepth: int) {
+		if (V3.isComponent(context.spec.container)) {
+			// don't bother inlining into component constructors
+			if (context.spec.member.checkFact(Facts.M_NEW)) return;
+		}
+		if (genDepth < MAX_EARLY_GEN_DEPTH) {
+			for (l = gen.directCallTargets; l != null; l = l.tail) {
+				// generate the SSA of possible inlining candidates
+				context.compiler.genSsa(context.prog, l.head, genDepth + 1);
+			}
+		}
+		for (l = gen.directCallBlocks; l != null; l = l.tail) {
+			tryInlining(l.head);
+		}
+		if (inlines > 0) context.printSsa("Inlined");
+	}
+	def tryInlining(block: SsaBlock) {
+		var index = 0;
+		while (index < block.instrs.length) {
+			var i = block.instrs.get(index++);
+			if (i.opcode() != V3Opcode.CallMethod) continue;
+			var inlinee = V3Op.extractIrSpec(SsaApplyOp.!(i).op);
+			if (!shouldInline(inlinee)) continue;
+			var inliner = SsaInliner.new(context, block, index - 1, inlinee);
+			inliner.inline();
+			if (Aeneas.PRINT_INLINING.get()) {
+				var loc = if (inliner.call.source != null, inliner.call.source.render, context.spec.render);
+				Terminal.put3("Inlined %1 instructions from %2 into %3\n", inliner.inlinedInstrs, inlinee.render, loc);
+			}
+			inlines++;
+			if (inliner.continuationIndex < 0) return;
+			// continuing inlining in code after the inlined section
+			block = inliner.continuation.block;
+			index = inliner.continuationIndex;
+		}
+	}
+	def shouldInline(inlinee: IrSpec) -> bool {
+		var ssa = inlinee.asMethod().ssa;
+		if (ssa == null) return false;
+		if (inlinee.member.checkFact(Facts.M_INLINE)) return true;
+		return checkRegionSize(ssa, MAX_EARLY_INLINE_BLOCKS, MAX_EARLY_INLINE_SIZE);
+	}
+}
+def checkRegionSize(ssa: SsaRegion, maxBlocks: int, maxInstrs: int) -> bool {
+	if (maxBlocks == 1) {
+		// quick check for one block with {maxInstrs}
+		if (ssa.startBlock.succ.length > 0) return false;
+		return ssa.startBlock.instrs.length <= maxInstrs;
+	}
+	// explore up to {maxBlocks} blocks of the inlinee
+	var queue = Sequence<SsaBlock>.new().grow(maxBlocks);
+	var mark = ++ssa.markGen;
+	queue.add(ssa.startBlock);
+	ssa.startBlock.mark = mark;
+	// do bread-first search over the CFG (order doesn't matter)
+	for (i = 0; i < queue.length; i++) {
+		var b = queue.get(i);
+		var endCost = if(SsaSwitch.?(b.end), 1); // branches cost 1, other ends 0
+		maxInstrs = maxInstrs - endCost - b.instrs.length;
+		ssa.addSuccessors(queue.get(i), queue, mark);
+		if (queue.length > maxBlocks) {
+			maxInstrs = -1;
+			break;
+		}
+	}
+	for (i = 0; i < queue.length; i++) queue.get(i).mark = 0; // clear marks
+	// XXX: cache the number of blocks in a region in the region itself?
+	return maxInstrs >= 0;
+}
