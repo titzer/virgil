@@ -437,13 +437,14 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			// bind variant parameters in the body if necessary
 			var p = c.patterns.first();
 			if (p.params != null) {
-				var keyType = key.getType();
-				var iv = ir.makeIrVariant(keyType), ic = iv.cases(p.variantCase.tag);
-				var ta = [keyType], args = [key], i = 0;
+				var keyType = key.getType(), newKeyType = V3.getSyntheticVariantType(keyType, p.variantCase);
+				var newKey = env.opTypeSubsume(keyType, newKeyType, key); // XXX: a cast is just to satisfy the typesystem of the JVM
+				var ta = [keyType], args = [newKey], i = 0;
+				var ic = ir.makeIrClass(newKeyType);
 				for (pl = p.params.list; pl != null; pl = pl.tail) {
-					var fieldRef = IrSpec.new(keyType, ta, ic.fields(i++));
+					var fieldRef = IrSpec.new(newKeyType, ta, ic.fields(i++));
 					pl.head.ssa = VstSsaVar.new();
-					pl.head.ssa.instr = env.addApply(null, V3Op.newVariantGetField(keyType, fieldRef), args);
+					pl.head.ssa.instr = env.opClassGetField(fieldRef, newKey);
 				}
 			}
 		}
@@ -512,6 +513,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			VstBinding.LOCAL: return env.get(LocalBinding.!(binding).decl.ssa);
 			VstBinding.VALUE: return env.addVal(binding.boundType, ValueBinding.!(binding).val);
 			VstBinding.OBJECT_METHOD: return env.opClassGetVirtual(specOf(binding), receiver);
+			VstBinding.VARIANT_FIELD,
 			VstBinding.OBJECT_FIELD: return env.opClassGetField(specOf(binding), receiver);
 			VstBinding.CLASS_METHOD: {
 				var spec = specOf(binding); // XXX: optimize in V3SsaBuilder/V3Op?
@@ -520,17 +522,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 				else return env.addOp(V3Op.newCallMethod(spec));
 			}
 			VstBinding.CLASS_FIELD: return env.addOp(V3Op.newClassGetField(specOf(binding)));
-			VstBinding.CLASS_NEW: {
-				var spec = specOf(binding);
-				if (spec.member == null) {
-					// trivial constructor
-					var ftype = ir.elimTypeVars(binding.boundType), paramTypes = Function.getParamTypeArray(ftype);
-					var ctype = Function.getReturnType(ftype);
-					var op = V3Op.newOp1(V3Opcode.ClassAlloc, [ctype], paramTypes, ctype, V3Op.evalEmptyClassAlloc, null);
-					return env.addOp(op);
-				}
-				return env.addOp(V3Op.newClassAlloc(spec));
-			}
+			VstBinding.CLASS_NEW: return genClassAllocOp(specOf(binding), binding, env);
 			VstBinding.COMPONENT_METHOD: {
 				var spec = specOf(binding);
 				if (receiver == null) receiver = initOf(binding, env);
@@ -543,32 +535,37 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			}
 			VstBinding.VARIANT_CASE: {
 				var mb = MemberBinding.!(binding);
-				var container = ir.elimTypeVars(mb.container);
 				var vcase = VstVariantCase.!(mb.member);
-				var ic = ir.makeIrVariant(container).cases(vcase.tag);
-				if (vcase.params == null && !container.open()) {
-					// XXX: constant fold variants in V3SsaBuilder instead?
-					return env.addVal(container, Variant_Value.new(container, ic, Values.NONE));
+				var container = V3.getSyntheticVariantType(ir.elimTypeVars(mb.container), vcase);
+				if (vcase.params == null) {
+					if (container.open()) {
+						// trivial constructor, but polymorphic type
+						var op = V3Op.newOp1(V3Opcode.ClassAlloc, [container], TypeUtil.NO_TYPES, container, V3Op.evalEmptyClassAlloc, null);
+						return env.addApply(null, op, SsaUtil.NO_INSTRS);
+					} else {
+						// trivial constructor; fold to a value
+						return env.addVal(container, ir.prog.newRecord(container, 0));
+					}
 				}
-				var op = V3Op.newVariantCreate(container, ic);
-				if (vcase.params != null) return env.addOp(op);
-				else return env.addApply(env.source, op, []);
-			}
-			VstBinding.VARIANT_METHOD: {
-				var spec = specOf(binding);
-				if (receiver == null) {
-					if (spec.member.checkFact(Facts.M_OVERRIDDEN)) return env.addOp(V3Op.newCallVariantMethod(spec));
-					else return env.addOp(V3Op.newCallMethod(spec));
-				}
-				return env.opVariantGetMethod(spec, receiver);
-			}
-			VstBinding.VARIANT_FIELD: {
-				return env.addApply(null, V3Op.newVariantGetField(receiver.getType(), specOf(binding)), [receiver]);
+				var constructor = ir.makeIrClass(container).methods(0);
+				var spec = IrSpec.new(container, [container], constructor);
+				return genClassAllocOp(spec, binding, env);
 			}
 			VstBinding.OTHER: return OtherBinding.!(binding).genRead(receiver, env);
 		}
 		context.fail("invalid binding in read");
 		return env.region.nop();
+	}
+	def genClassAllocOp(spec: IrSpec, binding: Binding, env: VstSsaEnv) -> SsaInstr {
+		var spec = specOf(binding);
+		if (spec.member == null) {
+			// trivial constructor
+			var ftype = ir.elimTypeVars(binding.boundType), paramTypes = Function.getParamTypeArray(ftype);
+			var ctype = Function.getReturnType(ftype);
+			var op = V3Op.newOp1(V3Opcode.ClassAlloc, [ctype], paramTypes, ctype, V3Op.evalEmptyClassAlloc, null);
+			return env.addOp(op);
+		}
+		return env.addOp(V3Op.newClassAlloc(spec));
 	}
 	def genWrite(receiver: SsaInstr, binding: Binding, val: SsaInstr, env: VstSsaEnv) -> SsaInstr {
 		// binding appears as a write such as "receiver.binding = val"
@@ -605,16 +602,12 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 				return env.opCallMethod(specOf(binding), env.genExprs(null, args));
 			}
 			VstBinding.VARIANT_CASE: {
-				// XXX: reduce duplication with genRead of variant case
 				var mb = MemberBinding.!(binding);
-				var container = ir.elimTypeVars(mb.container);
 				var vcase = VstVariantCase.!(mb.member);
-				var ic = ir.makeIrVariant(container).cases(vcase.tag);
-				var op = V3Op.newVariantCreate(container, ic);
-				return env.addApply(env.source, op, env.genExprs(null, args)); // XXX: constant folding
-			}
-			VstBinding.VARIANT_METHOD: {
-				return env.opVariantCallMethod(specOf(binding), env.genExprs(receiver, args));
+				var container = V3.getSyntheticVariantType(ir.elimTypeVars(mb.container), vcase);
+				var constructor = ir.makeIrClass(container).methods(0);
+				var spec = IrSpec.new(container, [container], constructor);
+				return env.opClassAlloc(spec, env.genExprs(null, args));
 			}
 			VstBinding.OTHER: return OtherBinding.!(binding).genApply(receiver, env, env.genExprs(null, args));
 		} else {
@@ -627,21 +620,14 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		var mb = MemberBinding.!(binding);
 		var container = ir.elimTypeVars(mb.container), m: IrMember;
 		if (V3.isVariant(container)) {
-			var iv = ir.makeIrVariant(container);
-			if (VstField.?(mb.member)) {
-				var vc = VstVariant.!(mb.member.container).container;
-				var ic = iv.cases(vc.tag);
-				m = ic.fields(ic.fields.length - mb.member.index - 1);
-			} else {
-				var c = VstVariant.!(mb.member.container), table = iv.methods(mb.member.index);
-				if (c.container != null) m = table(c.container.tag + 1);
-				else m = table(0);
-			}
-		} else {
-			var ic = ir.makeIrClass(container);
-			if (VstField.?(mb.member)) m = ic.fields(mb.member.index);
-			else m = ic.methods(mb.member.index);
+			var variant = VstVariant.!(mb.member.container);
+			if (variant.container != null) container = V3.getSyntheticVariantType(container, variant.container);
 		}
+
+		var ic = ir.makeIrClass(container);
+		if (VstField.?(mb.member)) m = ic.fields(mb.member.index);
+		else m = ic.methods(mb.member.index);
+
 		var newTa = [container];
 		if (mb.typeArgs != null) {
 			// add method type parameters to the type arguments array
@@ -695,8 +681,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		} else if (expr.partial != null) {
 			// this is a partial application
 			var bound = Sequence<SsaInstr>.new(), indexMap = Sequence<int>.new();
-			var ssaFunc = env.genExpr(f);
-			bound.add(ssaFunc);
+			bound.add(env.genExpr(f));
 			indexMap.add(0);
 			for (i = 0; i < args.length; i++) {
 				var arg = args(i);

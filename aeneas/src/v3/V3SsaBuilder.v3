@@ -3,7 +3,7 @@
 
 def PURE_LOAD = Facts.O_NO_NULL_CHECK | Facts.O_PURE;
 def ZERO_NON_ZERO = Facts.V_ZERO | Facts.V_NON_ZERO;
-def ABOVE_BELOW_ZERO = Facts.V_ABOVE_ZERO | Facts.V_BELOW_ZERO;
+def ABOVE_BELOW_ZERO = Facts.V_NON_ZERO | Facts.V_NON_NEGATIVE | Facts.V_BELOW_ZERO;
 
 // An SSA builder specific to Virgil-III language operators that also performs
 // local optimizations as each instruction is added to the block.
@@ -219,7 +219,8 @@ class V3SsaBuilder extends SsaBuilder {
 		var xc = x.opcode();
 		if (xc == V3Opcode.ArrayInit) return ik(x.inputs.length); // fold ArrayGetLength(ArrayInit)
 		if (xc == V3Opcode.ArrayAlloc) return SsaApplyOp.!(x).inputs(0).dest; // fold ArrayGetLength(ArrayAlloc)
-		return addPureLoad(V3Op.newArrayGetLength(arrayType), [x]);
+		var facts = implicitNullCheck(x, Facts.O_FOLDABLE, Facts.O_PURE);
+		return add(V3Op.newArrayGetLength(arrayType), [x], facts);
 	}
 	// ClassAlloc[new](args)
 	def opClassAlloc(m: IrSpec, x: Array<SsaInstr>) -> SsaInstr {
@@ -229,47 +230,70 @@ class V3SsaBuilder extends SsaBuilder {
 	}
 	// ClassGetField[f](x)
 	def opClassGetField(f: IrSpec, x: SsaInstr) -> SsaInstr {
-		var k = fieldConst(f); // fold constant fields
+		// fold ClassGetField[C.f](x) if C.f is a constant
+		var facts = implicitNullCheck(x, f.member.facts, 0);
+		var k = fieldConst(f);
 		if (k != null) {
-			opNullCheck(x.getType(), x);
+			addExplicitNullCheck(x, facts);
 			return k;
 		}
-		var isValueField = f.member.checkFact(Facts.F_VALUE);
-		var facts = if(isValueField, Facts.O_FOLDABLE);
+
+		// fold ClassGetField[C.f](x == zero)
+		if (isZero(x)) return opClassGetFieldNull(f);
+
+		// fold ClassGetField[C.f](K) if C.f is init-only
 		if (SsaValue.?(x)) {
-			var obj = rv(x);
-			if (obj == null) return addThrow(source, V3Exception.NullCheck);
-			if (isValueField) return region.valConst(f.getFieldType(), obj.values(f.member.index)); // fold field load
-			facts = Facts.O_NO_NULL_CHECK;
+			if (f.member.isConst()) return region.valConst(f.getFieldType(), rv(x).values(f.member.index));
 		}
-		return addLoad(V3Op.newClassGetField(f), [x], facts | f.member.facts);
+
+		return add(V3Op.newClassGetField(f), [x], facts);
+	}
+	// ClassGetField[f](null)
+	def opClassGetFieldNull(f: IrSpec) -> SsaInstr {
+		if (V3.isVariant(f.container)) return region.nullConst(f.getFieldType());
+		else return addThrow(source, V3Exception.NullCheck);
+	}
+	def implicitNullCheck(x: SsaInstr, facts: int, extra: int) -> int {
+		if (V3.isVariant(x.getType())) return facts;
+		if (isNonNull(x)) return facts | Facts.O_NO_NULL_CHECK | extra;
+		if (isZero(x)) {
+			addThrow(source, V3Exception.NullCheck);
+			return 0;
+		}
+		setNonNull(x);
+		return facts;
 	}
 	// ClassSetField[f](x, v)
 	def opClassSetField(f: IrSpec, x: SsaInstr, v: SsaInstr, init: bool) -> SsaInstr {
-		// XXX: remove useless field writes
-		var op = if(init, V3Op.newClassInitField(f), V3Op.newClassSetField(f));
-		return addLoad(op, [x, v], 0);
+		var facts = implicitNullCheck(x, 0, 0);
+		return add(if(init, V3Op.newClassInitField(f), V3Op.newClassSetField(f)), [x, v], facts);
 	}
 	// ClassGetMethod[m](x)
 	def opClassGetMethod(m: IrSpec, x: SsaInstr) -> SsaInstr {
+		var facts = implicitNullCheck(x, Facts.O_FOLDABLE, Facts.O_PURE);
 		if (SsaValue.?(x)) {
 			var obj = rv(x);
-			if (obj == null) return addThrow(source, V3Exception.NullCheck); // fold ClassGetMethod(null)
-			if (!m.isPolymorphic()) return region.valConst(m.getBoundType(), Delegate.new(obj, m)); // fold ClassGetMethod(K)
+			if (!m.isPolymorphic()) {
+				// fold ClassGetMethod(K)
+				addExplicitNullCheck(x, facts);
+				return region.valConst(m.getBoundType(), Delegate.new(obj, m));
+			}
 		}
-		return addPureLoad(V3Op.newClassGetMethod(m), [x]);
+		return add(V3Op.newClassGetMethod(m), [x], facts);
 	}
 	// ClassGetVirtual[m](x)
 	def opClassGetVirtual(m: IrSpec, x: SsaInstr) -> SsaInstr {
 		var dv = devirtualize(m, x);
 		if (dv != null) return opClassGetMethod(dv, x);
-		return addPureLoad(V3Op.newClassGetVirtual(m), [x]);
+		var facts = implicitNullCheck(x, Facts.O_FOLDABLE, Facts.O_PURE);
+		return add(V3Op.newClassGetVirtual(m), [x], facts);
 	}
 	// ClassGetVirtFunc[m](x)
 	def opClassGetVirtFunc(m: IrSpec, x: SsaInstr) -> SsaInstr {
 		var dv = devirtualize(m, x);
 		if (dv != null) return region.valConst(dv.getFuncType(), FuncVal.new(dv));
-		return addPureLoad(V3Op.newClassGetVirtFunc(m), [x]);
+		var facts = implicitNullCheck(x, Facts.O_FOLDABLE, Facts.O_PURE);
+		return add(V3Op.newClassGetVirtFunc(m), [x], facts);
 	}
 	// ComponentInit[new]
 	def opComponentInit(ctype: Type, m: IrMethod) -> SsaInstr {
@@ -307,10 +331,17 @@ class V3SsaBuilder extends SsaBuilder {
 	}
 	// NullCheck(x)
 	def opNullCheck(rtype: Type, x: SsaInstr) -> SsaInstr {
+		if (V3.isVariant(rtype)) return null;
 		if (isNonNull(x)) return null;
 		if (isZero(x)) return addThrow(source, V3Exception.NullCheck);
 		setNonNull(x);
 		return add(V3Op.newNullCheck(x.getType()), [x], 0);
+	}
+	def addExplicitNullCheck(x: SsaInstr, facts: int) {
+		if (0 == (facts & Facts.O_NO_NULL_CHECK)) {
+			var t = x.getType();
+			if (!V3.isVariant(t)) add(V3Op.newNullCheck(t), [x], 0);
+		}
 	}
 	private def isNonNull(x: SsaInstr) -> bool {
 		if (x == nonNullObj) return true;
@@ -352,7 +383,9 @@ class V3SsaBuilder extends SsaBuilder {
 	def opCallClassVirtual(m: IrSpec, x: Array<SsaInstr>) -> SsaInstr {
 		var dv = devirtualize(m, x(0));
 		if (dv != null) return opCallMethod(dv, x); // devirtualize call virtual method
-		return addLoad(V3Op.newCallClassVirtual(m), x, 0);
+		var op = V3Op.newCallClassVirtual(m);
+		if (V3.isClass(m.container)) return addLoad(op, x, 0);
+		else return add(op, x, if(isNonNull(x(0)), Facts.O_NO_NULL_CHECK));
 	}
 	// CallDelegate(args)
 	def opCallDelegate(ftype: Type, x: Array<SsaInstr>) -> SsaInstr {
@@ -421,21 +454,6 @@ class V3SsaBuilder extends SsaBuilder {
 		}
 		return add(V3Op.newConditionalThrow(ex), [x], 0);
 	}
-	// GetVariantMethod[m](x)
-	def opVariantGetMethod(m: IrSpec, x: SsaInstr) -> SsaInstr {
-		if (!m.member.checkFact(Facts.M_OVERRIDDEN)) return opCreateDelegate(m, x);
-		return add(V3Op.newVariantGetMethod(m), [x], Facts.O_PURE);
-	}
-	def opVariantCallMethod(m: IrSpec, x: Array<SsaInstr>) -> SsaInstr {
-		if (!m.member.checkFact(Facts.M_OVERRIDDEN)) {
-			var i = opCallMethod(m, x);
-			i.setFact(Facts.O_NO_NULL_CHECK);
-			return i;
-		}
-		x = Arrays.dup(x);
-		x(0) = opVariantGetMethod(m, x(0));
-		return opCallDelegate(x(0).getType(), x);
-	}
 	def v(y: SsaInstr) -> Val {
 		return SsaValue.!(y).val;
 	}
@@ -459,14 +477,6 @@ class V3SsaBuilder extends SsaBuilder {
 		var i = SsaApplyOp.new(source, op, args).setFact(facts | Operators.facts(op.opcode));
 		block.instrs.add(i);
 		return i;
-	}
-	def addPureLoad(op: Operator, args: Array<SsaInstr>) -> SsaInstr {
-		if (end) return unreachable(op.resultType);
-		var receiver = args(0);
-		if (isZero(receiver)) return addThrow(source, V3Exception.NullCheck);
-		var i = SsaApplyOp.new(source, op, args).setFact(Operators.facts(op.opcode));
-		block.instrs.add(i);
-		return setFactsIfNonNull(receiver, i, PURE_LOAD);
 	}
 	def addLoad(op: Operator, args: Array<SsaInstr>, facts: int) -> SsaInstr {
 		if (end) return unreachable(op.resultType);
