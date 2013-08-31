@@ -9,4 +9,5 @@ fi
 # run_exec_tests
 # TODO: complex variant tests only work on the interpreter.
 run_int_tests "int" ""
+run_int_tests "int-ra" "-ra"
 exit $?

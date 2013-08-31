@@ -13,6 +13,8 @@ def RF_VALS       = RF_VAL_ONE | RF_VAL_MANY;
 def RC_ALLOC      = 0x080;
 def RC_LIVE       = 0x100;
 def RC_DUMPED	  = 0x200;
+def RC_EQUALITY   = 0x400;
+def RC_VARIANT    = 0x800;
 
 // global reachability information for primitive types, accessed frequently
 def RA_VOID = RaType.new(Void.TYPE, Void.TYPE, TypeUtil.NO_TYPES);
@@ -83,6 +85,8 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		if (virtual != null) Terminal.put(" v");
 		if ((facts & RC_LIVE) != 0) Terminal.put(" l");
 		if ((facts & RC_ALLOC) != 0) Terminal.put(" a");
+		if ((facts & RC_VARIANT) != 0) Terminal.put(" t");
+		if ((facts & RC_EQUALITY) != 0) Terminal.put(" =");
 		if ((facts & RF_VALS) == RF_VAL_ONE) {
 			Terminal.put(" k");
 			Terminal.put1(" = %1", prog.render(val));
@@ -165,6 +169,10 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 			for (ml in c.methods) {
 				for (l = ml; l != null; l = l.tail) analyzeVirtual(rc, l.head);
 			}
+			if (0 == (rc.raFacts & RC_EQUALITY) && 0 != (c.raFacts & RC_EQUALITY)) {
+				rc.raFacts = rc.raFacts | RC_EQUALITY;
+				analyzeEquality(rc);
+			}
 		}
 	}
 	// analyze a possible virtual dispatch of the given method on the given type
@@ -175,6 +183,23 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		var impl = makeMethod(spec.typeArgs, IrMethod.!(spec.member), null);
 		rv.addImpl(impl);
 		getMethod(null, impl);
+	}
+	// analyze the use of equality on a given class type
+	def analyzeEquality(rc: RaClass) {
+		if (0 == (rc.raFacts & RC_VARIANT)) return;
+		// variants compare fields for equality.
+		var typeArgs = V3.getTypeArgs(rc.oldType);
+		for (i = 0; i < rc.fields.length; i++) {
+			var rf = rc.fields(i);
+			if (rf == null) {
+				var f = rc.orig.fields(i);
+				var ftn = makeType(f.fieldType.substitute(typeArgs));
+				rf = rc.makeField(f, ftn, ftn.size);
+			}
+			getField(rf);
+			var ft = if(rf.fieldType == null, rf.orig.fieldType, rf.fieldType.oldType);
+			analyzeEqualOnType(ft);
+		}
 	}
 	// analyze a method's code
 	def analyzeMethod(rm: RaMethod) {
@@ -227,6 +252,8 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 	// analyze an operator
 	def analyzeOp(op: SsaApplyOp, context: IrSpec) {
 		match (op.op.opcode) {
+			V3Opcode.Equal,
+			V3Opcode.NotEqual: analyzeEqualOnType(mono(op.op.typeArgs(0), context));
 			V3Opcode.ArrayAlloc,
 			V3Opcode.ArrayInit: allocation(makeType(mono(op.op.typeArgs(0), context)));
 			V3Opcode.ClassAlloc: {
@@ -243,7 +270,7 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 			V3Opcode.ClassGetField,
 			V3Opcode.ComponentGetField: {
 				if (op.useList != null) { // only analyze getfields if not dead
-					getField(op, makeField(op, context));
+					getField(makeField(op, context));
 				}
 			}
 			V3Opcode.ClassInitField: initField(op, makeField(op, context));
@@ -251,6 +278,12 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 			V3Opcode.ComponentSetField: setField(op, makeField(op, context));
 		}
 		// TODO: system operators, pointer operators, etc
+	}
+	// analyze an equality comparison
+	def analyzeEqualOnType(t: Type) {
+		match (t.typeCon.kind) {
+			V3Kind.CLASS, V3Kind.VARIANT: getClassEquality(t);
+		}
 	}
 	// analyze an access of a field
 	def analyzeGetField(container: RaClass, rf: RaField) {
@@ -268,6 +301,19 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 			analyzeLiveClass(RaClass.!(raType));
 		}
 	}
+	def getClassEquality(t: Type) {
+		var rc = makeClass(t);
+		if ((rc.raFacts & RC_EQUALITY) != 0) return; // already marked.
+		rc.raFacts = rc.raFacts | RC_EQUALITY;
+		queue.add(analyzeEquality, rc);
+		for (l = rc.subtypes; l != null; l = l.tail) {
+			var c = l.head;
+			if (0 == (c.raFacts & RC_EQUALITY)) {
+				c.raFacts = c.raFacts | RC_EQUALITY;
+				queue.add(analyzeEquality, c);
+			}
+		}
+	}
 	def getVirtual(op: SsaApplyOp, rm: RaMethod) {
 		if (rm.isVirtual()) return;
 		rm.virtual = RaVirtual.new(rm);
@@ -281,7 +327,7 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		liveMethods.add(rm);
 		queue.add(analyzeMethod, rm);
 	}
-	def getField(op: SsaApplyOp, rf: RaField) {
+	def getField(rf: RaField) {
 		if (rf.setFact(RF_READ)) return;
 		queue.add(analyzeGetField, (makeClass(rf.container), rf));
 	}
@@ -435,9 +481,11 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 					// Add a default value to the tag 0 class for field tracking
 					if (vcase != null && vcase.tag == 0) deferValue(prog.newRecord(t, ic.fields.length));
 				}
-				raType = newRaClass(t, t, ic, superClass);
+				var rc = newRaClass(t, t, ic, superClass);
+				rc.raFacts = rc.raFacts | RC_VARIANT;
+				raType = rc;
 			}
-			V3Kind.CLASS, V3Kind.VARIANT: {
+			V3Kind.CLASS: {
 				var superType = V3.getSuperType(t);
 				var superClass = if(superType != null, makeClass(superType));
 				var ic = oldIr.makeIrClass(t);
