@@ -6,8 +6,12 @@ if [ $# -gt 0 ]; then
 else
 	TESTS=*.v3
 fi
-# run_exec_tests
-# TODO: complex variant tests only work on the interpreter.
-run_int_tests "int" ""
-run_int_tests "int-ra" "-ra"
+
+if [ -z "$NATIVE" ]; then
+  run_int_tests "int" ""
+  run_int_tests "int-ra" "-ra"
+else
+ run_exec_tests
+fi
+
 exit $?
