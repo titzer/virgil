@@ -166,6 +166,14 @@ public class V3S_System {
         return (y < 0 || x <= y) ? 1 : 0;
     }
 
+    public static int natDiv(int x, int y) {
+	return (int)((x & 0xffffffffL) / (y & 0xffffffffL));
+    }
+
+    public static int natMod(int x, int y) {
+	return (int)((x & 0xffffffffL) % (y & 0xffffffffL));
+    }
+
     public static int natGt(int x, int y) {
         return 1 ^ natLteq(x, y);
     }
