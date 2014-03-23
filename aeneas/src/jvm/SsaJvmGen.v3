@@ -16,6 +16,12 @@ class SsaJvmInstr {
 }
 def TRUNCATE = true;
 def NO_TRUNCATE = false;
+class SsaJvmCompareBranch {
+	def lcmp: bool;
+	def op: byte;
+	def args: Array<SsaDfEdge>;
+	new(lcmp, op, args) { }
+}
 // Emits JVM code for a method in SSA form.
 class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmCodeBuilder) {
 	def blockMap = LazyMap.new(SsaBlock.uid, SsaBlock.==, SsaJvmBlock.new);
@@ -98,75 +104,77 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 		last(0) = first;
 
 		// check for switch instruction combine first
-		if (SsaSwitch.?(block.end) && max > 0) {
-			if (tryCombine(block, ins)) return;
-		}
+		var cmpBranch = matchCompareBranch(b);
+		if (cmpBranch != null) max--;
 
 		// compute the effects on the stack of each instruction
 		for (j < max) computeInstrEffect(block, j, ins.get(j));
-		computeInstrEffect(block, max, block.end);
+		if (cmpBranch != null) computeArgLoads(cmpBranch.args);
+		else computeInstrEffect(block, max, block.end);
 
 		// use previous results to emit code that uses the Java operand stack well
 		if (first.loads != null) emitLoads(first.loads);
 		for (j < max) emitCode(block, instrs(j));
 		ssaDecon.genSsaMoves(block);
-		emitEnd(block, instrs(max));
+
+		// emit the control flow at the end of the block
+		if (cmpBranch != null) emitCompareBranch(block, cmpBranch);
+		else emitEnd(block, instrs(max));
 		checkStackHeight(block);
 	}
-	def tryCombine(block: SsaBlock, ins: Sequence<SsaInstr>) -> bool {
+	def emitCompareBranch(block: SsaBlock, b: SsaJvmCompareBranch) {
+		var b0 = block.succ(0).dest, b1 = block.succ(1).dest;
+		if (b.lcmp) code.lcmp();
+		if (Bool.unbox(SsaSwitch.!(block.end).vals(0))) emitBranchIf(b.op, b0, b1);
+		else emitBranchIf(b.op, b1, b0);
+	}
+	def matchCompareBranch(b: SsaJvmBlock) -> SsaJvmCompareBranch {
+		var block = b.block, ins = block.instrs;
+		if (ins.length == 0) return null;
+		if (!SsaSwitch.?(block.end)) return null;
 		var max = ins.length, key = block.end.input0();
-		if (key == ins.get(max - 1) && key.useList.next == null && SsaApplyOp.?(key)) {
-			var args = key.inputs, k = SsaApplyOp.!(key);
-			match (k.op.opcode) {
-				V3Opcode.Equal:	{
-					var t = k.op.typeArgs(0);
-					match (t.typeCon.kind) {
-						V3Kind.BOOL, V3Kind.INT:
-							return emitCombined(block, args, JvmBytecode.IF_ICMPEQ, JvmBytecode.IF_ICMPNE);
-						V3Kind.CLASS, V3Kind.VARIANT, V3Kind.ARRAY:
-							return emitCombined(block, args, JvmBytecode.IF_ACMPEQ, JvmBytecode.IF_ACMPNE);
+		if (key != ins.get(max - 1)) return null;
+		if (key.useList.next != null) return null;
+		if (!SsaApplyOp.?(key)) return null;
+		var i = SsaApplyOp.!(key), lcmp = false, op: byte;
+		match (i.op.opcode) {
+			V3Opcode.Equal, V3Opcode.NotEqual: {
+				var eq = i.op.opcode == V3Opcode.Equal;
+				var t = i.op.typeArgs(0);
+				match (t.typeCon.kind) {
+					V3Kind.BOOL,
+					V3Kind.INT: {
+						if (V3.isLong(t)) { lcmp = true; op = if(eq, JvmBytecode.IFEQ, JvmBytecode.IFNE); }
+						else op = if(eq, JvmBytecode.IF_ICMPEQ, JvmBytecode.IF_ICMPNE);
+					}
+					V3Kind.CLASS, V3Kind.VARIANT, V3Kind.ARRAY: {
+						op = if(eq, JvmBytecode.IF_ACMPEQ, JvmBytecode.IF_ACMPNE);
 					}
 				}
-				V3Opcode.NotEqual: {
-					var t = k.op.typeArgs(0);
-					match (t.typeCon.kind) {
-						V3Kind.BOOL, V3Kind.INT:
-							return emitCombined(block, args, JvmBytecode.IF_ICMPNE, JvmBytecode.IF_ICMPEQ);
-						V3Kind.CLASS, V3Kind.VARIANT, V3Kind.ARRAY:
-							return emitCombined(block, args, JvmBytecode.IF_ACMPNE, JvmBytecode.IF_ACMPEQ);
-					}
-				}
-				V3Opcode.IntLt:		if (isInt32(k)) return emitCombined(block, args, JvmBytecode.IF_ICMPLT, JvmBytecode.IF_ICMPGE);
-				V3Opcode.IntGt:		if (isInt32(k)) return emitCombined(block, args, JvmBytecode.IF_ICMPGT, JvmBytecode.IF_ICMPLE);
-				V3Opcode.IntLteq:	if (isInt32(k)) return emitCombined(block, args, JvmBytecode.IF_ICMPLE, JvmBytecode.IF_ICMPGT);
-				V3Opcode.IntGteq:	if (isInt32(k)) return emitCombined(block, args, JvmBytecode.IF_ICMPGE, JvmBytecode.IF_ICMPLT);
+			}
+			V3Opcode.IntLt:	{
+				var t = i.op.paramTypes(0);
+				if (V3.isLong(t)) { lcmp = true; op = JvmBytecode.IFLT; }
+				else if (V3.isInt32(t)) op = JvmBytecode.IF_ICMPLT;
+			}
+			V3Opcode.IntGt:	{
+				var t = i.op.paramTypes(0);
+				if (V3.isLong(t)) { lcmp = true; op = JvmBytecode.IFGT; }
+				else if (V3.isInt32(t)) op = JvmBytecode.IF_ICMPGT;
+			}
+			V3Opcode.IntLteq: {
+				var t = i.op.paramTypes(0);
+				if (V3.isLong(t)) { lcmp = true; op = JvmBytecode.IFLE; }
+				else if (V3.isInt32(t)) op = JvmBytecode.IF_ICMPLE;
+			}
+			V3Opcode.IntGteq: {
+				var t = i.op.paramTypes(0);
+				if (V3.isLong(t)) { lcmp = true; op = JvmBytecode.IFGE; }
+				else if (V3.isInt32(t)) op = JvmBytecode.IF_ICMPGE;
 			}
 		}
-		return false;
-	}
-	def isInt32(i: SsaApplyOp) -> bool {
-		var t = i.op.resultType;
-		if (t == Int.TYPE) return true;
-		return V3.isInt(t) && V3.asInt(t).width < 32;
-	}
-	def emitCombined(block: SsaBlock, args: Array<SsaDfEdge>, opTrue: byte, opFalse: byte) -> bool {
-		var ins = block.instrs, max = ins.length - 1; // skip last instr
-		// compute the effects on the stack of each instruction
-		for (j < max) computeInstrEffect(block, j, ins.get(j));
-		computeArgLoads(args);
-
-		// use previous results to emit code that uses the Java operand stack well
-		if (first.loads != null) emitLoads(first.loads);
-		for (j < max) emitCode(block, instrs(j));
-		ssaDecon.genSsaMoves(block);
-
-		// emit the combined branch
-		var b0 = block.succ(0).dest, b1 = block.succ(1).dest;
-		if (Bool.unbox(SsaSwitch.!(block.end).vals(0))) emitBranchIf(opTrue, opFalse, b0, b1);
-		else emitBranchIf(opTrue, opFalse, b1, b0);
-		checkStackHeight(block);
-		return true;
-	}
+		return if(op != 0, SsaJvmCompareBranch.new(lcmp, op, i.inputs));
+	} 
 	def checkStackHeight(block: SsaBlock) {
 		if (code.cur_stack != 0) {
 			var msg = Strings.format1("B#%1: stack height should be zero", block.uid);
@@ -310,26 +318,29 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 	}
 	def emitTwoWay(block: SsaBlock, i: SsaSwitch, t: Type, v: Val) {
 		var b0 = block.succ(0).dest, b1 = block.succ(1).dest;
-		var opTrue: byte, opFalse: byte;
+		var opTrue: byte;
 		if (t == Bool.TYPE) {
 			if (Bool.unbox(v)) return emitBranchIfNonZero(b0, b1);
 			else return emitBranchIfNonZero(b1, b0);
 		} else if (V3.isInt(t)) {
+			if (V3.isLong(t)) {
+				code.builder.emitValue(code, t, v);
+				code.lcmp();
+				return emitBranchIfNonZero(b0, b1);
+			}
 			if (Int.unbox(v) == 0) return emitBranchIfNonZero(b1, b0);
 			opTrue = JvmBytecode.IF_ICMPEQ;
-			opFalse = JvmBytecode.IF_ICMPNE;
 		} else if (V3.isClass(t) || V3.isArray(t) || V3.isVariant(t)) {
-			if (v == null) return emitBranchIf(JvmBytecode.IFNULL, JvmBytecode.IFNONNULL, b0, b1);
+			if (v == null) return emitBranchIf(JvmBytecode.IFNULL, b0, b1);
 			opTrue = JvmBytecode.IF_ACMPEQ;
-			opFalse = JvmBytecode.IF_ACMPNE;
 		} else if (V3.isFunction(t)) {
-			if (v == null) return emitBranchIf(JvmBytecode.IFNULL, JvmBytecode.IFNONNULL, b0, b1);
+			if (v == null) return emitBranchIf(JvmBytecode.IFNULL, b0, b1);
 			code.builder.emitValue(code, t, v);
 			jprog.invokesystem(code, "equals", JvmTypes.SIG_EQUALS);
 			return emitBranchIfNonZero(b0, b1);
 		}
 		code.builder.emitValue(code, t, v);
-		emitBranchIf(opTrue, opFalse, b0, b1);
+		emitBranchIf(opTrue, b0, b1);
 	}
 	def emitIfSeq(block: SsaBlock, i: SsaSwitch, t: Type) {
 		var kind = jprog.jvmKind(t), tmp = allocReg(null, t);
@@ -348,9 +359,9 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 		emitGotoOrFallThru(block.succ(max).dest);
 	}
 	def emitBranchIfNonZero(tb: SsaBlock, fb: SsaBlock) {
-		emitBranchIf(JvmBytecode.IFNE, JvmBytecode.IFEQ, tb, fb);
+		emitBranchIf(JvmBytecode.IFNE, tb, fb);
 	}
-	def emitBranchIf(opTrue: byte, opFalse: byte, tb: SsaBlock, fb: SsaBlock) {
+	def emitBranchIf(opTrue: byte, tb: SsaBlock, fb: SsaBlock) {
 		var ti = blockMap.get(tb), fi = blockMap.get(fb);
 		if (fi.codeStart < 0) {
 			emitBranch(opTrue, ti);
@@ -358,7 +369,7 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 			return;
 		}
 		if (ti.codeStart < 0) {
-			emitBranch(opFalse, fi);
+			emitBranch(inverse(opTrue), fi);
 			blocks = List.new(ti, blocks);
 			return;
 		}
@@ -396,8 +407,8 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 		var popped = false;
 		// arguments are already assumed to be on the stack
 		match (op.opcode) {
-			V3Opcode.Equal:			code.builder.emitCompare(code, true, op.typeArgs(0));
-			V3Opcode.NotEqual:		code.builder.emitCompare(code, false, op.typeArgs(0));
+			V3Opcode.Equal:			emitCompare(true, op.typeArgs(0));
+			V3Opcode.NotEqual:		emitCompare(false, op.typeArgs(0));
 			V3Opcode.IntAdd:		emitIntBinop(i, JvmBytecode.IADD, JvmBytecode.LADD, TRUNCATE);
 			V3Opcode.IntSub:		emitIntBinop(i, JvmBytecode.ISUB, JvmBytecode.LSUB, TRUNCATE);
 			V3Opcode.IntMul:		emitIntBinop(i, JvmBytecode.IMUL, JvmBytecode.LMUL, TRUNCATE);
@@ -406,16 +417,8 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 			V3Opcode.IntAnd:		emitIntBinop(i, JvmBytecode.IAND, JvmBytecode.LAND, NO_TRUNCATE);
 			V3Opcode.IntOr:			emitIntBinop(i, JvmBytecode.IOR, JvmBytecode.LOR, NO_TRUNCATE);
 			V3Opcode.IntXor:		emitIntBinop(i, JvmBytecode.IXOR, JvmBytecode.LXOR, NO_TRUNCATE);
-			V3Opcode.IntShl: {
-				if (i.checkFact(Facts.O_NO_SHIFT_CHECK)) code.binop(JvmBytecode.ISHL);
-				else jprog.invokesystem(code, "shl", JvmTypes.SIG_INT_INT_INT);
-				emitIntTrunc(V3.asInt(i.op.resultType));
-			}
-			V3Opcode.IntShr: {
-				if (i.checkFact(Facts.O_NO_SHIFT_CHECK)) code.binop(JvmBytecode.IUSHR);
-				else jprog.invokesystem(code, "shr", JvmTypes.SIG_INT_INT_INT);
-				emitIntTrunc(V3.asInt(i.op.resultType));
-			}
+			V3Opcode.IntShl: 		emitShift(i, true);
+			V3Opcode.IntShr: 		emitShift(i, false);
 			V3Opcode.IntLt:			emitIntCmp(i, JvmBytecode.IF_ICMPLT, JvmBytecode.IFLT, "natLt");
 			V3Opcode.IntGt:			emitIntCmp(i, JvmBytecode.IF_ICMPGT, JvmBytecode.IFGT, "natGt");
 			V3Opcode.IntLteq:		emitIntCmp(i, JvmBytecode.IF_ICMPLE, JvmBytecode.IFLE, "natLteq");
@@ -564,6 +567,69 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 		}
 		return popped;
 	}
+	def emitCompare(equ: bool, ctype: Type) {
+		if (V3.isTuple(ctype) || V3.isFunction(ctype)) {
+			code.invokestatic(JvmTypes.systemClassName, "equals", JvmTypes.SIG_EQUALS);
+			if (!equ) {
+				code.iconst_1();
+				code.binop(JvmBytecode.IXOR);
+			}
+		} else {
+			var kind = jprog.jvmType(ctype).kind;
+			if (kind == JvmTypes.KIND_BOOLEAN) {
+				if (equ) {
+					code.iconst_1();
+					code.binop(JvmBytecode.IXOR);
+				}
+				code.binop(JvmBytecode.IXOR);
+			} else if (isInteger(kind)) {
+				if (equ) branchValue(JvmBytecode.IF_ICMPEQ);
+				else branchValue(JvmBytecode.IF_ICMPNE);
+			} else if (kind == JvmTypes.KIND_OBJECT) {
+				if (equ) branchValue(JvmBytecode.IF_ACMPEQ);
+				else branchValue(JvmBytecode.IF_ACMPNE);
+			} else if (kind == JvmTypes.KIND_VOID) {
+				code.iconst_1(); // comparisons of type void are always true
+			} else if (kind == JvmTypes.KIND_LONG) {
+				code.lcmp();
+				if (equ) branchValue(JvmBytecode.IFEQ);
+				else branchValue(JvmBytecode.IFNE);
+			} else {
+				jprog.context.fail("JvmCompiler error: unknown branch kind");
+			}
+		}
+	}
+	def branchValue(op: byte) {
+		var b1 = code.branch_fw(op);
+		code.iconst_0();
+		var height = code.cur_stack;
+		var b2 = code.goto_fw();
+		code.patchBranch(b1);
+		code.iconst_1();
+		code.patchBranch(b2);
+		code.cur_stack = height;
+	}
+	def isInteger(kind: JvmKind) -> bool {
+		return kind == JvmTypes.KIND_INT || kind == JvmTypes.KIND_BYTE || kind == JvmTypes.KIND_SHORT || kind == JvmTypes.KIND_CHAR;
+	}
+	def emitShift(i: SsaApplyOp, left: bool) {
+		var t = i.op.resultType;
+		if (i.checkFact(Facts.O_NO_SHIFT_CHECK)) {
+			if (V3.isLong(t)) {
+				code.l2i();
+				code.lbinop(if(left, JvmBytecode.LSHL, JvmBytecode.LUSHR));
+			} else {
+				code.binop(if(left, JvmBytecode.ISHL, JvmBytecode.IUSHR));
+			}
+		} else {
+			if (V3.isLong(t)) {
+				jprog.invokesystem(code, if(left, "lshl", "lshr"), JvmTypes.SIG_LONG_LONG_LONG);
+			} else {
+				jprog.invokesystem(code, if(left, "shl", "shr"), JvmTypes.SIG_INT_INT_INT);
+			}
+		}
+		emitIntTrunc(V3.asInt(t));
+	}
 	def emitIntBinop(i: SsaApplyOp, iop: byte, lop: byte, trunc: bool) {
 		var tt = V3.asInt(i.op.resultType);
 		if (tt.width <= 32) code.binop(iop);
@@ -575,8 +641,10 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 		if (tt.isU32()) {
 			var meth = if(i.op.opcode == V3Opcode.IntDiv, "natDiv", "natMod");
 			jprog.invokesystem(code, meth, JvmTypes.SIG_INT_INT_INT);
-		} else {
+		} else if (tt.width <= 32) {
 			code.binop(if(i.op.opcode == V3Opcode.IntDiv, JvmBytecode.IDIV, JvmBytecode.IREM));
+		} else {
+			code.lbinop(if(i.op.opcode == V3Opcode.IntDiv, JvmBytecode.LDIV, JvmBytecode.LREM));
 		}
 		emitIntTrunc(tt);
 	}
@@ -587,7 +655,11 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 			emitIntTrunc(tt);
 		} else if (ft.width < tt.width) {
 			if (ft.width <= 32 && tt.width > 32) {
-				code.i2l();  // TODO: zero extension
+				code.i2l();
+				if (ft.isU32()) {
+					code.lconst(0, -1);
+					code.lbinop(JvmBytecode.LAND);
+				}
 			}
 		}
 	}
@@ -616,11 +688,9 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 		var tt = V3.asInt(i.op.paramTypes(0));
 		if (tt.isU32()) {
 			// TODO: generate inline 32-bit unsigned compare
-			jprog.invokesystem(code, sysMethName, JvmTypes.SIG_INT_INT_INT);
-			return;
+			return jprog.invokesystem(code, sysMethName, JvmTypes.SIG_INT_INT_INT);
 		}
 		if (tt.width > 32) {
-			// TODO: add/subtract instead of branching?
 			// TODO: u64 support.
 			code.lcmp();
 			var height = code.cur_stack;
@@ -631,15 +701,16 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 			code.iconst_1();
 			code.patchBranch(pos2);
 			code.cur_stack = height;
+		} else {
+			var height = code.cur_stack - 1;
+			var pos1 = code.branch_fw(iop);
+			code.iconst_0();
+			var pos2 = code.goto_fw();
+			code.patchBranch(pos1);
+			code.iconst_1();
+			code.patchBranch(pos2);
+			code.cur_stack = height;
 		}
-		var height = code.cur_stack - 1;
-		var pos1 = code.branch_fw(iop);
-		code.iconst_0();
-		var pos2 = code.goto_fw();
-		code.patchBranch(pos1);
-		code.iconst_1();
-		code.patchBranch(pos2);
-		code.cur_stack = height;
 	}
 	def emitTypeCast(t1: Type, t2: Type) {
 		// XXX: clean up type cast handling in JVM backend
@@ -709,5 +780,26 @@ class SsaJvmGen(jprog: JvmProgram, context: SsaContext, jsig: JvmSig, code: JvmC
 		var t = code.max_locals;
 		code.max_locals = t + 1;
 		return t;
+	}
+	def inverse(op: byte) -> byte {
+		match (op) {
+			JvmBytecode.IF_ICMPEQ: return JvmBytecode.IF_ICMPNE;
+			JvmBytecode.IF_ICMPNE: return JvmBytecode.IF_ICMPEQ;
+			JvmBytecode.IF_ICMPLT: return JvmBytecode.IF_ICMPGE;
+			JvmBytecode.IF_ICMPGE: return JvmBytecode.IF_ICMPLT;
+			JvmBytecode.IF_ICMPGT: return JvmBytecode.IF_ICMPLE;
+			JvmBytecode.IF_ICMPLE: return JvmBytecode.IF_ICMPGT;
+			JvmBytecode.IF_ACMPEQ: return JvmBytecode.IF_ACMPNE;
+			JvmBytecode.IF_ACMPNE: return JvmBytecode.IF_ACMPEQ;
+			JvmBytecode.IFEQ:      return JvmBytecode.IFNE;
+			JvmBytecode.IFNE:      return JvmBytecode.IFEQ;
+			JvmBytecode.IFLT:      return JvmBytecode.IFGE;
+			JvmBytecode.IFGE:      return JvmBytecode.IFLT;
+			JvmBytecode.IFGT:      return JvmBytecode.IFLE;
+			JvmBytecode.IFLE:      return JvmBytecode.IFGT;
+			JvmBytecode.IFNULL:    return JvmBytecode.IFNONNULL;
+			JvmBytecode.IFNONNULL: return JvmBytecode.IFNULL;
+		}
+		return V3.fail1("cannot invert JvmBytecode %1", op);
 	}
 }

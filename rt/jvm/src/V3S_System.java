@@ -156,6 +156,16 @@ public class V3S_System {
 	return 0;
     }
 
+    public static long lshl(long a, long b) {
+	if ((b & 63) == b) return a << b;
+	return 0;
+    }
+
+    public static long lshr(long a, long b) {
+	if ((b & 63) == b) return a >>> b;
+	return 0;
+    }
+
     public static int natLt(int x, int y) {
         if (x < 0) return y < 0 ? (y > x ? 1 : 0) : 0;
         return (y < 0 || x < y) ? 1 : 0;
