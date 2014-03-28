@@ -138,10 +138,7 @@ function run_native_tests() {
 	run_native $target
 }
 
-function run_exec_tests() {
-	run_int_tests "int" ""
-	run_int_tests "int-ra" "-ra"
-
+function run_jvm_tests() {
 	mkdir -p $OUT/jvm
 	C=$OUT/jvm/compile.out
 	R=$OUT/jvm/run.out
@@ -156,6 +153,13 @@ function run_exec_tests() {
 		$HOST_JAVA -cp $VIRGIL_LOC/rt/jvm/bin:$OUT/jvm V3S_Tester $TESTS > $R
 		check_red $R
 	fi
+}
+
+function run_exec_tests() {
+	run_int_tests "int" ""
+	run_int_tests "int-ra" "-ra"
+
+        run_jvm_tests
 
 	run_native_tests x86-darwin x86-darwin-test
 	run_native_tests x86-linux x86-linux-test
