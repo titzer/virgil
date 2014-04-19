@@ -191,4 +191,22 @@ public class V3S_System {
     public static int natGteq(int x, int y) {
         return 1 ^ natLt(x, y);
     }
+
+    public static int natlLt(long x, long y) {
+        if (x < 0) return y < 0 ? (y > x ? 1 : 0) : 0;
+        return (y < 0 || x < y) ? 1 : 0;
+    }
+
+    public static int natlLteq(long x, long y) {
+        if (x < 0) return y < 0 ? (y >= x ? 1 : 0) : 0;
+        return (y < 0 || x <= y) ? 1 : 0;
+    }
+
+    public static int natlGt(long x, long y) {
+        return 1 ^ natlLteq(x, y);
+    }
+
+    public static int natlGteq(long x, long y) {
+        return 1 ^ natlLt(x, y);
+    }
 }
