@@ -73,7 +73,6 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		stmt.loopNum = pushLoop();
 		stmt.loopVar = VstSsaVar.new(); // synthesize new loop variable
 		setAssigned(stmt.loopVar);
-		// TODO: allow (int, int) and (byte, byte) ranges
 		var exprType = inferClosedType(stmt.expr);
 		if (V3.isArray(exprType)) {
 			var elemType = V3Array.elementType(exprType);
@@ -97,13 +96,14 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		methodEnv.bindVar(varDecl);
 		stmt.loopNum = pushLoop();
 		setAssigned(varDecl.ssa);
-		var exprType = inferClosedTypeWithOuter(stmt.expr, varDecl.vtype);
-		typeCheckExpr(stmt.expr, varDecl.vtype, "foreach limit");
-		if (V3.isInt(exprType)) {
-			if (varDecl.vtype == null) varDecl.vtype = exprType;
+		var exprType = varDecl.vtype;
+		if (exprType != null) {
+			typeCheckExpr(stmt.expr, exprType, "foreach limit");
 		} else {
+			varDecl.vtype = exprType = inferClosedType(stmt.expr);
+		}
+		if (!V3.isInt(exprType)) {
 			error(stmt.expr.range(), "TypeError", Strings.format1("foreach requires integral expression and found %1", TYPE(exprType)));
-			if (varDecl.tref == null) varDecl.vtype = getErrorType();
 		}
 		typeCheckStmt(stmt.body);
 		popLoop();
@@ -425,17 +425,6 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 	}
 	def visitValueBinding(expr: VarExpr, lit: ValueBinding, outer: Type) -> Type {
-		if (lit.boundType == outer) return lit.boundType;
-		if (V3.isInt(outer) && V3.isInt(lit.boundType)) {
-			var repr = V3.asInt(outer).represent(lit.val, V3.asInt(lit.boundType));
-			if (repr.0) {
-				lit = ValueBinding.new(lit.token, repr.1, outer);
-				expr.binding = lit;
-				expr.exactType = outer;
-			} else {
-				RepresentationError(lit.token, outer);
-			}
-		}
 		return lit.boundType;
 	}
 	def visitString(expr: StringExpr, outer: Type) -> Type {
@@ -556,11 +545,36 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 	}
 	def visitBinOp(expr: BinOpExpr, outer: Type) -> Type {
-		var infix = expr.op.infix, lt: Type, rt: Type;
-		if (infix == V3Infix.Equal || infix == V3Infix.NotEqual) return visitComparison(expr, outer);
-		if (infix == V3Infix.AndAnd || infix == V3Infix.OrOr) lt = rt = Bool.TYPE;
-		var ltype = inferClosedTypeWithOuter(expr.left, lt);
-		var rtype = inferClosedTypeWithOuter(expr.right, rt);
+		match (expr.op.infix) {
+			V3Infix.Equal,
+			V3Infix.NotEqual: {
+				var ltype = inferClosedType(expr.left), rtype = inferClosedType(expr.right);
+				var wtype = TypeSystem.widen(ltype, rtype);
+				if (wtype == null) {
+					if (!TypeSystem.maybeEqual(ltype, rtype)) {
+						TypeError(expr.range(), ltype, rtype, "comparison");
+						return Bool.TYPE;
+					}
+					wtype = ltype;
+				}
+				if (expr.op.infix == V3Infix.Equal) expr.set(V3Op.newEqual(wtype));
+				else expr.set(V3Op.newNotEqual(wtype));
+				if (wtype != ltype) expr.left.implicitType = wtype;
+				if (wtype != rtype) expr.right.implicitType = wtype;
+				return Bool.TYPE;
+			}
+			V3Infix.OrOr,
+			V3Infix.AndAnd: {
+				typeCheckExpr(expr.left, Bool.TYPE, "logical operator");
+				typeCheckExpr(expr.right, Bool.TYPE, "logical operator");
+				expr.set(if(expr.op.infix == V3Infix.OrOr, V3Op.opBoolOr, V3Op.opBoolAnd));
+				return Bool.TYPE;
+			}
+		}
+
+		var infix = expr.op.infix;
+		var ltype = inferClosedType(expr.left);
+		var rtype = inferClosedType(expr.right);
 		var wtype = TypeSystem.widen(ltype, rtype);
 		var op: Operator;
 
@@ -575,29 +589,8 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		typeCheckExpr(expr.right, op.paramTypes(1), "infix operator");
 		return op.resultType;
 	}
-	def visitComparison(expr: BinOpExpr, outer: Type) -> Type {
-		var ltype = inferClosedType(expr.left), rtype = inferClosedType(expr.right);
-		var wtype = TypeSystem.widen(ltype, rtype);
-		if (wtype == null) {
-			if (!TypeSystem.maybeEqual(ltype, rtype)) {
-				TypeError(expr.range(), ltype, rtype, "comparison");
-				return Bool.TYPE;
-			}
-			wtype = ltype;
-		}
-		if (expr.op.infix == V3Infix.Equal) expr.set(V3Op.newEqual(wtype));
-		else expr.set(V3Op.newNotEqual(wtype));
-		if (wtype != ltype) expr.left.implicitType = wtype;
-		if (wtype != rtype) expr.right.implicitType = wtype;
-		return Bool.TYPE;
-	}
 	def resolveBinOp(t: Type, infix: byte) -> Operator {
-		if (infix == V3Infix.AndAnd) return V3Op.opBoolAnd;
-		if (infix == V3Infix.OrOr) return V3Op.opBoolOr;
-		if (Member_TypeCon.?(t.typeCon)) {
-			return Member_TypeCon.!(t.typeCon).lookupInfix(infix);
-		}
-		return null;
+		return if(Member_TypeCon.?(t.typeCon), Member_TypeCon.!(t.typeCon).lookupInfix(infix));
 	}
 	def visitIfExpr(expr: IfExpr, outer: Type) -> Type {
 		var args = expr.exprs.asArray(), what = "if expression", len = args.length;
@@ -641,9 +634,27 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			expr.exactType = exactType;
 		}
 		if (exactType != outerType && outerType != null) {
+			if (VarExpr.?(expr) && TryRepresentationChangeOfLiteral(VarExpr.!(expr), outerType)) return;
 			if (TypeSystem.isImplicitlyConvertible(exactType, outerType)) expr.implicitType = outerType;
 			else TypeError(expr.range(), outerType, exactType, op);
 		}
+	}
+	def TryRepresentationChangeOfLiteral(expr: VarExpr, outer: Type) -> bool {
+		if (!ValueBinding.?(expr.binding)) return false;
+		var lit = ValueBinding.!(expr.binding);
+		if (V3.isInt(outer) && V3.isInt(lit.boundType)) {
+			var repr = V3.asInt(outer).represent(lit.val, V3.asInt(lit.boundType));
+			if (repr.0) {
+				lit = ValueBinding.new(lit.token, repr.1, outer);
+				expr.binding = lit;
+				expr.exactType = outer;
+				return true;
+			} else {
+				RepresentationError(lit.token, outer);
+				return false;
+			}
+		}
+		return false;
 	}
 	def typeCheckExprs(args: TupleExpr, types: List<Type>, op: string) {
 		var tl = types;
@@ -661,9 +672,6 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	def inferClosedType(expr: Expr) -> Type {
 		if (expr.exactType != null) return expr.exactType;
 		return expr.exactType = elim(expr.accept(this, null));
-	}
-	def inferClosedTypeWithOuter(expr: Expr, outer: Type) -> Type {
-		return expr.exactType = elim(expr.accept(this, outer));
 	}
 	def inferType(expr: Expr, outerType: Type) -> Type {
 		return expr.exactType = expr.accept(this, outerType);
