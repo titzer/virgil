@@ -216,13 +216,11 @@ public class V3S_System {
 	    if (y == 2) return x >>> 1;
 	    if (y == 4) return x >>> 2;
 	    if (y == 8) return x >>> 3;
-	    if (y < 0) return y >= x ? 1 : 0;
+	    if (y < 0) return y <= x ? 1 : 0;
 	    long approx = (x >>> 1) / (y >>> 1);
 	    long rem = x - y * approx;
-	    while (rem >= y) {
-		approx++;
-		rem -= y;
-	    }
+	    if (rem < 0) approx--;
+	    else if (rem >= y) approx++;
 	    return approx;
 	} else {
 	    if (y < 0) return 0;
