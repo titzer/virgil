@@ -1,7 +1,7 @@
 #!/bin/bash
 
 jvm=0
-if [ "$1" = -jvm ]; then
+if [ "$1" == "-jvm" ]; then
     jvm=1
     shift
 fi
@@ -32,7 +32,7 @@ else
 	TESTS=*.v3
 fi
 
-if [ "$jvm" ]; then
+if [ "$jvm" == 1 ]; then
   run_jvm_tests
 else
   run_exec_tests
