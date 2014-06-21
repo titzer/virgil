@@ -57,12 +57,12 @@ class SsaMachGen extends SsaRebuilder {
 			V3Opcode.IntDiv,
 			V3Opcode.IntMod,
 			V3Opcode.IntShl,
-			V3Opcode.IntShr:		return genIntOp(oi, true);
+			V3Opcode.IntShr:		return genTruncatingIntOp(oi);
 			// Output of integer operations must be normalized
-			V3Opcode.IntAnd,
-			V3Opcode.IntOr,
-			V3Opcode.IntXor:		return genIntOp(oi, false);
-			// Conversions have to be normalized
+			V3Opcode.IntAnd:		return genParallelIntOp(oi, V3Infix.And);
+			V3Opcode.IntOr:			return genParallelIntOp(oi, V3Infix.Or);
+			V3Opcode.IntXor:		return genParallelIntOp(oi, V3Infix.Xor);
+			// Conversions have to be normalized specially
 			V3Opcode.IntConvert:		return genIntConvert(oi);
 
 			V3Opcode.TypeCast: 		ni = genTypeCast(oi);
@@ -73,7 +73,7 @@ class SsaMachGen extends SsaRebuilder {
 			V3Opcode.ArrayGetElem: 		ni = genArrayGetElem(oi);
 			V3Opcode.ArraySetElem: 		ni = genArraySetElem(oi);
 			V3Opcode.ArrayGetLength: 	ni = genArrayGetLength(oi);
-			V3Opcode.ClassAlloc: 		ni = genClassAlloc(oi);
+			V3Opcode.ClassAlloc: 		return genClassAlloc(oi);
 			V3Opcode.ClassGetField: 	ni = genClassGetField(oi);
 			V3Opcode.ClassInitField,
 			V3Opcode.ClassSetField: 	ni = genClassSetField(oi);
@@ -81,7 +81,6 @@ class SsaMachGen extends SsaRebuilder {
 			V3Opcode.ClassGetVirtFunc: 	ni = genClassGetVirtual(oi);
 			V3Opcode.ComponentGetField: 	ni = genComponentGetField(oi);
 			V3Opcode.ComponentSetField: 	ni = genComponentSetField(oi);
-			V3Opcode.TupleCreate: 		ni = genTupleCreate(oi);
 			V3Opcode.TupleGetElem: 		ni = genTupleGetElem(oi);
 			V3Opcode.NullCheck: {
 				ni = genNullCheck(oi);
@@ -89,11 +88,12 @@ class SsaMachGen extends SsaRebuilder {
 				return; // don't update SSA facts!!!
 			}
 			V3Opcode.BoundsCheck: 		ni = genBoundsCheck(oi, true);
-			V3Opcode.CallMethod: 		ni = genCallMethod(oi);
-			V3Opcode.CallClassVirtual: 	ni = genCallClassVirtual(oi);
+			V3Opcode.CallMethod: 		return genCallMethod(oi);
+			V3Opcode.CallClassVirtual: 	return genCallClassVirtual(oi);
 			V3Opcode.CallFunction: {
-				var ftype = oi.op.typeArgs(0);
-				ni = call(oi.source, true, mach.machType(ftype), null, genRefs(oi.inputs));
+				var funcRep = mach.getFuncRep(oi.op.typeArgs(0));
+				call(oi, funcRep, genRefs(oi.inputs));
+				return;
 			}
 			V3Opcode.VariantGetTag:	{
 				var oobj = oi.inputs(0), nobj = genRef1(oobj);
@@ -105,6 +105,7 @@ class SsaMachGen extends SsaRebuilder {
 				var loweringFunc = oi.op.attr<(SsaApplyOp, SsaMachGen) -> SsaInstr>();
 				ni = loweringFunc(oi, this);
 			}
+			V3Opcode.TupleCreate,
 			V3Opcode.ClassGetVirtual,
 			V3Opcode.ComponentInit,
 			V3Opcode.ComponentGetMethod,
@@ -118,18 +119,77 @@ class SsaMachGen extends SsaRebuilder {
 	def unexpected(oi: SsaApplyOp) {
 		context.fail(Strings.format1("unexpected operator %1", V3Op.renderOp(oi.op)));
 	}
-	def genIntOp(oi: SsaApplyOp, truncate: bool) {
+	def genTruncatingIntOp(oi: SsaApplyOp) {
 		var tt = V3.asInt(oi.op.resultType);
-		var ni = apply(oi.source, oi.op, genRefs(oi.inputs));
-		if (mach.intNorm.isNormalType(tt)) {
-			// a single output is produced.
-			if (truncate && tt.width < mach.intNorm.width) {
-				ni = apply(null, V3Op.newIntConvert(Int.TYPE, oi.op.resultType), [ni]);
+		var inputs = genRefs(oi.inputs);
+		if (inputs.length == 2) {
+			// two inputs => one output.
+			var ni = apply(oi.source, oi.op, inputs);
+			if (tt.width < mach.intNorm.width) {
+				ni = curBlock.opIntConvert(V3Op.newIntConvert(mach.intNorm.word, oi.op.resultType), ni);
 			}
 			return map1(oi, ni);
 		}
 		// multiple outputs are produced.
 		var tn = mach.intNorm.makeType(tt);
+		var ni = apply(oi.source, V3Op.newIntWide(oi.op, tn.sub, tn.newType), inputs);
+		return mapWide(oi, ni, tn, true);
+	}
+	def genParallelIntOp(oi: SsaApplyOp, infix: byte) {
+		var inputs = genRefs(oi.inputs);
+		if (inputs.length == 2) {
+			// simple case: two inputs => one output.
+			return map1(oi, apply(oi.source, oi.op, inputs));
+		}
+		// multiple outputs are produced.
+		var tt = V3.asInt(oi.op.resultType);
+		var tn = mach.intNorm.makeType(tt);
+		var vals = Array<SsaInstr>.new(tn.size);
+		for (i < vals.length) {
+			var op = V3.asInt(tn.sub(i)).lookupInfix(infix, null);
+			vals(i) = apply(oi.source, op, [inputs(i), inputs(i + tn.size)]);
+		}
+		return mapN(oi, vals);
+	}
+	def genIntConvert(oi: SsaApplyOp) {
+		var inputs = genRefs(oi.inputs);
+		var ft = V3.asInt(oi.op.paramTypes(0));
+		var tt = V3.asInt(oi.op.resultType);
+		if (tt.width > mach.intNorm.width) {
+			// more than 1 output.
+			var ftn = mach.intNorm.makeType(ft);
+			var ttn = mach.intNorm.makeType(tt);
+			var vals = Array<SsaInstr>.new(ttn.size);
+			for (i < ttn.size) {
+				var val = inputs(i);
+				if (i < ftn.size) {
+					if (i == ftn.bigEndIndex() && ttn.sub(i) != ftn.sub(i)) {
+						val = curBlock.opIntConvert(V3Op.newIntConvert(ftn.sub(i), ttn.sub(i)), val);
+					}
+				} else {
+					if (ft.signed) val = newGraph.zeroConst(); // TODO: shift right arithmetic
+					else val = newGraph.zeroConst();
+				}
+				vals(i) = inputs(i);
+			}
+			return mapN(oi, vals);
+		}
+		var ni: SsaInstr;
+		if (ft.width > mach.intNorm.width) {
+			// more than one input.
+			var tn = mach.intNorm.makeType(ft);
+			var lt = tn.sub(tn.littleEndIndex());
+			var little = inputs(tn.littleEndIndex());
+			if (lt == oi.op.resultType) ni = little;
+			else ni = curBlock.opIntConvert(V3Op.newIntConvert(lt, oi.op.resultType), little);
+		} else {
+			// 1 -> 1 conversion.
+			ni = apply(oi.source, oi.op, inputs);
+		}
+		map1(oi, ni);
+	}
+	def mapWide(oi: SsaInstr, ni: SsaInstr, tn: RaIntType, truncate: bool) {
+		if (tn == null) return map1(oi, ni);
 		var vals = Array<SsaInstr>.new(tn.sub.length);
 		for (i < tn.size) vals(i) = apply(null, V3Op.newTupleGetElem(tn.newType, i), [ni]);
 		if (truncate) {
@@ -140,9 +200,6 @@ class SsaMachGen extends SsaRebuilder {
 			}
 		}
 		mapN(oi, vals);
-	}
-	def genIntConvert(oi: SsaApplyOp) {
-		map1(oi, genSimple(oi));
 	}
 	def genSimple(oi: SsaApplyOp) -> SsaInstr {
 		return apply(oi.source, oi.op, genRefs(oi.inputs));
@@ -314,7 +371,7 @@ class SsaMachGen extends SsaRebuilder {
 		var oarr = oi.inputs(0), narr = genRef1(oarr);
 		return refLoad(Int.TYPE, oi, oarr, narr, mach.getArrayLengthOffset(oi.op.typeArgs(0)));
 	}
-	def genClassAlloc(oi: SsaApplyOp) -> SsaInstr {
+	def genClassAlloc(oi: SsaApplyOp) {
 		var classType = oi.getType();
 		var size = mach.getObjectSize(classType, null);
 		// allocate the object
@@ -322,13 +379,14 @@ class SsaMachGen extends SsaRebuilder {
 		storeObjectTag(nobj, classType);
 		var newRef = V3Op.extractIrSpec(oi.op);
 		if (newRef.member != null) {
-			// TODO: norm
+			var funcRep = mach.funcRep(newRef);
 			// nontrivial constructor
-			var constr = mach.getCodeAddress(newRef);
-			var newType = mach.funcType(newRef);
-			call(oi.source, true, newType, newGraph.valConst(newType, constr), Arrays.prepend(nobj, genRefs(oi.inputs)));
+			var func = newGraph.valConst(funcRep.machType, mach.getCodeAddress(newRef));
+			var args = Arrays.prepend(func, Arrays.prepend(nobj, genRefs(oi.inputs)));
+			call(oi, funcRep, args);
+			return;
 		}
-		return nobj;
+		return map1(oi, nobj);
 	}
 	def genClassGetField(oi: SsaApplyOp) -> SsaInstr {
 		// TODO: norm
@@ -349,23 +407,25 @@ class SsaMachGen extends SsaRebuilder {
 		else return ptrStore(ft, nobj, offset, val);
 	}
 	def genClassGetMethod(oi: SsaApplyOp) -> SsaInstr {
-		var methodRef = V3Op.extractIrSpec(oi.op), machType = mach.funcType(methodRef);
-		return newGraph.valConst(machType, mach.getCodeAddress(methodRef));
+		var methodRef = V3Op.extractIrSpec(oi.op);
+		var funcRep = mach.funcRep(methodRef);
+		return newGraph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
 	}
 	def genClassGetVirtual(oi: SsaApplyOp) -> SsaInstr {
 		var methodRef = V3Op.extractIrSpec(oi.op);
+		var funcRep = mach.funcRep(methodRef);
 		var oobj = oi.inputs(0), nobj = genRef1(oobj);
 		if (V3.isVariant(methodRef.container)) {
 			var defm = mach.getCodeAddress(context.prog.ir.resolveVariantDefaultMethodImpl(methodRef));
-			return genIfNull(oi, mach.funcType(methodRef), nobj, defm, genMtableLookup(oi, oobj, _, methodRef));
+			return genIfNull(oi, funcRep.machType, nobj, defm, genMtableLookup(oi, oobj, _, funcRep, methodRef));
 		}
-		return genMtableLookup(oi, oobj, nobj, methodRef);
+		return genMtableLookup(oi, oobj, nobj, funcRep, methodRef);
 	}
-	def genMtableLookup(oi: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, methodRef: IrSpec) -> SsaInstr {
+	def genMtableLookup(oi: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, funcRep: Mach_FuncRep, methodRef: IrSpec) -> SsaInstr {
 		// use method-table based dispatch
 		var tid = refLoad(mach.tagType, oi, oobj, nobj, 0);
 		var mtbl = newGraph.valConst(mach.data.ptrType, mach.methodTable(methodRef));
-		return ptrLoad(mach.funcType(methodRef), ptrAdd(mtbl, tid), 0);
+		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
 	}
 	def genComponentGetField(oi: SsaApplyOp) -> SsaInstr {
 		// TODO: norm
@@ -377,11 +437,6 @@ class SsaMachGen extends SsaRebuilder {
 		var fieldRef = V3Op.extractIrSpec(oi.op);
 		var val = genRef1(oi.inputs(1));
 		return ptrStore(mach.machType(fieldRef.getFieldType()), componentFieldPtr(fieldRef), 0, val);
-	}
-	def genTupleCreate(oi: SsaApplyOp) -> SsaInstr {
-		// TODO: norm
-		var ni = genRefs(oi.inputs);
-		return apply(null, V3Op.newTupleCreate(mach.machType(oi.getType())), ni);
 	}
 	def genTupleGetElem(oi: SsaApplyOp) -> SsaInstr {
 		// TODO: norm
@@ -416,19 +471,19 @@ class SsaMachGen extends SsaRebuilder {
 		apply(oi.source, throwOp, [apply(null, MachOp.opIntUgteq, [index, len])]);
 		return index;
 	}
-	def genCallMethod(oi: SsaApplyOp) -> SsaInstr {
+	def genCallMethod(oi: SsaApplyOp) {
 		var methodRef = V3Op.extractIrSpec(oi.op);
 		if (V3.isClass(methodRef.container)) genNullCheck(oi);
-		var addr = mach.getCodeAddress(methodRef);
-		var ftype = mach.funcType(methodRef);
-		var receiver = !V3.isComponent(methodRef.container);
-		return call(oi.source, receiver, ftype, newGraph.valConst(ftype, addr), genRefs(oi.inputs));
+		var funcRep = mach.funcRep(methodRef);
+		var func = newGraph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+		var args = Arrays.prepend(func, genRefs(oi.inputs));
+		call(oi, funcRep, args);
 	}
-	def genCallClassVirtual(oi: SsaApplyOp) -> SsaInstr {
+	def genCallClassVirtual(oi: SsaApplyOp) {
+		var func = genClassGetVirtual(oi);
 		var methodRef = V3Op.extractIrSpec(oi.op);
-		var addr = genClassGetVirtual(oi);
-		var ftype = mach.funcType(methodRef);
-		return call(oi.source, true, ftype, addr, genRefs(oi.inputs));
+		var args = Arrays.prepend(func, genRefs(oi.inputs));
+		call(oi, mach.funcRep(methodRef), args);
 	}
 	def genVariantGetTag(oi: SsaApplyOp, nobj: SsaInstr) -> SsaInstr {
 		var val = ptrLoad(mach.tagType, nobj, 0);
@@ -479,9 +534,11 @@ class SsaMachGen extends SsaRebuilder {
 		}
 	}
 
-	def call(source: Source, receiver: bool, ftype: Type, func: SsaInstr, args: Array<SsaInstr>) -> SsaInstr {
-		if (func != null) args = Arrays.prepend(func, args);
-		return curBlock.addApply(source, MachOp.newCallAddress(receiver, ftype, ftype.nested.head), args);
+	def call(oi: SsaApplyOp, funcRep: Mach_FuncRep, args: Array<SsaInstr>) -> SsaInstr {
+		var ni = curBlock.addApply(oi.source, MachOp.newCallAddress(funcRep), args);
+		var tn = mach.intNorm.normalize(Function.getReturnType(funcRep.origType));
+		mapWide(oi, ni, tn, false);
+		return ni;
 	}
 	def apply(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
 		return curBlock.addApply(source, op, args);
