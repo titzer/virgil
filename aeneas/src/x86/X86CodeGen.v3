@@ -31,6 +31,9 @@ class X86Instr<T> extends MachInstr {
 	new(name: string, emitFunc, params) super(name) { }
 	def emit() { emitFunc(params); }
 }
+def SHR_shifter = X86Shifter.new(V3Opcode.IntShr);
+def SAR_shifter = X86Shifter.new(V3Opcode.IntSar);
+def SHL_shifter = X86Shifter.new(V3Opcode.IntShl);
 // Generates X86 code from SSA-M32 form.
 // XXX: emit short branch instructions where possible
 // XXX: align loop headers to cache boundaries
@@ -41,14 +44,13 @@ class X86CodeGen extends MachCodeGen {
 	var multiBlock: bool;
 	var branches: List<(int, SsaBlock)>; // XXX: pull branches up to MachCodeGen?
 	var jumpTables: List<(int, SsaLookupTable)>;
-	var asm: X86MachAssembler;
+	var asm: X86MacroAssembler;
 
 	new(mach: MachProgram, context: SsaContext) super(mach, context) {
 		multiBlock = context.graph.isMultiBlock();
 		frame = MachFrame.new(X86VirgilCallConv.getForGraph(context.graph));
 	}
-	def genCode(asm: X86MachAssembler, codeStartOffset: int) {
-		this.codeStartOffset = codeStartOffset;
+	def genCode(asm: X86MacroAssembler) {
 		this.asm = asm;
 		blocks.computeOrder();
 		gen_entry();
@@ -94,7 +96,7 @@ class X86CodeGen extends MachCodeGen {
 		markLive(mv);
 	}
 	def emitInstrs() {
-		if (rtsrc != null) rtsrc.recordMethodStart(codeOffset(), context.method.source, frame);
+		if (rtsrc != null) rtsrc.recordMethodStart(asm.codeOffset(), context.method.source, frame);
 		var encoder = asm.encoder;
 		var offsets = Array<int>.new(code.length);
 		// assemble the code for each instruction
@@ -129,24 +131,24 @@ class X86CodeGen extends MachCodeGen {
 			}
 		}
 		encoder.atEnd();
-		if (rtsrc != null) rtsrc.recordMethodEnd(codeOffset(), context.method.source, frame);
+		if (rtsrc != null) rtsrc.recordMethodEnd(asm.codeOffset(), context.method.source, frame);
 	}
 	def genApply(i: SsaApplyOp, mv: MachVar) -> bool {
 		var root = false;
 		match (i.op.opcode) {
 			V3Opcode.IntAdd:		genAdd(i, mv);
 			V3Opcode.IntMul:		genMul(i, mv);
-			V3Opcode.IntDiv:		root = genDiv(i, mv);
-			V3Opcode.IntMod:		root = genMod(i, mv);
+			V3Opcode.IntDiv:		root = genDiv(i, mv, true);
+			V3Opcode.IntMod:		root = genDiv(i, mv, false);
 			V3Opcode.IntAnd,		// fall through
 			V3Opcode.BoolAnd:		genOp2("and", i, mv, X86Assembler.and);
 			V3Opcode.IntOr,			// fall through
 			V3Opcode.BoolOr:		genOp2("or", i, mv, X86Assembler.or);
 			V3Opcode.IntSub:		genOp2("sub", i, mv, X86Assembler.sub);
 			V3Opcode.IntXor:		genOp2("xor", i, mv, X86Assembler.xor);
-			V3Opcode.IntShl,
-			V3Opcode.IntSar,
-			V3Opcode.IntShr:		genShift(i, mv, i.op.opcode);
+			V3Opcode.IntShl:		genShift("shl", i, mv, SHL_shifter);
+			V3Opcode.IntSar:		genShift("sar", i, mv, SAR_shifter);
+			V3Opcode.IntShr:		genShift("shr", i, mv, SHR_shifter);
 			V3Opcode.IntWide:		genWide(i, i.op.attr<Operator>(), mv);
 			V3Opcode.Equal,			// fall through
 			V3Opcode.NotEqual,		// fall through
@@ -188,13 +190,14 @@ class X86CodeGen extends MachCodeGen {
 	}
 	def genWide(i: SsaApplyOp, orig: Operator, mv: MachVar) {
 		match (orig.opcode) {
+			V3Opcode.IntShl: return genWideShift(i, "wshl", SHL_shifter, mv);
+			V3Opcode.IntSar: return genWideShift(i, "wsar", SAR_shifter, mv);
+			V3Opcode.IntShr: return genWideShift(i, "wshr", SHR_shifter, mv);
 			V3Opcode.IntAdd,
 			V3Opcode.IntMul,
 			V3Opcode.IntDiv,
 			V3Opcode.IntMod,
 			V3Opcode.IntSub,
-			V3Opcode.IntShl,
-			V3Opcode.IntShr,
 			V3Opcode.IntLt,
 			V3Opcode.IntGt,
 			V3Opcode.IntLteq,
@@ -208,7 +211,16 @@ class X86CodeGen extends MachCodeGen {
 //			Terminal.put3("wide @%1.%2 = %2\n", i.uid, j, mv.varNum + j);
 			dfn(vars.get(mv.varNum + j));
 		}
-		gen("wide", asm_wide, ());
+		gen("wide", asm_nop, ()); // TODO
+	}
+	def genWideShift(i: SsaApplyOp, name: string, shifter: X86Shifter, mv: MachVar) {
+		gen(name, asm_wsh, (shifter,
+			dfnAt(vars.get(mv.varNum), X86MachRegs.EAX),
+			dfnAt(vars.get(mv.varNum + 1), X86MachRegs.EDX),
+			useFixed(i.input0(), X86MachRegs.EAX),
+			useFixed(i.input1(), X86MachRegs.EDX),
+			useFixed(i.inputs(2).dest, X86MachRegs.ECX),
+			useFixed(i.inputs(3).dest, X86MachRegs.EBX)));
 	}
 	def genIntConvert(i: SsaApplyOp, mv: MachVar) {
 		var tt = V3.asInt(i.op.resultType);
@@ -403,23 +415,19 @@ class X86CodeGen extends MachCodeGen {
 		gen_storex(size, x, scale, disp, val, nullCheck, i.source);
 		return true;
 	}
-	def genDiv(i: SsaApplyOp, mv: MachVar) -> bool {
-		dfnAt(mv, X86MachRegs.EAX);
-		kill(X86MachRegs.EDX);
+	def genDiv(i: SsaApplyOp, mv: MachVar, div: bool) -> bool {
+		dfnAt(mv, if(div, X86MachRegs.EAX, X86MachRegs.EDX));
+		kill(if(div, X86MachRegs.EDX, X86MachRegs.EAX));
 		useFixed(i.input0(), X86MachRegs.EAX);
 		var bu = useFixed(i.input1(), X86MachRegs.NOT_EDX);
-		var signed = V3.asInt(i.op.resultType).signed;
-		gen("idiv", asm_idiv, (signed, bu, i.facts, true, i.source));
-		return !i.checkFact(Facts.O_NO_ZERO_CHECK); // pure if no zero check
-	}
-	def genMod(i: SsaApplyOp, mv: MachVar) -> bool {
-		dfnAt(mv, X86MachRegs.EDX);
-		kill(X86MachRegs.EAX);
-		useFixed(i.input0(), X86MachRegs.EAX);
-		var bu = useFixed(i.input1(), X86MachRegs.NOT_EDX);
-		var signed = V3.asInt(i.op.resultType).signed;
-		gen("imod", asm_idiv, (signed, bu, i.facts, false, i.source));
-		return !i.checkFact(Facts.O_NO_ZERO_CHECK); // pure if no zero check
+		var zeroCheck = !i.checkFact(Facts.O_NO_ZERO_CHECK);
+		if (V3.asInt(i.op.resultType).signed) {
+			var negCheck = !i.checkFact(Facts.O_NO_DIV_CHECK);
+			gen(if(div, "idiv", "imod"), asm_idiv, (i.source, zeroCheck, negCheck, bu, div));
+		} else {
+			gen(if(div, "udiv", "umod"), asm_udiv, (i.source, zeroCheck, bu));
+		}
+		return zeroCheck; // pure if no zero check
 	}
 	def genCondThrow(i: SsaApplyOp, mv: MachVar) -> bool {
 		// generate a branch to the throw function
@@ -454,26 +462,21 @@ class X86CodeGen extends MachCodeGen {
 		}
 		return true;
 	}
-	def genShift(i: SsaApplyOp, mv: MachVar, op: byte) {
-		var y = i.input1();
+	def genShift(name: string, i: SsaApplyOp, mv: MachVar, shifter: X86Shifter) {
+		var x = i.input0(), y = i.input1();
 		if (SsaValue.?(y)) {
 			// shift by constant
-			var val = y.unbox<int>();
-			if (val >= 0 && val < 32) {
-				if (op == V3Opcode.IntShl) gen_shl_i(mv, i.input0(), val);
-				else if (op == V3Opcode.IntShr) gen_shr_i(mv, i.input0(), val);
-				else gen_sar_i(mv, i.input0(), val);
+			var imm = y.unbox<int>();
+			if (imm >= 0 && imm < 32) {
+				gen(name, asm_sh_i, (shifter, dfn(mv), use(x), imm, hint(x, mv)));
 			} else {
 				// XXX: use the valMoves machinery?
 				gen_const(mv, null);
 			}
 		} else {
 			// gen shift by cl
-			var xv = i.input0();
-			var check = !i.checkFact(Facts.O_NO_SHIFT_CHECK);
-			if (op == V3Opcode.IntShl) gen_shl(mv, xv, y, check);
-			else if (op == V3Opcode.IntShr) gen_shr(mv, xv, y, check);
-			else gen_sar(mv, xv, y, check);
+			var asm_meth = if(i.checkFact(Facts.O_NO_SHIFT_CHECK), asm_sh, asm_sh_checked);
+			gen(name, asm_meth, (shifter, dfn(mv), useFixed(y, X86MachRegs.ECX), use(x), hint(x, mv)));
 		}
 	}
 	def genReturn(i: SsaReturn) {
@@ -678,7 +681,7 @@ class X86CodeGen extends MachCodeGen {
 		return ("invalid", X86Assembler.movd_r_rm);
 	}
 	def asm_loadx(m: (X86Assembler, X86Reg, X86Rm) -> void, dest: int, base: int, scale: int, disp: int, canTrap: bool, source: Source) {
-		var off = codeOffset();
+		var off = asm.codeOffset();
 		m(asm, r(dest), X86Addr.new(r(base), scale, disp));
 		if (canTrap && rtsrc != null) rtsrc.recordSource(off, source);
 	}
@@ -709,12 +712,12 @@ class X86CodeGen extends MachCodeGen {
 		return true;
 	}
 	def asm_storex(m: (X86Assembler, X86Rm, X86Reg) -> void, base: int, scale: int, disp: int, val: int, canTrap: bool, source: Source) {
-		var off = codeOffset();
+		var off = asm.codeOffset();
 		m(asm, X86Addr.new(r(base), scale, disp), r(val));
 		if (canTrap && rtsrc != null) rtsrc.recordSource(off, source);
 	}
 	def asm_cmpswpx(m: (X86Assembler, X86Rm, X86Reg) -> void, dest: int, base: int, scale: int, disp: int, val: int, canTrap: bool, source: Source) {
-		var off = codeOffset();
+		var off = asm.codeOffset();
 		m(asm, X86Addr.new(r(base), scale, disp), r(val));
 		var reg = r(dest);
 		asm.setz(reg);
@@ -741,7 +744,7 @@ class X86CodeGen extends MachCodeGen {
 		recordPatch(pos, addr);
 	}
 	def asm_storex_i(m: (X86Assembler, X86Rm, int) -> void, base: int, scale: int, disp: int, imm: int, canTrap: bool, source: Source) {
-		var off = codeOffset();
+		var off = asm.codeOffset();
 		m(asm, X86Addr.new(r(base), scale, disp), imm);
 		if (canTrap && rtsrc != null) rtsrc.recordSource(off, source);
 	}
@@ -753,7 +756,7 @@ class X86CodeGen extends MachCodeGen {
 		asm.lea(r(dest), X86Addr.new(r(base), scale, disp));
 	}
 	def asm_test_i(base: int, scale: int, disp: int, imm: int, canTrap: bool, source: Source) {
-		var off = codeOffset();
+		var off = asm.codeOffset();
 		asm.test_rm_i(X86Addr.new(r(base), scale, disp), imm);
 		if (canTrap && rtsrc != null) rtsrc.recordSource(off, source);
 	}
@@ -847,64 +850,14 @@ class X86CodeGen extends MachCodeGen {
 		return loc_rm(dest);
 	}
 	// ---------- Shift operations ---------------------------------------------
-	def gen_shl(dest: MachVar, a: SsaInstr, b: SsaInstr, check: bool) {
-		var sh = if(check, asm_shift_check, asm_shift);
-		gen("shl", sh, (X86Assembler.shl_cl, dfn(dest), useFixed(b, X86MachRegs.ECX), use(a), hint(a, dest)));
+	def asm_sh(shifter: X86Shifter, dest: int, cl: int, a: int, v: void) {
+		shifter.sh_cl(asm, resolveOp1(dest, a));
 	}
-	def gen_shr(dest: MachVar, a: SsaInstr, b: SsaInstr, check: bool) {
-		var sh = if(check, asm_shift_check, asm_shift);
-		gen("shr", sh, (X86Assembler.shr_cl, dfn(dest), useFixed(b, X86MachRegs.ECX), use(a), hint(a, dest)));
+	def asm_sh_checked(shifter: X86Shifter, dest: int, cl: int, a: int, v: void) {
+		shifter.sh_checked(asm, rm(dest), rm(a), X86MachRegs.SCRATCH);
 	}
-	def gen_sar(dest: MachVar, a: SsaInstr, b: SsaInstr, check: bool) {
-		var sh = if(check, asm_shift_check, asm_shift);
-		gen("sar", sh, (X86Assembler.sar_cl, dfn(dest), useFixed(b, X86MachRegs.ECX), use(a), hint(a, dest)));
-	}
-	def asm_shift(m: (X86Assembler, X86Rm) -> void, dest: int, cl: int, a: int, v: void) {
-		m(asm, resolveOp1(dest, a));
-	}
-	def asm_shift_check(m: (X86Assembler, X86Rm) -> void, dest: int, cl: int, a: int, v: void) {
-		// XXX: are shift checks possible without a branch?
-		dest = loc(dest); a = loc(a);
-		asm.cmp.rm_i(X86Regs.ECX, 32);
-		asm.jnc(0);
-		var jump1 = asm.pos();
-
-		if (dest != a) {
-			if (dest == X86MachRegs.ECX) {
-				// don't overwrite ECX before shift, use scratch
-				var s = frame.conv.regSet.scratch;
-				asm_movd_l_l(a, s);
-				m(asm, loc_rm(s));
-				asm_movd_l_l(s, dest);
-			} else {
-				// move shiftor into destination first
-				asm_movd_l_l(a, dest);
-				m(asm, loc_rm(dest));
-			}
-		} else {
-			// no moves necessary
-			m(asm, loc_rm(dest));
-		}
-		asm.jmp(0);
-		var jump2 = asm.pos();
-
-		asm.movd_rm_i(loc_rm(dest), 0);
-		var end = asm.pos();
-		asm.encoder.at(jump1 - 1).i1(byte.!(jump2 - jump1));
-		asm.encoder.at(jump2 - 1).i1(byte.!(end - jump2));
-		asm.encoder.atEnd();
-	}
-	def gen_shl_i(dest: MachVar, a: SsaInstr, imm: int) {
-		gen("shl_i", asm_shift_i, (X86Assembler.shl_i, dfn(dest), use(a), imm, hint(a, dest)));
-	}
-	def gen_shr_i(dest: MachVar, a: SsaInstr, imm: int) {
-		gen("shr_i", asm_shift_i, (X86Assembler.shr_i, dfn(dest), use(a), imm, hint(a, dest)));
-	}
-	def gen_sar_i(dest: MachVar, a: SsaInstr, imm: int) {
-		gen("sar_i", asm_shift_i, (X86Assembler.sar_i, dfn(dest), use(a), imm, hint(a, dest)));
-	}
-	def asm_shift_i(m: (X86Assembler, X86Rm, int) -> void, dest: int, a: int, imm: int, v: void) {
-		m(asm, resolveOp1(dest, a), imm);
+	def asm_sh_i(shifter: X86Shifter, dest: int, a: int, imm: int, v: void) {
+		shifter.sh_i(asm, resolveOp1(dest, a), imm);
 	}
 	def asm_sext(dest: int, a: int, size: int) {
 		var d = resolveOp1(dest, a);
@@ -912,7 +865,7 @@ class X86CodeGen extends MachCodeGen {
 		asm.sar_i(d, 32 - size);
 	}
 	// ---------- Multiply / Divide -------------------------------------------
-	def gen_imul  (dest: MachVar, a: SsaInstr, b: SsaInstr) {
+	def gen_imul (dest: MachVar, a: SsaInstr, b: SsaInstr) {
 		gen("imul", asm_imul, (dfngpr(dest), use(a), use(b), hint(a, dest)));
 	}
 	def asm_imul(dest: int, a: int, b: int, v: void) {
@@ -930,32 +883,11 @@ class X86CodeGen extends MachCodeGen {
 		if (dest != a) asm_movd_l_l(a, dest);
 		asm.imul_r_i(loc_r(dest), imm);
 	}
-	def asm_idiv(signed: bool, b: int, facts: int, div: bool, source: Source) {
-		var brm = rm(b), jpatch = -1;
-		if (signed && 0 == (facts & Facts.O_NO_DIV_CHECK)) {
-			asm.cmp.rm_i(brm, -1);
-			asm.jnz(4); // if b != -1, branch to division (both cases are 4 bytes of code)
-			if (div) asm.neg(X86Regs.EAX); // a / -1 == 0 - a
-			else asm.xor.rm_r(X86Regs.EDX, X86Regs.EDX); // a % -1 == 0
-			asm.jmp(0); // jump past division to end
-			jpatch = asm.pos() - 1;
-		}
-		var off: int;
-		if (signed) {
-			asm.cdq();
-			off = codeOffset();
-			asm.idiv(brm);
-			if (jpatch >= 0) {
-				var offset = asm.pos() - jpatch - 1; // patch branch above
-				asm.encoder.at(jpatch).i1(offset);
-				asm.encoder.atEnd();
-			}
-		} else {
-			asm.xor.r_rm(X86Regs.EDX, X86Regs.EDX);
-			off = codeOffset();
-			asm.div(brm);
-		}
-		if (0 == (facts & Facts.O_NO_ZERO_CHECK) && rtsrc != null) rtsrc.recordSource(off, source);
+	def asm_idiv(source: Source, zeroCheck: bool, negCheck: bool, a: int, div: bool) {
+		asm.idivmod_checked(source, zeroCheck && rtsrc != null, negCheck, rm(a), div);
+	}
+	def asm_udiv(source: Source, zeroCheck: bool, a: int) {
+		asm.udivmod_checked(source, zeroCheck && rtsrc != null, rm(a));
 	}
 	def gen_set(cond: X86Cond, a: MachVar) {
 		gen("set", asm_set, (cond, dfnAt(a, X86MachRegs.BYTE)));
@@ -973,7 +905,7 @@ class X86CodeGen extends MachCodeGen {
 		recordBranch(asm.pos() - 4, target);
 	}
 	def asm_brthrow(cond: X86Cond, ex: string, source: Source) {
-		asm.jmpx_addr(cond, rt.getExceptionDest(codeOffset(), ex, source));
+		asm.jmpx_addr(cond, rt.getExceptionDest(asm.codeOffset(), ex, source));
 	}
 	def gen_phi_dfn(phis: SsaPhis) {
 		phiList = List.new(phis, phiList);
@@ -982,8 +914,9 @@ class X86CodeGen extends MachCodeGen {
 	def asm_nop() {
 		// do nothing.
 	}
-	def asm_wide() {
-		// do nothing.
+	def asm_wsh(shifter: X86Shifter, dl: int, dh: int, al: int, ah: int, sl: int, sh: int) {
+		// Assumes sl == ECX
+		shifter.wsh_checked(asm, r(dh), r(dl), r(sh));
 	}
 	def asm_caller_ip(dst: int) {
 		var d = rm(dst);
@@ -1011,14 +944,14 @@ class X86CodeGen extends MachCodeGen {
 	}
 	def asm_call(conv: MachCallConv, lp: int, target: Addr, source: Source) {
 		asm.call_addr(target);
-		var off = codeOffset();
+		var off = asm.codeOffset();
 		if (rtgc != null) rtgc.recordStackRefMap(off, source, buildStackMap(off, conv, lp));
 		if (rtsrc != null) rtsrc.recordReturnSource(off, source);
 	}
 	def asm_icall(conv: MachCallConv, lp: int, addr: int, source: Source) {
 		// TODO: record canTrap for indirect calls
 		asm.icall(rm(addr));
-		var off = codeOffset();
+		var off = asm.codeOffset();
 		if (rtgc != null) rtgc.recordStackRefMap(off, source, buildStackMap(off, conv, lp));
 		if (rtsrc != null) rtsrc.recordReturnSource(off, source);
 	}
@@ -1084,7 +1017,7 @@ class X86CodeGen extends MachCodeGen {
 		}
 	}
 	def asm_throw(source: Source, ex: string) {
-		asm.jmpx_addr(null, rt.getExceptionDest(codeOffset(), ex, source));
+		asm.jmpx_addr(null, rt.getExceptionDest(asm.codeOffset(), ex, source));
 	}
 	def asm_tableswitch(sw: SsaLookupTable, val: int) {
 		var rm = rm(val);
@@ -1169,7 +1102,7 @@ class X86CodeGen extends MachCodeGen {
 		return frame.conv.regSet.scratch;
 	}
 	def loc_r(loc: int) -> X86Reg {
-		return asm.loc_r(loc); // XXX: inline
+		return asm.loc_r(frame, loc); // XXX: inline
 	}
 	def loc_rm(loc: int) -> X86Rm {
 		return asm.loc_rm(frame, loc); // XXX: inline?
@@ -1197,108 +1130,5 @@ class X86CodeGen extends MachCodeGen {
 	}
 	def emitValMoves(list: List<(Val, int)>) {
 		for (l = list; l != null; l = l.tail) asm.movd_l_val(frame, loc(l.head.1), l.head.0);
-	}
-	def codeOffset() -> int {
-		return asm.encoder.pos - codeStartOffset;
-	}
-}
-// An extended X86Assembler that has additional machine-level utilities, such as
-// recording patch locations and translating between regset locations and x86
-// registers/memory.
-class X86MachAssembler extends X86Assembler {
-	def mach: MachProgram;		  // machine program
-	def machEncoder: MachDataEncoder; // machine-level encoder
-	def regSet: MachRegSet;		  // register set in use
-
-	new(mach, machEncoder) super(machEncoder) { }
-	// call an absolute address and record the patch location
-	def call_addr(addr: Addr) {
-		call(X86Addrs.REL_CONST);
-		machEncoder.recordPatch(addr, machEncoder.pos - 4);
-	}
-	// jump (conditionally) to an absolute address and record the patch location
-	def jmpx_addr(cond: X86Cond, addr: Addr) {
-		jmpx(cond, X86Addrs.REL_CONST);
-		machEncoder.recordPatch(addr, machEncoder.pos - 4);
-	}
-	// a macro to move between any two register/memory operands
-	def movd_rm_rm(d: X86Rm, s: X86Rm, scratch: X86Reg) {
-		if (s == d) return;
-		if (X86Reg.?(d)) return movd_r_rm(X86Reg.!(d), s);
-		if (X86Reg.?(s)) return movd_rm_r(d, X86Reg.!(s));
-		if (scratch != null) {
-			movd_r_rm(scratch, s);
-			movd_rm_r(d, scratch);
-		}
-		// XXX: use XMM register for memory-memory move instead of stack
-		push(s);            // push value from source memory onto the stack
-		pop(X86Addr.!(d));  // pop value off stack into destination memory
-	}
-	// a macro to move a value into a location
-	def movd_l_val(frame: MachFrame, loc: int, val: Val) {
-		var d = loc_rm(frame, loc);
-		if (val == null) {
-			movd_rm_i(d, 0);
-		} else if (Addr.?(val)) {
-			var pos = encoder.pos;
-			movd_rm_i(d, X86Addrs.ABS_CONST);
-			recordPatch(pos, Addr.!(val));
-		} else {
-			movd_rm_i(d, V3.unboxIntegral(val));
-		}
-	}
-	// convert a location into an x86 register
-	def loc_r(loc: int) -> X86Reg {
-		match(loc) {
-			X86MachRegs.EAX: return X86Regs.EAX;
-			X86MachRegs.EBX: return X86Regs.EBX;
-			X86MachRegs.ECX: return X86Regs.ECX;
-			X86MachRegs.EDX: return X86Regs.EDX;
-			X86MachRegs.ESI: return X86Regs.ESI;
-			X86MachRegs.EDI: return X86Regs.EDI;
-			X86MachRegs.EBP: return X86Regs.EBP;
-		}
-		return failLocation("required x86 register", loc);
-	}
-	// convert a location into an x86 register/memory reference
-	def loc_rm(frame: MachFrame, loc: int) -> X86Rm {
-		match(loc) {
-			0: return failLocation("unassigned location", loc);
-			X86MachRegs.EAX: return X86Regs.EAX;
-			X86MachRegs.EBX: return X86Regs.EBX;
-			X86MachRegs.ECX: return X86Regs.ECX;
-			X86MachRegs.EDX: return X86Regs.EDX;
-			X86MachRegs.ESI: return X86Regs.ESI;
-			X86MachRegs.EDI: return X86Regs.EDI;
-			X86MachRegs.EBP: return X86Regs.EBP;
-		}
-		var regSet = frame.conv.regSet, wordSize = mach.data.addressSize, offset: int;
-		if (loc >= regSet.calleeStart) offset = wordSize * (loc - regSet.calleeStart);
-		else if (loc >= regSet.callerStart) offset = frame.size() + (wordSize * (loc - regSet.callerStart));
-		else if (loc >= regSet.spillStart) offset = wordSize * (loc - regSet.spillStart + frame.spillArgs);
-		else return failLocation("invalid spill location", loc);
-		return X86Regs.ESP.plus(offset);
-	}
-	def failLocation(msg: string, loc: int) -> X86Reg {
-		mach.fail(Strings.format2("%1: %2", msg, regSet.identify(loc)));
-		return X86MachRegs.SCRATCH;
-	}
-	// patch an absolute address, scanning backwards up to "start"
-	def recordPatch(start: int, target: Addr) {
-		// scan backwards, looking for the absolute constant
-		var pos = findAbsConst(start);
-		if (pos >= 0) return machEncoder.recordPatch(target, pos);
-	}
-	def findAbsConst(start: int) -> int {
-		var data = encoder.array;
-		for (i = encoder.pos; i >= start; i--) {
-			if (data(i-4) != X86Addrs.ABS_CONST0) continue;
-			if (data(i-3) != X86Addrs.ABS_CONST1) continue;
-			if (data(i-2) != X86Addrs.ABS_CONST2) continue;
-			if (data(i-1) != X86Addrs.ABS_CONST3) continue;
-			return i - 4;
-		}
-		mach.fail("Could not find absolute constant to patch");
-		return -1;
 	}
 }

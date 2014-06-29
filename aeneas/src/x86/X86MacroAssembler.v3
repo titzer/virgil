@@ -1,0 +1,270 @@
+// Copyright 2014 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// An extended X86Assembler that has additional machine-level utilities, such as
+// recording patch locations and translating between regset locations and x86
+// registers/memory.
+class X86MacroAssembler extends X86Assembler {
+	def mach: MachProgram;		  // machine program
+	def machEncoder: MachDataEncoder; // machine-level encoder
+	def codeStartOffset: int;
+
+	new(mach, machEncoder, codeStartOffset) super(machEncoder) { }
+	def codeOffset() -> int {
+		return encoder.pos - codeStartOffset;
+	}
+	// call an absolute address and record the patch location
+	def call_addr(addr: Addr) {
+		call(X86Addrs.REL_CONST);
+		machEncoder.recordPatch(addr, machEncoder.pos - 4);
+	}
+	// jump (conditionally) to an absolute address and record the patch location
+	def jmpx_addr(cond: X86Cond, addr: Addr) {
+		jmpx(cond, X86Addrs.REL_CONST);
+		machEncoder.recordPatch(addr, machEncoder.pos - 4);
+	}
+	// a macro to move between any two register/memory operands
+	def movd_rm_rm(d: X86Rm, s: X86Rm, scratch: X86Reg) {
+		if (s == d) return;
+		if (X86Reg.?(d)) return movd_r_rm(X86Reg.!(d), s);
+		if (X86Reg.?(s)) return movd_rm_r(d, X86Reg.!(s));
+		if (scratch != null) {
+			movd_r_rm(scratch, s);
+			movd_rm_r(d, scratch);
+		}
+		// XXX: use XMM register for memory-memory move instead of stack
+		push(s);            // push value from source memory onto the stack
+		pop(X86Addr.!(d));  // pop value off stack into destination memory
+	}
+	// a macro to move a value into a location
+	def movd_l_val(frame: MachFrame, loc: int, val: Val) {
+		var d = loc_rm(frame, loc);
+		if (val == null) {
+			movd_rm_i(d, 0);
+		} else if (Addr.?(val)) {
+			var pos = encoder.pos;
+			movd_rm_i(d, X86Addrs.ABS_CONST);
+			recordPatch(pos, Addr.!(val));
+		} else {
+			movd_rm_i(d, V3.unboxIntegral(val));
+		}
+	}
+	// convert a location into an x86 register
+	def loc_r(frame: MachFrame, loc: int) -> X86Reg {
+		match(loc) {
+			X86MachRegs.EAX: return X86Regs.EAX;
+			X86MachRegs.EBX: return X86Regs.EBX;
+			X86MachRegs.ECX: return X86Regs.ECX;
+			X86MachRegs.EDX: return X86Regs.EDX;
+			X86MachRegs.ESI: return X86Regs.ESI;
+			X86MachRegs.EDI: return X86Regs.EDI;
+			X86MachRegs.EBP: return X86Regs.EBP;
+		}
+		return failLocation("required x86 register", loc, frame.conv.regSet);
+	}
+	// convert a location into an x86 register/memory reference
+	def loc_rm(frame: MachFrame, loc: int) -> X86Rm {
+		match(loc) {
+			0: return failLocation("unassigned location", loc, frame.conv.regSet);
+			X86MachRegs.EAX: return X86Regs.EAX;
+			X86MachRegs.EBX: return X86Regs.EBX;
+			X86MachRegs.ECX: return X86Regs.ECX;
+			X86MachRegs.EDX: return X86Regs.EDX;
+			X86MachRegs.ESI: return X86Regs.ESI;
+			X86MachRegs.EDI: return X86Regs.EDI;
+			X86MachRegs.EBP: return X86Regs.EBP;
+		}
+		var regSet = frame.conv.regSet, wordSize = mach.data.addressSize, offset: int;
+		if (loc >= regSet.calleeStart) offset = wordSize * (loc - regSet.calleeStart);
+		else if (loc >= regSet.callerStart) offset = frame.size() + (wordSize * (loc - regSet.callerStart));
+		else if (loc >= regSet.spillStart) offset = wordSize * (loc - regSet.spillStart + frame.spillArgs);
+		else return failLocation("invalid spill location", loc, frame.conv.regSet);
+		return X86Regs.ESP.plus(offset);
+	}
+	def failLocation(msg: string, loc: int, regSet: MachRegSet) -> X86Reg {
+		mach.fail(Strings.format2("%1: %2", msg, regSet.identify(loc)));
+		return X86MachRegs.SCRATCH;
+	}
+	// patch an absolute address, scanning backwards up to "start"
+	def recordPatch(start: int, target: Addr) {
+		// scan backwards, looking for the absolute constant
+		var pos = findAbsConst(start);
+		if (pos >= 0) return machEncoder.recordPatch(target, pos);
+	}
+	def findAbsConst(start: int) -> int {
+		var data = encoder.array;
+		for (i = encoder.pos; i >= start; i--) {
+			if (data(i-4) != X86Addrs.ABS_CONST0) continue;
+			if (data(i-3) != X86Addrs.ABS_CONST1) continue;
+			if (data(i-2) != X86Addrs.ABS_CONST2) continue;
+			if (data(i-1) != X86Addrs.ABS_CONST3) continue;
+			return i - 4;
+		}
+		mach.fail("Could not find absolute constant to patch");
+		return -1;
+	}
+	def jmpl_near(cond: X86Cond, label: Label) {
+		var off = 0;
+		if (cond == null) jmp(off);
+		else j(off, 0x70 + cond.index, 0x80 + cond.index);
+		if (label.pos >= 0) {
+			off = label.pos - pos();
+			encoder.at(pos() - 1).i1(byte.!(off));
+			encoder.atEnd();
+		} else {
+			label.near_uses = List.new(pos(), label.near_uses);
+		}
+	}
+	def bind(label: Label) {
+		label.pos = pos();
+		for (l = label.near_uses; l != null; l = l.tail) {
+			encoder.at(l.head - 1).i1(byte.!(label.pos) - l.head);
+		}
+		encoder.atEnd();
+	}
+	// edx:eax / a
+	def idivmod_checked(source: Source, zeroCheck: bool, negCheck: bool, a: X86Rm, div: bool) {
+		var label: Label;
+		if (negCheck) {
+			cmp.rm_i(a, -1);
+			jnz(4); // if b != -1, branch to division (both cases are 4 bytes of code)
+			if (div) neg(X86Regs.EAX); // a / -1 == 0 - a
+			else xor.rm_r(X86Regs.EDX, X86Regs.EDX); // a % -1 == 0
+			label = Label.new();
+			jmpl_near(X86Conds.ALWAYS, label); // jump past division to end
+		}
+		cdq();
+		var off = codeOffset();
+		idiv(a);
+		if (label != null) bind(label);
+		if (zeroCheck) mach.runtime.src.recordSource(off, source);
+	}
+	// edx:eax / a
+	def udivmod_checked(source: Source, zeroCheck: bool, a: X86Rm) {
+		xor.rm_r(X86Regs.EDX, X86Regs.EDX);
+		var off = codeOffset();
+		div(a);
+		if (zeroCheck) mach.runtime.src.recordSource(off, source);
+	}
+}
+// A helper for generating shift operations for a given V3 opcode.
+class X86Shifter(opcode: byte) {
+	// Checked shift {ra} by the amount in CL into {rd}. May clobber scratch register.
+	def sh_checked(asm: X86MacroAssembler, rd: X86Rm, ra: X86Rm, scratch: X86Reg) {
+		var zero = Label.new(), done = Label.new();
+		asm.cmp.rm_i(X86Regs.ECX, 32);
+		asm.jmpl_near(X86Conds.NC, zero);
+
+		if (rd != ra) {
+			if (rd == X86Regs.ECX) {
+				// don't overwrite ECX before shift, use scratch
+				asm.movd_r_rm(scratch, ra);
+				sh_cl(asm, scratch);
+				asm.movd_rm_r(rd, scratch);
+			} else {
+				// move shiftor into destination first
+				if (X86Reg.?(ra)) {
+					asm.movd_rm_r(rd, X86Reg.!(ra));
+				} else if (X86Reg.?(rd)) {
+					asm.movd_r_rm(X86Reg.!(rd), ra);
+				} else {
+					asm.movd_r_rm(scratch, ra);
+					asm.movd_rm_r(rd, scratch);
+				}
+				sh_cl(asm, rd);
+			}
+		} else {
+			// no moves necessary
+			sh_cl(asm, rd);
+		}
+		asm.jmpl_near(X86Conds.ALWAYS, done);
+		asm.bind(zero);
+		asm.movd_rm_i(rd, 0);
+		asm.bind(done);;
+	}
+	// Checked wide shift {rdl,rdh} in place by the amount in CL.
+	def wsh_checked(asm: X86MacroAssembler, rdl: X86Reg, rdh: X86Reg, sh: X86Rm) {
+		var zero = Label.new(), done = Label.new(), big = Label.new();
+		asm.cmp.rm_i(sh, 0);
+		asm.jmpl_near(X86Conds.NZ, zero);
+		// perform the 32 bit shift.
+		wsh_cl(asm, rdl, rdh);
+		asm.cmp.rm_i(X86Regs.ECX, 32);
+		asm.jmpl_near(X86Conds.A, big);
+		asm.jmpl_near(X86Conds.L, done);
+		// shift amount was actually >= 32.
+		asm.bind(big);
+		asm.cmp.rm_i(X86Regs.ECX, 64);
+		asm.jmpl_near(X86Conds.GE, zero);
+		wsh_adjust(asm, rdl, rdh);
+		asm.jmpl_near(X86Conds.ALWAYS, done);
+		// overall result should be zero.
+		asm.bind(zero);
+		asm.xor.rm_r(rdh, rdh);
+		asm.xor.rm_r(rdl, rdl);
+		// done.
+		asm.bind(done);
+	}
+	// Shift by the amount in CL.
+	def sh_cl(asm: X86MacroAssembler, dest: X86Rm) {
+		match (opcode) {
+			V3Opcode.IntShr: asm.shr_cl(dest);
+			V3Opcode.IntSar: asm.sar_cl(dest);
+			V3Opcode.IntShl: asm.shl_cl(dest);
+		}
+	}
+	// Shift by an immediate.
+	def sh_i(asm: X86MacroAssembler, dest: X86Rm, imm: int) {
+		if (imm == 0) return;
+		if (u32.!(imm) >= u32.!(32)) return asm.movd_rm_i(dest, 0);
+		match (opcode) {
+			V3Opcode.IntShr: asm.shr_i(dest, imm);
+			V3Opcode.IntSar: asm.sar_i(dest, imm);
+			V3Opcode.IntShl: asm.shl_i(dest, imm);
+		}
+	}
+	// Wide shift by the amount in CL.
+	def wsh_cl(asm: X86MacroAssembler, rdl: X86Reg, rdh: X86Reg) {
+		match (opcode) {
+			V3Opcode.IntShr: {
+				asm.shrd_cl(rdl, rdh);
+				asm.shr_cl(rdh);
+			}
+			V3Opcode.IntSar: {
+				asm.shrd_cl(rdl, rdh);
+				asm.sar_cl(rdh);
+			}
+			V3Opcode.IntShl: {
+				asm.shld_cl(rdh, rdl);
+				asm.shl_cl(rdl);
+			}
+		}
+	}
+	// Wide shift by an immediate.
+	def wsh_i(asm: X86MacroAssembler, rdl: X86Reg, rdh: X86Reg, imm: int) {
+		if (imm == 0) return;
+		if (u32.!(imm) >= u32.!(64)) {
+			asm.xor.rm_r(rdl, rdl);
+			asm.xor.rm_r(rdh, rdh);
+			return;
+		}
+		return V3.fail("unimplemented");
+	}
+	// Adjust an already shifted result if the shift amount in CL was 32 <= x < 64.
+	private def wsh_adjust(asm: X86MacroAssembler, rdl: X86Reg, rdh: X86Reg) {
+		match (opcode) {
+			V3Opcode.IntShr: {
+				asm.movd_rm_r(rdl, rdh);
+				asm.xor.rm_r(rdh, rdh);
+			}
+			V3Opcode.IntSar: {
+				asm.movd_rm_r(rdl, rdh);
+				asm.shl_i(rdh, 31);
+			}
+			V3Opcode.IntShl: {
+				asm.movd_rm_r(rdh, rdl);
+				asm.xor.rm_r(rdl, rdl);
+			}
+		}
+	}
+}

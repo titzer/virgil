@@ -17,10 +17,17 @@ class SsaMachGen extends SsaRebuilder {
 		return mach.machVal(v);
 	}
 	def genValN(e: SsaDfEdge, index: int, oi: SsaValue, tn: TypeNorm, seq: Sequence<SsaInstr>) {
-		tn = normalize(typeFromEdge(e, index));
-		var vals = Array<Val>.new(tn.size);
-		genValIntoArray(oi.val, tn, vals, 0);
-		for (i < tn.size) seq.add(newGraph.valConst(tn.sub(i), vals(i)));
+		var edgeType = typeFromEdge(e, index);
+		tn = normalize(edgeType);
+		if (tn == null) {
+			seq.add(newGraph.valConst(edgeType, oi.val));
+		} else if (tn.size == 1) {
+			seq.add(newGraph.valConst(tn.newType, oi.val));
+		} else {
+			var vals = Array<Val>.new(tn.size);
+			genValIntoArray(oi.val, tn, vals, 0);
+			for (i < tn.size) seq.add(newGraph.valConst(tn.sub(i), vals(i)));
+		}
 	}
 	def genValIntoArray(v: Val, tn: TypeNorm, dest: Array<Val>, index: int) {
 		if (tn == null || tn.size == 1) {
@@ -55,10 +62,10 @@ class SsaMachGen extends SsaRebuilder {
 			V3Opcode.IntSub,
 			V3Opcode.IntMul,
 			V3Opcode.IntDiv,
-			V3Opcode.IntMod,
+			V3Opcode.IntMod:		return genTruncatingIntOp(oi);
 			V3Opcode.IntShl,
 			V3Opcode.IntSar,
-			V3Opcode.IntShr:		return genTruncatingIntOp(oi);
+			V3Opcode.IntShr:		return genShiftOp(oi);
 			// Output of integer operations must be normalized
 			V3Opcode.IntAnd:		return genParallelIntOp(oi, V3Infix.And);
 			V3Opcode.IntOr:			return genParallelIntOp(oi, V3Infix.Or);
@@ -86,7 +93,7 @@ class SsaMachGen extends SsaRebuilder {
 			V3Opcode.NullCheck: {
 				ni = genNullCheck(oi);
 				instrMap.set(oi, ni);
-				return; // don't update SSA facts!!!
+				return; // don't update SSA facts of the receiver if folded.
 			}
 			V3Opcode.BoundsCheck: 		ni = genBoundsCheck(oi, true);
 			V3Opcode.CallMethod: 		return genCallMethod(oi);
@@ -120,18 +127,22 @@ class SsaMachGen extends SsaRebuilder {
 	def unexpected(oi: SsaApplyOp) {
 		context.fail(Strings.format1("unexpected operator %1", V3Op.renderOp(oi.op)));
 	}
+	def genShiftOp(oi: SsaApplyOp) {
+		// TODO: recognize shift by constants for wide shifts and rearrange words.
+		genTruncatingIntOp(oi);
+	}
 	def genTruncatingIntOp(oi: SsaApplyOp) {
 		var tt = V3.asInt(oi.op.resultType);
 		var inputs = genRefs(oi.inputs);
 		if (inputs.length == 2) {
-			// two inputs => one output.
+			// 2 -> 1 operation.
 			var ni = apply(oi.source, oi.op, inputs);
 			if (tt.width < mach.intNorm.width) {
 				ni = curBlock.opIntConvert(V3Op.newIntConvert(mach.intNorm.word, oi.op.resultType), ni);
 			}
 			return map1(oi, ni);
 		}
-		// multiple outputs are produced.
+		// N*2 -> N operation.
 		var tn = mach.intNorm.makeType(tt);
 		var ni = apply(oi.source, V3Op.newIntWide(oi.op, tn.sub, tn.newType), inputs);
 		return mapWide(oi, ni, tn, true);
@@ -139,10 +150,10 @@ class SsaMachGen extends SsaRebuilder {
 	def genParallelIntOp(oi: SsaApplyOp, infix: byte) {
 		var inputs = genRefs(oi.inputs);
 		if (inputs.length == 2) {
-			// simple case: two inputs => one output.
+			// 2 -> 1 operation.
 			return map1(oi, apply(oi.source, oi.op, inputs));
 		}
-		// multiple outputs are produced.
+		// N*2 -> N operation.
 		var tt = V3.asInt(oi.op.resultType);
 		var tn = mach.intNorm.makeType(tt);
 		var vals = Array<SsaInstr>.new(tn.size);
@@ -152,43 +163,43 @@ class SsaMachGen extends SsaRebuilder {
 		}
 		return mapN(oi, vals);
 	}
+	def extendBigEnd(bigEnd: SsaInstr, ft: Int_TypeCon) -> SsaInstr {
+		if (ft.signed) {
+			var shift = newGraph.intConst(mach.intNorm.width - 1);
+			return apply(null, ft.lookupInfix(V3Infix.Sar, null), [bigEnd, shift]);
+		}
+		return newGraph.nullConst(mach.intNorm.word);
+	}
 	def genIntConvert(oi: SsaApplyOp) {
 		var inputs = genRefs(oi.inputs);
 		var ft = V3.asInt(oi.op.paramTypes(0));
 		var tt = V3.asInt(oi.op.resultType);
 		if (tt.width > mach.intNorm.width) {
-			// more than 1 output.
+			// M -> (N > 1) conversion.
 			var ftn = mach.intNorm.makeType(ft);
 			var ttn = mach.intNorm.makeType(tt);
-			var vals = inputs;
-			if (ttn.size < ftn.size) {
-				vals = Arrays.range(inputs, 0, ttn.size);
-			} else if (ttn.size > ftn.size) {
-				// sign or zero extend the big end.
-				vals = Arrays.grow(inputs, ttn.size);
-				var expand = if (ft.signed,
-					apply(null, ft.lookupInfix(V3Infix.Sar, null), [inputs(inputs.length - 1),
-						 newGraph.intConst(mach.intNorm.width -1)]),
-					newGraph.nullConst(mach.intNorm.word));
-				for (i = ftn.size; i < ttn.size; i++) {
-					vals(i) = expand;
-				}
+			var fbig = ftn.bigEndIndex();
+			if (ftn.size < ttn.size) {
+				// M < N, so sign or zero extend the big end.
+				var extend = extendBigEnd(inputs(fbig), ft);
+				var vals = ftn.growToN(inputs, ttn.size, extend);
+				return mapN(oi, vals);
 			}
-			// convert the big end.
-			var b = ftn.bigEndIndex();
-			if (b <= ttn.size && ttn.sub(b) != ftn.sub(b)) {
-				vals(b) = curBlock.opIntConvert(V3Op.newIntConvert(ftn.sub(b), ttn.sub(b)), vals(b));
-			}
+			// M >= N, so select N values from inputs.
+			var vals = ftn.getLowestN(inputs, ttn.size);
+			// truncate the big end if necessary.
+			var fbt = ftn.sub(fbig), tbig = ftn.bigEndIndex(), tbt = ttn.sub(tbig);
+			if (fbt != tbt) vals(tbig) = curBlock.opIntConvert(V3Op.newIntConvert(fbt, tbt), vals(tbig));
 			return mapN(oi, vals);
 		}
 		var ni: SsaInstr;
 		if (ft.width > mach.intNorm.width) {
-			// more than one input.
-			var tn = mach.intNorm.makeType(ft);
-			var lt = tn.sub(tn.littleEndIndex());
-			var little = inputs(tn.littleEndIndex());
-			if (lt == oi.op.resultType) ni = little;
-			else ni = curBlock.opIntConvert(V3Op.newIntConvert(lt, oi.op.resultType), little);
+			// (N > 1) -> 1 conversion.
+			var ttn = mach.intNorm.makeType(tt);
+			var lt = ttn.sub(ttn.littleEndIndex());
+			var little = inputs(ttn.littleEndIndex());
+			if (lt == ttn.newType) ni = little;
+			else ni = curBlock.opIntConvert(V3Op.newIntConvert(lt, ttn.newType), little);
 		} else {
 			// 1 -> 1 conversion.
 			ni = apply(oi.source, oi.op, inputs);
@@ -201,9 +212,9 @@ class SsaMachGen extends SsaRebuilder {
 		for (i < tn.size) vals(i) = apply(null, V3Op.newTupleGetElem(tn.newType, i), [ni]);
 		if (truncate) {
 			// truncate the big end of the result if necessary.
-			var big = tn.bigEndIndex(), rem = tn.sub(big);
+			var tbig = tn.bigEndIndex(), rem = tn.sub(tbig);
 			if (V3.asInt(rem).width < mach.intNorm.width) {
-				vals(big) = apply(null, V3Op.newIntConvert(rem, mach.intNorm.word), [vals(big)]);
+				vals(tbig) = apply(null, V3Op.newIntConvert(rem, mach.intNorm.word), [vals(tbig)]);
 			}
 		}
 		mapN(oi, vals);
