@@ -11,12 +11,15 @@ public class V3S_System {
     private static final int PRINT_SIZE = 128;
     private static final int MAX_FILES = 128;
 
-    public static final FileInputStream[] fileInput;
-    public static final FileOutputStream[] fileOutput;
+    public static final InputStream[] fileInput;
+    public static final OutputStream[] fileOutput;
 
     static {
-        fileInput = new FileInputStream[MAX_FILES];
-        fileOutput = new FileOutputStream[MAX_FILES];
+        fileInput = new InputStream[MAX_FILES];
+        fileOutput = new OutputStream[MAX_FILES];
+	fileInput[0] = System.in;
+	fileOutput[1] = System.out;
+	fileOutput[2] = System.err;
     }
 
     public static void putc(byte ch) {

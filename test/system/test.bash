@@ -8,24 +8,22 @@ mkdir -p $T
 
 # TODO: reduce duplication between stacktrace and system
 function do_test() {
-        if [[ "$TESTS" == *"$1"* ]]; then
-	    params="$2"
-	    exp="$3"
-	    local expect=$T/$1.expect
-	    local out=$T/$1.out
-	    rm -f $out $expect
-	    if [ "$exp" = "" ]; then touch $expect
-	    else printf "$exp" > $expect
-	    fi
-	    if [ $compiled = 1 ]; then
-		run_io_test $target "${1%*.*}" "$params" "$expect" 
-	    else
-		print_status Running int $1
-		run_v3c "" -run $1 $params > $out
-		diff $expect $out > /dev/null
-		check $?
-	    fi
-	fi
+    params="$2"
+    exp="$3"
+    local expect=$T/$1.expect
+    local out=$T/$1.out
+    rm -f $out $expect
+    if [ "$exp" = "" ]; then touch $expect
+    else printf "$exp" > $expect
+    fi
+    if [ $compiled = 1 ]; then
+	run_io_test $target "${1%*.*}" "$params" "$expect" 
+    else
+	print_status Running int $1
+	run_v3c "" -run $1 $params > $out
+	diff $expect $out > /dev/null
+	check $?
+    fi
 }
 
 function do_tests() {
@@ -48,6 +46,7 @@ do_test System_fileLeft1.v3 "" "32"
 do_test System_fileLoad1.v3 "" "32"
 do_test System_fileOpen1.v3 "" "success"
 do_test System_fileRead1.v3 "" "success"
+do_test System_fileWrite0.v3 "" "stdout"
 do_test System_fileWrite1.v3 "" ""
 do_test System_putc1.v3 "" "System.putc\n"
 do_test System_putc2.v3 "" "System.putc\n"
