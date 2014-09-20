@@ -7,28 +7,31 @@
 // XXX: normalize tuple returns
 class SsaInliner extends SsaRebuilder {
 	def callerBlock: SsaBlock;
-	def index: int;
+	def call: SsaApplyOp;
 	def inlinee: IrSpec;
-	def call = SsaApplyOp.!(callerBlock.instrs.get(index));
-	def contInstrs = Arrays.range(callerBlock.instrs.array, index + 1, callerBlock.instrs.length);
-	def contEnd = callerBlock.end;
+	def remnant = call.next;
 	def contSuccs = Arrays.dup(callerBlock.succ);
 	var continuation: V3SsaBuilder;
-	var continuationIndex: int;
 	var inlinedBlocks: int;
 	var inlinedInstrs: int;
 	var retVal: SsaInstr;
 	var returns: List<(SsaCfEdge, SsaInstr)>;
 
-	new(context: SsaContext, callerBlock, index, inlinee) super(context) { }
+	new(context: SsaContext, callerBlock, call, inlinee) super(context) {
+		var end = callerBlock.end(), prev = call.prev;
+		prev.next = callerBlock;
+		callerBlock.prev = prev;
+		call.next = null;
+		call.prev = null;
+		remnant.prev = null;
+		end.next = null;
+	}
 
 	def inline() {
 		var target = inlinee.asMethod().ssa;
 		newGraph = context.graph;
 		// trim the current block to include only instructions before the call
 		curBlock = V3SsaBuilder.new(context, newGraph, callerBlock);
-		callerBlock.instrs.length = index;
-		callerBlock.end = null;
 
 		if (V3.isComponent(inlinee.container)) mapComponentParams(target.params);
 		else mapParams(target.params);
@@ -91,20 +94,18 @@ class SsaInliner extends SsaRebuilder {
 	// inline a simple, straight-line method directly into this block
 	def inlineSimple(targetStart: SsaBlock) {
 		continuation = curBlock;
-
-		var oseq = targetStart.instrs;
-		for (j < oseq.length) {
+		var i = targetStart.next;
+		while (i != targetStart) {
 			// translate each instruction in the block
-			genApplyOp(SsaApplyOp.!(oseq.get(j)));
+			if (SsaApplyOp.?(i)) genApplyOp(SsaApplyOp.!(i));
+			else if (SsaThrow.?(i)) genThrow(SsaThrow.!(i));
+			else if (SsaReturn.?(i)) break;
+			if (curBlock.end) return killContinuation();
+			i = i.next;
 		}
-		// translate the end of the block (should be return or throw)
-		var end = targetStart.end;
-		if (SsaThrow.?(end)) genThrow(SsaThrow.!(end));
-		if (curBlock.end) return killContinuation();
-		if (!SsaReturn.?(end)) context.fail("expected throw or return when inlining simple method");
 
 		// create the appropriate return value
-		var inputs = SsaReturn.!(end).inputs, rv: SsaInstr;
+		var inputs = SsaReturn.!(i).inputs, rv: SsaInstr;
 		if (inputs.length == 0) rv = newGraph.nop();
 		else if (inputs.length == 1) rv = genRef1(inputs(0));
 		else rv = curBlock.addApply(null, V3Op.newTupleCreate(inlinee.getReturnType()), genRefs(inputs));
@@ -112,14 +113,8 @@ class SsaInliner extends SsaRebuilder {
 		// replace call instruction with return value
 		call.replace(rv);
 		call.kill();
-		// copy the continuation instructions after the inlinee code
-		continuationIndex = continuation.block.instrs.length;
-		continuation.block.instrs.addN(contInstrs);
-		// reset block end back to original, if there was one
-		if (contEnd != null) {
-			continuation.end = true;
-			continuation.block.end = contEnd; // XXX: fold original end branch
-		}
+		// Add the previous instructions at the end of this block.
+		callerBlock.appendN(remnant);
 	}
 	// inline a method with more than one block into this method
 	def inlineComplex(targetStart: SsaBlock) {
@@ -161,30 +156,25 @@ class SsaInliner extends SsaRebuilder {
 		// replace call instruction with return value
 		call.replace(retVal);
 		call.kill();
-		// copy the continuation instructions after the inlinee code
-		continuationIndex = cb.instrs.length;
-		cb.instrs.addN(contInstrs);
-		// set end of continuation to be a copy of original end
-		cb.end = contEnd; // XXX: fold original end branch
-		if (contEnd != null) {
-			// replace control flow edges from original block
-			var opt = SsaCfOptimizer.new(context);
-			for (i < cb.succ.length) {
-				var oe = cb.succ(i), ne = SsaCfEdge.new(cb, oe.dest);
-				opt.replaceEdge(oe, ne);
-				cb.succ(i) = ne;
-			}
-			continuation.end = true;
+		// copy the remnant instructions after the inlinee code
+		cb.appendN(remnant);
+		var opt = SsaCfOptimizer.new(context);
+		for (j < cb.succ.length) {
+			var oe = cb.succ(j), ne = SsaCfEdge.new(cb, oe.dest);
+			opt.replaceEdge(oe, ne);
+			cb.succ(j) = ne;
 		}
 	}
 	def killContinuation() {
-		if (contEnd != null) {
-			for (i in contInstrs) i.kill();
-			contEnd.kill();
-			var opt = SsaCfOptimizer.new(context);
-			for (s in contSuccs) opt.removeEdge(s); // XXX: delete unreachable blocks
-			continuationIndex = -1;
+		if (continuation == null) return;
+		for (i = remnant; i != null; i = i.next) {
+			if (SsaInstr.?(i)) SsaInstr.!(i).kill();
+			if (SsaEnd.?(i)) {
+				var opt = SsaCfOptimizer.new(context), contSuccs = callerBlock.succ;
+				for (s in contSuccs) opt.removeEdge(s); // XXX: delete unreachable blocks
+			}
 		}
+		continuation = null;
 	}
 	def genApplyOp(oi: SsaApplyOp) {
 		var op = oi.op.subst(inlinee.instantiateType);
@@ -236,7 +226,7 @@ class SsaInliner extends SsaRebuilder {
 // after initial SSA generation, and thus has tuning parameters appropriately set.
 class SsaEarlyInliner(context: SsaContext, gen: VstSsaGen) {
 	def MAX_EARLY_GEN_DEPTH = 5;
-	def MAX_EARLY_INLINE_SIZE = 3;
+	def MAX_EARLY_INLINE_SIZE = 4;
 	def MAX_EARLY_INLINE_BLOCKS = 1;
 	var inlines = 0;
 	def inline(genDepth: int) {
@@ -256,23 +246,21 @@ class SsaEarlyInliner(context: SsaContext, gen: VstSsaGen) {
 		if (inlines > 0) context.printSsa("Inlined");
 	}
 	def tryInlining(block: SsaBlock) {
-		var index = 0;
-		while (index < block.instrs.length) {
-			var i = block.instrs.get(index++);
-			if (i.opcode() != V3Opcode.CallMethod) continue;
-			var inlinee = V3Op.extractIrSpec(SsaApplyOp.!(i).op);
+		var i = block.next;
+		while (SsaInstr.?(i)) {
+			var instr = SsaInstr.!(i);
+			i = i.next;
+			if (instr.opcode() != V3Opcode.CallMethod) continue;
+			var apply = SsaApplyOp.!(instr), inlinee = V3Op.extractIrSpec(apply.op);
 			if (!shouldInline(inlinee)) continue;
-			var inliner = SsaInliner.new(context, block, index - 1, inlinee);
+			var inliner = SsaInliner.new(context, block, apply, inlinee);
 			inliner.inline();
+			inlines++;
 			if (Aeneas.PRINT_INLINING.get()) {
 				var loc = if (inliner.call.source != null, inliner.call.source.render, context.spec.render);
 				Terminal.put3("Inlined %1 instructions from %2 into %3\n", inliner.inlinedInstrs, inlinee.render, loc);
 			}
-			inlines++;
-			if (inliner.continuationIndex < 0) return;
-			// continuing inlining in code after the inlined section
-			block = inliner.continuation.block;
-			index = inliner.continuationIndex;
+			if (inliner.continuation == null) return;
 		}
 	}
 	def shouldInline(inlinee: IrSpec) -> bool {
@@ -286,7 +274,7 @@ def checkGraphSize(ssa: SsaGraph, maxBlocks: int, maxInstrs: int) -> bool {
 	if (maxBlocks == 1) {
 		// quick check for one block with {maxInstrs}
 		if (ssa.startBlock.succ.length > 0) return false;
-		return ssa.startBlock.instrs.length <= maxInstrs;
+		return ssa.startBlock.countDown(maxInstrs) >= 0;
 	}
 	// explore up to {maxBlocks} blocks of the inlinee
 	var queue = Sequence<SsaBlock>.new().grow(maxBlocks);
@@ -296,8 +284,9 @@ def checkGraphSize(ssa: SsaGraph, maxBlocks: int, maxInstrs: int) -> bool {
 	// do bread-first search over the CFG (order doesn't matter)
 	for (i < queue.length) {
 		var b = queue.get(i);
-		var endCost = if(SsaIf.?(b.end), 1); // branches cost 1, other ends 0
-		maxInstrs = maxInstrs - endCost - b.instrs.length;
+		var endCost = if(SsaIf.?(b.end()), 1); // branches cost 1, other ends 0
+		maxInstrs = b.countDown(maxInstrs) - endCost;
+		if (maxInstrs < 0) break;
 		ssa.addSuccessors(queue.get(i), queue, mark);
 		if (queue.length > maxBlocks) {
 			maxInstrs = -1;
