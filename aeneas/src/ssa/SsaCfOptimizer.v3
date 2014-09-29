@@ -83,6 +83,7 @@ class SsaCfOptimizer(context: SsaContext) {
 				applyDominatorOptForInput0(cond.input0(), sw.block.succ(0), optFoldCast(_, queryTypes));
 			} else if (cond.op.opcode == V3Opcode.Equal) {
 				tryPropagatingCmpNonZero(cond, sw.block.succ(0), sw.block.succ(1));
+				tryBuildingSwitch(sw, cond.op.typeArgs(0), cond);
 			} else if (cond.op.opcode == V3Opcode.NotEqual) {
 				tryPropagatingCmpNonZero(cond, sw.block.succ(1), sw.block.succ(0));
 			}
@@ -145,6 +146,103 @@ class SsaCfOptimizer(context: SsaContext) {
 		if (right.checkFact(Facts.V_ZERO)) {
 			return applyDominatorOptForInput0(left, neEdge, optNullCheck);
 		}
+	}
+	def matchSwitchCmp(key: SsaInstr, block: SsaBlock) -> SwitchCmp {
+		// XXX: match V3Opcode.NotEqual, commute constants, etc.
+		var end = block.end();
+		if (!SsaIf.?(end)) return null;
+		var i = SsaIf.!(end);
+		var edge = i.inputs(0);
+		if (!edge.isOnlyEdge()) return null;
+		var cmp = edge.dest;
+		if (cmp.opcode() != V3Opcode.Equal) return null;
+		if (cmp.inputs(0).dest != key) return null;
+		var r = cmp.inputs(1).dest;
+		if (!SsaValue.?(r)) return null;
+		return SwitchCmp.new(Int.unbox(SsaValue.!(r).val), cmp, i, i.block.succ(0), i.block.succ(1));
+	}
+	def verifySwitchCmpBlock(cmp: SwitchCmp, block: SsaBlock) -> bool {
+		for (i = block.next; i != block; i = i.next) {
+			if (i != cmp.cmp && i != cmp.end) return false;
+		}
+		return true;
+	}
+	def tryBuildingSwitch(sw: SsaIf, t: Type, cmp: SsaInstr) {
+		if (!context.compiler.EmitSwitch) return;
+		if (!V3.isInt32(t)) return;
+		var key = cmp.inputs(0).dest;
+		var cmp = matchSwitchCmp(key, sw.block);
+		if (cmp == null) return;
+		var seq = Sequence<SwitchCmp>.new();
+		seq.add(cmp);
+		// add switch case candidates to the list.
+		while (true) {
+			if (!cmp.fSucc.isOnlyEdge()) break;
+			var block = cmp.fSucc.dest;
+			cmp = matchSwitchCmp(key, block);
+			if (cmp == null) break;
+			if (!verifySwitchCmpBlock(cmp, block)) break;
+			seq.add(cmp);
+		}
+
+		// determine if building a table would be profitable.
+		if (seq.length < 4) return;  // not enough cases.
+		var min = Int.MAX_VALUE, max = Int.MIN_VALUE;
+		for (i < seq.length) {
+			var v = seq.get(i).val;
+			if (v < min) min = v;
+			if (v > max) max = v;
+		}
+		var diff = u32.!(max - min) + 1;
+		if (diff > seq.length * 2) return; // table would be less than 50% full.
+		if (diff > int.max) return;  // table would be too large.
+		var size = int.!(diff);
+		var table = Array<SsaCfEdge>.new(size);
+		// build dispatch table.
+		for (i = seq.length - 1; i >= 0; i--) {
+			var c = seq.get(i), index = c.val - min;
+			var p = table(index);
+			if (p != null) removeEdge(p);
+			table(index) = c.tSucc;
+		}
+		// build array of successor edges.
+		var succ = Array<SsaCfEdge>.new(size + 1);
+		var dmerge: SsaBlock;
+		for (i < size) {
+			var e = table(i);
+			if (e == null) {  // hole in the table; go to default
+				if (dmerge == null) dmerge = SsaBlock.new();
+				succ(i) = SsaCfEdge.new(sw.block, dmerge);
+			} else {
+				succ(i) = SsaCfEdge.new(sw.block, e.dest);
+				replaceEdge(e, succ(i));
+			}
+		}
+		// set up default edge.
+		var defedge = seq.get(seq.length - 1).fSucc;
+		if (dmerge != null) {
+			succ(size) = SsaCfEdge.new(sw.block, dmerge);
+			var goto = SsaCfEdge.new(dmerge, defedge.dest);
+			dmerge.append(SsaGoto.new(dmerge));
+			dmerge.succ = [goto];
+			replaceEdge(defedge, goto);
+		} else {
+			succ(size) = SsaCfEdge.new(sw.block, defedge.dest);
+			replaceEdge(defedge, succ(size));
+		}
+
+		// Remove the ifs and comparisons from the end of the blocks.
+		for (i < seq.length) {
+			var c = seq.get(i);
+			c.end.kill();
+			c.end.remove();
+			c.cmp.kill();
+			c.cmp.remove();
+		}
+
+		// Replace the first if with a switch.
+		sw.block.append(SsaSwitch.new(sw.block, key.getType(), min, max, key));
+		sw.block.succ = succ;
 	}
 	def killBlock(block: SsaBlock) {
 		if (block.checkFact(Facts.O_KILLED)) return;
@@ -346,3 +444,4 @@ class SsaCfOptimizer(context: SsaContext) {
 		// XXX: propagate the fact to blocks dominated by this block
 	}
 }
+class SwitchCmp(val: int, cmp: SsaInstr, end: SsaIf, tSucc: SsaCfEdge, fSucc: SsaCfEdge) { }
