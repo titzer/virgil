@@ -726,11 +726,6 @@ class RaField(container: Type, orig: IrField, fieldType: TypeNorm, size: int) ex
 		}
 		return false;
 	}
-	def isSimple() -> bool {
-		if (fieldType == null) return true;
-		if (fieldType.newType != fieldType.oldType) return false;
-		return size == 1;
-	}
 }
 // Information about a method, including any specialization, whether it is reusable
 // across normalization, etc.
@@ -779,6 +774,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 
 	def normalize() {
 		// layout fields into classes
+		if (Aeneas.PRINT_DEAD_CODE.get()) DeadCodeAnalyzer.new(ra).report();
 		ra.heapTypes.apply(visitHeapType);
 		if (ra.compiler.PartialSpecialization) {
 			// if partial specialization is enabled, do specialization analysis
@@ -1138,8 +1134,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		return normSpecCode(context, rm);
 	}
 	def normSpecCode(context: SsaContext, rm: RaMethod) {
-		var rt = if(rm.spec == null, rm.orig.returnType, rm.spec.getReturnType());
-		SsaRaNormalizer.new(context, this, ra.makeType(rt)).build(rm.norm);
+		SsaRaNormalizer.new(context, this).build(rm.norm);
 		newIr.methods.add(rm.norm);
 	}
 }
@@ -1159,11 +1154,10 @@ class RaTarget extends Target("ra") {
 // XXX: preserve the dataflow facts when normalizing an instruction
 class SsaRaNormalizer extends SsaRebuilder {
 	def norm: ReachabilityNormalizer;
-	def returnTn: TypeNorm;
 	var voidArray: Array<SsaInstr>;
 	var specSet: SpecSet;
 
-	new(context: SsaContext, norm, returnTn) super(context) {}
+	new(context: SsaContext, norm) super(context) {}
 	def build(newMethod: IrMethod) {
 		newMethod.ssa = genGraph();
 		context.method = newMethod;
@@ -1595,9 +1589,6 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var newCheck = curBlock.opBoundsCheck(op.typeArgs(0), newArgs(0), newArgs(1));
 		if (newCheck != null) newCheck.facts = newCheck.facts | oldInstr.facts;
 	}
-	def genType1(t: Type) -> Type {
-		return normalize(t).newType;
-	}
 	def genValIntoArray(v: Val, tn: TypeNorm, dest: Array<Val>, index: int) {
 		norm.normValIntoArray(v, tn, dest, index);
 	}
@@ -1826,7 +1817,6 @@ class IntNormalizer(width: int, bigEndian: bool) {
 	def cache = TypeUtil.newTypeMap<RaIntType>();
 	def word = Int.getType(false, width);
 	def byteSize = (width + 7) / 8;
-	var temp: Array<Val>;
 	// Normalize an integer value into an array of values.
 	def normalizeIntIntoArray(tt: Int_TypeCon, v: int, array: Array<Val>, index: int) {
 		if (width >= 32) {  // degenerate case.
@@ -1900,13 +1890,94 @@ class IntNormalizer(width: int, bigEndian: bool) {
 		}
 		return nt;
 	}
-	// Gets a shared temporary value array large enough to hold any normalization.
-	def getTempArray() -> Array<Val> {
-		if (temp == null) temp = Array<Val>.new((Int.MAX_WIDTH + width - 1) / width);
-		return temp;
-	}
 	def box(v: (int, int)) -> Val {
 		if (width > 32) return Int64.box(v);
 		return Int.box(v.1);
+	}
+}
+// Reports code that is neither used during initialization nor reachable from main().
+class DeadCodeAnalyzer(ra: ReachabilityAnalyzer) {
+	def buf = TerminalBuffer.new();
+	def report() {
+		ra.typeMap.apply(processType);
+		for (i < ra.prog.ir.classes.length) {
+			var c = ra.prog.ir.classes.get(i);
+			processIrClass(c);
+			reportClass(c);
+		}
+	}
+	def reportClass(ic: IrClass) {
+		buf.reset();
+		if (!ic.checkFact(Facts.X_LIVE) && !isSynthetic(ic)) {
+			// the entire class is dead
+			addLine("dead ", ic);
+		} else {
+			// report dead fields if any
+			for (f in ic.fields) {
+				if (ic.inherits(f)) continue;
+				if (!f.checkFact(Facts.X_LIVE)) {
+					if (buf.length == 0) addLine("within ", ic);
+					buf.puts("  dead field: ");
+					f.render(buf.red()).end().ln();
+				}
+			}
+			// report dead methods if any
+			for (m in ic.methods) {
+				if (m == null) continue;
+				if (ic.inherits(m)) continue;
+				if (m.checkFact(Facts.M_EMPTY)) continue;
+				if (!m.checkFact(Facts.X_LIVE)) {
+					if (buf.length == 0) addLine("within ", ic);
+					buf.puts("  dead method: ");
+					m.render(buf.red()).end().ln();
+				}
+			}
+		}
+		if (buf.length > 0) Terminal.putb(buf);
+	}
+	def addLine(p: string, ic: IrClass) {
+		buf.puts(p);
+		if (V3.isClass(ic.ctype)) buf.puts("class ");
+		if (V3.isVariant(ic.ctype)) buf.puts("variant ");
+		if (V3.isComponent(ic.ctype)) {
+			if (isSynthetic(ic)) buf.puts("file ");
+			else buf.puts("component ");
+		}
+		ic.ctype.render(buf.red()).end().ln();
+	}
+	def isSynthetic(ic: IrClass) -> bool {
+		return V3.isComponent(ic.ctype) && V3.asComponent(ic.ctype).componentDecl.isSynthetic;
+	}
+	def processIrClass(ic: IrClass) {
+		for (f in ic.fields) {
+			if (f.checkFact(Facts.X_LIVE)) markMember(f);
+		}
+		for (m in ic.methods) {
+			if (m != null && m.ic != null) markMember(m);
+		}
+	}
+	def processType(t: Type, tn: TypeNorm) {
+		if (!RaClass.?(tn)) return;
+		var rc = RaClass.!(tn);
+		for (f in rc.fields) {
+			if (f == null) continue;
+			if ((f.raFacts & RF_READ) != 0) markMember(f.orig);
+		}
+		for (ml in rc.methods) {
+			for (l = ml; l != null; l = l.tail) {
+				var m = l.head;
+				if ((m.raFacts & RM_LIVE) != 0) markMember(m.orig);
+			}
+		}
+		if ((rc.raFacts & (RC_LIVE | RC_ALLOC)) != 0 || rc.orig.checkFact(Facts.X_LIVE)) {
+			while (rc != null) {
+				rc.orig.setFact(Facts.X_LIVE);
+				rc = rc.parent;
+			}
+		}
+	}
+	def markMember(m: IrMember) {
+		m.setFact(Facts.X_LIVE);
+		ra.prog.ir.getIrClass(m.container).setFact(Facts.X_LIVE);
 	}
 }
