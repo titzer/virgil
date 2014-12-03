@@ -1,0 +1,304 @@
+// Copyright 2014 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Represents an Arm instruction for register allocation and assembling
+class ArmInstr<T> extends MachInstr {
+	def emitFunc: T -> void;
+	def params: T;
+	new(name: string, emitFunc, params) super(name) { }
+	def emit() { emitFunc(params); }
+}
+// Generates Arm code from SSA-M32 form.
+// XXX: emit short branch instructions where possible
+// XXX: align loop headers to cache boundaries
+// XXX: schedule loads of constants for calls, phis, etc
+// XXX: remove use of scratch register
+class ArmCodeGen extends MachCodeGen {
+	var multiBlock: bool;
+	var branches: List<(int, SsaBlock)>; // XXX: pull branches up to MachCodeGen?
+	var jumpTables: List<(int, SsaSwitch)>;
+	var asm: ArmMacroAssembler;
+
+	new(mach: MachProgram, context: SsaContext) super(mach, context) {
+		multiBlock = context.graph.isMultiBlock();
+		frame = MachFrame.new(ArmVirgilCallConv.getForGraph(context.graph));
+	}
+	def genCode(asm: ArmMacroAssembler) {
+		this.asm = asm;
+		blocks.computeOrder();
+		gen_entry();
+		var blocks = blocks.order;
+		for (i < blocks.length) {
+			// emit all blocks in order
+			var info = blocks.get(i);
+			info.start = code.length;
+			genBlock(info.block);
+			info.end = code.length;
+		}
+		markAllLiveVars();
+		genPhis();
+		lsra = LinearScanRegAlloc.new(this, ArmMachRegs.regs);
+		lsra.assignRegs();
+		frame.frameSize = mach.alignTo(frame.slots() * mach.refSize + mach.code.addressSize, mach.stackAlign);
+		if (Aeneas.PRINT_MACH.get()) print();
+		emitInstrs();
+	}
+	def genBlock(b: SsaBlock) {
+		// generate code for each instruction in a block
+		context.block = b;
+		curBlockStart = code.length;
+		if (b.phis != null) gen_phi_dfn(b.phis); // special instruction defines phis
+		for (i = b.next; SsaInstr.?(i); i = i.next) {
+			var mv = makeVar(SsaInstr.!(i));
+			mv.start = code.length;
+			var root = true;
+			if (SsaApplyOp.?(i)) root = genApply(SsaApplyOp.!(i), mv);
+			else if (SsaReturn.?(i)) genReturn(SsaReturn.!(i));
+			else if (SsaIf.?(i)) genIf(SsaIf.!(i));
+			else if (SsaGoto.?(i)) genGoto(SsaGoto.!(i).target());
+			else if (SsaSwitch.?(i)) genSwitch(SsaSwitch.!(i));
+			else if (SsaThrow.?(i)) genThrow(SsaThrow.!(i));
+			mv.end = code.length;
+			if (root) markUsesLive(mv);
+		}
+	}
+	def emitInstrs() {
+		if (rtsrc != null) rtsrc.recordMethodStart(asm.codeOffset(), context.method.source, frame);
+		var encoder = asm.encoder;
+		var offsets = Array<int>.new(code.length);
+		// assemble the code for each instruction
+		for (i < code.length) {
+			var instr = code.get(i);
+			offsets(i) = encoder.pos;
+			if (!instr.live) continue;
+			var m = instr.moves;
+			if (m != null) { // emit any spills / constants before instruction
+				emitMoves(m.before);
+				emitVarMoves(m.varMoves);
+				emitValMoves(m.valMoves);
+			}
+			instr.emit();
+			if (m != null) { // emit any restores after instruction
+				emitMoves(m.after);
+			}
+		}
+		// patch any branch instructions with the target address
+		for (l = branches; l != null; l = l.tail) {
+			var p = l.head.0;
+			var t = offsets(blocks.order.get(l.head.1.mark).start);
+			// TODO: encoder.at(p).i4le(t - p - 4); // encode pc-relative address
+		}
+		// patch any jump tables
+		for (l = jumpTables; l != null; l = l.tail) {
+			var p = l.head.0, sw = l.head.1;
+			encoder.at(p);
+			var succ = sw.block.succ;
+			for (i < succ.length) {
+				var t = offsets(blocks.order.get(succ(i).dest.mark).start);
+				// TODO: encoder.i4le(t + asm.machEncoder.startAddr); // encode absolute address
+			}
+		}
+		encoder.atEnd();
+		if (rtsrc != null) rtsrc.recordFrameEnd(asm.codeOffset());
+	}
+	def genApply(i: SsaApplyOp, mv: MachVar) -> bool {
+		var root = true;
+		// TODO
+		return root;
+	}
+	def genReturn(i: SsaReturn) {
+		for (j < i.inputs.length) {
+			useFixed(i.inputs(j).dest, frame.conv.callerRet(j));
+		}
+		// TODO: 	gen("ret", asm_ret, ());
+	}
+	def genGoto(target: SsaBlock) {
+		if (target.phis != null) gen("phi_resolve", asm_phi_resolve, code.length);
+		if (blocks.isImmediatelyAfter(context.block, target)) gen("nop", asm_nop, ());
+		else ; // TODO: gen_br(null, target); ;
+	}
+	def genThrow(i: SsaThrow) {
+		// TODO: gen("throw", asm_throw, (i.source, i.exception));
+	}
+	def genIf(i: SsaIf) {
+		// TODO: gen compare and branch
+	}
+	def genSwitch(i: SsaSwitch) {
+		// TODO: gen("sw", asm_tableswitch, (i, use(i.input0())));
+	}
+	def gen_phi_dfn(phis: SsaPhis) {
+		phiList = List.new(phis, phiList);
+		gen("phi_dfn", asm_nop, ()).live = true;
+	}
+
+	def numVars(i: SsaInstr) -> int {
+		// a call could have multiple return values
+		return Tuple.length(i.getType());
+	}
+	def matchEdge(e: SsaDfEdge, opcode: int) -> bool {
+		return soleEdge(e) && e.dest.opcode() == opcode;
+	}
+	def soleEdge(e: SsaDfEdge) -> bool {
+		if (e.next != null) return false; // not the only use
+		var i = e.dest;
+		if (i.useList != e) return false; // not the only use
+		return inSameBlock(i);
+	}
+	def matchOpcode(i: SsaInstr) -> int {
+		if (inSameBlock(i)) return i.opcode();
+		return -1;
+	}
+	def inSameBlock(i: SsaInstr) -> bool {
+		if (multiBlock) {
+			if (i.mark < 0) return false;
+			return vars.get(i.mark).start >= curBlockStart;
+		}
+		return true;
+	}
+	def gen_entry() {
+		// add defs of each parameter as the first instruction
+		var p = context.graph.params, max = p.length;
+		var defs = Array<int>.new(max);
+		for (i < max) {
+			var pvar = makeVar(p(i)), loc = frame.conv.callerParam(i);
+			if (frame.conv.regSet.isReg(loc)) {
+				defs(i) = dfnAt(pvar, loc);
+				pvar.hint = byte.!(loc); // register hint
+			} else {
+				defs(i) = dfnAt(pvar, loc);
+				pvar.spill = loc; // reuse spill slot in caller frame
+			}
+		}
+		gen("entry", asm_entry, defs).live = true;
+	}
+	def asm_entry(defs: Array<int>) {
+		var adjust = frameAdjust();
+		if (adjust > 0) {
+			// TODO: subtract immediate from stack pointer.
+		}
+	}
+	def asm_phi_resolve(pos: int) {
+		// do nothing. all moves should be inserted by main emit() loop
+	}
+	def asm_nop() {
+	}
+
+	def buildStackMap(off: int, conv: MachCallConv, lp: int) -> int {
+		var builder = rtgc.beginRefMap(frame.slots(), 20);
+		if (conv != null && conv.overflow > 0) {
+			// record any outgoing overflow parameters that are references
+			var pt = conv.paramTypes, rs = conv.regSet;
+			for (i < pt.length) {
+				var ploc = conv.calleeParam(i);
+				if (rs.isStack(ploc) && mach.isRefType(pt(i))) {
+					builder.setRefMap(ploc - rs.calleeStart);
+				}
+			}
+		}
+		// lazily compute the reference slot index for each live MachVar
+		if (varRefSlotIndex == null) computeVarRefSlotIndex();
+		var width = lsra.livemap.width, start = width * lp;
+		var bits = lsra.livemap.bits;
+		// for each live variable, set the appropriate bit (if any) in the stackmap
+		for (i < width) {
+			var vnum = i * 32;
+			for (b = bits(i + start); b != 0; b = b #>> 1) {
+				if ((b & 1) != 0) { // variable is live
+					var refSlot = varRefSlotIndex(vnum);
+					if (refSlot > 0) builder.setRefMap(refSlot - 1 + frame.spillArgs);
+				}
+				vnum++;
+			}
+		}
+		return builder.finishRefMap();
+	}
+	// compute the reference slot index for each (live) MachVar
+	def computeVarRefSlotIndex() {
+		// XXX: pull this code up to MachCodeGen--currently depends on frame layout
+		varRefSlotIndex = Array<int>.new(vars.length);
+		var regSet = frame.conv.regSet;
+		for (i = 0; i < vars.length; ()) {
+			var machVar = vars.get(i);
+			if (machVar.varSize > 1) {
+				// set reference slots for all sub-variables
+				var types = Tuple.toTypeArray(machVar.ssa.getType());
+				for (j < machVar.varSize) {
+					var subVar = vars.get(i + j);
+					if (subVar.live) setVarRefSlot(subVar, types(j));
+				}
+				i = i + machVar.varSize;
+			} else if (machVar.live && machVar.ssa != null) {
+				// set a reference slot for this live mach var
+				setVarRefSlot(machVar, machVar.ssa.getType());
+				i++;
+			} else {
+				i++;
+			}
+		}
+	}
+	def setVarRefSlot(machVar: MachVar, t: Type) {
+		if (machVar.live && mach.isRefType(t)) {
+			var spill = machVar.spill, regSet = frame.conv.regSet;
+			if (spill >= regSet.spillStart && spill < regSet.callerStart) {
+				varRefSlotIndex(machVar.varNum) = 1 + spill - regSet.spillStart;
+			}
+		}
+	}
+	// generates a single ArmInstr and adds it to the "code" sequence
+	def gen<T>(name: string, f: T -> void, params: T) -> MachInstr {
+		return addInstr(ArmInstr.new(name, f, params));
+	}
+
+	def gpr(a: SsaInstr) -> int {
+		return useAt(makeVar(a), ArmMachRegs.GPR);
+	}
+	def use(a: SsaInstr) -> int {
+		return useAt(makeVar(a), 0);
+	}
+	def useFixed(a: SsaInstr, fixed: int) -> int {
+		return useAt(makeVar(a), fixed);
+	}
+	def dfn(a: MachVar) -> int {
+		return dfnAt(a, 0);
+	}
+	def dfngpr(a: MachVar) -> int {
+		return dfnAt(a, ArmMachRegs.GPR);
+	}
+	// get the location assignment for a use position
+	def loc(usepos: int) -> int {
+		return lsra.getAssignment(usepos);
+	}
+	// convert a use into an x86 register
+	def r(usepos: int) -> ArmReg {
+		return loc_r(loc(usepos));
+	}
+	def print() {
+		if (lsra != null) lsra.print();
+	}
+	// amount to adjust the frame at the beginning and end of invocation
+	def frameAdjust() -> int {
+		return frame.size() - mach.code.addressSize; // assumes return address already pushed
+	}
+	def allocMoveTmp() -> int {
+		return frame.conv.regSet.scratch;
+	}
+	def loc_r(loc: int) -> ArmReg {
+		return asm.loc_r(frame, loc); // XXX: inline
+	}
+	def asm_movd_l_l(src: int, dst: int) {
+		if (src <= 0) return; // nothing to do
+		if (src == dst) return; // nothing to do
+		// TODO: asm.movd_rm_rm(asm.loc_rm(frame, dst), asm.loc_rm(frame, src), null);
+	}
+	def emitMoves(mr: MoveResolver) {
+		if (mr != null) mr.genMoves(allocMoveTmp, asm_movd_l_l);
+	}
+	def emitVarMoves(list: List<(int, int)>) {
+		var mr = MoveResolver.new(context.ERROR);
+		for (l = list; l != null; l = l.tail) mr.addMove(loc(l.head.0), loc(l.head.1));
+		mr.genMoves(allocMoveTmp, asm_movd_l_l);
+	}
+	def emitValMoves(list: List<(Val, int)>) {
+		for (l = list; l != null; l = l.tail) ; // TODO: asm.movd_l_val(frame, loc(l.head.1), l.head.0);
+	}
+}
