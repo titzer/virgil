@@ -12,6 +12,7 @@ mkdir -p $OUT
 
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $(dirname ${BASH_SOURCE[0]}) && cd .. && pwd)}
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
+AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
 
 UNAME=$(uname -sm)
 HOST_PLATFORM=$($VIRGIL_LOC/bin/dev/sense_host | cut -d' ' -f1)
