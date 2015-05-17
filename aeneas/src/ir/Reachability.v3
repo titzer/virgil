@@ -476,9 +476,8 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 				if (superType != null) {
 					parent = makeClass(superType);
 				} else {
-					// Add a default value to the tag 0 class for field tracking
-					var record = V3.makeDefaultVariantRecord(prog, t);
-					if (record != null) deferValue(record);
+					// make the default variant record for field analysis
+					deferValue(V3.makeDefaultVariantRecord(prog, t));
 				}
 				var rc = newRaClass(t, t, ic, parent);
 				rc.raFacts = rc.raFacts | RC_VARIANT;
@@ -854,6 +853,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	}
 	def numberVariantClass(rc: RaClass) {
 		layoutFields(rc);
+		var equality = (rc.raFacts & RC_EQUALITY) != 0;
 		// number variant classes consistently with their tagging order.
 		for (l = rc.children; l != null; l = l.tail) {
 			var c = l.head;
@@ -865,13 +865,14 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			liveClasses.grow(index + 1);
 			if (liveClasses.length < c.maxClassId) liveClasses.length = index + 1;
 			liveClasses.set(index, c);
-			if ((rc.raFacts & RC_EQUALITY) != 0 && c.normFields.length > 0) {
+			if ((c.raFacts & RC_EQUALITY) != 0) {
 				// generate an equality method for each live subclass
-				VariantComparatorGen.new(context, c).generate();
+				equality = true;
+				if (c.normFields.length > 0) VariantComparatorGen.new(context, c).generate();
 			}
 		}
 		rc.maxClassId = liveClasses.length;
-		if ((rc.raFacts & RC_EQUALITY) != 0) {
+		if (equality) {
 			// generate an equality method for the root
 			var rm = VariantComparatorGen.new(context, rc).generate();
 			// analyze the equality method as a "virtual" dispatch
@@ -1264,14 +1265,18 @@ class SsaRaNormalizer extends SsaRebuilder {
 			CallClassVirtual: {
 				// devirtualize methods that are not overridden
 				var t = extractVirtualRef(orig), m = t.0, newOp: Operator;
+				var facts = 0;
 				if (t.1) { // still a virtual dispatch
 					newOp = V3Op.newCallClassVirtual(m);
 				} else {
 					// devirtualized to call abstract method => no objects instantiated of that type
 					if (m.member.checkFact(Facts.M_ABSTRACT)) return map1(app, newGraph.nullConst(m.getReturnType()));
 					else newOp = V3Op.newCallMethod(m);
+					// don't emit a null check for devirtualized variant calls
+					facts = if(m.container.typeCon.kind == V3Kind.VARIANT, Facts.O_NO_NULL_CHECK);
 				}
-				normGeneralOp(app, op, newOp);
+				var i = normGeneralOp(app, op, newOp);
+				i.setFact(facts);
 			}
 			CallClosure: {
 				var tn = normTypeArg(op, 0);
@@ -1307,11 +1312,12 @@ class SsaRaNormalizer extends SsaRebuilder {
 		return curBlock.addReturn(genRefs(oldRet.inputs));
 	}
 	// normalize a general, non-pure, operator
-	def normGeneralOp(oldInstr: SsaApplyOp, op: Operator, newOp: Operator) {
+	def normGeneralOp(oldInstr: SsaApplyOp, op: Operator, newOp: Operator) -> SsaInstr {
 		var newArgs = genRefs(oldInstr.inputs);
 		var newInstr = curBlock.addApply(oldInstr.source, newOp, newArgs);
 		newInstr.facts = newInstr.facts | oldInstr.facts;
 		mapNorm(oldInstr, newInstr, normReturnType(op));
+		return newInstr;
 	}
 	def normTypeSubsume(oldInstr: SsaApplyOp, op: Operator) {
 		var atn = normTypeArg(op, 0), rtn = normTypeArg(op, 1);
@@ -1350,12 +1356,23 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def normVariantEqual(oldApp: SsaApplyOp, tn: TypeNorm, x: SsaInstr, y: SsaInstr) {
 		var rc = RaClass.!(tn);
-		var rm = rc.methods(IrUtil.EQUALS_METHOD_INDEX).head;
+		var list = rc.methods(IrUtil.EQUALS_METHOD_INDEX);
+		if (list == null) {
+			tn = normalize(V3.getSuperType(tn.oldType));
+			return normVariantEqual(oldApp, tn, x, y);
+		}
+		var rm = list.head;
 		// devirtualize methods that are not overridden
 		var t = tryDevirtualize(rm, [rc.newType]), m = t.0, newOp: Operator;
-		if (t.1) newOp = V3Op.newCallClassVirtual(m);
-		else newOp = V3Op.newCallMethod(m);
+		var facts = Facts.O_PURE | Facts.O_COMMUTATIVE;
+		if (t.1) {
+			newOp = V3Op.newCallClassVirtual(m);
+		} else {
+			newOp = V3Op.newCallMethod(m);
+			facts = facts | Facts.O_NO_NULL_CHECK;
+		}
 		var call = curBlock.addApply(oldApp.source, newOp, [x, y]);
+		call.setFact(facts);
 		if (oldApp.op.opcode == Opcode.NotEqual) {
 			call = curBlock.opBoolNot(call);
 		}
@@ -1680,7 +1697,7 @@ class VariantComparatorGen(context: SsaContext, rv: RaClass) {
 
 		context.enterSpec(spec);
 
-		var tag = V3.getVariantTag(rv.newType);
+		var tag = V3.asClass(rv.newType).classDecl.variantTag;
 		var params = Array<SsaParam>.new(2);
 		p0 = params(0) = SsaParam.new(0, rv.newType);
 		p1 = params(1) = SsaParam.new(1, pv.newType);
@@ -1938,9 +1955,9 @@ class DeadCodeAnalyzer(ra: ReachabilityAnalyzer) {
 	}
 	def addLine(p: string, ic: IrClass) {
 		buf.puts(p);
-		if (V3.isClass(ic.ctype)) buf.puts("class ");
 		if (V3.isVariant(ic.ctype)) buf.puts("variant ");
-		if (V3.isComponent(ic.ctype)) {
+		else if (V3.isClass(ic.ctype)) buf.puts("class ");
+		else if (V3.isComponent(ic.ctype)) {
 			if (isSynthetic(ic)) buf.puts("file ");
 			else buf.puts("component ");
 		}

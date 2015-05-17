@@ -95,6 +95,7 @@ class VstCompound extends Decl {
 	var typeEnv: TypeEnv;
 	var memberMap: Map<string, VstMember>;
 	var declType: Type;
+	var fullName: string;
 	var numFields: int;
 	var numMethods: int;
 	var constructor: VstNew;
@@ -102,7 +103,9 @@ class VstCompound extends Decl {
 	var isFileScope: bool;
 	var verifier: VstCompoundVerifier;
 
-	new(name: Token, typeParams, params, superclause, members) super(name) { }
+	new(name: Token, typeParams, params, superclause, members) super(name) {
+		fullName = name.image;
+	}
 	def getDeclaredType() -> Type {
 		if (declType == null && typeCon != null) {
 			declType = typeCon.create(Lists.map(typeParams, Type.!<TypeParam>));
@@ -112,10 +115,15 @@ class VstCompound extends Decl {
 	def getParams() -> List<ParamDecl> {
 		return if(params != null, params.list);
 	}
+	def isVariant() -> bool { return VstClass.?(this) && VstClass.!(this).tagType != null; }
+	def isVariantCase() -> bool { return VstClass.?(this) && VstClass.!(this).variantTag >= 0; }
 }
 // Parsed "class X { ... }"
 class VstClass extends VstCompound {
 	def superclass: TypeRef;
+	var variantTag = -1;
+	var caseCount = -1;
+	var tagType: Type;
 	new(name: Token, typeParams: List<TypeParam>, params: VstList<ParamDecl>, superclass, superclause: SuperClause, members: List<VstMember>) 
 		super(name, typeParams, params, superclause, members) { }
 }
@@ -124,40 +132,50 @@ class VstComponent extends VstCompound {
 	var recordIndex: int;
 	new(name: Token, members: List<VstMember>) super(name, null, null, null, members) { }
 }
-// Parsed "type X { ... }"
-class VstVariant extends VstCompound {
-	var cases: List<VstVariantCase>;
-	var firstCase: VstVariantCase;
-	var parent: VstVariant;
-	var container: VstVariantCase;
-	var count: int;
-	new(name: Token, typeParams: List<TypeParam>, params: VstList<ParamDecl>, members: List<VstMember>) 
-		super(name, typeParams, params, null, members) {
-		// gather type cases from member list
-		var cl: List<VstVariantCase>;
-		for (l = members; l != null; l = l.tail) {
-			if (VstVariantCase.?(l.head)){
-				cl = List.new(VstVariantCase.!(l.head), cl);
-				count++;
-			}
-		}
-		cases = Lists.reverse(cl);
+// A helper class for desugaring variants into VstClasses.
+class VariantDesugaring(outer: VstIdent<TypeParam>) {
+	def superclass = TypeRef.new(null, outer.name, Lists.map(outer.list(), TypeUtil.typeRefOfParam), null, null);
+	var cases: List<VstClass>;
+	var caseCount = 0;
+	def synthesizeMembers(fileName: string, line: int, col: int) -> List<VstMember> {
+		var tagToken = Token.new(fileName, "tag", line, col);
+		var nameToken = Token.new(fileName, "name", line, col);
+		var list: List<VstMember>;
+		list = List.new(VstVariantTagMember.new(tagToken), list);
+		list = List.new(VstVariantNameMember.new(nameToken), list);
+		return list;
 	}
-}
-// Parsed "case X { ... }"
-class VstVariantCase extends VstMember {
-	def params: VstList<ParamDecl>;
-	def members: List<VstMember>;
-	var synthetic: VstVariant;
-	var tag: int;
-	new(name: Token, params, members) super(false, name) {}
-	def getType() -> Type {
-		return container.getDeclaredType();
+	def synthesizeTopLevelClass(members: List<VstMember>) -> VstClass {
+		var decl = VstClass.new(outer.name, outer.list(), null, null, null, members);
+		decl.tagType = getTagType();
+		for (l = cases; l != null; l = l.tail) l.head.tagType = decl.tagType;
+		decl.caseCount = caseCount;
+		return decl;
+	}
+	def synthesizeVariantCaseMember(id: VstIdent<void>, params: VstList<ParamDecl>, members: List<VstMember>) -> VstVariantCaseMember {
+		var synthetic = VstClass.new(id.name, outer.list(), params, superclass, null, members);
+		synthetic.variantTag = caseCount++;
+		synthetic.isSynthetic = true;
+		var buf = StringBuffer.new().puts(superclass.token.image);
+		buf.putc('.');
+		synthetic.fullName = buf.puts(id.name.image).toString();
+		cases = List.new(synthetic, cases);
+		return VstVariantCaseMember.new(synthetic);
+	}
+	// compute the type of the tag based on the number of variants.
+	def getTagType() -> Type {
+		var width = 1, exp = 2;
+		while (exp < caseCount) {
+			exp = exp #<< 1;
+			width++;
+		}
+		return Int.getType(false, width);
 	}
 }
 // A member of a class or component
 class VstMember extends Decl {
 	def isPrivate: bool;
+	var isSynthetic: bool;
 	var container: VstCompound;
 	var index: int;
 
@@ -165,15 +183,27 @@ class VstMember extends Decl {
 
 	def getType() -> Type;
 	def renderLong(buf: StringBuffer) -> StringBuffer {
-		if (container != null && !container.isFileScope) {
-			if (VstVariant.?(container)) {
-				var variantDecl = VstVariant.!(container);
-				if (variantDecl.parent != null) buf.puts(variantDecl.parent.name()).putc('.');
-			}
-			buf.puts(container.name()).putc('.');
-		}
+		if (!container.isFileScope) buf.puts(container.fullName).putc('.');
 		return buf.puts(token.image);
 	}
+}
+// Desugared case member from a variant.
+class VstVariantCaseMember extends VstMember {
+	def decl: VstClass;
+	new(decl) super(false, decl.token) { }
+	def getType() -> Type { return decl.declType; }
+}
+// Synthesized .tag member from a variant.
+class VstVariantTagMember extends VstMember {
+	new(name: Token) super(false, name) { }
+	def getType() -> Type {
+		return VstClass.!(container).tagType;
+	}
+}
+// Synthesized .name member from a variant.
+class VstVariantNameMember extends VstMember {
+	new(name: Token) super(false, name) { }
+	def getType() -> Type { return V3.stringType; }
 }
 // A method
 class VstMethod extends VstMember {
@@ -355,8 +385,9 @@ class MatchCase(default: FilePoint, patterns: VstList<MatchPattern>, stmt: Stmt)
 }
 // var(params)
 class MatchPattern(expr: Expr, params: VstList<VarDecl>) {
-	var variantCase: VstVariantCase;  // if this is a match on a variant case
+	var variantCase: VstVariantCaseMember;  // if this is a match on a variant case
 	var val: Val;
+	def decl() -> VstClass { return variantCase.decl; }
 }
 // continue;
 class ContinueStmt(src: FileRange) extends Stmt {
