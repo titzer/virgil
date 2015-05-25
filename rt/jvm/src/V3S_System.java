@@ -159,6 +159,11 @@ public class V3S_System {
 	return 0;
     }
 
+    public static int sar(int a, int b) {
+	if (b >= 31) return a >> 31;
+	return a >> b;
+    }
+
     public static long lshl(long a, long b) {
 	if ((b & 63) == b) return a << b;
 	return 0;
@@ -167,6 +172,11 @@ public class V3S_System {
     public static long lshr(long a, long b) {
 	if ((b & 63) == b) return a >>> b;
 	return 0;
+    }
+
+    public static long lsar(long a, long b) {
+	if (b >= 63) return a >> 63;
+	return a >> b;
     }
 
     public static int natLt(int x, int y) {
