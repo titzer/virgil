@@ -174,6 +174,12 @@ public class V3S_System {
 	return 0;
     }
 
+    public static long lszr(long a, byte b, byte rem) {
+        if (b == 0) return a;
+        if (b >= 63) return 0;
+        return (a << rem) >>> rem >>> b;
+    }
+
     public static long lsar(long a, long b) {
 	if (b >= 63) return a >> 63;
 	return a >> b;
