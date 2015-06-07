@@ -7,6 +7,8 @@ if [ "$TEST_TARGET" != $target ]; then
 	exit 0
 fi
 
+chmod 444 readonly.txt
+
 if [ $# == 0 ]; then
   TESTS=*.v3
 else
