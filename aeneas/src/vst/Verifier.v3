@@ -1041,3 +1041,830 @@ class TypeVarConstraint {
 		return t;
 	}
 }
+
+def FLOW_THRU = 0;
+def FLOW_END  = 1;
+def FLOW_RET  = 2;
+def FLOW_NONE = 3;
+
+// Typechecks VST code, resolving all references and types
+class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type> {
+	var methodEnv: MethodEnv;
+	var flow: int;			// used to detect unreachable code
+	var loopStack: List<int>;	// stack of nested loops
+	var elimError: TypeVarEliminator;
+	var elimClose: TypeVarEliminator;
+	
+	new() {
+		elimError = TypeVarEliminator.new(TypeParamInferError);
+		elimClose = TypeVarEliminator.new(null);
+	}
+	def enterMethod(m: MethodEnv) {
+		methodEnv = m;
+		loopStack = null;
+		flow = FLOW_THRU;
+	}
+	def mergeFlow(a: int, b: int) -> int {
+		if (a == FLOW_NONE) return b;
+		if (b == FLOW_NONE) return a;
+		if (a == FLOW_THRU || b == FLOW_THRU) return FLOW_THRU;
+		if (a == FLOW_END || b == FLOW_END) return FLOW_END;
+		return a;
+	}
+	def visitIf(stmt: IfStmt, outer: Type) -> Type {
+		typeCheckExpr(stmt.cond, Bool.TYPE, "if condition");
+		var tf = typeCheckStmt(stmt.tbranch);
+		flow = FLOW_THRU;
+		var ff = typeCheckStmt(stmt.fbranch);
+		flow = mergeFlow(tf, ff);
+		return Void.TYPE;
+	}
+	def visitBlock(stmt: BlockStmt, outer: Type) -> Type {
+		methodEnv.enterScope();
+		for (l = stmt.stmts.list; l != null; l = l.tail) typeCheckStmt(l.head);
+		methodEnv.exitScope();
+		return Void.TYPE;
+	}
+	def visitWhile(stmt: WhileStmt, outer: Type) -> Type {
+		stmt.loopNum = pushLoop();
+		typeCheckExpr(stmt.cond, Bool.TYPE, "while condition");
+		typeCheckStmt(stmt.body);
+		popLoop();
+		flow = FLOW_THRU;
+		return Void.TYPE;
+	}
+	def visitFor(stmt: ForStmt, outer: Type) -> Type {
+		methodEnv.enterScope();
+		checkVarDecl(stmt.varDecl);
+		stmt.loopNum = pushLoop();
+		typeCheckExpr(stmt.cond, Bool.TYPE, "for condition");
+		inferClosedType(stmt.update);
+		typeCheckStmt(stmt.body);
+		popLoop();
+		flow = FLOW_THRU;
+		methodEnv.exitScope();
+		return Void.TYPE;
+	}
+	def visitForeach(stmt: ForeachStmt, outer: Type) -> Type {
+		methodEnv.enterScope();
+		var varDecl = stmt.varDecl;
+		if (varDecl.init != null) VarDeclError(stmt.varDecl, "foreach variable cannot have an initializer");
+		if (varDecl.tref != null) varDecl.vtype = methodEnv.resolveType(varDecl.tref);
+		methodEnv.bindVar(varDecl);
+		stmt.loopNum = pushLoop();
+		stmt.loopVar = VstSsaVar.new(); // synthesize new loop variable
+		setAssigned(stmt.loopVar);
+		var exprType = inferClosedType(stmt.expr);
+		if (V3.isArray(exprType)) {
+			var elemType = V3Array.elementType(exprType);
+			if (varDecl.tref == null) varDecl.vtype = elemType;
+			else if (!isAssignable(elemType, varDecl.vtype)) TypeError(stmt.expr.range(), varDecl.vtype, elemType, "foreach");
+		} else {
+			error(stmt.expr.range(), "TypeError", Strings.format1("foreach requires array expression and found %1", TYPE(exprType)));
+			if (varDecl.tref == null) varDecl.vtype = getErrorType();
+		}
+		typeCheckStmt(stmt.body);
+		popLoop();
+		flow = FLOW_THRU;
+		methodEnv.exitScope();
+		return Void.TYPE;
+	}
+	def visitForLess(stmt: ForLessStmt, outer: Type) -> Type {
+		methodEnv.enterScope();
+		var varDecl = stmt.varDecl;
+		if (varDecl.init != null) VarDeclError(stmt.varDecl, "foreach variable cannot have an initializer");
+		if (varDecl.tref != null) varDecl.vtype = methodEnv.resolveType(varDecl.tref);
+		methodEnv.bindVar(varDecl);
+		stmt.loopNum = pushLoop();
+		setAssigned(varDecl.ssa);
+		var exprType = varDecl.vtype;
+		if (exprType != null) {
+			typeCheckExpr(stmt.expr, exprType, "foreach limit");
+		} else {
+			varDecl.vtype = exprType = inferClosedType(stmt.expr);
+		}
+		if (!IntType.?(exprType)) {
+			error(stmt.expr.range(), "TypeError", Strings.format1("foreach requires integral expression and found %1", TYPE(exprType)));
+		}
+		typeCheckStmt(stmt.body);
+		popLoop();
+		flow = FLOW_THRU;
+		methodEnv.exitScope();
+		return Void.TYPE;
+	}
+	def pushLoop() -> int {
+		var loopNum = methodEnv.mdecl.numLoops++;
+		loopStack = List.new(loopNum, loopStack);
+		return loopNum;
+	}
+	def popLoop() {
+		loopStack = loopStack.tail;
+	}
+	def visitLocal(stmt: LocalStmt, outer: Type) -> Type {
+		Lists.apply(stmt.vars, checkVarDecl);
+		return Void.TYPE;
+	}
+	def checkVarDecl(varDecl: VarDecl) {
+		if (varDecl.tref != null) {
+			varDecl.vtype = methodEnv.resolveType(varDecl.tref);
+			if (varDecl.init != null) {
+				typeCheckExpr(varDecl.init, varDecl.vtype, "var initialization");
+			}
+		} else {
+			if (varDecl.init == null) {
+				VarDeclError(varDecl, "must have a declared type or an initializer");
+				varDecl.vtype = getErrorType();
+			} else {
+				varDecl.vtype = inferClosedType(varDecl.init);
+			}
+		}
+		methodEnv.bindVar(varDecl);
+	}
+	def visitBreak(stmt: BreakStmt, outer: Type) -> Type {
+		if (loopStack == null) LoopError(stmt.range(), "break must be in loop");
+		flow = FLOW_END;
+		return Void.TYPE;
+	}
+	def visitContinue(stmt: ContinueStmt, outer: Type) -> Type {
+		if (loopStack == null) LoopError(stmt.range(), "continue must be in loop");
+		flow = FLOW_END;
+		return Void.TYPE;
+	}
+	def visitExpr(stmt: ExprStmt, outer: Type) -> Type {
+		var e = stmt.expr;
+		inferClosedType(e);
+		if (AppExpr.?(e)) return Void.TYPE;
+		if (AssignExpr.?(e)) return Void.TYPE;
+		if (AutoExpr.?(e)) return Void.TYPE;
+		StatementError(e.range());
+		return Void.TYPE;
+	}
+	def visitMatch(stmt: MatchStmt, outer: Type) -> Type {
+		var etype = inferClosedType(stmt.expr);
+		checkSingleDefaultCase(stmt);
+		if (V3.isVariant(etype)) {
+			var vt = ClassType.!(etype);
+			while (vt.classDecl.isVariantCase()) vt = vt.getSuperType();
+			checkVariantMatch(stmt, vt);
+		}
+		else checkPrimMatch(stmt, etype);
+		return Void.TYPE;
+	}
+	def checkSingleDefaultCase(stmt: MatchStmt) {
+		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
+			var c = cases.head;
+			if (c.default != null) {
+				if (stmt.defcase != null) MatchError(c.default, "Default match case already defined");
+				stmt.defcase = c;
+			}
+		}
+	}
+	def checkPrimMatch(stmt: MatchStmt, etype: Type) {
+		var check = checkPrimPattern(_, etype);
+		var bf = FLOW_NONE;
+		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
+			var c = cases.head;
+			if (c.default != null) continue;  // check default case last
+			for (p = c.patterns.list; p != null; p = p.tail) {
+				checkPrimPattern(p.head, etype);
+			}
+			flow = FLOW_THRU;
+			bf = mergeFlow(bf, typeCheckStmt(c.stmt));
+		}
+		if (stmt.defcase != null) {
+			flow = FLOW_THRU;
+			bf = flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
+		} else {
+			flow = FLOW_THRU;
+		}
+	}
+	def checkPrimPattern(pattern: MatchPattern, etype: Type) {
+		var e = pattern.expr;
+		if (pattern.params != null) MatchError(pattern.params.range(), "match value cannot have parameters");
+		typeCheckExpr(e, etype, "match case");
+		if (Literal.?(e)) {
+			return assignPatternVal(pattern, Literal.!(e).val);
+		}
+		if (!VarExpr.?(e)) return MatchError(e.range(), "match expression is not a constant");
+		var ve = VarExpr.!(e);
+		if (MemberBinding.?(ve.binding)) {
+			// check whether this is a constant field
+			var m = MemberBinding.!(ve.binding);
+			if (V3.isComponent(m.container) && VstField.?(m.member)) {
+				var f = VstField.!(m.member);
+				if (Literal.?(f.init) && f.isReadOnly) {
+					return assignPatternVal(pattern, Literal.!(f.init).val);
+				}
+			}
+		}
+		MatchError(ve.range(), "match expression is not a value");
+	}
+	def assignPatternVal(pattern: MatchPattern, val: Val) {
+		if (pattern.expr.implicitType != null) {
+			// perform an implicit conversion of the value if necessary
+			var r = TypeSystem.evalTypeCast(pattern.expr.exactType, pattern.expr.implicitType, val);
+			if (r.approx == CastOp.VALUE) val = r.result;
+		}
+		pattern.val = val;
+	}
+	def checkVariantMatch(stmt: MatchStmt, vt: ClassType) {
+		var bf = FLOW_NONE;
+		var covered = Array<bool>.new(vt.classDecl.caseCount);
+		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
+			var c = cases.head;
+			if (c.default != null) continue;  // check default case last
+			var p = checkVariantPatterns(c, vt, covered);
+			flow = FLOW_THRU;
+			if (p != null) {
+				methodEnv.enterScope();
+				bindVariantParams(p, vt);
+			}
+			bf = mergeFlow(bf, typeCheckStmt(c.stmt));
+			if (p != null) {
+				methodEnv.exitScope();
+			}
+		}
+		if (stmt.defcase != null) {
+			flow = bf;
+			for (c in covered) if (!c) flow = FLOW_THRU;
+			bf = flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
+		} else {
+			var buf: StringBuffer;
+			for (i < covered.length) {
+				if (!covered(i)) {
+					if (buf == null) buf = StringBuffer.new().format1("match on type %1 does not cover:", vt.render);
+					var c = vt.searchForVariantWithTag(i);
+					if (c != null) buf.puts(" ").puts(c.name());
+				}
+			}
+			if (buf != null) MatchError(stmt.range(), buf.toString());
+			flow = bf;
+		}
+	}
+	def bindVariantParams(p: MatchPattern, vt: ClassType) {
+		if (p.params == null) return;
+		if (p.decl().params == null) {
+			var msg = Strings.format2("case %1.%2 has no declared parameters", vt.render, p.decl().name());
+			return MatchError(p.params.range(), msg);
+		}
+		var ll = p.params.list, pl = p.decl().params.list;
+		var typeArgs = vt.getTypeArgs();
+		while (ll != null) {
+			if (pl == null) {
+				var msg = Strings.format2("case %1.%2", vt.render, p.decl().name());
+				return ArityMismatch(ll.head.token.range(), msg, Lists.length(p.decl().params.list), Lists.length(p.params.list));
+			}
+			ll.head.vtype = pl.head.vtype.substitute(typeArgs);
+			methodEnv.bindVar(ll.head);
+			ll = ll.tail;
+			pl = pl.tail;
+		}
+		if (pl != null) {
+			var msg = Strings.format2("case %1.%2", vt.render, p.decl().name());
+			return ArityMismatch(p.params.range().lastByte(), msg, Lists.length(p.decl().params.list), Lists.length(p.params.list));
+		}
+	}
+	def checkVariantPatterns(c: MatchCase, vt: ClassType, covered: Array<bool>) -> MatchPattern {
+		var p: MatchPattern, count = 0;
+		for (l = c.patterns.list; l != null; l = l.tail) {
+			p = l.head;
+			if (!VarExpr.?(p.expr)) continue;
+			var ve = VarExpr.!(p.expr);
+			if (ve.expr != null) {
+				var msg = Strings.format1("match on type %1 requires unqualified case", vt.render);
+				MatchError(ve.range(), msg);
+			}
+			var vc = p.variantCase = vt.lookupCase(ve.ident.name.image);
+			if (vc == null) {
+				var msg = Strings.format2("unresolved case %1.%2", vt.render, ve.ident.name.image);
+				MatchError(ve.range(), msg);
+				p = null;
+			} else {
+				if (covered(vc.decl.variantTag)) MatchError(ve.range(), "duplicate match pattern");
+				else covered(vc.decl.variantTag) = true;
+				p.val = Int.box(vc.decl.variantTag);
+			}
+			count++;
+		}
+		return if(count == 1, p);
+	}
+	def visitEmpty(stmt: EmptyStmt, outer: Type) -> Type {
+		return Void.TYPE;
+	}
+	def visitReturn(stmt: ReturnStmt, outer: Type) -> Type {
+		var returnType = methodEnv.resolveType(methodEnv.mdecl.rettype);
+		if (stmt.expr != null) typeCheckExpr(stmt.expr, returnType, "return statement");
+		else if (returnType != Void.TYPE) TypeError(stmt.src, returnType, Void.TYPE, "return statement");
+		flow = FLOW_RET;
+		return Void.TYPE;
+	}
+	def visitTuple(expr: TupleExpr, outer: Type) -> Type {
+		var etypes: List<Type>;
+		if (outer == null || !V3.isTuple(outer)) {
+			// infer the expressions' types if the outer is a not a tuple type
+			etypes = expr.exprs.mapList(inferClosedType);
+		} else {
+			// type check the expressions if the outer is a tuple type
+			etypes = Lists.reduce(expr.exprs.list, outer.nested, typeCheckTupleElem);
+		}
+		typeCheckExprs(expr, etypes, "tuple creation");
+		var ttype = Tuple.newType(etypes);
+		return ttype;
+	}
+	def typeCheckTupleElem(e: Expr, t: Type) -> Type {
+		typeCheckExpr(e, t, "tuple creation");
+		if (e.implicitType != null) return e.implicitType;
+		return e.exactType;
+	}
+	def visitParamExpr(expr: ParamExpr, outer: Type) -> Type {
+		ParamExprError(expr.range(), "param expression can only be function call argument");
+		return if(outer == null, getErrorType(), outer);
+	}
+	def visitAutoExpr(expr: AutoExpr, outer: Type) -> Type {
+		var t = inferClosedType(expr.expr);
+		checkAssignable(expr.expr);
+		var op = expr.op;
+		if (Member_TypeCon.?(t.typeCon)) {
+			op = Member_TypeCon.!(t.typeCon).lookupInfix(expr.infix, t);
+		}
+		if (op == null) {
+			UnresolvedOp(expr.token, t, null);
+			return t;
+		}
+		expr.op = op;
+		typeCheckExpr(expr.expr, op.resultType, "auto expression");
+		return t;
+	}
+	def visitArray(expr: ArrayExpr, outer: Type) -> Type {
+		var se = expr.exprs.list;
+		var etype = Void.TYPE;
+		if (outer != null && V3.isArray(outer)) {
+			etype = outer.nested.head; // element type is first type parameter to array type
+		} else {
+			if (se == null) {
+				TypeInferError(expr.range(), "cannot infer empty array type");
+			} else {
+				etype = inferClosedType(se.head);
+				for (rest = se.tail; rest != null; rest = rest.tail) {
+					etype = TypeSystem.widen(etype, inferClosedType(rest.head));
+					if (etype == null) {
+						TypeInferError(rest.head.range(), "cannot infer type of array");
+						return getErrorType();
+					}
+				}
+			}
+		}
+
+		Lists.apply(expr.exprs.list, typeCheckExpr(_, etype, "array expression"));
+
+		return V3Array.newType(etype);
+	}
+	def visitVar(expr: VarExpr, outer: Type) -> Type {
+		var binding = bind(expr, outer, false);
+		if (binding == null) return if(outer == null, getErrorType(), outer);
+		if (outer != null) TypeSystem.unifyWiden(binding.boundType, outer);
+		return binding.boundType;
+	}
+	def visitLiteral(expr: Literal, outer: Type) -> Type {
+		return expr.exactType;
+	}
+	def bind(expr: VarExpr, outer: Type, nested: bool) -> Binding {
+		var binding = lookupBinding(expr, outer, nested);
+		if (binding != null) {
+			expr.exactType = binding.boundType;
+			expr.binding = binding;
+		}
+		return binding;
+	}
+	def lookupBinding(expr: VarExpr, outer: Type, nested: bool) -> Binding {
+		var binding = expr.binding;
+		if (binding != null) return binding;
+		if (expr.expr == null) {
+			// "var" -- top level variable
+			binding = methodEnv.lookupVar(expr, nested);
+			if (binding == null) UnresolvedIdentifier(expr.ident.name);
+			return binding;
+		} else {
+			// "expr.var" -- a member expression
+			if (VarExpr.?(expr.expr)) {
+				// "var.var" -- a member of another var
+				binding = bind(VarExpr.!(expr.expr), null, true);
+				if (binding != null) {
+					var rtype = binding.boundType;
+					if (TypeBinding.?(binding)) {
+						binding = methodEnv.lookupTypeMember(expr, rtype);
+						if (binding == null) UnresolvedMember(expr.ident.name, true, rtype);
+					} else {
+						binding = methodEnv.lookupExprMember(expr, rtype, false);
+						if (binding == null) UnresolvedMember(expr.ident.name, false, rtype);
+					}
+				}
+			} else {
+				// "expr.var" -- a member of some other kind of expression
+				var rtype = inferClosedType(expr.expr);
+				binding = methodEnv.lookupExprMember(expr, rtype, false);
+				if (binding == null) UnresolvedMember(expr.ident.name, false, rtype);
+			}
+			return binding;
+		}
+	}
+	def visitString(expr: StringExpr, outer: Type) -> Type {
+		var vst = methodEnv.verifier.verifier.prog.vst;
+		expr.recordIndex = vst.numStrings++;
+		return V3.stringType;
+	}
+	def visitApp(expr: AppExpr, outer: Type) -> Type {
+		// infer an open type for the function or array
+		var funcType = inferType(expr.func, null);
+		if (V3.isArray(funcType)) {
+			return typeCheckArrayAccess(expr, funcType, outer);
+		} else if (V3.isFunction(funcType)) {
+			return typeCheckMethodApp(expr, funcType, outer);
+		}
+		TypeError(expr.func.range(), getErrorFunctionType(), funcType, "application");
+		return getErrorType();
+	}
+	def typeCheckArrayAccess(expr: AppExpr, arrayType: Type, outer: Type) -> Type {
+		arrayType = elim(arrayType);
+		typeCheckExprs(expr.args, Int.TYPE_LIST, "array index");
+		expr.func.exactType = arrayType;
+		return V3Array.elementType(arrayType);
+	}
+	def typeCheckMethodApp(expr: AppExpr, funcType: Type, outer: Type) -> Type {
+		def op = "function application";
+		// get the parameter type and parameter type list
+		var paramType = Function.getParamType(funcType);
+		var argList = expr.args.exprs.list, ptlist: List<Type>;
+		if (argList == null || argList.tail != null) ptlist = Tuple.toTypeList(paramType);
+		else ptlist = List.new(paramType, null); // one arg -> use tuple type
+
+		// infer argument expressions' types, including parameter expressions '_'
+		var checkList: List<(Expr, Type)>, partialIndex = 0, tl = ptlist;
+		for (el = argList; el != null; el = el.tail) {
+			var arg = el.head;
+			if (tl == null) {
+				// too many parameters
+				inferClosedType(arg);
+				ArityMismatch(arg.range(), op, Lists.length(ptlist), expr.args.exprs.length());
+				continue;
+			}
+			var paramType = tl.head;
+			if (ParamExpr.?(arg)) {
+				var param = ParamExpr.!(arg);
+				param.ptype = paramType;
+				expr.partial = List.new(param, expr.partial);
+			} else if (paramType.hasTypeVars()) {
+				// parameter type has type variables
+				TypeSystem.unifyWiden(paramType, inferClosedType(arg));
+				checkList = List.new((arg, paramType), checkList);
+			} else {
+				// no type variables; use parameter type to help infer inner types
+				typeCheckExpr(arg, paramType, op);
+			}
+			tl = tl.tail;
+		}
+		if (tl != null) {
+			// too few parameters
+			ArityMismatch(expr.args.exprs.range().lastByte(), op, Lists.length(ptlist), expr.args.exprs.length());
+		}
+		// unify return type with outer
+		var returnType = Function.getReturnType(funcType);
+		var resultType: Type;
+		if (expr.partial != null) {
+			// this is a partial application, and its result is a function
+			var plist: List<Type>;
+			for (l = expr.partial; l != null; l = l.tail) {
+				plist = List.new(l.head.ptype, plist);
+			}
+			resultType = Function.newType(Tuple.newType(plist), returnType);
+			if (outer != null) TypeSystem.unifyWiden(resultType, outer);
+		} else {
+			// this is a complete application, its result is the return type
+			if (outer != null) TypeSystem.unifyWiden(returnType, outer);
+			resultType = returnType;
+		}
+
+		// typecheck remaining expressions against the inferred (closed) type
+		tl = ptlist;
+		for (cl = checkList; cl != null; cl = cl.tail) {
+			typeCheckExpr(cl.head.0, elim(cl.head.1), "function application");
+		}
+
+		expr.func.exactType = elim(funcType);
+		return elim(resultType);
+	}
+	def visitNot(expr: NotExpr, outer: Type) -> Type {
+		typeCheckExpr(expr.expr, Bool.TYPE, "boolean not operator");
+		return Bool.TYPE;
+	}
+	def visitAssign(expr: AssignExpr, outer: Type) -> Type {
+		var left = expr.target;
+		var ltype = inferClosedType(left);
+		var result = ltype;
+		checkAssignable(left);
+		var infix = expr.infix;
+		if (infix != null) {
+			if (Member_TypeCon.?(ltype.typeCon)) {
+				infix.op = Member_TypeCon.!(ltype.typeCon).lookupInfix(infix.infix, null);
+			}
+			if (infix.op == null) {
+				UnresolvedOp(infix.token, ltype, null);
+				return getErrorType();
+			}
+			typeCheckExpr(expr.expr, infix.op.paramTypes(1), "compound assignment");
+			result = infix.op.resultType;
+		} else {
+			typeCheckExpr(expr.expr, result, "assignment");
+		}
+		return result;
+	}
+	def checkAssignable(left: Expr) {
+		if (VarExpr.?(left)) {
+			var binding = (VarExpr.!(left)).binding;
+			if (binding != null) {
+				if (!binding.isAssignable()) AssignError(left.range());
+				if (LocalBinding.?(binding)) setAssigned(LocalBinding.!(binding).decl.ssa);
+			}
+		} else if (AppExpr.?(left)) {
+			if (!V3.isArray(AppExpr.!(left).func.exactType)) AssignError(left.range());
+		} else {
+			AssignError(left.range());
+		}
+	}
+	def setAssigned(ssa: VstSsaVar) {
+		// update info for an assigned var variable
+		if (ssa.index < 0) ssa.index = methodEnv.mdecl.numNonSsa++;
+		for (l = loopStack; l != null; l = l.tail) {
+			ssa.setWrittenInLoop(l.head);
+		}
+	}
+	def visitBinOp(expr: BinOpExpr, outer: Type) -> Type {
+		var ltype = inferClosedType(expr.left), rtype = inferClosedType(expr.right);
+		var op: Operator;
+		if (Member_TypeCon.?(ltype.typeCon)) {
+			op = Member_TypeCon.!(ltype.typeCon).lookupInfix(expr.op.infix, rtype);
+		}
+		if (op == null) {
+			if (expr.op.infix == V3Infix.Equal) op = equalityOp(expr, ltype, rtype, true);
+			else if (expr.op.infix == V3Infix.NotEqual) op = equalityOp(expr, ltype, rtype, false);
+		}
+		if (op == null) {
+			UnresolvedOp(expr.op.token, ltype, null);
+			return getErrorType();
+		}
+		expr.set(op);
+		typeCheckExpr(expr.left, op.paramTypes(0), "infix operator");
+		typeCheckExpr(expr.right, op.paramTypes(1), "infix operator");
+		return op.resultType;
+	}
+	def equalityOp(expr: Expr, ltype: Type, rtype: Type, eq: bool) -> Operator {
+		var wtype = TypeSystem.widen(ltype, rtype);
+		if (wtype == null) {
+			ComparisonError(expr.range(), ltype, rtype);
+			return null;
+		}
+		return if(eq, V3Op.newEqual(wtype), V3Op.newNotEqual(wtype));
+	}
+	def MixedSignIntCompare(ltype: Type, rtype: Type) -> Type {
+		// TypeSystem.widen(l, r) returned null, so unsigned >= signed.
+		if (!IntType.?(ltype)) return null;
+		var lwidth = IntType.!(ltype).width;
+		if (!IntType.?(rtype)) return null;
+		var rwidth = IntType.!(rtype).width;
+		var max = if(lwidth >= rwidth, lwidth, rwidth);
+		if (max < 64) return Int.getType(true, max + 1);
+		return null;  // TODO: mixed signed 64 bit comparisons are conceptually 65 bits
+	}
+	def visitIfExpr(expr: IfExpr, outer: Type) -> Type {
+		var args = expr.exprs.asArray(), what = "if expression", len = args.length;
+		// 2 or 3 expressions required
+		if (len < 2 || len > 3) {
+			ArityMismatch(expr.range(), what, 3, len);
+			return getErrorType();
+		}
+		typeCheckExpr(args(0), Bool.TYPE, what);
+		var a = args(1), atype = outer;
+		if (outer != null) typeCheckExpr(a, outer, what);
+		else atype = inferClosedType(a);
+
+		// 1 alternative => Value.BOTTOM for false
+		if (len == 2) return atype;
+
+		// 2 alternatives => unify types if necessary
+		var b = args(2);
+		if (outer != null) {
+			typeCheckExpr(b, outer, what);
+			return outer;
+		}
+
+		// typecheck and unify
+		var btype = inferClosedType(b);
+		var wtype = TypeSystem.widen(atype, btype);
+		if (wtype != null) {
+			if (a.exactType != wtype) typeCheckExpr(a, wtype, what);
+			if (b.exactType != wtype) typeCheckExpr(b, wtype, what);
+			return wtype;
+		} else {
+			TypeError(expr.range(), atype, btype, what);
+			return atype;
+		}
+	}
+	def typeCheckExpr(expr: Expr, outerType: Type, op: string) {
+		var exactType = expr.exactType;
+		if (exactType == null) {
+			exactType = expr.accept(this, outerType);
+			exactType = elim(exactType);
+			expr.exactType = exactType;
+		}
+		if (exactType != outerType) {
+			if (IntLiteral.?(expr)) {
+				var rtype = TryRepresentationChangeOfLiteral(IntLiteral.!(expr), outerType);
+				if (rtype == outerType) { expr.exactType = rtype; return; }
+				if (rtype == null) return;  // error already reported
+			}
+			if (TypeSystem.isImplicitlyConvertible(exactType, outerType)) expr.implicitType = outerType;
+			else TypeError(expr.range(), outerType, exactType, op);
+		}
+	}
+	// Try representation changes of integer literals.
+	def TryRepresentationChangeOfLiteral(lit: IntLiteral, outer: Type) -> Type {
+		if (!IntType.?(outer)) return lit.exactType;
+		var tt = IntType.!(outer);
+		// For all integer literals, suffixes force the type and only allow the normal implicit conversions.
+		if (lit.usuffix || lit.lsuffix) return lit.exactType;
+		var error: string = null;
+		if (HexLiteral.?(lit)) {
+			var hex = HexLiteral.!(lit);
+			// If the literal is short enough, check whether it is properly sign or zero extended as written.
+			// Sign extend the upper bits if necessary.
+			var rt = Int.getType(tt.signed, (tt.width + 3) & (-1 ^ 3));  // round up
+			if (hex.width * 4 > rt.width) {
+				error = "too many hex digits";
+			} else {
+				var fail: bool;
+				if (tt.width <= 32) {
+					var o = Int.unbox(hex.val), t = tt.trunc_32(o);
+					if (rt.width > tt.width) fail = (t != rt.trunc_32(o));
+					hex.val = Int.box(t);
+				} else {
+					var o = Int.unboxLS(hex.val, tt.signed), t = tt.trunc_64(o);
+					if (rt.width > tt.width) fail = (t != rt.trunc_64(o));
+					hex.val = Box.new(t);
+				}
+				// sign extend or change Box representation if necessary
+				if (fail) error = Strings.format1("improperly %1-extended hex literal", if(tt.signed, "sign", "zero"));
+			}
+		} else if (BinLiteral.?(lit)) {
+			// Check the binary literal is short enough to fit in the outer type.
+			var bin = BinLiteral.!(lit);
+			if (bin.width <= tt.width) {
+				// sign extend or change Box representation
+				bin.val = IntOp.evalTruncate(tt, tt.signed, bin.val);
+			} else {
+				error = "too many binary digits";
+			}
+		} else if (DecLiteral.?(lit)) {
+			// Check that the decimal literal fits in the [min,max] value range.
+			var dec = DecLiteral.!(lit), range_error = "decimal out of range";
+			var v = dec.val, fsigned = IntType.!(dec.exactType).signed;
+			if (dec.negative && !tt.signed) {
+				error = "negative decimal used as unsigned";
+			} else if (v == null) {
+				// == 0, always fits.
+			} else if (tt.width <= 32) {
+				if (!Box<int>.?(v)) return dec.exactType;
+				var i = Int.unbox(v);
+				if (tt.width < 32) {
+					if (i < Int.unbox(tt.min) || i > Int.unbox(tt.max)) error = range_error;
+				} else if (i < 0 && tt.signed != fsigned) {
+					error = range_error;;
+				}
+			} else if (tt.width <= 64) {
+				def u = Int.unboxLS, l = u(v, fsigned);
+				if (tt.width < 64) {
+					if (l < u(tt.min, tt.signed) || l > u(tt.max, tt.signed)) error = range_error;
+				} else if (l < 0 && tt.signed != fsigned) {
+					error = range_error;
+				}
+				dec.val = Box.new(l);
+			}
+		}
+		if (error == null) return outer;
+		this.error(lit.token.range(), "TypeError", Strings.format3("\"%1\" cannot be %2 (%3)", lit.token.image, TYPE(outer), error));
+		return null;
+	}
+	def typeCheckExprs(args: TupleExpr, types: List<Type>, op: string) {
+		var tl = types;
+		for (el = args.exprs.list; el != null; el = el.tail) {
+			if (tl == null) {
+				ArityMismatch(el.head.range(), op, Lists.length(types), args.exprs.length());
+				break;
+			} else {
+				typeCheckExpr(el.head, tl.head, op);
+				tl = tl.tail;
+			}
+		}
+		if (tl != null) ArityMismatch(args.exprs.range().lastByte(), op, Lists.length(types), args.exprs.length());
+	}
+	def inferClosedType(expr: Expr) -> Type {
+		if (expr.exactType != null) return expr.exactType;
+		return expr.exactType = elim(expr.accept(this, null));
+	}
+	def inferType(expr: Expr, outerType: Type) -> Type {
+		return expr.exactType = expr.accept(this, outerType);
+	}
+	def typeCheckStmt(stmt: Stmt) -> int {
+		if (stmt != null) {
+			if (flow == FLOW_THRU) stmt.accept(this, Void.TYPE);
+			else UnreachableCode(stmt.range());
+		}
+		return flow;
+	}
+	def typeCheckBody(stmt: Stmt) {
+		if (typeCheckStmt(stmt) != FLOW_RET) {
+			if (methodEnv.resolveType(methodEnv.mdecl.rettype) != Void.TYPE) MissingReturn(stmt.range());
+		}
+	}
+	def elim(vtype: Type) -> Type {
+		if (vtype == null) return null;
+		return vtype.substitute(elimError);
+	}
+	def isAssignable(src: Type, dest: Type) -> bool {
+		return src == dest || TypeSystem.isImplicitlyConvertible(src, dest);
+	}
+	// -- Utility methods to generate errors ----------------------------------
+	def TypeError(range: FileRange, t1: Type, t2: Type, op: string) {
+		if (ERROR.numErrors == 0 || (t1 != ERROR.errorType && t2 != ERROR.errorType)) {
+			error(range, "TypeError", Strings.format3("%1 requires type %2 and found %3", op, TYPE(t1), TYPE(t2)));
+		}
+	}
+	def ComparisonError(range: FileRange, t1: Type, t2: Type) {
+		if (ERROR.numErrors == 0 || (t1 != ERROR.errorType && t2 != ERROR.errorType)) {
+			error(range, "ComparisonError", Strings.format2("%1 cannot be compared to %2", TYPE(t1), TYPE(t2)));
+		}
+	}
+	def TypeParamInferError(tvar: TypeVar) {
+		if (tvar.error) return; // prevent multiple errors for same type var
+		tvar.error = true;
+		var msg = Strings.format2("cannot infer type parameter %1 of \"%2\"", tvar.typeParam.token.image, tvar.token.image);
+		error(tvar.token.range().end().rangeOf(0), "TypeParamInferError", msg);
+	}
+	def TypeInferError(range: FileRange, reason: string) {
+		error(range, "TypeInferError", reason);
+	}
+	def VarDeclError(vdecl: VarDecl, msg: string) {
+		error(vdecl.token.range(), "VarDeclError", msg);
+	}
+	def UnresolvedIdentifier(token: Token) {
+		error(token.range(), "UnresolvedIdentifier", Strings.format1("identifier \"%1\" cannot be found", token.image));
+	}
+	def UnresolvedOp(token: Token, t1: Type, t2: Type) {
+		var buf = StringBuffer.new().format1("operator \"%1\" cannot be found", token.image);
+		if (t1 != null) buf.format1(" for type \"%1\"", t1.render);
+		if (t2 != null && t2 != t1) buf.format1(" or type \"%1\"", t2.render);
+		error(token.range(), "UnresolvedOp", buf.toString());
+	}
+	def UnresolvedMember(token: Token, inType: bool, tref: Type) {
+		var msg = "expression of type %1 has no such member \"%2\"";
+		if (inType) msg = "type %1 has no such member \"%2\"";
+		error(token.range(), "UnresolvedMember", Strings.format2(msg, TYPE(tref), token.image));
+	}
+	def StatementError(range: FileRange) {
+		error(range, "StatementError", "not a statement");
+	}
+	def UnreachableCode(point: FilePoint) {
+		error(point.rangeOf(0), "UnreachableCode", "unreachable code");
+	}
+	def MissingReturn(point: FilePoint) {
+		error(point.rangeOf(0), "MissingReturn", "method does not end in a return statement");
+	}
+	def AssignError(range: FileRange) {
+		error(range, "AssignError", "expression is not assignable");
+	}
+	def MatchError(point: FilePoint, msg: string) {
+		error(point.rangeOf(0), "MatchError", msg);
+	}
+	def LoopError(point: FilePoint, msg: string) {
+		error(point.rangeOf(0), "LoopError", msg);
+	}
+	def ParamExprError(point: FilePoint, msg: string) {
+		error(point.rangeOf(0), "ParamExprError", msg);
+	}
+	def ArityMismatch(range: FileRange, op: string, expect: int, found: int) {
+		if (expect == 1) error(range, "TypeError", Strings.format2("%1 requires 1 argument and found %2", op, found));
+		else error(range, "TypeError", Strings.format3("%1 requires %2 arguments and found %3", op, expect, found));
+	}
+	def getErrorType() -> Type {
+		return ERROR.getErrorType();
+	}
+	def getErrorFunctionType() -> Type {
+		return TypeCon.new("function", V3Kind.DELEGATE, 0, methodEnv.verifier.verifier.prog.typeCache).create0();
+	}
+	def error(range: FileRange, error: string, msg: string) {
+		ERROR.addError(range, file.extractLine(range.beginLine), error, msg);
+	}
+	def TYPE(tref: Type) -> string {
+		if (tref == null) return "<unknown>";
+		return tref.render(StringBuffer.new()).toString();
+	}
+}
