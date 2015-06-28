@@ -575,16 +575,16 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			}
 			VstBinding.CLASS_FIELD: return env.addOp(V3Op.newClassGetField(specOf(binding)), 0);
 			VstBinding.CLASS_NEW: {
-				return env.addOp(newClassAllocOp(specOf(binding), binding, env), 0);
+				return env.addOp(newClassAllocOp(specOf(binding), ir.elimTypeVars(binding.boundType), env), 0);
 			}
 			VstBinding.COMPONENT_METHOD: {
 				var spec = specOf(binding);
-				if (receiver == null) receiver = initOf(binding, env);
+				if (receiver == null) receiver = initOf(MemberBinding.!(binding).member, env);
 				return env.opComponentGetMethod(spec, receiver);
 			}
 			VstBinding.COMPONENT_FIELD: {
 				var spec = specOf(binding);
-				if (receiver == null) receiver = initOf(binding, env);
+				if (receiver == null) receiver = initOf(MemberBinding.!(binding).member, env);
 				return env.opComponentGetField(spec, receiver);
 			}
 			VstBinding.VARIANT_CASE: {
@@ -599,7 +599,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 				}
 				var constructor = ir.makeIrClass(container).methods(0);
 				var spec = IrSpec.new(container, [container], constructor);
-				var op = newClassAllocOp(spec, binding, env);
+				var op = newClassAllocOp(spec, ir.elimTypeVars(binding.boundType), env);
 				var ftype = Function.newType(Tuple.newType(Lists.fromArray(op.paramTypes)), variant);
 				return env.opTypeSubsume(op.getFunctionType(), ftype, env.addOp(op, Facts.O_PURE));
 			}
@@ -608,11 +608,117 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		context.fail("invalid binding in read");
 		return env.graph.nop();
 	}
-	def newClassAllocOp(spec: IrSpec, binding: Binding, env: VstSsaEnv) -> Operator {
+	def genRead2(source: Source, shape: BindingShape, args: Array<SsaInstr>, env: VstSsaEnv) -> SsaInstr {
+		match(shape) {
+			Value(val, vtype): return env.graph.valConst(vtype, val);
+			Local(decl): return env.get(decl.ssa);
+			ObjectMethod(container, member, typeArgs): {
+				var spec = specOf2(container, member, typeArgs);
+				return env.opClassGetVirtual(spec, args(0));
+			}
+			ObjectField(container, member): {
+				var spec = specOf2(container, member, null);
+				return env.opClassGetField(spec, args(0));
+			}
+			ClassMethod(container, member, typeArgs): {
+				var spec = specOf2(container, member, typeArgs);
+				var virtual = spec.member.checkFact(Facts.M_OVERRIDDEN);
+				var facts = if(spec.container.typeCon.kind != V3Kind.CLASS, Facts.O_NO_NULL_CHECK);
+				if (virtual) return env.addOp(V3Op.newCallClassVirtual(spec), 0);
+				else return env.addOp(V3Op.newCallMethod(spec), facts);
+			}
+			ClassField(container, member): {
+				var spec = specOf2(container, member, null);
+				return env.addOp(V3Op.newClassGetField(spec), 0);
+			}
+			ClassNew(container, member): {
+				var spec = specOf2(container, member, null);
+				return env.addOp(newClassAllocOp(spec, container, env), 0);
+			}
+			ComponentMethod(member, typeArgs): {
+				var spec = specOf2(member.container.getDeclaredType(), member, typeArgs);
+				var receiver = if(args.length > 0, args(0), initOf(member, env));
+				return env.opComponentGetMethod(spec, receiver);
+			}
+			ComponentField(member): {
+				var spec = specOf2(member.container.getDeclaredType(), member, null);
+				var receiver = if(args.length > 0, args(0), initOf(member, env));
+				return env.opComponentGetField(spec, receiver);
+			}
+			VariantCase(container, member): ;
+			VariantField(container, member): {
+				var spec = specOf2(container, member, null);
+				return env.opClassGetField(spec, args(0));
+			}
+			ArrayElem(arrayType): {
+				return env.opArrayGetElem(ir.elimTypeVars(arrayType), 0, args(0), args(1));
+			}
+			Inst(comp, facts): {
+				return env.addOp(comp, facts);
+			}
+			Apply(comp, facts): {
+				if (Operator.?(comp)) {
+					var op = Operator.!(comp), i = env.addApply(source, op, args);
+					i.setFact(facts);
+					return i;
+				} else {
+					return SsaGenerator.!(comp).gen(source, args, facts, env);
+				}
+			}
+			CallClosure(t): {
+				return env.opCallClosure(t, args);
+			}
+			_: ;
+		}
+		return V3.fail1("unexpected binding %1 in genRead2()", shape.name);
+	}
+	def genWrite2(source: Source, shape: BindingShape, args: Array<SsaInstr>, val: SsaInstr, env: VstSsaEnv) -> SsaInstr {
+		match(shape) {
+			Local(decl): env.set(decl.ssa, val);
+			ObjectField(container, member): {
+				var spec = specOf2(container, member, null);
+				env.opClassSetField(spec, args(0), val, false);
+			}
+			ComponentField(member): {
+				var spec = specOf2(member.container.getDeclaredType(), member, null);
+				env.opClassSetField(spec, args(0), val, false);
+			}
+			ArrayElem(arrayType): {
+				env.opArraySetElem(ir.elimTypeVars(arrayType), 0, args(0), args(1), val);
+			}
+			_: V3.fail1<void, string>("unexpected binding %1 in genWrite2()", shape.name);
+		}
+		return val;
+	}
+	def genReadModifyWrite2(source: Source, lval: Expr, modify: (SsaInstr, VstSsaEnv) -> SsaInstr, env: VstSsaEnv) -> (SsaInstr, SsaInstr) {
+		var pre: SsaInstr, post: SsaInstr;
+		if (AppExpr.?(lval)) {
+			// read-modify-write of an array element
+			var app = AppExpr.!(lval), array = env.genExpr(app.func);
+			var index = env.genExpr(app.args.exprs.first());
+			var arrayType = ir.elimTypeVars(app.func.exactType);
+			env.source = exprSource(lval);
+			pre = env.opArrayGetElem(arrayType, 0, array, index);
+			env.source = source;
+			post = modify(pre, env);
+			env.at(source).opArraySetElem(arrayType, Facts.O_SAFE_BOUNDS, array, index, post);
+		} else if (VarExpr.?(lval)) {
+			// read-modify-write of a general binding
+			var shape: BindingShape;
+			var args: Array<SsaInstr>;  // TODO
+			pre = genRead2(source, shape, args, env);
+			post = modify(pre, env);
+			genWrite2(source, shape, args, post, env);
+		} else {
+			pre = error(lval, "invalid lvalue");
+		}
+		return (pre, post);
+	}
+	def newClassAllocOp(spec: IrSpec, funcType: Type, env: VstSsaEnv) -> Operator {
 		if (spec.member == null) {
 			// trivial constructor
-			var ftype = ir.elimTypeVars(binding.boundType), paramTypes = Function.getParamTypeArray(ftype);
-			var ctype = spec.container;
+			funcType = ir.elimTypeVars(funcType);
+			var paramTypes = Function.getParamTypeArray(funcType), ctype = spec.container;
 			return V3Op.newOp1(Opcode.ClassAlloc, [ctype], paramTypes, ctype, V3Op.evalEmptyClassAlloc, null);
 		}
 		return V3Op.newClassAlloc(spec);
@@ -624,7 +730,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			VstBinding.OBJECT_FIELD: env.opClassSetField(specOf(binding), receiver, val, false);
 			VstBinding.COMPONENT_FIELD: {
 				var spec = specOf(binding);
-				if (receiver == null) receiver = initOf(binding, env);
+				if (receiver == null) receiver = initOf(MemberBinding.!(binding).member, env);
 				env.opComponentSetField(spec, receiver, val);
 			}
 			VstBinding.OTHER: OtherBinding.!(binding).genWrite(receiver, val, env);
@@ -648,7 +754,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 				return env.opClassAlloc(specOf(binding), env.genExprs(null, args));
 			}
 			VstBinding.COMPONENT_METHOD: {
-				if (receiver == null) initOf(binding, env);
+				if (receiver == null) initOf(MemberBinding.!(binding).member, env);
 				return env.opCallMethod(specOf(binding), env.genExprs(null, args));
 			}
 			VstBinding.VARIANT_CASE: {
@@ -668,16 +774,18 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	}
 	def specOf(binding: Binding) -> IrSpec {
 		var mb = MemberBinding.!(binding);
-		var container = ir.elimTypeVars(mb.container), m: IrMember;
-
-		var ic = ir.makeIrClass(container);
-		if (VstField.?(mb.member)) m = ic.fields(mb.member.index);
-		else m = ic.methods(mb.member.index);
+		return specOf2(mb.container, mb.member, mb.typeArgs);
+	}
+	def specOf2(container: Type, member: VstMember, typeArgs: TypeArgs) -> IrSpec {
+		container = ir.elimTypeVars(container);
+		var ic = ir.makeIrClass(container), m: IrMember;
+		if (VstField.?(member)) m = ic.fields(member.index);
+		else m = ic.methods(member.index);
 
 		var newTa = [container];
-		if (mb.typeArgs != null) {
+		if (typeArgs != null) {
 			// add method type parameters to the type arguments array
-			var oldTa = mb.typeArgs.types;
+			var oldTa = typeArgs.types;
 			newTa = Array<Type>.new(1 + oldTa.length);
 			newTa(0) = container;
 			for (i < oldTa.length) {
@@ -686,8 +794,8 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		}
 		return IrSpec.new(container, newTa, m);
 	}
-	def initOf(binding: Binding, env: VstSsaEnv) -> SsaInstr {
-		var decl = VstComponent.!(MemberBinding.!(binding).member.container);
+	def initOf(member: VstMember, env: VstSsaEnv) -> SsaInstr {
+		var decl = VstComponent.!(member.container);
 		var ctype = decl.getDeclaredType(), ic = ir.makeIrClass(ctype);
 		var meth = ic.methods(0);
 		if (meth != null) return env.opComponentInit(ctype, meth);
@@ -707,7 +815,8 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	}
 	def visitVar(expr: VarExpr, env: VstSsaEnv) -> SsaInstr {
 		// var expression should be bound and the appropriate binding method called
-		return error(expr, "unbound var expression");
+		var receiver = if(expr.expr != null, [env.genExpr(expr.expr)], Ssa.NO_INSTRS);
+		return genRead2(exprSource(expr), expr.shape, receiver, env);
 	}
 	def visitLiteral(expr: Literal, env: VstSsaEnv) -> SsaInstr {
 		// generate a constant
@@ -1013,7 +1122,7 @@ class VstSsaEnv extends SsaBuilder {
 	def addVal(t: Type, val: Val) -> SsaInstr {
 		return graph.valConst(t, val);
 	}
-	def addOp(op: Operator, facts: int) -> SsaInstr {
+	def addOp(op: Computation, facts: int) -> SsaInstr {
 		// XXX: perform LVN and GVN
 		var spec = gen.opBuilder.buildOpMethod(gen.context.compiler, op, facts);
 		var any = AnyObject.TYPE;
@@ -1063,6 +1172,7 @@ class VstSsaEnv extends SsaBuilder {
 			for (i < a.length) r(i + 1) = genExpr(a(i));
 			return r;
 		} else { // XXX: inlined Arrays.map
+			if (a.length == 0) return Ssa.NO_INSTRS;
 			var r = Array<SsaInstr>.new(a.length);
 			for (i < a.length) r(i) = genExpr(a(i));
 			return r;
