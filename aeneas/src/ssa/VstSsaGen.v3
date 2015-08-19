@@ -1,6 +1,7 @@
 // Copyright 2011 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+def INDEX_0 = [0];
 // Information about a local variable, including whether it is written (i.e. non-SSA),
 // and all loops in which it is written
 class VstSsaVar {
@@ -31,7 +32,6 @@ class VstSsaVar {
 		return extWriteFlags(loopIndex - 32);
 	}
 }
-
 // Generates SSA (static single assignment) form from VST syntax trees
 // XXX: simplify conservative phis generated for loops
 class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
@@ -41,7 +41,6 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	def meth = context.method.source;	// the VST method
 	def opBuilder: IrOpMethodBuilder;	// builder for IrOpMethods
 	var nonSsaVars: Array<VarDecl>;		// variables that are assigned more than once
-	var ssaGen: SsaGen;			// provided interface to OtherBinding
 	var directCallTargets: List<IrSpec>;
 	var directCallBlocks: List<SsaBlock>;
 
@@ -347,7 +346,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		// desugar "for(i < E) S" to "for(i = 0; i < E; i++) S"
 		var t = IntType.!(stmt.varDecl.vtype);
 		var ref = VarExpr.new(null, null, VstIdent.new(stmt.varDecl.token, 0, null));
-		ref.binding = LocalBinding.new(stmt.varDecl);
+		ref.varbind = VarBinding.Local(stmt.varDecl);
 		ref.exactType = stmt.varDecl.vtype;
 
 		var infix = InfixOp.new(stmt.lt, V3Infix.Lt, V3Infix.prec(V3Infix.Lt), false);
@@ -573,54 +572,8 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	def visitAutoExpr(expr: AutoExpr, env: VstSsaEnv) -> SsaInstr {
 		var tc = IntType.!(expr.exactType);
 		var one = graph.valConst(expr.exactType, tc.box(1));
-		var t = genReadModifyWrite(exprSource(expr), expr.expr, expr.op, genInc, env);
+		var t = genReadModifyWrite(exprSource(expr), expr.expr, genInc(expr.op, _, _), env);
 		return if(expr.post, t.0, t.1);
-	}
-	def genReadModifyWrite(source: Source, lval: Expr, c: Computation, gen: (Computation, SsaInstr, VstSsaEnv) -> SsaInstr, env: VstSsaEnv) -> (SsaInstr, SsaInstr) {
-		// XXX: factor common code out of visitAssign() and here
-		var pre: SsaInstr, post: SsaInstr;
-		if (AppExpr.?(lval)) {
-			// auto-assignment to an array element
-			var app = AppExpr.!(lval), array = env.genExpr(app.func);
-			var index = env.genExpr(app.args.exprs.first());
-			var arrayType = ir.elimTypeVars(app.func.exactType);
-			env.source = exprSource(lval);
-			pre = env.opArrayGetElem(arrayType, 0, array, index);
-			env.source = source;
-			post = gen(c, pre, env);
-			env.at(source).opArraySetElem(arrayType, Facts.O_SAFE_BOUNDS, array, index, post);
-		} else if (VarExpr.?(lval)) {
-			var varDecl = VarExpr.!(lval), binding = varDecl.binding;
-			// XXX: simplify by just calling read/modify/write on binding
-			if (LocalBinding.?(binding)) {
-				// read-modify-write a var variable
-				var lb = LocalBinding.!(binding);
-				pre = env.get(lb.decl.ssa);
-				env.source = source;
-				post = gen(c, pre, env);
-				env.set(lb.decl.ssa, post);
-			} else if (MemberBinding.?(binding)) {
-				// read-modify-write of member binding
-				var receiver = genReceiver(binding.receiver, env);
-				env.source = exprSource(lval);
-				pre = genRead(receiver, binding, env);
-				env.source = source;
-				post = gen(c, pre, env);
-				genWrite(receiver, binding, post, env);
-			} else if (OtherBinding.?(binding)) {
-				var ref = OtherBinding.!(binding);
-				// generate receiver expression
-				var receiver = genReceiver(ref.receiver, env);
-				env.source = exprSource(lval);
-				var gener = genOf(lval, ref.container, env);
-				pre = ref.member.genRead(gener, receiver);
-				env.source = source;
-				post = gen(c, pre, env);
-				ref.member.genWrite(gener, receiver, post);
-			}
-		}
-		if (pre == null) pre = error(lval, "invalid lvalue");
-		return (pre, post);
 	}
 	def genInc(c: Computation, pre: SsaInstr, env: VstSsaEnv) -> SsaInstr {
 		var rtype = c.resultType;
@@ -631,173 +584,165 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		var val = env.genExpr(expr);
 		return env.addApply(env.source, c, [pre, val]);
 	}
-	def genRead(receiver: SsaInstr, binding: Binding, env: VstSsaEnv) -> SsaInstr {
-		// binding appears as an expression such as "receiver.binding"
-		match (binding.kind) {
-			VstBinding.LOCAL: return env.get(LocalBinding.!(binding).decl.ssa);
-			VstBinding.OBJECT_METHOD: return env.opClassGetVirtual(specOf(binding), receiver);
-			VstBinding.OBJECT_FIELD: return env.opClassGetField(specOf(binding), receiver);
-			VstBinding.CLASS_METHOD: {
-				var spec = specOf(binding); // XXX: optimize in SsaBuilder/V3Op?
-				var virtual = spec.member.checkFact(Facts.M_OVERRIDDEN);
-				var facts = if(spec.container.typeCon.kind != V3Kind.CLASS, Facts.O_NO_NULL_CHECK);
-				if (virtual) return env.addOp(V3Op.newCallClassVirtual(spec), 0);
-				else return env.addOp(V3Op.newCallMethod(spec), facts);
-			}
-			VstBinding.CLASS_FIELD: return env.addOp(V3Op.newClassGetField(specOf(binding)), 0);
-			VstBinding.CLASS_NEW: {
-				return env.addOp(newClassAllocOp(specOf(binding), ir.elimTypeVars(binding.boundType), env), 0);
-			}
-			VstBinding.COMPONENT_METHOD: {
-				var spec = specOf(binding);
-				if (receiver == null) receiver = initOf(MemberBinding.!(binding).member, env);
-				return env.opComponentGetMethod(spec, receiver);
-			}
-			VstBinding.COMPONENT_FIELD: {
-				var spec = specOf(binding);
-				if (receiver == null) receiver = initOf(MemberBinding.!(binding).member, env);
-				return env.opComponentGetField(spec, receiver);
-			}
-			VstBinding.VARIANT_CASE: {
-				var mb = MemberBinding.!(binding);
-				var vcase = VstCaseMember.!(mb.member);
-				var variant = ir.elimTypeVars(mb.container);
-				var container = V3.getSyntheticVariantType(variant, vcase);
-				if (vcase.decl.params == null) {
-					// generate an allocation
-					var spec = IrSpec.new(container, [container], null);
-					return env.opClassAlloc(spec, Ssa.NO_INSTRS);
-				}
-				var constructor = ir.makeIrClass(container).methods(0);
-				var spec = IrSpec.new(container, [container], constructor);
-				var op = newClassAllocOp(spec, ir.elimTypeVars(binding.boundType), env);
-				var ftype = Function.newType(Tuple.newType(Lists.fromArray(op.paramTypes)), variant);
-				return env.opTypeSubsume(op.getFunctionType(), ftype, env.addOp(op, Facts.O_PURE));
-			}
-			VstBinding.ENUM_INST_PARAM: {
-				var m = MemberBinding.!(binding), f = VstField.!(m.member);
-				return genEnumGetParam(f, receiver, env);
-			}
-			VstBinding.ENUM_DECL_PARAM: {
-				var m = MemberBinding.!(binding), f = VstField.!(m.member);
-				var enumType = m.container;
-				return env.addOp(SsaGenerator.new(TypeUtil.NO_TYPES, [enumType], f.getType(), genEnumGetParamAdapt(f, _, _, _, _, _)),0);
-			}
-			VstBinding.OTHER: return OtherBinding.!(binding).genRead(receiver, env);
-		}
-		context.fail("invalid binding in read");
-		return env.graph.nop();
-	}
-	def genEnumGetParamAdapt(f: VstField, context: SsaContext, source: Source, args: Array<SsaInstr>, facts: int, block: SsaBuilder) -> SsaInstr {
-		return genEnumGetParam(f, args(0), block);
-	}
-	def genEnumGetParam(f: VstField, receiver: SsaInstr, block: SsaBuilder) -> SsaInstr {
-		var x = initOf(f, block);
-		var arrayType = f.enumVals.rtype;
-		var array = block.graph.valConst(arrayType, f.enumVals);
-		return block.opArrayGetElem(arrayType, Facts.O_SAFE_BOUNDS, array, receiver);
-	}
-	def genRead2(source: Source, shape: BindingShape, args: Array<SsaInstr>, env: VstSsaEnv) -> SsaInstr {
-		match(shape) {
+	def genVarRead(receiver: SsaInstr, binding: VarBinding, env: VstSsaEnv) -> SsaInstr {
+		match(binding) {
+			None: return V3.fail("unbound in genVarRead()");
 			Value(val, vtype): return env.graph.valConst(vtype, val);
 			Local(decl): return env.get(decl.ssa);
 			ObjectMethod(container, member, typeArgs): {
-				var spec = specOf2(container, member, typeArgs);
-				return env.opClassGetVirtual(spec, args(0));
+				var spec = specOf(container, member, typeArgs);
+				return env.opClassGetVirtual(spec, receiver);
 			}
 			ObjectField(container, member): {
-				var spec = specOf2(container, member, null);
-				return env.opClassGetField(spec, args(0));
+				var spec = specOf(container, member, null);
+				return env.opClassGetField(spec, receiver);
 			}
 			ClassMethod(container, member, typeArgs): {
-				var spec = specOf2(container, member, typeArgs);
+				var spec = specOf(container, member, typeArgs);
 				var virtual = spec.member.checkFact(Facts.M_OVERRIDDEN);
 				var facts = if(spec.container.typeCon.kind != V3Kind.CLASS, Facts.O_NO_NULL_CHECK);
 				if (virtual) return env.addOp(V3Op.newCallClassVirtual(spec), 0);
 				else return env.addOp(V3Op.newCallMethod(spec), facts);
 			}
 			ClassField(container, member): {
-				var spec = specOf2(container, member, null);
+				var spec = specOf(container, member, null);
 				return env.addOp(V3Op.newClassGetField(spec), 0);
 			}
-			ClassNew(container, member): {
-				var spec = specOf2(container, member, null);
-				return env.addOp(newClassAllocOp(spec, container, env), 0);
+			ClassNew(container, member, funcType): {
+				var spec = specOf(container, member, null);
+				return env.addOp(newClassAllocOp(spec, funcType, env), 0);
 			}
 			ComponentMethod(member, typeArgs): {
-				var spec = specOf2(member.container.getDeclaredType(), member, typeArgs);
-				var receiver = if(args.length > 0, args(0), initOf(member, env));
+				var spec = specOf(member.container.getDeclaredType(), member, typeArgs);
+				if (receiver == null) receiver = initOf(member, env);
 				return env.opComponentGetMethod(spec, receiver);
 			}
 			ComponentField(member): {
-				var spec = specOf2(member.container.getDeclaredType(), member, null);
-				var receiver = if(args.length > 0, args(0), initOf(member, env));
+				var spec = specOf(member.container.getDeclaredType(), member, null);
+				if (receiver == null) receiver = initOf(member, env);
 				return env.opComponentGetField(spec, receiver);
 			}
-			VariantCase(container, member): ;
 			VariantField(container, member): {
-				var spec = specOf2(container, member, null);
-				return env.opClassGetField(spec, args(0));
+				var spec = specOf(container, member, null);
+				return env.opClassGetField(spec, receiver);
 			}
-			ArrayElem(arrayType): {
-				return env.opArrayGetElem(ir.elimTypeVars(arrayType), 0, args(0), args(1));
-			}
-			Inst(comp, facts): {
+			Inst(c, facts): {
+				var comp = c.subst(ir.elimTypeVars);
 				return env.addOp(comp, facts);
 			}
-			Apply(comp, facts): {
+			Apply(c, facts): {
+				var args = [receiver];
+				var comp = c.subst(ir.elimTypeVars);
 				if (Operator.?(comp)) {
-					var op = Operator.!(comp), i = env.addApply(source, op, args);
+					var op = Operator.!(comp), i = env.addApply(env.source, op, args);
 					i.setFact(facts);
 					return i;
 				} else {
-					return SsaGenerator.!(comp).gen(context, source, args, facts, env);
+					return SsaGenerator.!(comp).gen(context, env.source, args, facts, env);
 				}
 			}
-			CallClosure(t): {
-				return env.opCallClosure(t, args);
+			Type: return V3.fail("read of type binding");
+			VariantCase(c, vcase): {
+				var container = ir.elimTypeVars(c);
+				var variant = V3.getSyntheticVariantType(container, vcase);
+				if (vcase.decl.params == null) {
+					// generate an allocation
+					var spec = IrSpec.new(variant, [variant], null);
+					return env.opClassAlloc(spec, Ssa.NO_INSTRS);
+				}
+				var constructor = ir.makeIrClass(variant).methods(0);
+				var spec = IrSpec.new(variant, [variant], constructor);
+				var op = newClassAllocOp(spec, variant, env);
+				return env.addOp(op, Facts.O_PURE);
 			}
-			_: ;
+			Partial(c, facts): {
+				var comp = c.subst(ir.elimTypeVars);
+				return env.addClosureCreate(comp, [receiver], INDEX_0);
+			}
 		}
-		return V3.fail1("unexpected binding %1 in genRead2()", shape.name);
 	}
-	def genWrite2(source: Source, shape: BindingShape, args: Array<SsaInstr>, val: SsaInstr, env: VstSsaEnv) -> SsaInstr {
-		match(shape) {
+	def genVarWrite(varbind: VarBinding, varSource: Source, receiver: SsaInstr, val: SsaInstr, checked: bool, env: VstSsaEnv) -> SsaInstr {
+		match(varbind) {
 			Local(decl): env.set(decl.ssa, val);
 			ObjectField(container, member): {
-				var spec = specOf2(container, member, null);
-				env.opClassSetField(spec, args(0), val, false);
+				var spec = specOf(container, member, null);
+				var i = env.at(varSource).opClassSetField(spec, receiver, val, false);
+				if (checked && i != null) i.setFact(Facts.O_NO_NULL_CHECK);
 			}
 			ComponentField(member): {
-				var spec = specOf2(member.container.getDeclaredType(), member, null);
-				env.opClassSetField(spec, args(0), val, false);
+				var spec = specOf(member.container.getDeclaredType(), member, null);
+				if (receiver == null) receiver = initOf(member, env);
+				env.opComponentSetField(spec, receiver, val);
 			}
-			ArrayElem(arrayType): {
-				env.opArraySetElem(ir.elimTypeVars(arrayType), 0, args(0), args(1), val);
-			}
-			_: V3.fail1<void, string>("unexpected binding %1 in genWrite2()", shape.name);
+			_: return V3.fail1("unexpected binding %1 in genVarWrite()", varbind.name);
 		}
 		return val;
 	}
-	def genReadModifyWrite2(source: Source, lval: Expr, modify: (SsaInstr, VstSsaEnv) -> SsaInstr, env: VstSsaEnv) -> (SsaInstr, SsaInstr) {
+	def genAppRead(appbind: AppBinding, target: SsaInstr, args: Array<SsaInstr>, env: VstSsaEnv) -> SsaInstr {
+		match (appbind) {
+			None: return V3.fail("unbound in genAppRead()");
+			ArrayElem(arrayType): {
+				return env.opArrayGetElem(ir.elimTypeVars(arrayType), 0, target, args(0));
+			}
+			CallClosure(t): {
+				return env.opCallClosure(ir.elimTypeVars(t), Arrays.prepend(target, args));
+			}
+			CallComponentMethod(container, member, typeArgs): {
+				var spec = specOf(container, member, typeArgs);
+				if (target == null) initOf(member, env);
+				return env.opCallMethod(spec, args);
+			}
+			CallObjectMethod(container, member, typeArgs): {
+				var spec = specOf(container, member, typeArgs);
+				return env.opCallClassVirtual(spec, Arrays.prepend(target, args));
+			}
+			CallClassMethod(container, member, typeArgs): {
+				var spec = specOf(container, member, typeArgs);
+				return env.opCallClassVirtual(spec, args);
+			}
+			ClassNew(container, member): {
+				var spec = specOf(container, member, null);
+				return env.opClassAlloc(spec, args);
+			}
+			Apply(c, facts): {
+				var comp = c.subst(ir.elimTypeVars);
+				if (target != null) args = Arrays.prepend(target, args);
+				return env.addApply(env.source, comp, args);
+			}
+			Partial(boundMap): {
+				// XXX: optimize C.m(... _ ...) and o.m(... _ ...) and <val>(... _ ...)
+				args = Arrays.prepend(target, args);
+				return env.addClosureCreate(V3Op.newCallClosure(target.getType()), args, boundMap);
+			}
+		}
+	}
+	def genAppWrite(appbind: AppBinding, source: Source, target: SsaInstr, args: Array<SsaInstr>, val: SsaInstr, checked: bool, env: VstSsaEnv) {
+		match (appbind) {
+			ArrayElem(arrayType): {
+				var i = env.at(source).opArraySetElem(ir.elimTypeVars(arrayType), 0, target, args(0), val);
+				if (checked && i != null) i.setFact(Facts.O_SAFE_BOUNDS);
+			}
+			_: return V3.fail1("unexpected binding %1 in genAppWrite()", appbind.name);
+		}
+	}
+	def genReadModifyWrite(source: Source, lval: Expr, modify: (SsaInstr, VstSsaEnv) -> SsaInstr, env: VstSsaEnv) -> (SsaInstr, SsaInstr) {
 		var pre: SsaInstr, post: SsaInstr;
 		if (AppExpr.?(lval)) {
-			// read-modify-write of an array element
-			var app = AppExpr.!(lval), array = env.genExpr(app.func);
-			var index = env.genExpr(app.args.exprs.first());
-			var arrayType = ir.elimTypeVars(app.func.exactType);
-			env.source = exprSource(lval);
-			pre = env.opArrayGetElem(arrayType, 0, array, index);
-			env.source = source;
+			// read-modify-write of an app expression
+			var expr = AppExpr.!(lval);
+			var t = evalAppExprs(expr, env);
+			var appSource = exprSource(expr);
+			pre = genAppRead(expr.appbind, t.0, t.1, env.at(appSource));
 			post = modify(pre, env);
-			env.at(source).opArraySetElem(arrayType, Facts.O_SAFE_BOUNDS, array, index, post);
+			genAppWrite(expr.appbind, appSource, t.0, t.1, post, true, env.at(source));
 		} else if (VarExpr.?(lval)) {
-			// read-modify-write of a general binding
-			var shape: BindingShape;
-			var args: Array<SsaInstr>;  // TODO
-			pre = genRead2(source, shape, args, env);
+			// read-modify-write of a var expression
+			var expr = VarExpr.!(lval);
+			var receiver = genReceiver(expr.receiver, env);
+			var varSource = exprSource(expr);
+			pre = genVarRead(receiver, expr.varbind, env.at(varSource));
 			post = modify(pre, env);
-			genWrite2(source, shape, args, post, env);
+			genVarWrite(expr.varbind, varSource, receiver, post, true, env.at(source));
 		} else {
 			pre = error(lval, "invalid lvalue");
 		}
@@ -807,65 +752,12 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		if (spec.member == null) {
 			// trivial constructor
 			funcType = ir.elimTypeVars(funcType);
-			var paramTypes = Function.getParamTypeArray(funcType), ctype = spec.container;
-			return V3Op.newOp1(Opcode.ClassAlloc, [ctype], paramTypes, ctype, V3Op.evalEmptyClassAlloc, null);
+			var paramTypes = Function.getParamTypeArray(funcType), classType = spec.container;
+			return V3Op.newOp1(Opcode.ClassAlloc, [classType], paramTypes, classType, V3Op.evalEmptyClassAlloc, null);
 		}
 		return V3Op.newClassAlloc(spec);
 	}
-	def genWrite(receiver: SsaInstr, binding: Binding, val: SsaInstr, env: VstSsaEnv) -> SsaInstr {
-		// binding appears as a write such as "receiver.binding = val"
-		match (binding.kind) {
-			VstBinding.LOCAL: env.set(LocalBinding.!(binding).decl.ssa, val);
-			VstBinding.OBJECT_FIELD: env.opClassSetField(specOf(binding), receiver, val, false);
-			VstBinding.COMPONENT_FIELD: {
-				var spec = specOf(binding);
-				if (receiver == null) receiver = initOf(MemberBinding.!(binding).member, env);
-				env.opComponentSetField(spec, receiver, val);
-			}
-			VstBinding.OTHER: OtherBinding.!(binding).genWrite(receiver, val, env);
-		} else {
-			context.fail("invalid binding in write");
-		}
-		return val;
-	}
-	def genApply(receiver: SsaInstr, binding: Binding, env: VstSsaEnv, args: Array<Expr>) -> SsaInstr {
-		// binding appears as a call such as "receiver.binding(args)"
-		match (binding.kind) {
-			VstBinding.OBJECT_METHOD: {
-				env.opNullCheck(receiver.getType(), receiver);
-				var x = env.genExprs(receiver, args);
-				return env.opCallClassVirtual(specOf(binding), x);
-			}
-			VstBinding.CLASS_METHOD: {
-				return env.opCallClassVirtual(specOf(binding), env.genExprs(null, args));
-			}
-			VstBinding.CLASS_NEW: {
-				return env.opClassAlloc(specOf(binding), env.genExprs(null, args));
-			}
-			VstBinding.COMPONENT_METHOD: {
-				if (receiver == null) initOf(MemberBinding.!(binding).member, env);
-				return env.opCallMethod(specOf(binding), env.genExprs(null, args));
-			}
-			VstBinding.VARIANT_CASE: {
-				var mb = MemberBinding.!(binding);
-				var vcase = VstCaseMember.!(mb.member);
-				var container = V3.getSyntheticVariantType(ir.elimTypeVars(mb.container), vcase);
-				var constructor = ir.makeIrClass(container).methods(0);
-				var spec = IrSpec.new(container, [container], constructor);
-				return env.opClassAlloc(spec, env.genExprs(null, args));
-			}
-			VstBinding.OTHER: return OtherBinding.!(binding).genApply(receiver, env, env.genExprs(null, args));
-		} else {
-			var del = genRead(receiver, binding, env);
-			var ftype = binding.boundType;
-			return env.opCallClosure(ftype, env.genExprs(del, args));
-		}
-	}
-	def specOf(binding: Binding) -> IrSpec {
-		var mb = MemberBinding.!(binding);
-		return specOf2(mb.container, mb.member, mb.typeArgs);
-	}
-	def specOf2(container: Type, member: VstMember, typeArgs: TypeArgs) -> IrSpec {
+	def specOf(container: Type, member: VstMember, typeArgs: TypeArgs) -> IrSpec {
 		container = ir.elimTypeVars(container);
 		var ic = ir.makeIrClass(container), m: IrMember;
 		if (VstField.?(member)) m = ic.fields(member.index);
@@ -900,9 +792,8 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		return env.at(exprSource(expr)).opArrayInit(expr.exactType, expr.exprs.mapArray(env.genExpr));
 	}
 	def visitVar(expr: VarExpr, env: VstSsaEnv) -> SsaInstr {
-		// var expression should be bound and the appropriate binding method called
-		var receiver = if(expr.expr != null, [env.genExpr(expr.expr)], Ssa.NO_INSTRS);
-		return genRead2(exprSource(expr), expr.shape, receiver, env);
+		var receiver = genReceiver(expr.receiver, env);
+		return genVarRead(receiver, expr.varbind, env.at(exprSource(expr)));
 	}
 	def visitLiteral(expr: Literal, env: VstSsaEnv) -> SsaInstr {
 		// generate a constant
@@ -913,87 +804,60 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		return env.addVal(V3.stringType, context.prog.getStringRecord(expr));
 	}
 	def visitApp(expr: AppExpr, env: VstSsaEnv) -> SsaInstr {
+		var t = evalAppExprs(expr, env);
+		return genAppRead(expr.appbind, t.0, t.1, env.at(exprSource(expr)));
+	}
+	def evalAppExprs(expr: AppExpr, env: VstSsaEnv) -> (SsaInstr, Array<SsaInstr>) {
 		var args = expr.args.exprs.asArray(), f = expr.func;
 		// flatten any nested tuple expressions
 		while (args.length == 1 && TupleExpr.?(args(0))) {
 			args = (TupleExpr.!(args(0))).exprs.asArray();
 		}
-		var ftype = ir.elimTypeVars(f.exactType);
-		if (V3.isArray(ftype)) {
-			// this an array get element
-			var array = env.genExpr(f), index = env.genExpr(args(0));
-			return env.at(exprSource(expr)).opArrayGetElem(ftype, 0, array, index);
-		} else if (expr.partial != null) {
-			// this is a partial application
-			var bound = Vector<SsaInstr>.new(), indexMap = Vector<int>.new();
-			bound.add(env.genExpr(f));
-			indexMap.add(0);
-			for (i < args.length) {
-				var arg = args(i);
-				if (ParamExpr.?(arg)) continue;
-				bound.add(env.genExpr(arg));
-				indexMap.add(i + 1);
-			}
-			// XXX: optimize C.m(... _ ...) and o.m(... _ ...) and <val>(... _ ...)
-			return env.addClosureCreate(V3Op.newCallClosure(f.exactType), bound.extract(), indexMap.extract());
-		} else if (VarExpr.?(f)) {
-			// this could be a member call
-			var func = VarExpr.!(f);
-			if (MemberBinding.?(func.binding)) {
-				var receiver = genReceiver(MemberBinding.!(func.binding).receiver, env);
-				env.source = exprSource(expr);
-				return genApply(receiver, func.binding, env, args);
-			}
-			if (OtherBinding.?(func.binding)) {
-				var b = OtherBinding.!(func.binding);
-				var receiver = genReceiver(b.receiver, env);
-				var args = Arrays.map(args, env.genExpr);
-				return b.member.genApply(genOf(expr, b.container, env), receiver, args);
+		// evaluate target (either receiver or function)
+		var target: SsaInstr;
+		if (expr.target != null) {
+			target = env.genExpr(expr.target);
+			if (expr.appbind.nullCheck()) {
+				env.at(exprSource(expr.target)).opNullCheck(target.getType(), target);
 			}
 		}
-		// generate a regular closure call
-		var ssaArgs = env.genExprs(env.genExpr(f), args);
-		return env.addCall(exprSource(expr), ftype, ssaArgs);
+		// evaluate bound arguments
+		var boundMap = expr.boundMap;
+		var instrs: Array<SsaInstr>;
+		if (boundMap != null) {
+			instrs = Array<SsaInstr>.new(boundMap.length - 1);
+			for (i < boundMap.length - 1) instrs(i) = env.genExpr(args(boundMap(i+1)-1));
+		} else {
+			instrs = Array<SsaInstr>.new(args.length);
+			for (i < args.length) instrs(i) = env.genExpr(args(i));
+		}
+		// return the target and the arguments
+		return (target, instrs);
 	}
 	def visitNot(expr: NotExpr, env: VstSsaEnv) -> SsaInstr {
 		// generate a boolean inversion
 		return env.at(exprSource(expr)).opBoolNot(env.genExpr(expr.expr));
 	}
 	def visitAssign(expr: AssignExpr, env: VstSsaEnv) -> SsaInstr {
-		var lval = expr.target;
+		var lval = expr.target, source = exprSource(expr), rval = expr.expr;
 		if (expr.infix != null) {
-			var t = genReadModifyWrite(exprSource(expr), lval, expr.infix.op, genBinop(_, _, expr.expr, _), env);
+			var t = genReadModifyWrite(source, lval, genBinop(expr.infix.op, _, expr.expr, _), env);
 			return t.1;
 		}
-
 		if (VarExpr.?(lval)) {
-			var varDecl = VarExpr.!(lval), binding = varDecl.binding;
-			if (LocalBinding.?(binding)) {
-				// assignment to a var variable
-				var lb = LocalBinding.!(binding);
-				var val = env.genExpr(expr.expr);
-				env.set(lb.decl.ssa, val);
-				return val;
-			} else if (MemberBinding.?(binding)) {
-				// apply the operator to the receiver expression
-				var receiver = genReceiver(binding.receiver, env);
-				return genWrite(receiver, binding, env.genExpr(expr.expr), env);
-			} else if (OtherBinding.?(binding)) {
-				var ref = OtherBinding.!(binding);
-				// apply the operator to the receiver expression
-				var ne = genReceiver(ref.receiver, env);
-				var ve = env.genExpr(expr.expr);
-				ref.member.genWrite(genOf(expr, ref.container, env), ne, ve);
-				return ve;
-			}
+			// assignment to a variable binding
+			var varExpr = VarExpr.!(lval);
+			var receiver = genReceiver(varExpr.receiver, env);
+			var val = env.genExpr(rval);
+			genVarWrite(varExpr.varbind, exprSource(varExpr), receiver, val, false, env.at(source));
+			return val;
 		}
 		if (AppExpr.?(lval)) {
 			// assignment to an array element
-			var app = AppExpr.!(lval);
-			var array = env.genExpr(app.func);
-			var index = env.genExpr(app.args.exprs.first());
-			var val = env.genExpr(expr.expr);
-			env.at(exprSource(expr)).opArraySetElem(ir.elimTypeVars(app.func.exactType), 0, array, index, val);
+			var appExpr = AppExpr.!(lval);
+			var t = evalAppExprs(appExpr, env);
+			var val = env.genExpr(rval);
+			genAppWrite(appExpr.appbind, exprSource(appExpr), t.0, t.1, val, false, env.at(source));
 			return val;
 		}
 		return error(expr, "invalid expression as target of assignment");
@@ -1109,25 +973,6 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		}
 		return graph.nop(); // neither fell through
 	}
-	// -- Bindings -------------------------------------------------------------
-	def visitLocalBinding(expr: VarExpr, ref: LocalBinding, env: VstSsaEnv) -> SsaInstr {
-		// binding to a var variable
-		return env.get(ref.decl.ssa); // get the variable mapping
-	}
-	def visitTypeBinding(expr: VarExpr, ref: TypeBinding, env: VstSsaEnv) -> SsaInstr {
-		// type should not be used as expression
-		return error(expr, "type binding used as expression");
-	}
-	def visitMemberBinding(expr: VarExpr, ref: MemberBinding, env: VstSsaEnv) -> SsaInstr {
-		// type should not be used as expression
-		var receiver = genReceiver(ref.receiver, env);
-		env.source = exprSource(expr);
-		return genRead(receiver, ref, env);
-	}
-	def visitOtherBinding(expr: VarExpr, ref: OtherBinding, env: VstSsaEnv) -> SsaInstr {
-		var receiver = genReceiver(ref.receiver, env);
-		return ref.member.genRead(genOf(expr, ref.container, env), receiver);
-	}
 	// -- Utility methods ------------------------------------------------------
 	def error(expr: Expr, msg: string) -> SsaInstr {
 		context.fail(msg);
@@ -1139,39 +984,6 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	}
 	def tokenSource(point: FilePoint) -> Source {
 		return Source.new(meth, point.beginLine, point.beginColumn, null);
-	}
-	def genOf(expr: Expr, container: Type, env: VstSsaEnv) -> Gen<SsaInstr> {
-		if (ssaGen == null) ssaGen = SsaGen.new(this);
-		ssaGen.env = env;
-		ssaGen.expr = expr;
-		return ssaGen;
-	}
-}
-// Generates SSA code for use by Member implementations
-class SsaGen(gen: VstSsaGen) extends Gen<SsaInstr> {
-	var env: VstSsaEnv;
-	var expr: Expr;
-
-	def getCompiler() -> Compiler { return env.gen.context.compiler; }
-	def getProgram() -> Program { return env.gen.context.prog; }
-	def source() -> Source { return gen.exprSource(expr); }
-	def genVal(t: Type, v: Val) -> SsaInstr { return gen.graph.valConst(t, v); }
-	def genApplyOp(op: Operator, args: Array<SsaInstr>) -> SsaInstr { return env.addApply(source(), op, args); }
-	def genCall(args: Array<SsaInstr>) -> SsaInstr { return env.addCall(source(), args(0).getType(), args); }
-	def genInstOp(op: Operator, args: Array<SsaInstr>, indexMap: Array<int>) -> SsaInstr {
-		return env.addClosureCreate(op, args, indexMap);
-	}
-	def genOp(op: Computation) -> SsaInstr { return env.addOp(op, 0); }
-	def subst(op: Operator) -> Operator { return op.subst(gen.ir.elimTypeVars); }
-	def expectNoReceiver(receiver: SsaInstr) {
-		if (receiver != null) gen.error(expr, "unexpected receiver");
-	}
-	def expectReceiver(receiver: SsaInstr) -> SsaInstr {
-		if (receiver == null) gen.error(expr, "expected receiver");
-		return receiver;
-	}
-	def setFact(e: SsaInstr, facts: int) {
-		e.setFact(facts);
 	}
 }
 // An environment for generating code, including the current block and the current
@@ -1187,6 +999,10 @@ class VstSsaEnv extends SsaBuilder {
 	new(size: int, gen, parent, block: SsaBlock) super(gen.context, gen.graph, block) {
 		if (parent == null) varMap = Array.new(size);
 		else varMap = parent.varMap;
+	}
+	def at(source: Source) -> VstSsaEnv {
+		this.source = source;
+		return this;
 	}
 	def split() -> VstSsaEnv {
 		return VstSsaEnv.new(varMap.length, gen, this, SsaBlock.new());
@@ -1218,9 +1034,9 @@ class VstSsaEnv extends SsaBuilder {
 		// return a closure value
 		return graph.valConst(op.getFunctionType(), Closure.new(null, spec));
 	}
-	def addClosureCreate(op: Operator, args: Array<SsaInstr>, indexMap: Array<int>) -> SsaInstr {
+	def addClosureCreate(comp: Computation, args: Array<SsaInstr>, indexMap: Array<int>) -> SsaInstr {
 		var context = SsaContext.new(gen.context.compiler, gen.context.prog);
-		return gen.opBuilder.buildOpClosure(context, this, op, args, indexMap);
+		return gen.opBuilder.buildOpClosure(context, this, comp, args, indexMap);
 	}
 	def addApply(source: Source, c: Computation, args: Array<SsaInstr>) -> SsaInstr {
 		if (Operator.?(c)) {

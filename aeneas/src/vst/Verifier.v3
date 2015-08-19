@@ -4,6 +4,7 @@
 // Performs verification on class and component declarations, including
 // resolving all references, enforcing overriding and inheritance rules,
 // and typechecking all code
+def INDEX_0 = [0];
 class Verifier(compiler: Compiler, prog: Program) {
 	def ERROR = prog.ERROR;
 	var classList: List<VstClass>;
@@ -328,7 +329,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 		for (l = superclause.args.exprs.list; l != null; l = l.tail) {
 			var expr = l.head;
 			if (Literal.?(expr)) continue;
-			if (VarExpr.?(expr) && LocalBinding.?(VarExpr.!(expr).binding)) continue;
+			if (VarExpr.?(expr) && VarExpr.!(expr).isLocal()) continue;
 			return true;
 		}
 		return false;
@@ -456,7 +457,7 @@ class VstCompoundVerifier {
 		decl.root = decl;
 		decl.index = compound.numMethods++;
 	}
-	def lookupSuperMember(name: string) -> MemberBinding {
+	def lookupSuperMember(name: string) -> ResolvedMember {
 		// XXX: reduce duplicated code with MethodEnv.lookupClassMember
 		if (superType == null) return null;
 		var classType = superType;
@@ -467,7 +468,7 @@ class VstCompoundVerifier {
 				if (member.isPrivate) return null;
 				var memberType = member.getType();
 				if (memberType != null) memberType = memberType.substitute(classType.getTypeArgs());
-				return MemberBinding.new(VstBinding.OBJECT_METHOD, classType, null, member, memberType, false);
+				return ResolvedMember.new(classType, member, null, memberType);
 			}
 			// member was not found in this type
 			classType = classType.getSuperType();
@@ -475,10 +476,10 @@ class VstCompoundVerifier {
 		}
 		return null;
 	}
-	def checkMethodOverride(decl: VstMethod, binding: MemberBinding) {
+	def checkMethodOverride(decl: VstMethod, binding: ResolvedMember) {
 		if (VstMethod.?(binding.member)) {
 			var superDecl = VstMethod.!(binding.member);
-			var superMethodType = binding.boundType;
+			var superMethodType = binding.memberType;
 			var methodType = decl.getType();
 			decl.index = superDecl.index;
 			decl.root = superDecl.root;
@@ -716,13 +717,14 @@ class MethodEnv {
 			mdecl.numParams = count;
 		}
 	}
-	def lookupExprMember(expr: VarExpr, etype: Type, useThis: bool) -> Binding {
+	def lookupExprMember(expr: VarExpr, etype: Type, useThis: bool) -> VarBinding {
 		var name = expr.ident.name;
 		match (etype.typeCon.kind) {
 			V3Kind.ARRAY: {
 				// an array expression has a member named "length"
 				if (Strings.equal("length", name.image)) {
-					return newApplyOpBinding(expr.expr, etype, V3Op.newArrayGetLength(etype));
+					var op = V3Op.newArrayGetLength(etype);
+					return expr.bind(expr.expr, VarBinding.Apply(op, 0), op.resultType);
 				}
 			}
 			V3Kind.TUPLE: {
@@ -731,19 +733,19 @@ class MethodEnv {
 				if (Strings.equal("last", name.image)) ival = Int.box(len - 1);
 				else ival = Int.parseDecimal(name.image);
 				if (ival != null && ival.val >= 0 && ival.val < len) {
-					return newApplyOpBinding(expr.expr, etype, V3Op.newTupleGetElem(etype, ival.val));
+					return newApplyCompBinding(expr, expr.expr, V3Op.newTupleGetElem(etype, ival.val));
 				}
 			}
 			V3Kind.COMPONENT: {
-				var binding = lookupComponentMember(expr, etype, name.image);
-				if (binding != null) binding.receiver = objExpr(useThis, name, expr);
+				var binding = lookupComponentMember(expr, expr.expr, etype, name.image);
+				if (binding.ok()) expr.receiver = objExpr(useThis, name, expr);
 				return binding;
 			}
 			V3Kind.ENUM,
 			V3Kind.VARIANT,
 			V3Kind.CLASS: {
 				var binding = lookupClassMember(expr, false, ClassType.!(etype), name.image);
-				if (binding != null) binding.receiver = objExpr(useThis, name, expr);
+				if (binding.ok()) expr.receiver = objExpr(useThis, name, expr);
 				return binding;
 			}
 		}
@@ -753,16 +755,16 @@ class MethodEnv {
 			var result = mt.lookupMember(etype, name.image, true);
 			if (result.tag != LookupResult.None.tag) return bindShape(expr, receiver, etype, result);
 		}
-		return null;
+		return VarBinding.None;
 	}
 	def objExpr(useThis: bool, token: Token, expr: VarExpr) -> Expr {
 		if (!useThis) return expr.expr;
 		var thisExpr = VarExpr.new(null, token.copy(""), expr.ident);
-		thisExpr.binding = LocalBinding.new(thisParam);
+		thisExpr.varbind = VarBinding.Local(thisParam);
 		thisExpr.exactType = verifier.thisType;
 		return thisExpr;
 	}
-	def lookupTypeMember(expr: VarExpr, etype: Type) -> Binding {
+	def lookupTypeMember(expr: VarExpr, etype: Type) -> VarBinding {
 		var name = expr.ident.name.image;
 
 		// try to match cast or query operator
@@ -771,20 +773,20 @@ class MethodEnv {
 			if (first == '?') {
 				var ft = abstractTypeParams("type query", expr, TypeUtil.ONE_TYPE_PARAM);
 				ft = addTypeVarConstraint(ft, expr, etype, true);
-				return newOpBinding(etype, V3Op.newTypeQuery(ft.head, etype));
+				return newCompBinding(expr, V3Op.newTypeQuery(ft.head, etype));
 			}
 			if (first == '!') {
 				var ft = abstractTypeParams("type cast", expr, TypeUtil.ONE_TYPE_PARAM);
 				ft = addTypeVarConstraint(ft, expr, etype, false);
-				return newOpBinding(etype, V3Op.newTypeCast(ft.head, etype));
+				return newCompBinding(expr, V3Op.newTypeCast(ft.head, etype));
 			}
 		}
 
 		// try to match != and == operators
 		if (name.length == 2 && name(1) == '=') {
 			var first = name(0);
-			if (first == '!') return newOpBinding(etype, V3Op.newNotEqual(etype));
-			if (first == '=') return newOpBinding(etype, V3Op.newEqual(etype));
+			if (first == '!') return newCompBinding(expr, V3Op.newNotEqual(etype));
+			if (first == '=') return newCompBinding(expr, V3Op.newEqual(etype));
 		}
 
 		var typeCon = etype.typeCon, kind = typeCon.kind;
@@ -794,32 +796,32 @@ class MethodEnv {
 				if (Strings.equal(name, "set")) {
 					var tref = TypeRef.new(TypeUtil.typeRefOf(classType), expr.ident.name, null, null, null);
 					verifier.getEnumSetType(tref, classType);
-					return TypeBinding.new(tref);
+					return expr.bind(null, VarBinding.Type(tref.rtype), tref.rtype);
 				}
 				if (Strings.equal(name, "|")) {
 					if (classType.classDecl.enumSetTypeCon == null) {
 						var tref = TypeRef.new(TypeUtil.typeRefOf(classType), expr.ident.name, null, null, null);
 						verifier.getEnumSetType(tref, classType);
-						if (tref.rtype == null) return null;
+						if (tref.rtype == null) return VarBinding.None;
 					}
 					var op = classType.classDecl.enumSetTypeCon.lookupInfix(V3Infix.Or, null);
-					return newCompBinding(classType, op);
+					return newCompBinding(expr, op);
 				}
 				return lookupClassMember(expr, true, classType, name);
 			}
 			V3Kind.VARIANT,
 			V3Kind.CLASS: return lookupClassMember(expr, true, ClassType.!(etype), name);
-			V3Kind.COMPONENT: return lookupComponentMember(expr, etype, name);
+			V3Kind.COMPONENT: return lookupComponentMember(expr, null, etype, name);
 			V3Kind.ARRAY: {
-				if (Strings.equal("new", name)) return newOpBinding(etype, V3Op.newArrayAlloc(etype));
-				if (Strings.equal("length", name)) return newOpBinding(etype, V3Op.newArrayGetLength(etype));
+				if (Strings.equal("new", name)) return newCompBinding(expr, V3Op.newArrayAlloc(etype));
+				if (Strings.equal("length", name)) return newCompBinding(expr, V3Op.newArrayGetLength(etype));
 			}
 			V3Kind.TUPLE: {
 				// syntax currently precludes specifying a tuple type as a VarExpr,
 				// but support unbound tuple members internally anyway
 				var ival = Int.parseDecimal(name);
 				if (ival != null && ival.val >= 0 && ival.val < Lists.length(etype.nested)) {
-					return newOpBinding(etype, V3Op.newTupleGetElem(etype, ival.val));
+					return newCompBinding(expr, V3Op.newTupleGetElem(etype, ival.val));
 				}
 			}
 		}
@@ -833,63 +835,56 @@ class MethodEnv {
 			var infix = V3Infix.parse(name);
 			if (infix != '\x00') {
 				var op = mt.lookupInfix(infix, etype);
-				if (op != null) return newCompBinding(etype, op);
+				if (op != null) return newCompBinding(expr, op);
 			}
 		}
-		return null;
+		return VarBinding.None;
 	}
-	def bindShape(expr: VarExpr, receiver: Expr, etype: Type, result: LookupResult) -> Binding {
+	def bindShape(expr: VarExpr, receiver: Expr, etype: Type, result: LookupResult) -> VarBinding {
 		match (result) {
 			Value(vtype, val): {
-				expr.shape = BindingShape.Value(val, vtype);
-				return OtherBinding.new(receiver, etype, Members.valMember(vtype, val, false));
+				return expr.bind(receiver, VarBinding.Value(val, vtype), vtype);
 			}
-			Op(op, typeParams): {
+			Inst(comp, typeParams): {
 				var typeArgs = abstractTypeParams2("member", expr, typeParams);
-				var rop = if(typeArgs != null, op.subst(typeArgs.substitute), op);
-				expr.shape = BindingShape.Inst(rop, 0);
-				return OtherBinding.new(receiver, etype, Members.opMember(rop, typeParams));
+				var rop = if(typeArgs != null, comp.subst(typeArgs.substitute), comp);
+				return expr.bind(receiver, VarBinding.Inst(rop, 0), rop.getFunctionType());
 			}
-			Partial(op, typeParams): {
+			Partial(comp, typeParams): {
 				var typeArgs = abstractTypeParams2("member", expr, typeParams);
-				var rop = if(typeArgs != null, op.subst(typeArgs.substitute), op);
-				expr.shape = BindingShape.Inst(rop, 0);
-				return OtherBinding.new(receiver, etype, Members.closureMember(rop, typeParams));
+				var rop = if(typeArgs != null, comp.subst(typeArgs.substitute), comp);
+				var resultType = rop.getResidualType(INDEX_0);
+				return expr.bind(receiver, VarBinding.Partial(rop, 0), resultType);
 			}
-			Gen(gen, typeParams, facts): {
+			Apply(gen, typeParams, facts): {
 				var typeArgs = abstractTypeParams2("member", expr, typeParams);
 				var rgen = if(typeArgs != null, gen.subst(typeArgs.substitute), gen);
-				expr.shape = BindingShape.Inst(rgen, facts);
-				var resultType = if(receiver == null, rgen.getFunctionType(), rgen.resultType);
-				return OtherBinding.new(receiver, etype, GenMember.new(gen, resultType));
+				expr.receiver = receiver;
+				return expr.bind(receiver, VarBinding.Apply(rgen, facts), rgen.resultType);
 			}
-			_: ;
+			_: return VarBinding.None;
 		}
-		return null; // TODO
 	}
-	def newOtherMemberBinding(expr: VarExpr, receiver: Expr, etype: Type, member: Member) -> OtherBinding {
-		var typeArgs = abstractTypeParams("member", expr, member.typeParams);
-		if (typeArgs != null) member = member.bindTypeArgs(typeArgs);
-		return OtherBinding.new(receiver, etype, member);
-	}
-	def lookupComponentMember(expr: VarExpr, etype: Type, name: string) -> Binding {
+	def lookupComponentMember(expr: VarExpr, receiver: Expr, etype: Type, name: string) -> VarBinding {
 		var member = V3Component_TypeCon.!(etype.typeCon).componentDecl.memberMap.get(name);
-		if (member == null || isNotAccessible(member)) return null;
+		if (member == null || isNotAccessible(member)) return VarBinding.None;
 		var memberType = inferMemberType(member);
 		if (VstMethod.?(member)) {
-			return methodBinding(expr, VstBinding.COMPONENT_METHOD, etype, VstMethod.!(member), memberType);
+			var r = asResolvedMethod(expr, etype, VstMethod.!(member), memberType);
+			return expr.bind(receiver, VarBinding.ComponentMethod(r.getMethod(), r.typeArgs), r.memberType);
 		}
 		if (VstField.?(member)) {
 			abstractTypeParams("field", expr, null);
-			return MemberBinding.new(VstBinding.COMPONENT_FIELD, etype, null, member, memberType, !VstField.!(member).isReadOnly);
+			return expr.bind(receiver, VarBinding.ComponentField(VstField.!(member)), memberType);
 		}
-		return null;
+		return VarBinding.None;
 	}
-	def lookupClassMember(expr: VarExpr, inType: bool, classType: ClassType, name: string) -> Binding {
+	def lookupClassMember(expr: VarExpr, inType: bool, classType: ClassType, name: string) -> VarBinding {
 		var member: VstMember;
+		var binding: VarBinding;
 		if (Strings.equal("new", name)) {
 			// lookup constructor
-			if (!inType || classType.typeCon.kind != V3Kind.CLASS) return null;
+			if (!inType || classType.typeCon.kind != V3Kind.CLASS) return binding;
 			member = classType.classDecl.constructor;
 		} else {
 			// lookup method or field
@@ -899,44 +894,55 @@ class MethodEnv {
 		while (member == null) {
 			// member was not found in this type
 			classType = classType.getSuperType();
-			if (classType == null) return null;
+			if (classType == null) return binding;
 			member = classType.classDecl.memberMap.get(name);
 		}
-		if (isNotAccessible(member)) return null;
+		if (isNotAccessible(member)) return binding;
 		// get the type args associated with the object type and substitute for member type
 		var typeArgs = classType.getTypeArgs();
 		var memberType = inferMemberType(member).substitute(typeArgs);
 		if (VstNew.?(member)) {
 			var param = Function.getParamType(memberType);
 			var newType = Function.newType(param, classType);
-			return MemberBinding.new(VstBinding.CLASS_NEW, classType, null, member, newType, false);
+			return expr.bind(null, VarBinding.ClassNew(classType, VstNew.!(member), newType), newType);
 		}
 		if (VstMethod.?(member)) {
-			var kind = VstBinding.OBJECT_METHOD;
+			var method = VstMethod.!(member);
 			if (inType) {
-				kind = VstBinding.CLASS_METHOD;
 				memberType = Function.prependParamType(classType, memberType);
+				var r = asResolvedMethod(expr, classType, method, memberType);
+				return expr.bind(null, VarBinding.ClassMethod(r.container, method, r.typeArgs), r.memberType);
+			} else {
+				var r = asResolvedMethod(expr, classType, method, memberType);
+				return expr.bind(expr.expr, VarBinding.ObjectMethod(r.container, method, r.typeArgs), r.memberType);
 			}
-			return methodBinding(expr, kind, classType, VstMethod.!(member), memberType);
 		}
 		if (VstField.?(member)) {
 			abstractTypeParams("field", expr, null);
-			var kind: byte;
-			var writable = !VstField.!(member).isReadOnly;
+			var field = VstField.!(member);
+			var receiver = expr.expr;
 			if (inType) {
-				kind = if(classType.typeCon.kind == V3Kind.ENUM, VstBinding.ENUM_DECL_PARAM, VstBinding.CLASS_FIELD);
+				match (classType.typeCon.kind) {
+					V3Kind.ENUM: binding = VarBinding.Inst(classType.enumGetParamComputation(field), 0);
+					V3Kind.VARIANT,
+					V3Kind.CLASS: binding = VarBinding.ClassField(classType, field);
+				}
 				memberType = Function.newType(classType, memberType);
-				writable = false;
+				receiver = null;
 			} else {
-				kind = if(classType.typeCon.kind == V3Kind.ENUM, VstBinding.ENUM_INST_PARAM, VstBinding.OBJECT_FIELD);
+				match (classType.typeCon.kind) {
+					V3Kind.ENUM: binding = VarBinding.Apply(classType.enumGetParamComputation(field), 0);
+					V3Kind.VARIANT: binding = VarBinding.VariantField(classType, field);
+					V3Kind.CLASS: binding = VarBinding.ObjectField(classType, field);
+				}
 			}
-			return MemberBinding.new(kind, classType, null, member, memberType, writable);
+			return expr.bind(receiver, binding, memberType);
 		}
 		if (inType && VstCaseMember.?(member)) {
 			var vc = VstCaseMember.!(member);
 			if (vc.decl == null) {
 				// enum case member is a constant.
-				return OtherBinding.new(null, classType, Members.valMember(classType, Int.box(vc.tag), false));
+				return expr.bind(null, VarBinding.Value(Int.box(vc.tag), classType), classType);
 			}
 			if (vc.decl.params != null) {
 				// variant case member with params is a function.
@@ -944,46 +950,38 @@ class MethodEnv {
 				var ptype = Tuple.newType(ptypes).substitute(typeArgs);
 				memberType = Function.newType(ptype, memberType);
 			}
-			return MemberBinding.new(VstBinding.VARIANT_CASE, classType, null, vc, memberType, false);
+			return expr.bind(null, VarBinding.VariantCase(classType, vc), memberType);
 		}
 		if (VstVariantTagMember.?(member)) {
 			var op = V3Op.newVariantGetTag(classType);
-			if (inType) return newOpBinding(classType, op);
-			else return newApplyOpBinding(expr, classType, op);
+			if (inType) return newCompBinding(expr, op);
+			else return newApplyCompBinding(expr, expr.expr, op);
 		}
 		if (VstVariantNameMember.?(member)) {
-			if (inType) return OtherBinding.new(null, classType, V3Variant_NameFunction.new(classType));
-			else return OtherBinding.new(expr, classType, V3Variant_NameMember.new(classType));
+			var comp = classType.getNameComputation();
+			if (inType) return newCompBinding(expr, comp);
+			else return newApplyCompBinding(expr, expr.expr, comp);
 		}
-		return null;
+		return binding;
 	}
-	def methodBinding(expr: VarExpr, kind: byte, etype: Type, meth: VstMethod, memberType: Type) -> MemberBinding {
-		var mb = MemberBinding.new(kind, etype, null, meth, memberType, false);
+	def asResolvedMethod(expr: VarExpr, container: Type, meth: VstMethod, memberType: Type) -> ResolvedMember {
+		var result = ResolvedMember.new(container, meth, null, memberType);
 		var typeArgs = abstractTypeParams("method", expr, meth.typeParams);
 		if (typeArgs != null) {
 			var ta = TypeArgs.new(meth.typeEnv, Lists.toArray(typeArgs));
 			memberType = memberType.substitute(ta);
-			mb = MemberBinding.new(mb.kind, etype, null, mb.member, memberType, false);
-			mb.typeArgs = ta;
+			result = ResolvedMember.new(container, meth, ta, memberType);
 		}
-		return mb;
+		return result;
 	}
 	def isNotAccessible(member: VstMember) -> bool {
 		return member.isPrivate && member.container != compound;
 	}
-	def newOpBinding(container: Type, op: Operator) -> Binding {
-		return OtherBinding.new(null, container, Members.opMember(op, null));
+	def newCompBinding(expr: VarExpr, comp: Computation) -> VarBinding {
+		return expr.bind(null, VarBinding.Inst(comp, 0), comp.getFunctionType());
 	}
-	def newCompBinding(container: Type, op: Computation) -> Binding {
-		if (Operator.?(op)) return newOpBinding(container, Operator.!(op));
-		if (SsaGenerator.?(op)) {
-			// TODO expr.shape = BindingShape.Inst(op, 0);
-			return OtherBinding.new(null, container, GenMemberFunc.new(SsaGenerator.!(op)));
-		}
-		return null;
-	}
-	def newApplyOpBinding(thisExpr: Expr, container: Type, op: Operator) -> Binding {
-		return OtherBinding.new(thisExpr, container, Members.applyMember(op, null));
+	def newApplyCompBinding(expr: VarExpr, receiver: Expr, comp: Computation) -> VarBinding {
+		return expr.bind(receiver, VarBinding.Apply(comp, 0), comp.resultType);
 	}
 	def enterScope() {
 		if (envDepth == envStack.length) envStack = Arrays.grow(envStack, envStack.length * 2);
@@ -1003,26 +1001,29 @@ class MethodEnv {
 		map.set(varDecl.token.image, varDecl);
 		varDecl.ssa = VstSsaVar.new(); // XXX: move to VstSsaBuilder
 	}
-	def lookupVar(expr: VarExpr, nested: bool) -> Binding {
+	def lookupVar(expr: VarExpr, nested: bool) -> VarBinding {
 		var i = expr.ident, token = i.name, name = token.image;
-		var binding: Binding;
+		var binding: VarBinding;
 		// lookup up a local variable or parameter
-		if ((binding = lookupLocal(token)) != null) {
+		if ((binding = lookupLocal(expr, token)).ok()) {
 			if (i.parameterized()) verifier.TypeParamArityError(i.params.range(), "local", name, 0, i.params.length());
 			if (initOrder > 0) {
-				if (thisParam == LocalBinding.!(binding).decl) verifier.InvalidThisUse(expr.range());
+				match (binding) {
+					Local(decl): if (thisParam == decl) verifier.InvalidThisUse(expr.range());
+					_: ;
+				}
 			}
 			return binding;
 		}
 		// lookup a member in the current compound
-		if ((binding = lookupThisMember(expr, name)) != null) {
+		if ((binding = lookupThisMember(expr, name)).ok()) {
 			return binding;
 		}
 		// lookup a member in the current file
 		var synthetic = verifier.file.synthetic;
 		if (synthetic != null) {
-			var binding = lookupComponentMember(expr, synthetic.getDeclaredType(), name);
-			if (binding != null) return binding;
+			var binding = lookupComponentMember(expr, null, synthetic.getDeclaredType(), name);
+			if (binding.ok()) return binding;
 		}
 		// lookup a type
 		var typecon = typeEnv.lookup(name);
@@ -1043,42 +1044,45 @@ class MethodEnv {
 			var typeRef = TypeRef.new(null, token, typeRefs, null, null);
 			var ttype = resolveType(typeRef);
 			if (!nested) verifier.TypeExprError(expr.range(), ttype);
-			return TypeBinding.new(typeRef);
+			return expr.bind(null, VarBinding.Type(ttype), ttype);
 		}
-		return null;
+		return VarBinding.None;
 	}
-	def lookupThisMember(expr: VarExpr, name: string) -> Binding {
-		if (thisParam == null) return null;
-		var binding: Binding;
-		binding = lookupExprMember(expr, verifier.thisType, true);
-		// 3. lookup a member in the implicit "this" object
-		if (binding != null && initOrder > 0) return checkMemberInit(expr, binding);
+	def lookupThisMember(expr: VarExpr, name: string) -> VarBinding {
+		if (thisParam == null) return VarBinding.None;
+		var binding = lookupExprMember(expr, verifier.thisType, true);
+		// lookup a member in the implicit "this" object
+		if (binding.ok() && initOrder > 0) checkMemberInit(expr, binding);
 		return binding;
 	}
-	def checkMemberInit(expr: VarExpr, binding: Binding) -> Binding {
-		if (MemberBinding.?(binding)) {
-			// check if the member referred to this binding has been initialized
-			var m = MemberBinding.!(binding).member;
-			if (VstMethod.?(m)) verifier.MemberNotInitialized(expr.range(), "instance method cannot be referenced outside method body");
-			if (VstField.?(m)) {
-				var f = VstField.!(m);
-				if (f.initOrder <= initOrder) {
-					verifier.MemberNotInitialized(expr.range(), "field used before initialized");
-				}
+	def checkMemberInit(expr: VarExpr, binding: VarBinding) -> VarBinding {
+		var member: VstMember;
+		match (binding) {
+			ObjectField(container, m): member = m;
+			ComponentField(m): member = m;
+			ObjectMethod(container, m, t): member = m;
+			_: return binding;
+		}
+		// check if the member referred to this binding has been initialized
+		if (VstMethod.?(member)) verifier.MemberNotInitialized(expr.range(), "instance method cannot be referenced outside method body");
+		if (VstField.?(member)) {
+			var f = VstField.!(member);
+			if (f.initOrder <= initOrder) {
+				verifier.MemberNotInitialized(expr.range(), "field used before initialized");
 			}
 		}
 		return binding;
 	}
-	def lookupLocal(token: Token) -> Binding {
+	def lookupLocal(expr: VarExpr, token: Token) -> VarBinding {
 		var str = token.image;
 		for (i = envDepth - 1; i >= 0; i--) {
 			var map = envStack(i);
 			if (map != null) {
 				var varDecl = map.get(str);
-				if (varDecl != null) return LocalBinding.new(varDecl);
+				if (varDecl != null) return expr.bind(null, VarBinding.Local(varDecl), varDecl.vtype);
 			}
 		}
-		return null;
+		return VarBinding.None;
 	}
 	def abstractTypeParams(str: string, expr: VarExpr, typeParams: List<TypeParam>) -> List<Type> {
 		if (expr.ident.params == null) {
@@ -1402,15 +1406,13 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 		if (!VarExpr.?(e)) return MatchError(e.range(), "match expression is not a constant");
 		var ve = VarExpr.!(e);
-		if (MemberBinding.?(ve.binding)) {
-			// check whether this is a constant field
-			var m = MemberBinding.!(ve.binding);
-			if (V3.isComponent(m.container) && VstField.?(m.member)) {
-				var f = VstField.!(m.member);
-				if (Literal.?(f.init) && f.isReadOnly) {
-					return assignPatternVal(pattern, Literal.!(f.init).val);
+		match (ve.varbind) {
+			ComponentField(field): {
+				if (Literal.?(field.init) && field.isReadOnly) {
+					return assignPatternVal(pattern, Literal.!(field.init).val);
 				}
 			}
+			_: ;
 		}
 		MatchError(ve.range(), "match expression is not a value");
 	}
@@ -1574,53 +1576,46 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return V3Array.newType(etype);
 	}
 	def visitVar(expr: VarExpr, outer: Type) -> Type {
-		var binding = bind(expr, outer, false);
-		if (binding == null) return if(outer == null, getErrorType(), outer);
-		if (outer != null) TypeSystem.unifyWiden(binding.boundType, outer);
-		return binding.boundType;
+		var binding = lookupBinding(expr, outer, false);
+		if (binding.none()) return if(outer == null, getErrorType(), outer);
+		if (outer != null) TypeSystem.unifyWiden(expr.exactType, outer);
+		return expr.exactType;
 	}
 	def visitLiteral(expr: Literal, outer: Type) -> Type {
 		return expr.exactType;
 	}
-	def bind(expr: VarExpr, outer: Type, nested: bool) -> Binding {
-		var binding = lookupBinding(expr, outer, nested);
-		if (binding != null) {
-			expr.exactType = binding.boundType;
-			expr.binding = binding;
-		}
-		return binding;
-	}
-	def lookupBinding(expr: VarExpr, outer: Type, nested: bool) -> Binding {
-		var binding = expr.binding;
-		if (binding != null) return binding;
+	def lookupBinding(expr: VarExpr, outer: Type, nested: bool) -> VarBinding {
+		var binding = expr.varbind;
+		if (binding.ok()) return binding;
 		if (expr.expr == null) {
 			// "var" -- top level variable
 			binding = methodEnv.lookupVar(expr, nested);
-			if (binding == null) UnresolvedIdentifier(expr.ident.name);
-			return binding;
+			if (binding.none()) UnresolvedIdentifier(expr.ident.name);
 		} else {
 			// "expr.var" -- a member expression
 			if (VarExpr.?(expr.expr)) {
 				// "var.var" -- a member of another var
-				binding = bind(VarExpr.!(expr.expr), null, true);
-				if (binding != null) {
-					var rtype = binding.boundType;
-					if (TypeBinding.?(binding)) {
-						binding = methodEnv.lookupTypeMember(expr, rtype);
-						if (binding == null) UnresolvedMember(expr.ident.name, true, rtype);
-					} else {
+				binding = lookupBinding(VarExpr.!(expr.expr), outer, true);
+				match (binding) {
+					None: ;
+					Type(t): {
+						binding = methodEnv.lookupTypeMember(expr, t);
+						if (binding.none()) UnresolvedMember(expr.ident.name, true, t);
+					}
+					_: {
+						var rtype = expr.expr.exactType;
 						binding = methodEnv.lookupExprMember(expr, rtype, false);
-						if (binding == null) UnresolvedMember(expr.ident.name, false, rtype);
+						if (binding.none()) UnresolvedMember(expr.ident.name, false, rtype);
 					}
 				}
 			} else {
 				// "expr.var" -- a member of some other kind of expression
 				var rtype = inferClosedType(expr.expr);
 				binding = methodEnv.lookupExprMember(expr, rtype, false);
-				if (binding == null) UnresolvedMember(expr.ident.name, false, rtype);
+				if (binding.none()) UnresolvedMember(expr.ident.name, false, rtype);
 			}
-			return binding;
 		}
+		return binding;
 	}
 	def visitString(expr: StringExpr, outer: Type) -> Type {
 		var vst = methodEnv.verifier.verifier.prog.vst;
@@ -1642,6 +1637,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		arrayType = elim(arrayType);
 		typeCheckExprs(expr.args, Int.TYPE_LIST, "array index");
 		expr.func.exactType = arrayType;
+		expr.appbind = AppBinding.ArrayElem(arrayType);
 		return V3Array.elementType(arrayType);
 	}
 	def typeCheckMethodApp(expr: AppExpr, funcType: Type, outer: Type) -> Type {
@@ -1653,7 +1649,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		else ptlist = List.new(paramType, null); // one arg -> use tuple type
 
 		// infer argument expressions' types, including parameter expressions '_'
-		var checkList: List<(Expr, Type)>, partialIndex = 0, tl = ptlist;
+		var checkList: List<(Expr, Type)>, tl = ptlist, partialParamTypes: List<Type>;
 		for (el = argList; el != null; el = el.tail) {
 			var arg = el.head;
 			if (tl == null) {
@@ -1665,8 +1661,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			var paramType = tl.head;
 			if (ParamExpr.?(arg)) {
 				var param = ParamExpr.!(arg);
-				param.ptype = paramType;
-				expr.partial = List.new(param, expr.partial);
+				partialParamTypes = List.new(paramType, partialParamTypes);
 			} else if (paramType.hasTypeVars()) {
 				// parameter type has type variables
 				TypeSystem.unifyWiden(paramType, inferClosedType(arg));
@@ -1684,18 +1679,67 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		// unify return type with outer
 		var returnType = Function.getReturnType(funcType);
 		var resultType: Type;
-		if (expr.partial != null) {
-			// this is a partial application, and its result is a function
-			var plist: List<Type>;
-			for (l = expr.partial; l != null; l = l.tail) {
-				plist = List.new(l.head.ptype, plist);
+		if (partialParamTypes != null) {
+			// this is a partial application, result is a function
+			var boundMap = Vector<int>.new(), i = 1;
+			boundMap.add(0);
+			var paramTypes: List<Type>;
+			for (el = argList; el != null; (el = el.tail, i++)) {
+				if (ParamExpr.?(el.head)) continue;
+				boundMap.add(i);
 			}
-			resultType = Function.newType(Tuple.newType(plist), returnType);
+			resultType = Function.newType(Tuple.newType(Lists.reverse(partialParamTypes)), returnType);
 			if (outer != null) TypeSystem.unifyWiden(resultType, outer);
+			expr.boundMap = boundMap.extract();
+			expr.appbind = AppBinding.Partial(expr.boundMap);
 		} else {
 			// this is a complete application, its result is the return type
 			if (outer != null) TypeSystem.unifyWiden(returnType, outer);
 			resultType = returnType;
+			var varbind: VarBinding, receiver: Expr;
+			if (VarExpr.?(expr.func)) {
+				var v = VarExpr.!(expr.func);
+				varbind = v.varbind;
+				receiver = v.receiver;
+			}
+			match (varbind) {
+				ObjectMethod(container, method, typeArgs): {
+					expr.target = receiver;
+					expr.appbind = AppBinding.CallObjectMethod(container, method, typeArgs);
+				}
+				ComponentMethod(method, typeArgs): {
+					expr.target = receiver;
+					expr.appbind = AppBinding.CallComponentMethod(method.container.getDeclaredType(), method, typeArgs);
+				}
+				ClassMethod(container, method, typeArgs): {
+					expr.target = null;
+					expr.appbind = AppBinding.CallClassMethod(container, method, typeArgs);
+				}
+				ClassNew(container, member, funcType): {
+					expr.target = null;
+					expr.appbind = AppBinding.ClassNew(container, member);
+				}
+				Inst(comp, facts): {
+					expr.target = null;
+					expr.appbind = AppBinding.Apply(comp, facts);
+				}
+				Partial(comp, facts): {
+					expr.target = receiver;
+					expr.appbind = AppBinding.Apply(comp, facts);
+				}
+				VariantCase(container, member): {
+					if (member.decl.params != null) {
+						var variant = V3.getSyntheticVariantType(container, member);
+						expr.target = null;
+						expr.appbind = AppBinding.ClassNew(variant, member.decl.constructor);
+					} else {
+						expr.appbind = AppBinding.CallClosure(elim(funcType));
+					}
+				}
+				_: {
+					expr.appbind = AppBinding.CallClosure(elim(funcType));
+				}
+			}
 		}
 
 		// typecheck remaining expressions against the inferred (closed) type
@@ -1733,17 +1777,17 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return result;
 	}
 	def checkAssignable(left: Expr) {
-		if (VarExpr.?(left)) {
-			var binding = (VarExpr.!(left)).binding;
-			if (binding != null) {
-				if (!binding.isAssignable()) AssignError(left.range());
-				if (LocalBinding.?(binding)) setAssigned(LocalBinding.!(binding).decl.ssa);
+		var expr: VarExpr;
+		if (VarExpr.?(left) && (expr = VarExpr.!(left)).isAssignable()) {
+			match (expr.varbind) {
+				Local(decl): return setAssigned(decl.ssa);
+				_: return;
 			}
-		} else if (AppExpr.?(left)) {
-			if (!V3.isArray(AppExpr.!(left).func.exactType)) AssignError(left.range());
-		} else {
-			AssignError(left.range());
 		}
+		if (AppExpr.?(left) && AppExpr.!(left).isAssignable()) return;
+
+		// Only variables and assignable app expressions allowed
+		AssignError(left.range());
 	}
 	def setAssigned(ssa: VstSsaVar) {
 		// update info for an assigned var variable
@@ -2012,3 +2056,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return tref.render(StringBuffer.new()).toString();
 	}
 }
+class ResolvedMember(container: Type, member: VstMember, typeArgs: TypeArgs, memberType: Type) {
+	def getMethod() -> VstMethod { return VstMethod.!(member); }
+}
+
