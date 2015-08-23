@@ -16,7 +16,7 @@ fi
 if [ $# -gt 0 ]; then
   TESTS="$*"
 else
-  TESTS=$(cat execute.gc large.gc)
+  TESTS=$(cat execute.gc variants.gc large.gc)
 fi
 
 T=$OUT/$target
