@@ -1,0 +1,618 @@
+// Copyright 2015 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Option 1: use Facts to drive folding and reduction
+// Option 2: use "one big switch" to match opcodes
+// Option 3: use "two level switch" to match first int/long/double, then individual
+// Option 4: Operator comes with folding and reduction methods
+
+// Costs:
+// indirect branch of switching over opcodes => don't do if no reduction is likely
+// check if inputs are constants
+
+// Tasks:
+// fold pure operations with constant inputs
+// propagate value facts
+// strength reduce
+// remove redundant loads
+// fold loads of constants
+// Placeholder for looking up array lengths for load elimination.
+def ARRAY_LENGTH_FIELD = newField(V3.stringType, Int.TYPE, Facts.F_VALUE);
+
+def newField(container: Type, fieldType: Type, facts: int) -> IrField {
+	var f = IrField.new(container, fieldType);
+	f.facts |= facts;
+	return f;
+}
+
+// Matches various patterns of SSA instructions, recording the state of the match
+// in the exposed fields.
+class SsaInstrMatcher {
+	var x: SsaInstr;	// First input
+	var y: SsaInstr;	// Second input
+	var xconst: bool;	// true if {x} is a constant
+	var yconst: bool;	// true if {y} is a constant
+	var fold: bool;		// true if all inputs are constants
+	var wide: bool;		// true if this is a long int operation
+	var xval: Val;		// if {x} is a constant, then its value
+	var yval: Val;		// if {y} is a constant, then its value
+	var xint: int;		// if {x} is an int constant, then its value
+	var yint: int;		// if {y} is an int constant, then its value
+	var xlong: long;	// if {x} is a long constant, then its value
+	var ylong: long;	// if {y} is a long constant, then its value
+	var inttype: IntType;	// if this is an integer operation, the result type
+
+	// Initializes the match state for a binary operation and returns {yval}.
+	def binop(i: SsaApplyOp) -> Val {
+		x = i.input0();
+		y = i.input1();
+		fold = false;
+		if (xconst = SsaValue.?(x)) {
+			xval = SsaValue.!(x).val;
+			if (yconst = SsaValue.?(y)) {
+				fold = true;
+				return yval = SsaValue.!(y).val;
+			} else if (i.checkFact(Facts.O_COMMUTATIVE)) {
+				i.inputs(0).update(y);
+				i.inputs(1).update(x);
+				xconst = false;
+				yconst = true;
+				var t = x;
+				x = y;
+				y = t;
+				yval = xval;
+				xval = null;
+				return yval;
+			} else {
+				return yval = null;
+			}
+		}
+		return yval = if(yconst = SsaValue.?(y), SsaValue.!(y).val);
+	}
+	// Initializes the match state for an integer binary operation and returns {yint}.
+	def intbinop(i: SsaApplyOp) -> int {
+		binop(i);
+		if (xconst) xint = Int.unbox(xval);
+		if (yconst) yint = Int.unbox(yval);
+		return yint;
+	}
+	// Initializes the match state for a unary operation and returns {xval}.
+	def unop(i: SsaApplyOp) -> Val {
+		x = i.input0();
+		return xval = if(xconst = SsaValue.?(x), SsaValue.!(x).val);
+	}
+	// Initializes the match state for an n-nary operation and returns {xval}.
+	def n_op(i: SsaApplyOp) -> Val {
+		fold = true;
+		var max = i.inputs.length;
+		for (j < max) {
+			if (!SsaValue.?(x)) return (fold = false, null).last;
+		}
+		if (max >= 1) {
+			x = i.input0();
+			xconst = true;
+			xval = SsaValue.!(x).val;
+		}
+		if (max >= 2) {
+			y = i.input1();
+			yconst = true;
+			yval = SsaValue.!(y).val;
+		}
+		return xval;
+	}
+}
+
+// Optimizes SSA instructions one at a time.
+class SsaInstrOptimizer extends SsaInstrMatcher {
+	def prog: Program;
+	def graph: SsaGraph;
+	var optimize_loads: bool;
+	var optimize_nullchecks: bool;
+	var optimize_inits: bool;
+
+	// Flow-sensitive state.
+	var fields: List<(SsaInstr, IrField, SsaInstr)>;
+	var nonnull: List<SsaInstr>;
+	var inits: List<IrMethod>;
+
+
+	def optimize(i: SsaInstr) {
+		if (SsaApplyOp.?(i)) {
+			var app = SsaApplyOp.!(i);
+			var res = optimizeApplyOp(app);
+			if (res != app) app.replace(res);
+		}
+	}
+
+	def optimizeApplyOp(i: SsaApplyOp) -> SsaInstr {
+		def mismatch = Facts.V_ZERO | Facts.V_NON_ZERO;  // TODO MOVE ME
+		match (i.op.opcode) {
+			Equal: {
+				binop(i);
+				if (fold) return graph.boolConst(Values.equal(xval, yval));
+				if (x == y) return graph.trueConst();
+				if (((x.facts | y.facts) & mismatch) == mismatch) return graph.falseConst();
+			}
+			NotEqual: {
+				binop(i);
+				if (fold) return graph.boolConst(!Values.equal(xval, yval));
+				if (x == y) return graph.falseConst();
+				if (((x.facts | y.facts) & mismatch) == mismatch) return graph.trueConst();
+			}
+			IntAdd: {
+				var yint = intbinop(i);
+				if (fold) return i_const(xint + yint);  // K + K == K
+				if (yconst && yint == 0) return x;        // x + 0 == x
+			}
+			IntSub: {
+				var yint = intbinop(i);
+				if (fold) return i_const(xint - yint);  // K - K == K
+				if (yconst && yint == 0) return x;        // x - 0 == x
+			}
+			IntMul: {
+				var yint = intbinop(i);
+				if (fold) return i_const(xint * yint);  // K * K == K
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return y; // x * 0 == 0
+					if (yint == 1) return x; // x * 1 == 1
+					if (yint == 2) return emitBinop(i_infix(V3Infix.Add), x, x);
+					if ((yint & (yint - 1)) == 0) {
+						// x * 2^k == x << k
+						return emitBinop(i_infix(V3Infix.Shl), x, graph.intConst(IntOp.log(yint)));
+					}
+				}
+			}
+			IntDiv: {
+				var yint = intbinop(i);
+				if (fold && yint != 0) return i_const(xint / yint);  // K / K == K
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return addThrow(i.source, V3Exception.DivideByZero); // fold x / 0
+					if (yint == 1) return x; // x / 1 == x
+					if (yint == -1 && inttype.signed) return emitBinop(i_infix(V3Infix.Sub), graph.zeroConst(), x); // x / -1 == 0 - x
+					if ((yint & (yint - 1)) == 0 && x.checkFact(Facts.V_NON_NEGATIVE)) {
+						// x / 2^k == x >> k
+						return emitBinop(i_infix(V3Infix.Shr), x, graph.intConst(IntOp.log(yint)));
+					}
+					i.facts |= Facts.O_SAFE_DIVIDE;
+				}
+			}
+			IntMod: {
+				var yint = intbinop(i);
+				if (fold && yint != 0) return i_const(xint % yint);  // K / K == K
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return addThrow(i.source, V3Exception.DivideByZero); // fold x % 0
+					if (yint == 1 || (yint == -1 && inttype.signed)) return graph.zeroConst(); // x % +/-1 == 0
+					if ((yint & (yint - 1)) == 0 && x.checkFact(Facts.V_NON_NEGATIVE)) {
+						// x % 2^k == x & (2^k - 1)
+						return emitBinop(i_infix(V3Infix.And), x, graph.intConst(yint - 1));
+					}
+					i.facts |= Facts.O_SAFE_DIVIDE;
+				}
+			}
+			IntAnd: {
+				var yint = intbinop(i);
+				if (fold) return i_const(xint & yint);  // K & K == K
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return y; // x & 0 == 0
+					if (yint == -1) return x; // x & -1 == x
+					if (yint >= 0) i.facts |= Facts.V_NON_NEGATIVE;
+				}
+				if ((x.facts & y.facts & Facts.V_NON_NEGATIVE) == Facts.V_NON_NEGATIVE) i.facts |= Facts.V_NON_NEGATIVE;
+			}
+			IntOr: {
+				var yint = intbinop(i);
+				if (fold) return i_const(xint | yint);  // K | K == K
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return x; // x | 0 == x
+					if (yint == -1) return y; // x | -1 == -1
+					if (yint < 0) i.facts |= Facts.V_BELOW_ZERO;
+				}
+			}
+			IntXor: {
+				var yint = intbinop(i);
+				if (fold) return i_const(xint ^ yint);  // K ^ K == K
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return y; // x ^ 0 == x
+					if (yint >= 0) i.facts |= Facts.V_NON_NEGATIVE;
+				}
+			}
+			IntShl: {
+				var yint = intbinop(i);
+				if (fold) {  // K << K == K
+					var y5 = u5.!(yint);
+					return if(yint == y5, i_const(xint << y5));
+				}
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return x;
+					if (yint < 0 || yint >= inttype.width) return graph.zeroConst();
+					i.facts |= Facts.O_NO_SHIFT_CHECK;
+				}
+				// XXX: optimize ranges for shifts
+			}
+			IntSar: {
+				var yint = intbinop(i);
+				if (fold) {  // K >> K == K
+					var y5 = u5.!(yint);
+					return if(yint == y5, i_const(xint >> y5));
+				}
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return x;
+					if (yint < 0 || yint >= inttype.width) {
+						if (x.checkFact(Facts.V_NON_NEGATIVE)) return graph.zeroConst();
+						if (x.checkFact(Facts.V_BELOW_ZERO)) return graph.intConst(-1);
+						i.inputs(1).update(graph.intConst(inttype.width - 1));
+					}
+					i.facts |= Facts.O_NO_SHIFT_CHECK;
+				}
+				// XXX: optimize ranges for shifts
+			}
+			IntShr: {
+				// Legacy shift, do not optimize.
+			}
+			IntSzr: {
+				var yint = intbinop(i);
+				if (fold) {  // K >>> K = K
+					var y5 = u5.!(yint);
+					return i_const(if(yint == y5, xint & ((1 << inttype.width) - 1) >>> y5));
+				}
+				if (yconst) {
+					var yint = yint;
+					if (yint == 0) return x;
+					if (yint < 0 || yint >= inttype.width) return graph.zeroConst();
+					i.facts |= Facts.O_NO_SHIFT_CHECK;
+				}
+				if (y.checkFact(Facts.V_NON_ZERO)) i.facts |= Facts.V_NON_NEGATIVE;
+				// XXX: optimize ranges for shifts
+			}
+			IntLt: {
+				var yint = intbinop(i);
+				if (fold) {
+					if (inttype.signed) return graph.boolConst(xint < yint);
+					else return graph.boolConst(u32.!(xint) < u32.!(yint));
+				}
+				if (xconst) return emitBinop(i_infix(V3Infix.Gt), y, x);
+			}
+			IntLteq: {
+				var yint = intbinop(i);
+				if (fold) {
+					if (inttype.signed) return graph.boolConst(xint <= yint);
+					else return graph.boolConst(u32.!(xint) <= u32.!(yint));
+				}
+				if (xconst) return emitBinop(i_infix(V3Infix.Gteq), y, x);
+			}
+			IntGt: {
+				var yint = intbinop(i);
+				if (fold) {
+					if (inttype.signed) return graph.boolConst(xint > yint);
+					else return graph.boolConst(u32.!(xint) > u32.!(yint));
+				}
+				if (xconst) return emitBinop(i_infix(V3Infix.Lt), y, x);
+			}
+			IntGteq: {
+				var yint = intbinop(i);
+				if (fold) {
+					if (inttype.signed) return graph.boolConst(xint >= yint);
+					else return graph.boolConst(u32.!(xint) >= u32.!(yint));
+				}
+				if (xconst) return emitBinop(i_infix(V3Infix.Lteq), y, x);
+			}
+			IntConvert: {
+				var xval = unop(i);
+				if (xconst) {
+					var tt = i.op.resultType;
+					var r = IntOp.evalConversion(i.op.paramTypes(0), tt, xval);
+					if (r.approx == CastOp.TRUE) return graph.valConst(tt, xval);
+					if (r.approx == CastOp.VALUE) return graph.valConst(tt, r.result);
+				}
+			}
+			BoolAnd: {
+				binop(i);
+				if (fold) return graph.boolConst(Bool.unbox(xval) && Bool.unbox(yval)); // K && K => K
+				if (yconst) return if(Bool.unbox(yval), x, graph.falseConst()); // x && K => x 
+			}
+			BoolOr: {
+				binop(i);
+				if (fold) return graph.boolConst(Bool.unbox(xval) || Bool.unbox(yval)); // K || K => K
+				if (yconst) return if(Bool.unbox(yval), graph.trueConst(), x);  // x || K => x 
+			}
+			BoolNot: {
+				var xval = unop(i);
+				if (xconst) return graph.boolConst(!Bool.unbox(xval));  // !K  => K
+				if (x.opcode() == Opcode.BoolNot.tag) return x.input0();  // !!x => x
+			}
+			NullCheck: {
+				var receiver = nullcheck(i);
+				if (i.checkFact(Facts.O_NO_NULL_CHECK)) return receiver;
+			}
+			BoundsCheck: {
+				var receiver = boundscheck(i);
+			}
+			TypeSubsume: {
+				var xval = unop(i);
+				if (xconst) return graph.valConst(i.op.resultType, xval);
+			}
+			TypeCast: {
+				var xval = unop(i);
+				var ft = i.op.paramTypes(0), tt = i.op.resultType;
+				var cast = TypeSystem.newTypeCast(ft, tt);
+				if (SsaValue.?(x)) cast = cast.eval(ft, tt, SsaValue.!(x).val);
+				if (xconst) cast = cast.eval(ft, tt, xval);
+
+				match (cast.approx) {
+					CastOp.TRUE: return x; // fold TypeCast
+					CastOp.FALSE: {
+						return addThrow(i.source, V3Exception.TypeCheck); // fold TypeCast
+					}
+					CastOp.TRUE_X_NULL: {
+						// TypeCast -> ConditionalThrow(x == null)
+						var cmp = addEqual(ft, x, graph.nullConst(ft));
+						addConditionalThrow(i.source, V3Exception.TypeCheck, cmp);
+						return x;
+					}
+					CastOp.FALSE_X_NULL: {
+						// TypeCast -> ConditionalThrow(x != null)
+						var cmp = addNotEqual(ft, x, graph.nullConst(ft));
+						addConditionalThrow(i.source, V3Exception.TypeCheck, cmp);
+						return graph.nullConst(tt);
+					}
+					CastOp.VALUE: {
+						return graph.valConst(tt, cast.result);
+					}
+					CastOp.INT_CONVERSION: {
+						return replaceOp(i, V3Op.newIntConvert(ft, tt));
+					}
+					CastOp.ENUM_TO_SET: {
+						return addEnumToSet(V3EnumSet_TypeCon.!(tt.typeCon), x);
+					}
+				}
+				if (x.checkFact(Facts.V_NON_ZERO)) i.setFact(Facts.O_NO_NULL_CHECK);
+			}
+			TypeQuery: {
+				var xval = unop(i);
+				if (xconst) ;  // TODO: optimize type queries
+			}
+			ArrayAlloc: {
+				var len = i.input0();
+				if (len.checkFact(Facts.V_NON_NEGATIVE)) i.facts |= Facts.O_NO_LENGTH_CHECK;
+				if (optimize_loads) {
+					fields = List.new((i, ARRAY_LENGTH_FIELD, i.input0()), fields);
+				}
+			}
+			ArrayGetElem: {
+				var receiver = boundscheck(i);
+				// XXX: fold ArrayGetElem for immutable arrays
+			}
+			ArraySetElem: {
+				var receiver = boundscheck(i);
+			}
+			ArrayGetLength: {
+				var receiver = nullcheck(i);
+				var len = lookupField(i, receiver, ARRAY_LENGTH_FIELD);
+				if (len == null && receiver.opcode() == Opcode.ArrayInit.tag) {
+					// ArrayGetLength(ArrayInit(...)) => |...|
+					return graph.intConst(receiver.inputs.length);
+				}
+			}
+			ClassAlloc: {
+				if (!i.op.isPolymorphic() && i.checkFact(Facts.O_PURE)) {
+					n_op(i);
+					if (fold) {
+						// XXX: fold variant allocations
+					}
+				}
+			}
+			ClassGetField: {
+				var receiver = nullcheck(i), field = fieldOf(i);
+				if (field.isConst()) {
+					if (SsaValue.?(receiver)) {
+						return graph.valConst(getFieldType(i.op), rv(receiver).values(field.index));
+					}
+					i.setFactIf(Facts.O_NO_NULL_CHECK, Facts.O_PURE);
+					i.facts |= Facts.F_VALUE;
+					return lookupField(i, receiver, field);
+				}
+			}
+			ClassInitField: {
+				var field = fieldOf(i);
+				if (field.isConst() && optimize_loads) {
+					fields = List.new((i.input0(), field, i.input1()), fields);  // forward stores
+				}
+			}
+			ClassSetField: {
+				var receiver = nullcheck(i), field = fieldOf(i);
+				if (field.isConst() && optimize_loads) {
+					fields = List.new((receiver, field, i.input1()), fields);  // forward stores
+				}
+			}
+			ClassGetMethod: {
+				var receiver = nullcheck(i), xval = unop(i);
+				if (xconst) {
+					var obj = Record.!(xval);
+					if (!i.op.isPolymorphic()) {  // ClassGetMethod[m](K) => (m, K)
+						var spec = getIrSpec(i.op);
+						return graph.valConst(spec.getBoundType(), Closure.new(obj, spec));
+					}
+				}
+			}
+			ClassGetVirtual: {
+				var receiver = nullcheck(i), meth = getIrSpec(i.op);
+				var dv = devirtualize(meth, receiver);
+				if (dv != null) {
+					if (!i.op.isPolymorphic() && SsaValue.?(receiver)) {  // ClassGetVirtual[m](K) => (m, K)
+						var obj = Record.!(SsaValue.!(receiver).val);
+						return graph.valConst(dv.getBoundType(), Closure.new(obj, dv));
+					}
+					return replaceOp(i, V3Op.newClassGetMethod(dv));  // ClassGetVirtual[m](K) => ClassGetMethod[m](k)
+				}
+			}
+			ClassGetVirtFunc: {
+				var receiver = nullcheck(i), meth = getIrSpec(i.op);
+				var dv = devirtualize(meth, receiver);
+				if (dv != null) return graph.valConst(dv.getFuncType(), FuncVal.new(dv));
+			}
+			Init: {
+				if (!optimize_inits) return i;
+				var method = i.op.attr<IrMethod>();
+				for (l = inits; l != null; l = l.tail) {
+					if (l.head == method) return null;  // init[m]; init[m] => init[m]
+				}
+				inits = List.new(method, inits);
+			}
+			ComponentGetField: {
+				var field = fieldOf(i), sf = VstField.!(field.source);
+				if (sf != null && sf.isReadOnly) {
+					if (Literal.?(sf.init)) {  // C.f => K
+						var lit = Literal.!(sf.init);
+						var const = graph.valConst(lit.exactType, lit.val);
+						return if(lit.exactType != field.fieldType, convert(const, field.fieldType), const);
+					}
+				}
+				if (field.isConst()) return lookupField(i, null, field);
+			}
+			ComponentSetField: {
+				var field = fieldOf(i);
+				if (field.isConst() && optimize_loads) {
+					fields = List.new((null, field, i.input1()), fields);  // forward stores
+				}
+			}
+			ComponentGetMethod: {
+				var xval = unop(i);
+				// XXX: reduce to CreateClosure??
+				if (!i.op.isPolymorphic()) { // ComponentGetMethod[m](K) => (null, K)
+					var spec = getIrSpec(i.op);
+					return graph.valConst(spec.getBoundType(), Closure.new(null, spec));
+				}
+			}
+			TupleCreate: {
+				if (!i.op.isPolymorphic()) {
+					n_op(i);
+					if (fold) {  // (K, ..., K) => K
+						var inputs = i.inputs;
+						var r = prog.newRecord(i.op.resultType, inputs.length);
+						for (j < inputs.length) r.values(j) = SsaValue.!(inputs(j).dest).val;
+						return graph.valConst(i.op.resultType, r);
+					}
+				}
+			}
+			TupleGetElem: {
+				var xval = unop(i);
+				if (xconst) {
+					// fold K.N
+					var index = i.op.attr<int>(), tupleType = i.op.typeArgs(0);
+					var val = Tuple_Value.!(xval), t = Lists.get(tupleType.nested, index);
+					return graph.valConst(t, if(val != null, val.values(index), null));
+				}
+				if (x.opcode() == Opcode.TupleCreate.tag) {
+					// TupleGetElem[n](x:TupleCreate(...)) => x[n]
+					var index = i.op.attr<int>();
+					return SsaApplyOp.!(x).inputs(index).dest;
+				}
+			}
+			CallMethod: {
+				var m = i.op.attr<IrMember>();
+				var facts = m.facts & Facts.O_PURE;
+				if (m.container.typeCon.kind == V3Kind.CLASS) nullcheck(i);
+				else facts |= Facts.O_NO_NULL_CHECK;
+				i.facts |= facts;
+			}
+			CallClassVirtual: {
+				var receiver = i.input0(), meth = getIrSpec(i.op);
+				if (meth.container.typeCon.kind == V3Kind.CLASS) receiver = nullcheck(i);
+				else i.setFact(Facts.O_NO_NULL_CHECK);
+				var dv = devirtualize(meth, receiver);
+				if (dv != null) return replaceOp(i, V3Op.newCallMethod(dv));  // CallClassVirtual[m](K) => CallMethod[m](k)
+			}
+			CallClosure: ;  // TODO
+			CallFunction: ;  // TODO
+			CreateClosure: {
+				if (!i.op.isPolymorphic()) {
+					var xval = unop(i);
+					if (fold) {
+						var spec = getIrSpec(i.op);
+						return graph.valConst(spec.getBoundType(), Closure.new(xval, getIrSpec(i.op)));
+					}
+				}
+			}
+			_: ;
+		}
+		return i;
+	}
+
+	def i_infix(op: byte) -> Operator {
+		return inttype.lookupInfix0(op);
+	}
+	def i_const(v: int) -> SsaInstr {
+		return graph.intConst(inttype.trunc_32(v));
+	}
+	def boundscheck(i: SsaApplyOp) -> SsaInstr {
+		var receiver = nullcheck(i), yval = binop(i);
+		if (yconst) {
+			// TODO
+		}
+		return receiver;
+	}
+	def nullcheck(i: SsaApplyOp) -> SsaInstr {
+		var receiver = i.input0();
+		if (i.checkFact(Facts.O_NO_NULL_CHECK)) return receiver;
+		if (receiver.checkFact(Facts.V_NON_ZERO)) {
+			i.facts |= Facts.O_NO_NULL_CHECK;
+			return receiver;
+		}
+		if (receiver.checkFact(Facts.V_ZERO)) return addThrow(i.source, V3Exception.NullCheck);
+		if (!optimize_nullchecks) return receiver;
+		for (l = nonnull; l != null; l = l.tail) {
+			if (l.head == receiver) {
+				i.facts |= Facts.O_NO_NULL_CHECK;
+				return receiver;
+			}
+		}
+		nonnull = List.new(receiver, nonnull);
+		return receiver;
+	}	
+	def lookupField(load: SsaInstr, receiver: SsaInstr, field: IrField) -> SsaInstr {
+		if (!optimize_loads) return load;
+		for (l = fields; l != null; l = l.tail) {
+			var h = l.head;
+			if (h.0 == receiver && h.1 == field) return h.2;
+		}
+		fields = List.new((receiver, field, load), fields);
+		return load;
+	}
+
+	def replaceOp(i: SsaInstr, op: Operator) -> SsaInstr;
+	def getFieldType(op: Operator) -> Type {
+		return if(op.isPolymorphic(), getIrSpec(op).getFieldType(), IrField.!(op.attr<IrMember>()).fieldType);
+	}
+	def devirtualize(m: IrSpec, x: SsaInstr) -> IrSpec {
+		if (!m.member.checkFact(Facts.M_OVERRIDDEN)) {
+			return m; // CHA devirtualization
+		} else if (SsaValue.?(x) && rv(x) != null) {
+			return prog.ir.resolveMethodImpl(rv(x).rtype, m); // devirtualize K
+		} else if (x.opcode() == Opcode.ClassAlloc.tag) {
+			return prog.ir.resolveMethodImpl(SsaApplyOp.!(x).op.typeArgs(0), m); // devirtualize ClassAlloc
+		}
+		return null;
+	}
+	def getIrSpec(op: Operator) -> IrSpec {
+		var ta = op.typeArgs;
+		return IrSpec.new(ta(0), ta, op.attr<IrMember>());
+	}
+	def addExplicitNullCheck(i: SsaInstr, facts: int);
+	def addThrow(source: Source, exception: string) -> SsaInstr;
+	def addConditionalThrow(source: Source, exception: string, cond: SsaInstr) -> SsaInstr;
+	def emitBinop(op: Operator, x: SsaInstr, y: SsaInstr) -> SsaInstr;
+	def rv(i: SsaInstr) -> Record;
+	def fieldOf(i: SsaApplyOp) -> IrField;
+	def convert(i: SsaValue, t: Type) -> SsaInstr;
+	def addEqual(t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr;
+	def addNotEqual(t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr;
+	def addEnumToSet(tc: V3EnumSet_TypeCon, x: SsaInstr) -> SsaInstr;
+}
