@@ -767,28 +767,25 @@ class MethodEnv {
 	def lookupTypeMember(expr: VarExpr, etype: Type) -> VarBinding {
 		var name = expr.ident.name.image;
 
-		// try to match cast or query operator
-		if (name.length == 1) {
-			var first = name(0);
-			if (first == '?') {
+		// match casts, queries, and equality operators.
+		match (name(0)) {
+			'?': if (name.length == 1) {
 				var ft = abstractTypeParams("type query", expr, TypeUtil.ONE_TYPE_PARAM);
 				ft = addTypeVarConstraint(ft, expr, etype, true);
 				return newCompBinding(expr, V3Op.newTypeQuery(ft.head, etype));
 			}
-			if (first == '!') {
+			'!': if (name.length == 1) {
 				var ft = abstractTypeParams("type cast", expr, TypeUtil.ONE_TYPE_PARAM);
 				ft = addTypeVarConstraint(ft, expr, etype, false);
 				return newCompBinding(expr, V3Op.newTypeCast(ft.head, etype));
+			} else if (name.length == 2 && name(1) == '=') {
+				return newCompBinding(expr, V3Op.newNotEqual(etype));
 			}
+			'=': if (name.length == 2 && name(1) == '=') {
+				return newCompBinding(expr, V3Op.newEqual(etype));
+			}
+			
 		}
-
-		// try to match != and == operators
-		if (name.length == 2 && name(1) == '=') {
-			var first = name(0);
-			if (first == '!') return newCompBinding(expr, V3Op.newNotEqual(etype));
-			if (first == '=') return newCompBinding(expr, V3Op.newEqual(etype));
-		}
-
 		var typeCon = etype.typeCon, kind = typeCon.kind;
 		match (kind) {
 			V3Kind.ENUM: {
@@ -1005,19 +1002,25 @@ class MethodEnv {
 		var i = expr.ident, token = i.name, name = token.image;
 		var binding: VarBinding;
 		// lookup up a local variable or parameter
-		if ((binding = lookupLocal(expr, token)).ok()) {
-			if (i.parameterized()) verifier.TypeParamArityError(i.params.range(), "local", name, 0, i.params.length());
-			if (initOrder > 0) {
-				match (binding) {
-					Local(decl): if (thisParam == decl) verifier.InvalidThisUse(expr.range());
-					_: ;
+		for (j = envDepth - 1; j >= 0; j--) {
+			var map = envStack(j);
+			if (map != null) {
+				var varDecl = map.get(name);
+				if (varDecl != null) {
+					expr.bind(null, VarBinding.Local(varDecl), varDecl.vtype);
+					if (i.parameterized()) verifier.TypeParamArityError(i.params.range(), "local", name, 0, i.params.length());
+					if (initOrder > 0 && thisParam == varDecl) verifier.InvalidThisUse(expr.range());
+					return expr.varbind;
 				}
 			}
-			return binding;
 		}
-		// lookup a member in the current compound
-		if ((binding = lookupThisMember(expr, name)).ok()) {
-			return binding;
+		// lookup a member in the implicit "this" parameter
+		if (thisParam != null) {
+			binding = lookupExprMember(expr, verifier.thisType, true);
+			if (binding.ok()) {
+				if (initOrder > 0) checkMemberInit(expr, binding);
+				return binding;
+			}
 		}
 		// lookup a member in the current file
 		var synthetic = verifier.file.synthetic;
@@ -1048,13 +1051,6 @@ class MethodEnv {
 		}
 		return VarBinding.None;
 	}
-	def lookupThisMember(expr: VarExpr, name: string) -> VarBinding {
-		if (thisParam == null) return VarBinding.None;
-		var binding = lookupExprMember(expr, verifier.thisType, true);
-		// lookup a member in the implicit "this" object
-		if (binding.ok() && initOrder > 0) checkMemberInit(expr, binding);
-		return binding;
-	}
 	def checkMemberInit(expr: VarExpr, binding: VarBinding) -> VarBinding {
 		var member: VstMember;
 		match (binding) {
@@ -1072,17 +1068,6 @@ class MethodEnv {
 			}
 		}
 		return binding;
-	}
-	def lookupLocal(expr: VarExpr, token: Token) -> VarBinding {
-		var str = token.image;
-		for (i = envDepth - 1; i >= 0; i--) {
-			var map = envStack(i);
-			if (map != null) {
-				var varDecl = map.get(str);
-				if (varDecl != null) return expr.bind(null, VarBinding.Local(varDecl), varDecl.vtype);
-			}
-		}
-		return VarBinding.None;
 	}
 	def abstractTypeParams(str: string, expr: VarExpr, typeParams: List<TypeParam>) -> List<Type> {
 		if (expr.ident.params == null) {
@@ -1412,6 +1397,9 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 					return assignPatternVal(pattern, Literal.!(field.init).val);
 				}
 			}
+			Value(val, vtype): {
+				return assignPatternVal(pattern, val);
+			}
 			_: ;
 		}
 		MatchError(ve.range(), "match expression is not a value");
@@ -1586,35 +1574,40 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	}
 	def lookupBinding(expr: VarExpr, outer: Type, nested: bool) -> VarBinding {
 		var binding = expr.varbind;
-		if (binding.ok()) return binding;
+		if (binding.ok()) return binding;  // already bound
 		if (expr.expr == null) {
 			// "var" -- top level variable
 			binding = methodEnv.lookupVar(expr, nested);
 			if (binding.none()) UnresolvedIdentifier(expr.ident.name);
-		} else {
-			// "expr.var" -- a member expression
-			if (VarExpr.?(expr.expr)) {
-				// "var.var" -- a member of another var
-				binding = lookupBinding(VarExpr.!(expr.expr), outer, true);
-				match (binding) {
-					None: ;
-					Type(t): {
-						binding = methodEnv.lookupTypeMember(expr, t);
-						if (binding.none()) UnresolvedMember(expr.ident.name, true, t);
-					}
-					_: {
-						var rtype = expr.expr.exactType;
-						binding = methodEnv.lookupExprMember(expr, rtype, false);
-						if (binding.none()) UnresolvedMember(expr.ident.name, false, rtype);
-					}
-				}
-			} else {
-				// "expr.var" -- a member of some other kind of expression
-				var rtype = inferClosedType(expr.expr);
-				binding = methodEnv.lookupExprMember(expr, rtype, false);
-				if (binding.none()) UnresolvedMember(expr.ident.name, false, rtype);
-			}
+			return binding;
 		}
+		// "expr.var" -- a member expression
+		var etype: Type, inType: bool;
+		if (VarExpr.?(expr.expr)) {
+			// "var.var" -- a member of another var
+			binding = lookupBinding(VarExpr.!(expr.expr), outer, true);
+			match (binding) {
+				None: ;
+				Type(t): {
+					etype = t; inType = true;
+					binding = methodEnv.lookupTypeMember(expr, etype);
+				}
+				VariantCase(container, member): {
+					etype = expr.expr.exactType;
+					binding = methodEnv.lookupExprMember(expr, etype, false);
+					if (binding.none()) binding = methodEnv.lookupTypeMember(expr, etype);
+				}
+				_: {
+					etype = expr.expr.exactType;
+					binding = methodEnv.lookupExprMember(expr, etype, false);
+				}
+			}
+		} else {
+			// "expr.var" -- a member of some other kind of expression
+			etype = inferClosedType(expr.expr);
+			binding = methodEnv.lookupExprMember(expr, etype, false);
+		}
+		if (binding.none()) UnresolvedMember(expr.ident.name, inType, etype);
 		return binding;
 	}
 	def visitString(expr: StringExpr, outer: Type) -> Type {
