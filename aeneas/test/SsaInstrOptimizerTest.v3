@@ -16,16 +16,23 @@ def runAllTests() {
 	testArrayOps();
 	testBoundsChecks();
 	testNullChecks();
+	testFlowSensitiveNullChecks();
+	testLoadElimination();
 	testClassOps();
 	testComponentOps();
 	testTupleOps();
 	testClosureOps();
+	testVariantOps();
+	testConditionalThrow();
 }
 
 class SsaInstrOptimizerTester {
 	def prog = Program.new();
 	def graph = SsaGraph.new([SsaParam.new(0, Int.TYPE)], Int.TYPE);
 	def context = SsaContext.new(null, prog);
+	var optimize_loads: bool;	// activates load elimination
+	var optimize_nullchecks: bool;	// activates null check elimination
+	var optimize_inits: bool;	// activates init elimination
 	new() {
 		prog.addLanguage(V3Language.new(prog));
 	}
@@ -34,12 +41,33 @@ class SsaInstrOptimizerTester {
 			block = SsaBlock.new();
 			block.append(i);
 		}
-		var opt = SsaInstrOptimizer.new(context);
-		opt.reset(graph, block, i);
+		var opt = newOptimizer(block, i);
 		return opt.optimizeInstr(i);
 	}
+	def optB(block: SsaBlock) {
+		var opt = newOptimizer(block, null);
+		opt.optimizeBlock();
+	}
 	def assertIK(val: int, i: SsaInstr) {
-		TEST.eq(val, SsaValue.!(opt1(null, i)).unbox<int>());
+		var j = opt1(null, i);
+		if (!SsaValue.?(j)) failInstr(SsaValue.new(Int.TYPE, Int.box(val)), j);
+		TEST.eq(val, SsaValue.!(j).unbox<int>());
+	}
+	def assertRK(vals: Array<Val>, i: SsaInstr) {
+		var j = opt1(null, i);
+		TEST.eq(true, SsaValue.?(j));
+		var v = SsaValue.!(j);
+		TEST.eq(true, Record.?(v.val));
+		var r = Record.!(v.val);
+		TEST.eq(vals.length, r.values.length);
+		for (k < vals.length) {
+			TEST.eq(true, Values.equal(vals(k), r.values(k)));
+		}
+	}
+	def assertTK(vals: Array<Val>, i: SsaInstr) {
+		var j = opt1(null, i);
+		TEST.eq(true, SsaValue.?(j));
+		TEST.eq(true, Values.equal(Tuple_Value.new(vals), SsaValue.!(j).val));
 	}
 	def assertBK(val: bool, i: SsaInstr) {
 		TEST.eq(val, SsaValue.!(opt1(null, i)).unbox<bool>());
@@ -91,8 +119,7 @@ class SsaInstrOptimizerTester {
 		}
 	}
 	def addThrow(block: SsaBlock, i: SsaInstr, exception: string) -> SsaInstr {
-		var opt = SsaInstrOptimizer.new(context);
-		opt.reset(graph, block, i.prev);
+		var opt = newOptimizer(block, i.prev);
 		return opt.addThrow(null, exception);
 	}
 	def assertLink(i: SsaLink, j: SsaLink) {
@@ -138,6 +165,23 @@ class SsaInstrOptimizerTester {
 			p.buf.ln();
 		}
 		p.flush();
+	}
+	def newOptimizer(block: SsaBlock, link: SsaLink) -> SsaInstrOptimizer {
+		var opt = SsaInstrOptimizer.new(context);
+		opt.optimize_loads = optimize_loads;
+		opt.optimize_nullchecks = optimize_nullchecks;
+		opt.optimize_inits = optimize_inits;
+		opt.reset(graph, block, link);
+		return opt;
+	}
+	def recordConst(rtype: Type, vals: Array<Val>) -> SsaValue {
+		var r = prog.newRecord(rtype, vals.length);
+		for (i < vals.length) r.values(i) = vals(i);
+		return graph.valConst(rtype, r);
+	}
+	def tupleConst(rtype: Type, vals: Array<Val>) -> SsaValue {
+		var r = Tuple_Value.new(vals);
+		return graph.valConst(rtype, r);
 	}
 }
 
@@ -536,13 +580,80 @@ def testTypeQuery() {
 }
 
 def testArrayOps() {
-	// TODO
+	def T = SsaInstrOptimizerTester.new();
+	def P = T.graph.params(0);
+	def K = T.graph.intConst;
+
+	def R = T.recordConst(V3.stringType, [
+		Int.box(11),
+		Int.box(12),
+		Int.box(13),
+		Int.box(14),
+		Int.box(15)
+	]);
+
+	// test length check of ArrayAlloc
+	T.assertFact(Facts.O_NO_LENGTH_CHECK, ARRAY_ALLOC(K(0)));
+	T.assertFact(Facts.O_NO_LENGTH_CHECK, ARRAY_ALLOC(K(33)));
+
+	// test fold of ArrayInit
+	T.assertNo(ARRAY_INIT([K(0), P]));
+	T.assertNo(ARRAY_INIT([P, K(0)]));
+	T.assertRK([], ARRAY_INIT([]));
+	T.assertRK([Int.box(11)], ARRAY_INIT([K(11)]));
+	T.assertRK([Int.box(11), Int.box(12)], ARRAY_INIT([K(11), K(12)]));
+	T.assertRK([Int.box(11), Int.box(12), Int.box(-1333)], ARRAY_INIT([K(11), K(12), K(-1333)]));
+
+	// test fold of pure ArrayGetElem
+	for (i < Record.!(R.val).values.length) {
+		var G = ARRAY_GET_ELEM(R, K(i));
+		T.assertNo(        G);
+		G.setFact(Facts.O_PURE);
+		T.assertIK(11 + i, G);
+	}
+
+	// ArrayGetLength
+	T.assertId(P, ARRAY_GET_LENGTH(ARRAY_ALLOC(P)));
+	T.assertIK(5, ARRAY_GET_LENGTH(R));
+	T.assertIK(3, ARRAY_GET_LENGTH(ARRAY_INIT([K(1), K(2), K(3)])));
 }
 
 def ARRAY_ALLOC = unop(V3Op.newArrayAlloc(V3.stringType), _);
 def ARRAY_GET_ELEM = binop(V3Op.newArrayGetElem(V3.stringType), _, _);
 def ARRAY_SET_ELEM = triop(V3Op.newArrayGetElem(V3.stringType), _, _, _);
+def ARRAY_GET_LENGTH = unop(V3Op.newArrayGetLength(V3.stringType), _);
+def ARRAY_INIT(instrs: Array<SsaInstr>) -> SsaInstr {
+	var op = V3Op.newArrayInit(V3.stringType, instrs.length);
+	var i = SsaApplyOp.new(null, op, instrs);
+	i.setFact(Operators.facts(op.opcode));
+	return i;
+}
+def newTupleType(len: int) -> Type {
+	var l: List<Type>;
+	for (i < len) l = List.new(Int.TYPE, l);
+	return Tuple.newType(l);
+}
+def TUPLE_CREATE(instrs: Array<SsaInstr>) -> SsaInstr {
+	var op = V3Op.newTupleCreate(newTupleType(instrs.length));
+	var i = SsaApplyOp.new(null, op, instrs);
+	i.setFact(Operators.facts(op.opcode));
+	return i;
+}
 def BOUNDS_CHECK = binop(V3Op.newBoundsCheck(V3.stringType), _, _);
+
+def makeIrField(container: Type, fieldType: Type, facts: int) -> IrSpec {
+	var field = IrField.new(container, fieldType);
+	field.facts = facts;
+	field.index = 0;
+	return IrSpec.new(container, TypeUtil.NO_TYPES, field);
+}
+
+def TYPE_CACHE = TypeCache.new();
+def TEST_CLASS_TYPE = V3.stringType;
+def IMM_FIELD = makeIrField(TEST_CLASS_TYPE, Int.TYPE, Facts.F_VALUE);
+def MUT_FIELD = makeIrField(TEST_CLASS_TYPE, Int.TYPE, 0);
+def CLASS_GET_FIELD = unop(V3Op.newClassGetField(MUT_FIELD), _);
+def CLASS_SET_FIELD = binop(V3Op.newClassSetField(MUT_FIELD), _, _);
 
 def testBoundsChecks() {
 	def T = SsaInstrOptimizerTester.new();
@@ -607,7 +718,9 @@ def testNullChecks() {
 		BOUNDS_CHECK(_, K(0)),
 		ARRAY_GET_ELEM(_, K(0)),
 		ARRAY_SET_ELEM(_, K(0), K(0)),
-		ARRAY_SET_ELEM(_, K(0), K(0))
+		ARRAY_SET_ELEM(_, K(0), K(0)),
+		CLASS_GET_FIELD(_),
+		CLASS_SET_FIELD(_, K(0))
 	];
 
 	def N = T.graph.nullConst(V3.stringType);
@@ -629,22 +742,182 @@ def testNullChecks() {
 		// no null check for non-zero
 		T.assertFact(Facts.O_NO_NULL_CHECK, f(A));
 	}
+}
 
+def testFlowSensitiveNullChecks() {
+	def T = SsaInstrOptimizerTester.new();
+	def P = T.graph.params(0);
+	def K = T.graph.intConst;
+	def R = T.prog.newRecord(V3.stringType, 4);
 
+	def instrs = [
+		BOUNDS_CHECK(_, K(0)),
+		ARRAY_GET_ELEM(_, K(0)),
+		ARRAY_SET_ELEM(_, K(0), K(0)),
+		ARRAY_SET_ELEM(_, K(0), K(0)),
+		CLASS_GET_FIELD(_),
+		CLASS_SET_FIELD(_, K(0))
+	];
+
+	for (on in [false, true]) {
+		T.optimize_nullchecks = on;
+		for (f in instrs) {
+			var i = f(P), j = f(P);
+			var block = T.newBlock([i, j]);
+			T.optB(block);
+			T.assertBlock(block, [i, j]);
+			TEST.eq(false, i.checkFact(Facts.O_NO_NULL_CHECK));
+			TEST.eq(on,    j.checkFact(Facts.O_NO_NULL_CHECK));
+		}
+	}
+}
+
+def testLoadElimination() {
+	def T = SsaInstrOptimizerTester.new();
+	def P = T.graph.params(0);
+	def P2 = SsaParam.new(1, Int.TYPE);
+	def K = T.graph.intConst;
+
+	def getClass = unop(V3Op.newClassGetField(IMM_FIELD), _);
+	def setClass = binop(V3Op.newClassSetField(IMM_FIELD), _, _);
+	def initClass = binop(V3Op.newClassInitField(IMM_FIELD), _, _);
+	def getComp = unop(V3Op.newComponentGetField(IMM_FIELD), _);
+	def setComp = binop(V3Op.newComponentSetField(IMM_FIELD), _, _);
+
+	for (on in [false, true]) {
+		// load of the same field from the same object
+		T.optimize_loads = on;
+		var ia = [setClass, initClass, setComp, setComp];
+		var ja = [getClass, getClass, getComp, ARRAY_GET_LENGTH];
+		for (kind < 4) {
+			var i = ja(kind)(P);
+			var j = ja(kind)(P);
+			var k = INT32_ADD(i, j);
+			var block = T.newBlock([i, j, k]);
+			var before = i.checkFact(Facts.O_NO_NULL_CHECK);
+			T.optB(block);
+			TEST.eq(before, i.checkFact(Facts.O_NO_NULL_CHECK));
+			if (on) {
+				T.assertBlock(block, [i, k]);
+				assertShape(INT32_ADD(i, i), k);
+			} else {
+				T.assertBlock(block, [i, j, k]);
+			}
+		}
+		// load-store-forwarding
+		T.optimize_loads = on;
+		for (kind < 3) {
+			var i = ia(kind)(P, P2);
+			var j = ja(kind)(P);
+			var k = INT32_ADD(j, K(2));
+			var block = T.newBlock([i, j, k]);
+			var before = i.checkFact(Facts.O_NO_NULL_CHECK);
+			T.optB(block);
+			TEST.eq(before, i.checkFact(Facts.O_NO_NULL_CHECK));
+			if (on) {
+				T.assertBlock(block, [i, k]);
+				assertShape(INT32_ADD(P2, K(2)), k);
+			} else {
+				T.assertBlock(block, [i, j, k]);
+			}
+		}
+	}
+
+	{
+		// negative test; load P.f and P2.f
+		T.optimize_loads = true;
+		var i = getClass(P), j = getClass(P2), k = INT32_ADD(i, j);
+		var block = T.newBlock([i, j, k]);
+		T.optB(block);
+		TEST.eq(false, i.checkFact(Facts.O_NO_NULL_CHECK));
+		T.assertBlock(block, [i, j, k]);
+		assertShape(INT32_ADD(i, j), k);
+	}
+	{
+		// immutable fields
+		def R = T.recordConst(V3.stringType, [
+			Int.box(11),
+			Int.box(12),
+			Int.box(13)
+		]);
+		for (i < 3) {
+			def f = makeIrField(TEST_CLASS_TYPE, Int.TYPE, Facts.F_VALUE);
+			f.member.index = i;
+			T.assertIK(11 + i, unop(V3Op.newClassGetField(f), R));
+		}
+	}
 }
 
 def testClassOps() {
 	// TODO
+	def T = SsaInstrOptimizerTester.new();
+	def P = T.graph.params(0);
+	def P2 = SsaParam.new(1, Int.TYPE);
+	def K = T.graph.intConst;
+
+	def get = unop(V3Op.newClassGetField(IMM_FIELD), _);
+
 }
 
 def testComponentOps() {
 	// TODO
 }
 
+def TUPLE_GET_ELEM(index: int, x: SsaInstr) -> SsaInstr {
+	return unop(V3Op.newTupleGetElem(x.getType(), index), x);
+}
+
 def testTupleOps() {
-	// TODO
+	def T = SsaInstrOptimizerTester.new();
+	def P = T.graph.params(0);
+	def K = T.graph.intConst;
+
+	// test fold of TupleCreate
+	T.assertNo(TUPLE_CREATE([K(0), P]));
+	T.assertNo(TUPLE_CREATE([P, K(0)]));
+	T.assertTK([], TUPLE_CREATE([]));
+	T.assertTK([Int.box(11)], TUPLE_CREATE([K(11)]));
+	T.assertTK([Int.box(11), Int.box(12)], TUPLE_CREATE([K(11), K(12)]));
+	T.assertTK([Int.box(11), Int.box(12), Int.box(-1333)], TUPLE_CREATE([K(11), K(12), K(-1333)]));
+
+	// test fold of TupleGetElem
+	var tupleType = newTupleType(3);
+	def P1 = SsaParam.new(1, tupleType);
+	T.assertNo(TUPLE_GET_ELEM(0, P1));
+	T.assertNo(TUPLE_GET_ELEM(1, P1));
+	T.assertNo(TUPLE_GET_ELEM(2, P1));
+	def R = T.tupleConst(tupleType, [
+		Int.box(33),
+		Int.box(66),
+		Int.box(99)
+	]);
+	T.assertIK(33, TUPLE_GET_ELEM(0, R));
+	T.assertIK(66, TUPLE_GET_ELEM(1, R));
+	T.assertIK(99, TUPLE_GET_ELEM(2, R));
+
+	T.assertId(P,   TUPLE_GET_ELEM(0, TUPLE_CREATE([P, K(1), K(2)])));
+	T.assertIK(109, TUPLE_GET_ELEM(1, TUPLE_CREATE([P, K(109), K(207)])));
+	T.assertIK(313, TUPLE_GET_ELEM(2, TUPLE_CREATE([P, K(-99), K(313)])));
 }
 
 def testClosureOps() {
 	// TODO
+}
+
+def testVariantOps() {
+	// TODO
+}
+
+def CONDITIONAL_THROW(exception: string, x: SsaInstr) -> SsaInstr {
+	return SsaApplyOp.new(null, V3Op.newConditionalThrow(exception), [x]);
+}
+
+def testConditionalThrow() {
+	def T = SsaInstrOptimizerTester.new();
+	def P = T.graph.params(0);
+	def K = T.graph.boolConst;
+
+	T.assertNo(CONDITIONAL_THROW(V3Exception.BoundsCheck, P));
+	T.assertThrow(V3Exception.BoundsCheck, CONDITIONAL_THROW(V3Exception.BoundsCheck, K(true)));
+	T.assertFact(Facts.O_KILLED,  CONDITIONAL_THROW(V3Exception.BoundsCheck, K(false)));
 }

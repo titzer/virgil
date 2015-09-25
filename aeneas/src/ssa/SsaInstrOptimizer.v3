@@ -83,14 +83,14 @@ class SsaInstrMatcher {
 	// Initializes the match state for a unary operation and returns {xval}.
 	def unop(i: SsaApplyOp) -> Val {
 		x = i.input0();
-		return xval = if(xconst = SsaValue.?(x), SsaValue.!(x).val);
+		return xval = if(fold = xconst = SsaValue.?(x), SsaValue.!(x).val);
 	}
 	// Initializes the match state for an n-ary operation and returns {xval}.
 	def n_op(i: SsaApplyOp) -> Val {
 		fold = true;
 		var max = i.inputs.length;
 		for (j < max) {
-			if (!SsaValue.?(x)) return (fold = false, null).last;
+			if (!SsaValue.?(i.inputs(j).dest)) return (fold = false, null).last;
 		}
 		if (max >= 1) {
 			x = i.input0();
@@ -108,7 +108,6 @@ class SsaInstrMatcher {
 
 // Optimizes SSA instructions one at a time.
 class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
-	var prog: Program;
 	var graph: SsaGraph;
 	var block: SsaBlock;
 	var link: SsaLink;  		// current instruction insertion point
@@ -364,12 +363,7 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			BoundsCheck: {
 				var receiver = boundscheck(i);
 				if (SsaThrow.?(receiver)) return receiver;
-				if (i.checkFact(Facts.O_SAFE_BOUNDS)) {
-					i.remove();
-					i.kill();
-					i.setFact(Facts.O_KILLED);
-					return i;
-				}
+				if (i.checkFact(Facts.O_SAFE_BOUNDS)) return killInstr(i);
 			}
 			TypeSubsume: {
 				var xval = unop(i);
@@ -441,10 +435,23 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 					fields = List.new((i, ARRAY_LENGTH_FIELD, i.input0()), fields);
 				}
 			}
+			ArrayInit: {
+				if (i.op.isPolymorphic()) return i;
+				n_op(i);
+				if (!fold) return i;
+				// ArrayInit(#K, #K ...) => #K
+				var arrayType = i.op.typeArgs(0);
+				var record = context.prog.newRecord(arrayType, i.inputs.length);
+				for (j < i.inputs.length) record.values(j) = SsaValue.!(i.inputs(j).dest).val;
+				return graph.recordConst(record);
+			}
 			ArrayGetElem: {
 				var receiver = boundscheck(i);
 				if (SsaThrow.?(receiver)) return receiver;
-				// XXX: fold ArrayGetElem for immutable arrays
+				if (!i.checkFact(Facts.O_PURE)) return i;
+				var yval = binop(i);
+				// ArrayGetElem(#array, #index) => K
+				if (fold) return graph.valConst(i.getType(), Record.!(xval).values(Int.unbox(yval)));
 			}
 			ArraySetElem: {
 				var receiver = boundscheck(i);
@@ -453,25 +460,36 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			ArrayGetLength: {
 				var receiver = nullcheck(i);
 				if (SsaThrow.?(receiver)) return receiver;
+				var xval = unop(i);
+				if (xconst) return graph.intConst(Record.!(xval).values.length);
 				var len = lookupField(i, receiver, ARRAY_LENGTH_FIELD);
-				if (len == null && receiver.opcode() == Opcode.ArrayInit.tag) {
+				if (len != i) return len;
+				if (receiver.opcode() == Opcode.ArrayInit.tag) {
 					// ArrayGetLength(ArrayInit(...)) => |...|
 					return graph.intConst(receiver.inputs.length);
 				}
+				if (receiver.opcode() == Opcode.ArrayAlloc.tag) {
+					// ArrayGetLength(ArrayAlloc(x)) => x
+					return receiver.input0();
+				}
 			}
 			ClassAlloc: {
-				if (!i.op.isPolymorphic() && i.checkFact(Facts.O_PURE)) {
-					n_op(i);
-					if (fold) {
-						// XXX: fold variant allocations
-					}
-				}
+				if (i.op.isPolymorphic()) return i;
+				if (!i.checkFact(Facts.O_PURE)) return i;
+				n_op(i);
+				if (!fold) return i;
+				// ClassAlloc(#K, #K ..) => #K (variant)
+				var classType = i.op.typeArgs(0);
+				var record = context.prog.newRecord(classType, i.inputs.length);
+				for (j < i.inputs.length) record.values(j) = SsaValue.!(i.inputs(j).dest).val;
+				return graph.recordConst(record);
 			}
 			ClassGetField: {
 				var receiver = nullcheck(i), field = getIrField(i);
 				if (SsaThrow.?(receiver)) return receiver;
 				if (field.isConst()) {
 					if (SsaValue.?(receiver)) {
+						// ClassGetField(#K) => #K
 						return graph.valConst(getFieldType(i.op), asRecord(receiver).values(field.index));
 					}
 					i.setFactIf(Facts.O_NO_NULL_CHECK, Facts.O_PURE);
@@ -495,23 +513,24 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			ClassGetMethod: {
 				var receiver = nullcheck(i);
 				if (SsaThrow.?(receiver)) return receiver;
+				if (i.op.isPolymorphic()) return i;
 				var xval = unop(i);
 				if (xconst) {
+					// ClassGetMethod[m](#K) => (m, #K)
 					var obj = Record.!(xval);
-					if (!i.op.isPolymorphic()) {  // ClassGetMethod[m](K) => (m, K)
-						var spec = getIrSpec(i.op);
-						return graph.valConst(spec.getBoundType(), Closure.new(obj, spec));
-					}
+					var spec = extractIrSpec(i.op);
+					return graph.valConst(spec.getBoundType(), Closure.new(obj, spec));
 				}
 			}
 			ClassGetVirtual: {
 				var receiver = nullcheck(i);
 				if (SsaThrow.?(receiver)) return receiver;
-				var meth = getIrSpec(i.op);
+				var meth = extractIrSpec(i.op);
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) {
-					if (!i.op.isPolymorphic() && SsaValue.?(receiver)) {  // ClassGetVirtual[m](K) => (m, K)
-						var obj = Record.!(SsaValue.!(receiver).val);
+					var xval = unop(i);
+					if (xconst && !i.op.isPolymorphic()) {  // ClassGetVirtual[m](K) => (m, K)
+						var obj = Record.!(xval);
 						return graph.valConst(dv.getBoundType(), Closure.new(obj, dv));
 					}
 					return replaceOp(i, V3Op.newClassGetMethod(dv));  // ClassGetVirtual[m](K) => ClassGetMethod[m](k)
@@ -520,7 +539,7 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			ClassGetVirtFunc: {
 				var receiver = nullcheck(i);
 				if (SsaThrow.?(receiver)) return receiver;
-				var meth = getIrSpec(i.op);
+				var meth = extractIrSpec(i.op);
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) return graph.valConst(dv.getFuncType(), FuncVal.new(dv));
 			}
@@ -552,21 +571,21 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			ComponentGetMethod: {
 				var xval = unop(i);
 				// XXX: reduce to CreateClosure??
-				if (!i.op.isPolymorphic()) { // ComponentGetMethod[m](K) => (null, K)
-					var spec = getIrSpec(i.op);
-					return graph.valConst(spec.getBoundType(), Closure.new(null, spec));
-				}
+				if (i.op.isPolymorphic()) return i;
+				// ComponentGetMethod[m](K) => (null, K)
+				var spec = extractIrSpec(i.op);
+				return graph.valConst(spec.getBoundType(), Closure.new(null, spec));
 			}
 			TupleCreate: {
-				if (!i.op.isPolymorphic()) {
-					n_op(i);
-					if (fold) {  // (K, ..., K) => K
-						var inputs = i.inputs;
-						var r = prog.newRecord(i.op.resultType, inputs.length);
-						for (j < inputs.length) r.values(j) = SsaValue.!(inputs(j).dest).val;
-						return graph.valConst(i.op.resultType, r);
-					}
-				}
+				if (i.op.isPolymorphic()) return i;
+				n_op(i);
+				if (!fold) return i;
+				// (K, ..., K) => K
+				var tupleType = i.op.typeArgs(0);
+				var inputs = i.inputs;
+				var vals = Array<Val>.new(inputs.length);
+				for (j < inputs.length) vals(j) = SsaValue.!(inputs(j).dest).val;
+				return graph.valConst(i.op.resultType, Tuple_Value.new(vals));
 			}
 			TupleGetElem: {
 				var xval = unop(i);
@@ -594,7 +613,7 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 				i.facts |= facts;
 			}
 			CallClassVirtual: {
-				var receiver = i.input0(), meth = getIrSpec(i.op);
+				var receiver = i.input0(), meth = extractIrSpec(i.op);
 				if (meth.container.typeCon.kind == V3Kind.CLASS) {
 					receiver = nullcheck(i);
 					if (SsaThrow.?(receiver)) return receiver;
@@ -604,19 +623,96 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) return replaceOp(i, V3Op.newCallMethod(dv));  // CallClassVirtual[m](K) => CallMethod[m](k)
 			}
-			CallClosure: ;  // TODO
-			CallFunction: ;  // TODO
-			CreateClosure: {
-				if (!i.op.isPolymorphic()) {
-					var xval = unop(i);
-					if (fold) {
-						var spec = getIrSpec(i.op);
-						return graph.valConst(spec.getBoundType(), Closure.new(xval, getIrSpec(i.op)));
+			CallClosure: {
+				var target = nullcheck(i);
+				if (SsaThrow.?(target)) return target;
+				var xval = unop(i);
+				if (xconst) {
+					var d = Closure.!(xval);
+					if (V3.isComponent(d.memberRef.container)) {
+						// CallClosure(K) => CallMethod
+						var inputs = copyInputs(i, null, 1);
+						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs);
+					} else if (V3.isClass(d.memberRef.container)) {
+						// CallClosure(K) => CallMethod
+						var const = graph.valConst(d.memberRef.container, d.val);
+						var inputs = copyInputs(i, const, 1);
+						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs);
+					}
+				}
+				var opcode = x.opcode();
+				if (opcode == Opcode.ClassGetMethod.tag) {
+					// CallClosure(GetClassMethod) => CallMethod
+					var inputs = copyInputs(i, x.input0(), 1);
+					return add(i.source, V3Op.newCallMethod(extractIrSpec(i.op)), inputs);
+				}
+				if (opcode == Opcode.ClassGetVirtual.tag) {
+					// CallClosure(GetClassVirtual) => CallClassVirtual
+					var inputs = copyInputs(i, x.input0(), 1);
+					return add(i.source, V3Op.newCallClassVirtual(extractIrSpec(i.op)), inputs);
+				}
+				if (opcode == Opcode.ComponentGetMethod.tag) {
+					// CallClosure(GetComponentMethod) => CallMethod
+					var inputs = copyInputs(i, null, 1);
+					return add(i.source, V3Op.newCallMethod(extractIrSpec(i.op)), inputs);
+				}
+			}
+			CallFunction: {
+				var target = nullcheck(i);
+				if (SsaThrow.?(target)) return target;
+				var xval = unop(i);
+				if (xconst) {
+					var d = FuncVal.!(xval);
+					if (V3.isComponent(d.memberRef.container)) {
+						// CallFunction(#K) => CallMethod
+						var inputs = copyInputs(i, null, 2);
+						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs);
+					} else if (V3.isClass(d.memberRef.container)) {
+						// CallFunction(#K) => CallMethod
+						var inputs = copyInputs(i, null, 1);
+						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs);
 					}
 				}
 			}
+			CreateClosure: {
+				if (i.op.isPolymorphic()) return i;
+				var xval = unop(i);
+				if (!fold) return i;
+				// CreateClosure(#K) => #K
+				var spec = extractIrSpec(i.op);
+				return graph.valConst(spec.getBoundType(), Closure.new(xval, spec));
+			}
+			VariantGetTag: {
+				var xval = unop(i);
+				if (fold) {
+					// GetVariantTag(#K) => #K
+					if (Record.?(xval)) return graph.intConst(V3.getVariantTag(Record.!(xval).rtype));
+					return graph.intConst(Int.unbox(xval));
+				}
+			}
+			ConditionalThrow: {
+				var xval = unop(i);
+				if (!fold) return i;
+				// ConditionalThrow(#K) => throw | nop
+				if (Bool.unbox(xval)) return addThrow(i.source, i.op.attr<string>());
+				else return killInstr(i);
+			}
 			_: ;
 		}
+		return i;
+	}
+
+	def copyInputs(i: SsaInstr, prepend: SsaInstr, start: int) -> Array<SsaInstr> {
+		var extra = if(prepend != null, 1);
+		var inputs = Array<SsaInstr>.new(i.inputs.length - start + extra);
+		if (extra > 0) inputs(0) = prepend;
+		for (j = extra; j < inputs.length; j++) inputs(j) = i.inputs(j + start - extra).dest;
+		return inputs;
+	}
+	def killInstr(i: SsaInstr) -> SsaInstr {
+		i.remove();
+		i.kill();
+		i.setFact(Facts.O_KILLED);
 		return i;
 	}
 
@@ -687,14 +783,14 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 		if (!m.member.checkFact(Facts.M_OVERRIDDEN)) {
 			return m; // CHA devirtualization
 		} else if (SsaValue.?(x) && asRecord(x) != null) {
-			return prog.ir.resolveMethodImpl(asRecord(x).rtype, m); // devirtualize K
+			return context.prog.ir.resolveMethodImpl(asRecord(x).rtype, m); // devirtualize K
 		} else if (x.opcode() == Opcode.ClassAlloc.tag) {
-			return prog.ir.resolveMethodImpl(SsaApplyOp.!(x).op.typeArgs(0), m); // devirtualize ClassAlloc
+			return context.prog.ir.resolveMethodImpl(SsaApplyOp.!(x).op.typeArgs(0), m); // devirtualize ClassAlloc
 		}
 		return null;
 	}
 
-	def getIrSpec(op: Operator) -> IrSpec {
+	def extractIrSpec(op: Operator) -> IrSpec {
 		var ta = op.typeArgs;
 		return IrSpec.new(ta(0), ta, op.attr<IrMember>());
 	}
@@ -702,7 +798,7 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 		return Record.!(SsaValue.!(i).val);
 	}
 	def getFieldType(op: Operator) -> Type {
-		return if(op.isPolymorphic(), getIrSpec(op).getFieldType(), IrField.!(op.attr<IrMember>()).fieldType);
+		return if(op.isPolymorphic(), extractIrSpec(op).getFieldType(), IrField.!(op.attr<IrMember>()).fieldType);
 	}
 	def getIrField(i: SsaApplyOp) -> IrField {
 		return IrField.!(i.op.attr<IrMember>());
