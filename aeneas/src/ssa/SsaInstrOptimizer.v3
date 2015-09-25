@@ -85,7 +85,7 @@ class SsaInstrMatcher {
 		x = i.input0();
 		return xval = if(xconst = SsaValue.?(x), SsaValue.!(x).val);
 	}
-	// Initializes the match state for an n-nary operation and returns {xval}.
+	// Initializes the match state for an n-ary operation and returns {xval}.
 	def n_op(i: SsaApplyOp) -> Val {
 		fold = true;
 		var max = i.inputs.length;
@@ -363,6 +363,13 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			}
 			BoundsCheck: {
 				var receiver = boundscheck(i);
+				if (SsaThrow.?(receiver)) return receiver;
+				if (i.checkFact(Facts.O_SAFE_BOUNDS)) {
+					i.remove();
+					i.kill();
+					i.setFact(Facts.O_KILLED);
+					return i;
+				}
 			}
 			TypeSubsume: {
 				var xval = unop(i);
@@ -436,13 +443,16 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			}
 			ArrayGetElem: {
 				var receiver = boundscheck(i);
+				if (SsaThrow.?(receiver)) return receiver;
 				// XXX: fold ArrayGetElem for immutable arrays
 			}
 			ArraySetElem: {
 				var receiver = boundscheck(i);
+				if (SsaThrow.?(receiver)) return receiver;
 			}
 			ArrayGetLength: {
 				var receiver = nullcheck(i);
+				if (SsaThrow.?(receiver)) return receiver;
 				var len = lookupField(i, receiver, ARRAY_LENGTH_FIELD);
 				if (len == null && receiver.opcode() == Opcode.ArrayInit.tag) {
 					// ArrayGetLength(ArrayInit(...)) => |...|
@@ -459,6 +469,7 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			}
 			ClassGetField: {
 				var receiver = nullcheck(i), field = getIrField(i);
+				if (SsaThrow.?(receiver)) return receiver;
 				if (field.isConst()) {
 					if (SsaValue.?(receiver)) {
 						return graph.valConst(getFieldType(i.op), asRecord(receiver).values(field.index));
@@ -476,12 +487,15 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			}
 			ClassSetField: {
 				var receiver = nullcheck(i), field = getIrField(i);
+				if (SsaThrow.?(receiver)) return receiver;
 				if (field.isConst() && optimize_loads) {
 					fields = List.new((receiver, field, i.input1()), fields);  // forward stores
 				}
 			}
 			ClassGetMethod: {
-				var receiver = nullcheck(i), xval = unop(i);
+				var receiver = nullcheck(i);
+				if (SsaThrow.?(receiver)) return receiver;
+				var xval = unop(i);
 				if (xconst) {
 					var obj = Record.!(xval);
 					if (!i.op.isPolymorphic()) {  // ClassGetMethod[m](K) => (m, K)
@@ -491,7 +505,9 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			ClassGetVirtual: {
-				var receiver = nullcheck(i), meth = getIrSpec(i.op);
+				var receiver = nullcheck(i);
+				if (SsaThrow.?(receiver)) return receiver;
+				var meth = getIrSpec(i.op);
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) {
 					if (!i.op.isPolymorphic() && SsaValue.?(receiver)) {  // ClassGetVirtual[m](K) => (m, K)
@@ -502,7 +518,9 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			ClassGetVirtFunc: {
-				var receiver = nullcheck(i), meth = getIrSpec(i.op);
+				var receiver = nullcheck(i);
+				if (SsaThrow.?(receiver)) return receiver;
+				var meth = getIrSpec(i.op);
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) return graph.valConst(dv.getFuncType(), FuncVal.new(dv));
 			}
@@ -567,14 +585,22 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			CallMethod: {
 				var m = i.op.attr<IrMember>();
 				var facts = m.facts & Facts.O_PURE;
-				if (m.container.typeCon.kind == V3Kind.CLASS) nullcheck(i);
-				else facts |= Facts.O_NO_NULL_CHECK;
+				if (m.container.typeCon.kind == V3Kind.CLASS) {
+					var target = nullcheck(i);
+					if (SsaThrow.?(target)) return target;
+				} else {
+					facts |= Facts.O_NO_NULL_CHECK;
+				}
 				i.facts |= facts;
 			}
 			CallClassVirtual: {
 				var receiver = i.input0(), meth = getIrSpec(i.op);
-				if (meth.container.typeCon.kind == V3Kind.CLASS) receiver = nullcheck(i);
-				else i.setFact(Facts.O_NO_NULL_CHECK);
+				if (meth.container.typeCon.kind == V3Kind.CLASS) {
+					receiver = nullcheck(i);
+					if (SsaThrow.?(receiver)) return receiver;
+				} else {
+					i.setFact(Facts.O_NO_NULL_CHECK);
+				}
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) return replaceOp(i, V3Op.newCallMethod(dv));  // CallClassVirtual[m](K) => CallMethod[m](k)
 			}
@@ -604,11 +630,31 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 		return graph.intConst(inttype.trunc_32(int.!(v)));
 	}
 	def boundscheck(i: SsaApplyOp) -> SsaInstr {
-		var receiver = nullcheck(i), yval = binop(i);
+		var receiver = nullcheck(i);
+		if (SsaThrow.?(receiver)) return receiver;
+		var yval = binop(i);
 		if (yconst) {
-			// TODO
+			// index is constant. See if we can fold the bounds check.
+			var index = Int.unbox(yval);
+			if (index < 0) return addThrow(i.source, V3Exception.BoundsCheck);
+			var length = constArrayLengthOfX();
+			if (length >= 0) {
+				if (index >= 0 && index < length) i.setFact(Facts.O_SAFE_BOUNDS);
+				else return addThrow(i.source, V3Exception.BoundsCheck);
+			}
 		}
 		return receiver;
+	}
+	def constArrayLengthOfX() -> int {
+		if (xconst) {
+			var record = Record.!(xval), length = u32.!(record.values.length);
+			return Record.!(xval).values.length;
+		}
+		if (x.opcode() == Opcode.ArrayAlloc.tag) {
+			var l = x.inputs(0).dest;
+			if (SsaValue.?(l)) return l.unbox<int>();
+		}
+		return -1;
 	}
 	def nullcheck(i: SsaApplyOp) -> SsaInstr {
 		var receiver = i.input0();
