@@ -262,8 +262,9 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 				if (yconst) {
 					if (yint < 0 || yint >= inttype.width) return graph.zeroConst();
 					i.facts |= Facts.O_NO_SHIFT_CHECK;
+				} else {
+					shiftcheck(i, y);
 				}
-				// XXX: optimize ranges for shifts
 			}
 			IntSar: {
 				var yint = intbinop(i);
@@ -279,8 +280,9 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 						i.inputs(1).update(graph.intConst(inttype.width - 1));
 					}
 					i.facts |= Facts.O_NO_SHIFT_CHECK;
+				} else {
+					shiftcheck(i, y);
 				}
-				// XXX: optimize ranges for shifts
 			}
 			IntShr: {
 				// Legacy shift, do not optimize.
@@ -296,9 +298,10 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 				if (yconst) {
 					if (yint < 0 || yint >= inttype.width) return graph.zeroConst();
 					i.facts |= Facts.O_NO_SHIFT_CHECK;
+				} else {
+					shiftcheck(i, y);
 				}
 				if (y.checkFact(Facts.V_NON_ZERO)) i.facts |= Facts.V_NON_NEGATIVE;
-				// XXX: optimize ranges for shifts
 			}
 			IntLt: {
 				var yint = intbinop(i);
@@ -725,33 +728,107 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 	def u_const(v: u32) -> SsaInstr {
 		return graph.intConst(inttype.trunc_32(int.!(v)));
 	}
+	def shiftcheck(i: SsaApplyOp, y: SsaInstr) -> SsaInstr {
+		var bound = posIntBound(y);
+		if (bound >= 0 && bound < IntType.!(i.op.resultType).width) {
+			i.setFact(Facts.O_NO_SHIFT_CHECK);
+		}
+		return i;
+	}
 	def boundscheck(i: SsaApplyOp) -> SsaInstr {
 		var receiver = nullcheck(i);
 		if (SsaThrow.?(receiver)) return receiver;
+		// Initialize the match state for {x} and {y}.
 		var yval = binop(i);
-		if (yconst) {
-			// index is constant. See if we can fold the bounds check.
-			var index = Int.unbox(yval);
-			if (index < 0) return addThrow(i.source, V3Exception.BoundsCheck);
-			var length = constArrayLengthOfX();
-			if (length >= 0) {
-				if (index >= 0 && index < length) i.setFact(Facts.O_SAFE_BOUNDS);
-				else return addThrow(i.source, V3Exception.BoundsCheck);
-			}
+		if (yconst && Int.unbox(yval) < 0) {
+			// will always throw out of bounds, but might need a null check first.
+			if (!i.checkFact(Facts.O_NO_NULL_CHECK)) addExplicitNullCheck(i.source, receiver);
+			return addThrow(i.source, V3Exception.BoundsCheck);
 		}
+		// Compute the constant length of the array if possible.
+		var length = -1;
+		if (xconst) {
+			length = Record.!(xval).values.length;
+		} else if (x.opcode() == Opcode.ArrayAlloc.tag) {
+			var l = x.inputs(0).dest;
+			if (!SsaValue.?(l)) return receiver;
+			length = l.unbox<int>();
+		} else if (x.opcode() == Opcode.ArrayInit.tag) {
+			length = x.inputs.length;
+		} else {
+			return receiver;
+		}
+
+		if (yconst) {
+			// Array length and index are constants. Static bounds check.
+			var index = Int.unbox(yval);
+			if (index < length) {
+				i.setFact(Facts.O_SAFE_BOUNDS);
+				return receiver;
+			}
+			return addThrow(i.source, V3Exception.BoundsCheck);
+		}
+		// Array length is a constant, try range analysis of the index.
+		var bound = posIntBound(y);
+		if (bound < 0) return receiver;
+		if (bound < length) i.setFact(Facts.O_SAFE_BOUNDS);
 		return receiver;
 	}
-	def constArrayLengthOfX() -> int {
-		if (xconst) {
-			var record = Record.!(xval), length = u32.!(record.values.length);
-			return Record.!(xval).values.length;
+	def addExplicitNullCheck(source: Source, receiver: SsaInstr) -> SsaInstr {
+		var t = receiver.getType();
+		var check = add(source, V3Op.newEqual(t), [receiver, graph.nullConst(t)]);
+		return add(source, V3Op.newConditionalThrow(V3Exception.NullCheck), [check]);
+	}
+	def posIntBound(x: SsaInstr) -> int {
+		if (SsaValue.?(x)) {
+			var val = SsaValue.!(x).val;
+			if (val == null) return 0;
+			if (Box<int>.?(val)) return Box<int>.!(val).val;
+			return -1;
 		}
-		if (x.opcode() == Opcode.ArrayAlloc.tag) {
-			var l = x.inputs(0).dest;
-			if (SsaValue.?(l)) return l.unbox<int>();
+		var bound = posIntBoundFromType(x);
+		if (!SsaApplyOp.?(x)) return bound;
+		var i = SsaApplyOp.!(x);
+		match (i.op.opcode) {
+			IntAnd: {
+				var lb = posIntBound(i.input0()), rb = posIntBound(i.input1());
+				if (bound < 0 || (lb >= 0 && lb < bound)) bound = lb;
+				if (bound < 0 || (rb >= 0 && rb < bound)) bound = rb;
+			}
+			VariantGetTag: {
+				var c = ClassType.!(i.op.typeArgs(0)).classDecl;
+				var b = if(c.isVariantCase(), c.variantTag, c.cases.length - 1);
+				if (b < bound) bound = b;
+			}
+			IntConvert, TypeSubsume, TypeCast: {
+				var b = posIntBound(i.input0());
+				if (bound < 0 || (b >= 0 && b < bound)) {
+					var t = i.getType();
+					if (IntType.?(t)) {
+						// conversion to smaller signed type might overflow.
+						var it = IntType.!(t);
+						if (it.signed && it.width <= 32 && b > Int.unbox(it.max)) b = bound;
+					}
+					bound = b;
+				}
+			}
+			_: ;
+		}
+		return bound;
+	}
+	def posIntBoundFromType(x: SsaInstr) -> int {
+		var t = x.getType();
+		if (IntType.?(t)) {
+			var it = IntType.!(t);
+			if (it.width > 32) return -1;
+			if (!it.signed || x.checkFact(Facts.V_NON_NEGATIVE)) return Int.unbox(it.max);
+		}
+		if (t.typeCon.kind == V3Kind.ENUM) {
+			return ClassType.!(t).classDecl.cases.length - 1;
 		}
 		return -1;
 	}
+
 	def nullcheck(i: SsaApplyOp) -> SsaInstr {
 		var receiver = i.input0();
 		if (i.checkFact(Facts.O_NO_NULL_CHECK)) return receiver;
