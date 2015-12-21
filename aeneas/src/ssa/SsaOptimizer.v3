@@ -1107,3 +1107,741 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return i;
 	}
 }
+
+// Performs control flow optimizations on a completed SsaGraph.
+class SsaCfOptimizer(context: SsaContext) {
+	def mark = ++context.graph.markGen;
+	def queue = Vector<SsaBlock>.new();
+
+	def optimize() {
+		// visit all the blocks of the graph
+		// 1. reduce phis with identical inputs
+		// 2. merge straight-line blocks (may introduce critical edges)
+		// 3. optimize diamond-if patterns arising from if(a && b) patterns
+		// 4. XXX iteratively reduce/fold code
+		// 5. collapse if-chains into switches, esp if(T.?(e)) ...
+		// 6. XXX remove useless branches
+		queueBlock(context.graph.startBlock);
+		for (i < queue.length) optBlock(queue.get(i));
+	}
+	def queueBlock(block: SsaBlock) {
+		if (block.mark < mark) {
+			block.mark = mark;
+			queue.add(block);
+		}
+	}
+	def optBlock(block: SsaBlock) {
+		if (block.checkFact(Facts.O_KILLED)) return;
+		if (block.phis != null) {
+			optPhis(block);
+		}
+		for (s in block.succ) {
+			while (optEdge(s)) ; // optimize each edge
+		}
+		var end = block.end();
+		if (SsaIf.?(end)) {
+			optIf(block, SsaIf.!(end));
+		}
+		for (s in block.succ) {
+			if (s.dest != null) queueBlock(s.dest);
+		}
+	}
+	def optPhis(block: SsaBlock) {
+		// attempt to optimize the phis in this block
+		var phis = block.phis.phiInstrs;
+		for (i = 0; i < phis.length; ()) {
+			if (optPhi(phis.get(i))) phis.removeAt(i);
+			else i++;
+		}
+		if (phis.length == 0) block.phis = null; // no phis left
+	}
+	def optPhi(phi: SsaPhi) -> bool {
+		var inputs = phi.inputs;
+		if (inputs.length == 0) return true; // phi has no remaining inputs
+		var i0 = inputs(0).dest;
+		if (i0 == null || phi.useList == null) {
+			// one of the inputs is dead, or the phi is unused
+			killInstr(phi);
+			return true;
+		}
+		var facts = i0.facts, reduce = true;
+		for (i in inputs) {
+			var d = i.dest;
+			if (d != phi) {
+				facts = facts & d.facts;
+				if (d != i0) reduce = false;
+			}
+		}
+		if (reduce) {
+			phi.replace(i0); // the phi can be replaced by its (one) input
+			return true;
+		} else {
+			phi.setFact(facts); // phi facts are the intersection of all input facts
+			return false;
+		}
+	}
+	def optIf(block: SsaBlock, sw: SsaIf) {
+		var e = sw.inputs(0), v = e.dest;
+		if (SsaApplyOp.?(v)) {
+			var cond = SsaApplyOp.!(v);
+			if (cond.op.opcode == Opcode.TypeQuery) {
+				// propagate type query success on true successor
+				var queryTypes = cond.op.typeArgs;
+				applyDominatorOptForInput0(cond.input0(), block.succ(0), optFoldCast(_, queryTypes));
+			} else if (cond.op.opcode == Opcode.Equal) {
+				tryPropagatingCmpNonZero(cond, block.succ(0), block.succ(1));
+				tryBuildingSwitch(block, sw, cond.op.typeArgs(0), cond);
+			} else if (cond.op.opcode == Opcode.NotEqual) {
+				tryPropagatingCmpNonZero(cond, block.succ(1), block.succ(0));
+			}
+			return;
+		}
+
+		// match and simplify a control flow pattern where the input to a switch
+		// is the merge of a previous branch; e.g. this occurs in if(a && b)
+		if (!e.isOnlyEdge()) return; // condition is used elsewhere as well
+		if (!block.empty()) return; // block is not empty
+		if (!SsaPhi.?(v)) return; // branch condition is not a phi
+		var phi = SsaPhi.!(v);
+		if (phi.block != block) return; // phi is in a different block
+		if (block.phis.phiInstrs.length > 1) return; // other phis in this block
+
+		// search for and remove inputs to the phi that are constants
+		var ivec = Vector<SsaInstr>.new(), evec = Vector<SsaCfEdge>.new();
+		var inputs = phi.inputs, edges = block.phis.phiEdges;
+		for (i < inputs.length) {
+			var input = inputs(i), edge = edges.get(i);
+			if (SsaValue.?(input.dest)) {
+				// redirect incoming edge to outgoing edge
+				var succ = sw.findSucc(SsaValue.!(input.dest).val);
+				edge.update(succ.dest);
+				addEdge(succ, edge);
+				optEdge(edge);
+				input.update(null); // kill the use of the value
+			} else {
+				ivec.add(input.dest);
+				evec.add(edge);
+			}
+		}
+
+		if (ivec.length == phi.inputs.length) return; // no updates
+		if (ivec.length == 0) return killBlock(block); // no predecessors remain
+		if (ivec.length == 1) {
+			e.update(ivec.get(0)); // only one input remains
+			block.phis = null;  // phi is now dead
+			optEdge(block.predList);
+			return;
+		}
+		// more than one input to this phi is remaining, build a new phi
+		var newPhis = SsaPhis.new(block);
+		newPhis.phiEdges.addN(evec.extract());
+		var newPhi = newPhis.newPhi(phi.getType(), ivec.extract());
+		e.update(newPhi);
+		block.phis = newPhis;
+	}
+	def tryPropagatingCmpNonZero(cmp: SsaApplyOp, eqEdge: SsaCfEdge, neEdge: SsaCfEdge) {
+		var left = cmp.input0(), right = cmp.input1();
+		if (left.checkFact(Facts.V_NON_ZERO)) {
+			return applyDominatorOptForInput0(right, eqEdge, optNullCheck);
+		}
+		if (left.checkFact(Facts.V_ZERO)) {
+			return applyDominatorOptForInput0(right, neEdge, optNullCheck);
+		}
+		if (right.checkFact(Facts.V_NON_ZERO)) {
+			return applyDominatorOptForInput0(left, eqEdge, optNullCheck);
+		}
+		if (right.checkFact(Facts.V_ZERO)) {
+			return applyDominatorOptForInput0(left, neEdge, optNullCheck);
+		}
+	}
+	def matchSwitchCmp(key: SsaInstr, block: SsaBlock) -> SwitchCmp {
+		// XXX: match Opcode.NotEqual, commute constants, etc.
+		var end = block.end();
+		if (!SsaIf.?(end)) return null;
+		var i = SsaIf.!(end);
+		var edge = i.inputs(0);
+		if (!edge.isOnlyEdge()) return null;
+		var cmp = edge.dest;
+		if (cmp.opcode() != Opcode.Equal.tag) return null;
+		if (cmp.inputs(0).dest != key) return null;
+		var r = cmp.inputs(1).dest;
+		if (!SsaValue.?(r)) return null;
+		return SwitchCmp.new(Int.unbox(SsaValue.!(r).val), cmp, i, block.succ(0), block.succ(1));
+	}
+	def verifySwitchCmpBlock(cmp: SwitchCmp, block: SsaBlock) -> bool {
+		for (i = block.next; i != block; i = i.next) {
+			if (i != cmp.cmp && i != cmp.end) return false;
+		}
+		return true;
+	}
+	def tryBuildingSwitch(block: SsaBlock, sw: SsaIf, t: Type, cmp: SsaInstr) {
+		if (!context.compiler.EmitSwitch) return;
+		if (!V3.isInt32(t)) return;
+		var key = cmp.input0();
+		var cmp = matchSwitchCmp(key, block);
+		if (cmp == null) return;
+		var vec = Vector<SwitchCmp>.new();
+		vec.add(cmp);
+		// add switch case candidates to the list.
+		while (true) {
+			if (!cmp.fSucc.isOnlyEdge()) break;
+			var block = cmp.fSucc.dest;
+			cmp = matchSwitchCmp(key, block);
+			if (cmp == null) break;
+			if (!verifySwitchCmpBlock(cmp, block)) break;
+			vec.add(cmp);
+		}
+
+		// determine if building a table would be profitable.
+		if (vec.length < 4) return;  // not enough cases.
+		var min = Int.MAX_VALUE, max = Int.MIN_VALUE;
+		for (i < vec.length) {
+			var v = vec.get(i).val;
+			if (v < min) min = v;
+			if (v > max) max = v;
+		}
+		var diff = u32.!(max - min) + 1;
+		if (diff > vec.length * 2) return; // table would be less than 50% full.
+		if (diff > int.max) return;  // table would be too large.
+		var size = int.!(diff);
+		var table = Array<SsaCfEdge>.new(size);
+		// build dispatch table.
+		for (i = vec.length - 1; i >= 0; i--) {
+			var c = vec.get(i), index = c.val - min;
+			var p = table(index);
+			if (p != null) removeEdge(p);
+			table(index) = c.tSucc;
+		}
+		// build array of successor edges.
+		var succ = Array<SsaCfEdge>.new(size + 1);
+		var dmerge: SsaBlock;
+		for (i < size) {
+			var e = table(i);
+			if (e == null) {  // hole in the table; go to default
+				if (dmerge == null) dmerge = SsaBlock.new();
+				succ(i) = SsaCfEdge.new(block, dmerge);
+			} else {
+				succ(i) = SsaCfEdge.new(block, e.dest);
+				replaceEdge(e, succ(i));
+			}
+		}
+		// set up default edge.
+		var defedge = vec.get(vec.length - 1).fSucc;
+		if (dmerge != null) {
+			succ(size) = SsaCfEdge.new(block, dmerge);
+			var goto = SsaCfEdge.new(dmerge, defedge.dest);
+			dmerge.append(SsaGoto.new());
+			dmerge.succ = [goto];
+			replaceEdge(defedge, goto);
+		} else {
+			succ(size) = SsaCfEdge.new(block, defedge.dest);
+			replaceEdge(defedge, succ(size));
+		}
+
+		// Remove the ifs and comparisons from the end of the blocks.
+		for (i < vec.length) {
+			var c = vec.get(i);
+			c.end.kill();
+			c.end.remove();
+			c.cmp.kill();
+			c.cmp.remove();
+		}
+
+		// Replace the first if with a switch.
+		block.append(SsaSwitch.new(key.getType(), min, max, key));
+		block.succ = succ;
+	}
+	def killBlock(block: SsaBlock) {
+		if (block.checkFact(Facts.O_KILLED)) return;
+		block.setFact(Facts.O_KILLED);
+		// recursively kill this block and its successor blocks
+		for (i = block.next; SsaInstr.?(i); i = i.next) {
+			killInstr(SsaInstr.!(i));
+		}
+		// kill the phi instructions in this block
+		if (block.phis != null) {
+			var phis = block.phis.phiInstrs;
+			for (i < phis.length) {
+				killInstr(phis.get(i));
+			}
+		}
+		// kill the outgoing control flow edges
+		for (s in block.succ) {
+			var d = s.dest;
+			if (d != null) {
+				removeEdge(s);
+				if (d.predList == null) killBlock(d);
+			}
+		}
+	}
+	def killInstr(i: SsaInstr) {
+		i.kill();
+		i.setFact(Facts.O_KILLED);
+		// TODO: recursively kill any the inputs that are now dead
+	}
+	def optEdge(edge: SsaCfEdge) -> bool {
+		var src = edge.src, dest = edge.dest;
+		if (dest == null) return false; // edge may have already been optimized away
+		if (!edge.isOnlyEdge()) return false; // destination has more than one predecessor
+		if (src.succ.length > 1) {
+			// try to skip the destination block
+			if (dest.succ.length != 1) return false;	// doesn't end with a goto
+			if (!dest.empty()) return false;		// is not empty
+			var destdest = dest.succ(0).dest;
+			if (destdest.phis != null) return false;	// has phis
+			simplifyPhis(dest);
+			edge.update(destdest);				// redirect edge
+			killBlock(dest);				// try to kill the destination
+			return true;
+		}
+		// Kill the end of the previous block
+		var end = src.end();
+		end.kill();
+		end.remove();
+
+		// Move destination instructions into source
+		simplifyPhis(dest);
+		end = dest.end();
+		end.next = null;
+		end.remove();
+		src.appendN(dest.next);
+		dest.next = dest.prev = null;
+		// Create a new end for the source
+		if (SsaGoto.?(end)) {
+			var oedge = dest.succ(0), nedge = SsaCfEdge.new(src, oedge.dest);
+			src.succ = [nedge];
+			src.append(SsaGoto.new());
+			replaceEdge(oedge, nedge);
+		} else if (SsaThrow.?(end)) {
+			var throw = SsaThrow.!(end);
+			src.succ = [];
+			src.append(SsaThrow.new(throw.source, throw.exception));
+		} else if (SsaReturn.?(end)) {
+			var ret = SsaReturn.!(end);
+			src.succ = [];
+			src.append(SsaReturn.new(Ssa.inputs(ret)));
+		} else if (SsaIf.?(end)) {
+			var sw = SsaIf.!(end);
+			src.succ = Array.new(dest.succ.length);
+			for (i < src.succ.length) {
+				var oedge = dest.succ(i), nedge = SsaCfEdge.new(src, oedge.dest);
+				src.succ(i) = nedge;
+				replaceEdge(oedge, nedge);
+			}
+			src.append(SsaIf.new(sw.input0()));
+		}
+		end.kill();
+		edge.update(null);
+		return true;
+	}
+	def addEdge(abEdge: SsaCfEdge, xbEdge: SsaCfEdge) {
+		// add a new edge X -> B, using A's input to each phi as X's input
+		var dest = abEdge.dest, phis = dest.phis;
+		if (dest.phis != null) {
+			var index = Ssa.findIncomingPhiEdge(phis, abEdge, context);
+			phis.phiEdges.add(xbEdge);
+			for (i < phis.phiInstrs.length) {
+				// for each phi, add a new input corresponding to this edge
+				var phi = phis.phiInstrs.get(i);
+				var input = phi.inputs(index).dest;
+				phi.inputs = Arrays.append(SsaDfEdge.new(phi, input), phi.inputs);
+			}
+		}
+	}
+	def replaceEdge(abEdge: SsaCfEdge, xbEdge: SsaCfEdge) {
+		// replace the old edge A -> B with a new edge X -> B
+		if (xbEdge.dest == null || abEdge.dest == null) {
+			context.fail1("replaceEdge #%1 with null destination", xbEdge.src.uid);
+			return;
+		}
+		var dest = abEdge.dest, phis = dest.phis;
+		if (phis != null) {
+			var index = Ssa.findIncomingPhiEdge(phis, abEdge, context);
+			phis.phiEdges.set(index, xbEdge);
+		}
+		xbEdge.update(dest);
+		abEdge.update(null);
+	}
+	def removeEdge(edge: SsaCfEdge) {
+		var dest = edge.dest;
+		if (dest == null) return;
+		var phis = dest.phis;
+		if (phis != null) {
+			// remove the edge from the incoming phi edges
+			var index = Ssa.findIncomingPhiEdge(phis, edge, context);
+			phis.phiEdges.remove(edge);
+			for (i < phis.phiInstrs.length) {
+				// for each phi, remove the corresponding input
+				var phi = phis.phiInstrs.get(i), inputs = phi.inputs;
+				inputs(index).update(null); // kill the DF edge
+				Arrays.removeIndex(inputs, index); // compact input array
+				phi.inputs = Arrays.range(phi.inputs, 0, inputs.length - 1);
+			}
+		}
+		edge.update(null);
+		if (dest.predList != null && dest.predList.next == null) {
+			simplifyPhis(dest);
+			optEdge(dest.predList);
+		}
+	}
+	def simplifyPhis(block: SsaBlock) {
+		if (block.phis != null) {
+			// replace all phis with their first input value
+			var phis = block.phis.phiInstrs;
+			for (i < phis.length) {
+				var phi = phis.get(i);
+				phi.replace(phi.input0());
+				killInstr(phi);
+			}
+			block.phis = null;
+		}
+	}
+	// fold away a type cast if dominated by a type query that evaluates to true
+	def optFoldCast(i: SsaInstr, queryTypes: Array<Type>) -> SsaInstr {
+		if (i.opcode() == Opcode.TypeCast.tag) {
+			// fold away a type cast
+			var cast = SsaApplyOp.!(i), castTypes = cast.op.typeArgs;
+			if (TypeSystem.isSubtype(queryTypes(1), castTypes(1))) {
+				return SsaApplyOp.new(cast.source, V3Op.newTypeSubsume(castTypes(0), castTypes(1)), [i.input0()]);
+			} else {
+				i.setFact(Facts.O_NO_NULL_CHECK);
+			}
+		}
+		return optNullCheck(i);
+	}
+	// eliminate a null check on this instruction
+	def optNullCheck(i: SsaInstr) -> SsaInstr {
+		if (!SsaApplyOp.?(i)) return i;
+		match (SsaApplyOp.!(i).op.opcode) {
+			NullCheck,
+			BoundsCheck,
+			ArrayGetElem,
+			ArraySetElem,
+			ArrayGetLength,
+			TypeCast,
+			TypeQuery,
+			ClassGetMethod,
+			ClassGetVirtual,
+			CallMethod,
+			CallClassVirtual,
+			ClassGetField,
+			ClassSetField: {
+				i.setFact(Facts.O_NO_NULL_CHECK);
+			}
+			_: ;
+		}
+		return i;
+	}
+	// apply the function "f" to every dominated instruction i where i.input0() == obj
+	def applyDominatorOptForInput0(obj: SsaInstr, edge: SsaCfEdge, f: SsaInstr -> SsaInstr) {
+		if (!edge.isOnlyEdge()) return;
+		var block = edge.dest;
+		// search this block for instructions to optimize
+		// XXX: employ useList and domination numbers to only inspect instructions
+		// that use this value
+		for (l = block.next; l != block; l = l.next) {
+			if (!SsaInstr.?(l)) continue;
+			var i = SsaInstr.!(l);
+			if (i.inputs.length < 1) continue; // instr doesn't involve obj
+			if (i.input0() != obj) continue; // instr doesn't involve obj
+			var ni = f(i);
+			if (ni != i) {
+				ni.insertBefore(i);
+				i.remove();
+				i.replace(ni);
+				l = ni;
+			}
+		}
+		// XXX: propagate the fact to blocks dominated by this block
+	}
+	def replaceWithGoto(block: SsaBlock, i: SsaInstr, target: SsaCfEdge) {
+		// Kill the if
+		i.kill();
+		i.remove();
+		var oldsucc = block.succ;
+		// Add a goto
+		block.succ = [target];
+		block.append(SsaGoto.new());
+		// Optimize the dead branches
+		for (dead in oldsucc) {
+			if (dead == target) continue;
+			var dest = dead.dest;
+			removeEdge(dead);
+			if (dest.predList == null) killBlock(dest);
+		}
+		// Optimize the goto
+		optEdge(target);
+	}
+
+}
+class SwitchCmp(val: int, cmp: SsaInstr, end: SsaIf, tSucc: SsaCfEdge, fSucc: SsaCfEdge) { }
+
+
+// Performs optimizations on loops.
+// 1. eliminate rendundant bounds checks for induction variables.
+// 2. XXX eliminate redundant null checks.
+// 3. XXX loop rotation (move loop test condition to end of loop)
+// 4. XXX loop-invariant code motion (move code out of loops)
+// 5. XXX loop peeling (copy first iteration of loop)
+// 6. XXX induction variable simplifications
+// 7. XXX remove useless loops
+class SsaLoopOptimizer {
+	def graph: SsaGraph;
+	def header: SsaBlock;	// start of loop (ends with loop condition)
+	def loopBody: SsaBlock; // first block of loop body
+	def loopEnd: SsaBlock;  // first block outside of loop
+	def headerMark = ++graph.markGen;
+	def bodyMark = ++graph.markGen;
+	def gvn = Gvn.new(graph);
+	new(graph, header, loopBody, loopEnd) {}
+	def optimize() {
+		// XXX: optimize phis in header first
+		// XXX: pull loop-invariant code out of header
+		var c = findLoopControl(), cond = c.0, condTrue = c.1;
+		var ivs = findLinearIvs();
+		for (l = ivs; l != null; l = l.tail) {
+			var iv = l.head;
+			if (cond != null) tryBoundingIv(iv, cond, condTrue);
+			if (iv.boundOp != null) optBoundedIv(iv);
+		}
+	}
+	def tryBoundingIv(iv: SsaLinearIv, cond: SsaInstr, condTrue: bool) {
+		var opcode = cond.opcode();
+		if (opcode == Opcode.IntLt.tag ||
+		    opcode == Opcode.IntLteq.tag ||
+		    opcode == Opcode.IntGt.tag ||
+		    opcode == Opcode.IntGteq.tag) {
+			if (cond.input0() == iv.phi) boundIvInequality(iv, SsaApplyOp.!(cond).op, condTrue, cond.input1());
+			if (cond.input1() == iv.phi) boundIvInequality(iv, V3Op.commute(SsaApplyOp.!(cond).op), condTrue, cond.input0());
+		}
+	}
+	def boundIvInequality(iv: SsaLinearIv, op: Operator, condTrue: bool, bound: SsaInstr) {
+		if (condTrue) iv.boundOp = op;
+		else iv.boundOp = V3Op.inverse(op);
+		iv.bound = bound;
+	}
+	// identify the control condition of the loop
+	def findLoopControl() -> (SsaInstr, bool) {
+		var e = header.end();
+		if (SsaIf.?(e)) {
+			var sw = SsaIf.!(e);
+			if (sw.trueBlock() == loopBody) return (sw.input0(), true);
+			if (sw.falseBlock() == loopBody) return (sw.input0(), false);
+		}
+		return (null, false);
+	}
+	// find simple induction variables of the form v = phi(v, v + N, v + N)
+	def findLinearIvs() -> List<SsaLinearIv> {
+		var list: List<SsaLinearIv>;
+		if (header.phis == null) return null;
+		var phis = header.phis.phiInstrs;
+		for (i < phis.length) {
+			list = matchIv(phis.get(i), list);
+		}
+		return list;
+	}
+	// find a linear induction variable
+	def matchIv(phi: SsaPhi, prev: List<SsaLinearIv>) -> List<SsaLinearIv> {
+		var init: SsaInstr, step: Box<int>;
+		for (i in phi.inputs) {
+			var pi = i.dest;
+			if (hasInput(pi, phi)) {
+				// check increment matches in each induction
+				var n = gvn.matchInc(pi);
+				if (n == null) step = null;
+				else if (step == null) step = n;
+				else if (step.val != n.val) return prev;
+			} else if (init != null) {
+				if (pi != null) return prev;
+			} else {
+				init = pi;
+			}
+		}
+		if (init == null || step == null) return prev;
+		return List.new(SsaLinearIv.new(phi, init, step.val), prev);
+	}
+	// check whether x has i as one of its inputs
+	def hasInput(x: SsaInstr, i: SsaInstr) -> bool {
+		for (xi in x.inputs) {
+			if (xi.dest == i) return true;
+		}
+		return false;
+	}
+	// optimize uses of a bounded linear induction variable
+	def optBoundedIv(iv: SsaLinearIv) {
+		if (iv.step > 0) {
+			// XXX: what about uses before the condition is checked?
+			iv.phi.setFact(iv.init.facts & iv.bound.facts & Facts.V_NON_NEGATIVE);
+		}
+		markHeader(headerMark); // XXX: only mark header once?
+		for (u: Edge<SsaInstr> = iv.phi.useList; u != null; u = u.next) {
+			var use = u.src;
+			if (use.mark != headerMark) optBoundedIvUse(iv, use);
+		}
+		markHeader(-1);
+	}
+	def optBoundedIvUse(iv: SsaLinearIv, use: SsaInstr) {
+		var opcode = use.opcode();
+		// XXX: optimize inequalities, especially MachOp.opUgteq
+		if (opcode == Opcode.BoundsCheck.tag ||
+		    opcode == Opcode.ArrayGetElem.tag ||
+		    opcode == Opcode.ArraySetElem.tag) {
+			if (use.input1() == iv.phi) optBoundsCheck(iv, use, use.input0());
+		}
+	}
+	def optBoundsCheck(iv: SsaLinearIv, use: SsaInstr, array: SsaInstr) {
+		match(iv.boundOp.opcode) {
+			IntLt: {
+				if (iv.step < 0) return; // must be counting up
+				if (!iv.init.checkFact(Facts.V_NON_NEGATIVE)) return; // init must be >= 0
+				if (gvn.lteqArrayLength(iv.bound, array)) use.setFact(Facts.O_SAFE_BOUNDS);
+			}
+			IntGteq, IntGt: {
+				if (iv.step > 0) return; // must be counting down
+				if (!iv.bound.checkFact(Facts.V_NON_NEGATIVE)) return; // bound must be >= 0
+				if (gvn.ltArrayLength(iv.init, array)) use.setFact(Facts.O_SAFE_BOUNDS);
+			}
+			_: ;
+		}
+	}
+	// mark instructions in header, not in body or after loop end
+	def markHeader(mark: int) {
+		markBlocks(header, [loopBody, loopEnd], mark);
+	}
+	// mark instructions in body, not in header or after loop end
+	def markBody(mark: int) {
+		markBlocks(loopBody, [header, loopEnd], mark);
+	}
+	// mark all the blocks up to but not including [end] with the given mark
+	def markBlocks(block: SsaBlock, end: Array<SsaBlock>, mark: int) {
+		for (e in end) if (block == e) return; // reached an end block
+		if (block.mark == mark) return; // already marked
+		block.mark = mark;
+		markBlockInstrs(block, mark); // mark phis and instructions block
+		for (s in block.succ) markBlocks(s.dest, end, mark); // recursively mark successors
+	}
+	// mark all the instructions in a block with a given mark
+	def markBlockInstrs(block: SsaBlock, mark: int) {
+		for (i = block.next; i != block; i = i.next) i.mark = mark;
+		if (block.phis == null) return;
+		var phis = block.phis.phiInstrs;
+		for (i < phis.length) phis.get(i).mark = mark;
+	}
+}
+// an induction variable "x = I + N * i" with optional bound of the form
+// x <op> bound, e.g. x < a.length, x >= 3, etc
+class SsaLinearIv {
+	def phi: SsaPhi;	// x
+	def init: SsaInstr;	// I
+	def step: int;		// N
+	var boundOp: Operator;	// operator of bound (e.g. V3Op.opIntLt)
+	var bound: SsaInstr;	// value of bound
+	new(phi, init, step) {}
+}
+
+// Performs load/store optimizations on a completed SsaGraph.
+class SsaLoadOptimizer(context: SsaContext) {
+	var pure = SsaLoadedFields.new();
+	var impure = SsaLoadedFields.new();
+	var any = false;
+
+	def optimize() -> bool {
+		// visit all the blocks of the graph, removing redundant loads.
+		for (block in context.graph.bfBlocks()) optBlock(block);
+		return any;
+	}
+	def optBlock(block: SsaBlock) {
+		pure.length = 0;
+		impure.length = 0;
+		var i = block.next;
+		while (SsaApplyOp.?(i)) {
+			var instr = SsaApplyOp.!(i);
+			var next = instr.next;
+			var repl = optInstr(instr);
+			if (repl != null) {
+				any = true;
+				instr.replace(repl);
+				instr.remove();
+			}
+			i = next;
+		}
+	}
+	def optInstr(apply: SsaApplyOp) -> SsaInstr {
+		match (apply.op.opcode) {
+			ClassAlloc: {
+				if (memberOf(apply) != null) impure.length = 0;
+			}
+			// XXX: ClassGetMethod, ClassGetVirtual for monomorphic methods.
+			ClassGetField: return load(apply.input0(), apply);
+			ComponentGetField: return load(null, apply);
+			ClassInitField: {
+				var obj = apply.input0(), f = fieldOf(apply);
+				pure.add(obj, f, apply.input1());
+			}
+			ClassSetField: return store(apply.input0(), apply);
+			ComponentSetField: return store(null, apply);
+			Init,
+			CallMethod,
+			CallClassVirtual,
+			CallClosure,
+			CallFunction,
+			SystemOp: impure.length = 0;
+			_: ;
+		}
+		return null;
+	}
+	def load(obj: SsaInstr, apply: SsaApplyOp) -> SsaInstr {
+		if (apply.useList == null && apply.checkFact(Facts.O_NO_NULL_CHECK)) {
+			apply.replace(null);
+			return context.graph.zeroConst();  // XXX: recursively delete dead code
+		}
+		var m = memberOf(apply), val = find(obj, m);
+		if (val != null) return val;
+		if (m.isConst() || IrMethod.?(m)) pure.add(obj, m, apply);
+		else impure.add(obj, m, apply);
+		return null;
+	}
+	def store(obj: SsaInstr, apply: SsaApplyOp) -> SsaInstr {
+		var f = fieldOf(apply);
+		impure.kill(f);
+		impure.add(obj, f, apply.input1());
+		return null;
+	}
+	def find(o: SsaInstr, f: IrMember) -> SsaInstr {
+		var v = pure.find(o, f);
+		return if(v == null, impure.find(o, f), v);
+	}
+	def fieldOf(apply: SsaApplyOp) -> IrField {
+		return IrField.!(apply.op.attr<IrMember>());
+	}
+	def memberOf(apply: SsaApplyOp) -> IrMember {
+		return apply.op.attr<IrMember>();
+	}
+}
+// Analysis data for tracking the loaded fields.
+class SsaLoadedFields {
+	var array = Array<(SsaInstr, IrMember, SsaInstr)>.new(4);
+	var length = 0;
+	def add(obj: SsaInstr, f: IrMember, val: SsaInstr) {
+		if (length == array.length) array = Arrays.grow(array, array.length * 2);
+		array(length++) = (obj, f, val);
+	}
+	def find(obj: SsaInstr, f: IrMember) -> SsaInstr {
+		for (i < length) {
+			var t = array(i);
+			if (t.0 == obj && t.1 == f) return t.2;
+		}
+		return null;
+	}
+	def kill(f: IrField) {
+		var i = 0;
+		for (j < length) {
+			var t = array(j);
+			if (t.1 != f) {
+				if (i != j) array(i) = t;
+				i++;
+			}
+		}
+		length = i;
+	}
+}
