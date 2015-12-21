@@ -1,6 +1,49 @@
 // Copyright 2015 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// Coordinates optimizations of SSA graphs, blocks, and individual instructions.
+// Provides a facade to the outside that hide details of reduction, analysis,
+// etc.
+class SsaOptimizer(context: SsaContext) {
+	var optimize_loads: bool;
+	var optimize_branches: bool;
+	var optimize_nullchecks: bool;
+	var optimize_inits: bool;
+	var optimize_ivs: bool;
+	var optimize_licm: bool;
+	var dce: bool;
+	def iopt = SsaInstrReducer.new(context);
+	def copt = SsaCfOptimizer.new(context);
+
+	def reset(graph: SsaGraph) {
+		context.graph = graph;
+		context.block = null;
+	}
+	def optGraph() {
+	}
+	def optLoop(header: SsaBlock, loopBody: SsaBlock, loopEnd: SsaBlock) {
+	}
+	def optBlock(block: SsaBlock) {
+	}
+	def reduceIf(i: SsaIf) {
+		iopt.end = false;
+		iopt.link = i.prev;
+		iopt.block = i.block();
+		iopt.reduceIf(i);
+	}
+	def reduceApply(app: SsaApplyOp) -> SsaInstr {
+		iopt.end = false;
+		iopt.link = app.prev;
+		var res = iopt.reduceApplyOp(app);
+		if (res != app) {
+			app.replace(res);
+			app.remove();
+		}
+		return res;
+	}
+}
+
+
 def ARRAY_LENGTH_FIELD = newField(V3.stringType, Int.TYPE, Facts.F_VALUE);
 
 def newField(container: Type, fieldType: Type, facts: int) -> IrField {
@@ -27,6 +70,15 @@ class SsaInstrMatcher {
 	var yzero: bool;        // true if {y} is zero
 	var inttype: IntType;	// if this is an integer operation, the result type
 
+	// Resets this matcher
+	def clear() {
+		x = y = null;
+		xval = yval = null;
+		inttype = null;
+		xconst = yconst = yzero = fold = wide = false;
+		xint = yint = 0;
+		xlong = ylong = 0;
+	}
 	// Initializes the match state for a binary operation and returns {yval}.
 	def binop(i: SsaApplyOp) -> Val {
 		x = i.input0();
@@ -120,7 +172,7 @@ class SsaInstrMatcher {
 
 // Optimizes SSA instructions one at a time, performing such optimizations
 // as const folding, strength reduction, load elimination, and bounds check elimination.
-class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
+class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	var graph: SsaGraph;
 	var block: SsaBlock;
 	var link: SsaLink;  		// current instruction insertion point
@@ -146,19 +198,19 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 		this.link = link;
 	}
 
-	def optimizeBlock() {
+	def reduceBlock() {
 		if (block.phis != null) {
-			block.phis.phiInstrs.filter(optimizePhi);
+			block.phis.phiInstrs.filter(reducePhi);
 			if (block.phis.phiInstrs.length == 0) block.phis = null;
 		}
 		for (i = block.next; SsaInstr.?(i); ()) {
 			var next = i.next;
-			optimizeInstr(SsaInstr.!(i));
+			reduceInstr(SsaInstr.!(i));
 			if (end) break;
 			i = next;
 		}
 	}
-	def optimizePhi(i: SsaPhi) -> bool {
+	def reducePhi(i: SsaPhi) -> bool {
 		var i0 = i.input0(), facts = i0.facts, same = true;
 		for (n = 1; n < i.inputs.length; n++) {
 			var iN = i.inputs(n).dest;
@@ -174,11 +226,11 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 		return true;
 	}
 
-	def optimizeInstr(i: SsaInstr) -> SsaInstr {
+	def reduceInstr(i: SsaInstr) -> SsaInstr {
 		link = i.prev;
 		if (SsaApplyOp.?(i)) {
 			var app = SsaApplyOp.!(i);
-			var res = optimizeApplyOp(app);
+			var res = reduceApplyOp(app);
 			if (res != app) {
 				link = app.prev;
 				app.replace(res);
@@ -189,58 +241,60 @@ class SsaInstrOptimizer(context: SsaContext) extends SsaInstrMatcher {
 			return res;
 		}
 		if (SsaIf.?(i)) {
-			var ifi = SsaIf.!(i), val = ifi.input0();
-			if (SsaValue.?(val)) {
-				replaceWithGoto(i, block.succ(if(val.unbox<bool>(), 0, 1)));
-			}
-			return i;
+			return reduceIf(SsaIf.!(i));
 		}
 		if (SsaSwitch.?(i)) {
 			var sw = SsaSwitch.!(i), val = sw.input0();
 			if (SsaValue.?(val)) {
-				replaceWithGoto(i, sw.findSucc(SsaValue.!(val).val));
+				var cfopt = SsaCfOptimizer.new(context);
+				cfopt.replaceWithGoto(block, i, sw.findSucc(SsaValue.!(val).val));
 			}
 		}
 		if (SsaPhi.?(i)) {
 			var i0 = i.input0();
-			if (!optimizePhi(SsaPhi.!(i))) return i0;
+			if (!reducePhi(SsaPhi.!(i))) return i0;
 		}
 		return i;
 	}
-	def replaceWithGoto(i: SsaInstr, target: SsaCfEdge) {
-		// Kill the if
-		i.kill();
-		i.remove();
-		var oldsucc = block.succ;
-		// Add a goto
-		block.succ = [target];
-		block.append(SsaGoto.new());
-		// Optimize the dead branches
-		var cfopt = SsaCfOptimizer.new(context);
-		for (dead in oldsucc) {
-			if (dead == target) continue;
-			var dest = dead.dest;
-			cfopt.removeEdge(dead);
-			if (dest.predList == null) cfopt.killBlock(dest);
+	def reduceIf(ifi: SsaIf) -> SsaInstr {
+		var cond = ifi.input0();
+		if (SsaValue.?(cond)) {
+			var cfopt = SsaCfOptimizer.new(context);
+			cfopt.replaceWithGoto(block, ifi, block.succ(if(cond.unbox<bool>(), 0, 1)));
+		} else if (SsaApplyOp.?(cond)) {
+			if (SsaApplyOp.!(cond).op.opcode == Opcode.BoolNot) {
+				var cc = cond.input0();
+				block.succ = [block.succ(1), block.succ(0)];
+				var nif = SsaIf.new(cc);
+				ifi.replace(nif);
+				return nif;
+			}
+			// XXX: optimize if(x == true|false) and if(x != true|false)
 		}
-		// Optimize the goto
-		cfopt.optEdge(target);
+		return ifi;
 	}
-
-	def optimizeApplyOp(i: SsaApplyOp) -> SsaInstr {
-		def mismatch = Facts.V_ZERO | Facts.V_NON_ZERO;  // TODO MOVE ME
+	def reduceApplyOp(i: SsaApplyOp) -> SsaInstr {
+		def PURE_LOAD = Facts.O_NO_NULL_CHECK | Facts.O_PURE;
+		def ZERO_NON_ZERO = Facts.V_ZERO | Facts.V_NON_ZERO;
+		def ABOVE_BELOW_ZERO = Facts.V_NON_ZERO | Facts.V_NON_NEGATIVE | Facts.V_BELOW_ZERO;
 		match (i.op.opcode) {
 			Equal: {
 				binop(i);
 				if (fold) return graph.boolConst(Values.equal(xval, yval));
 				if (x == y) return graph.trueConst();
-				if (((x.facts | y.facts) & mismatch) == mismatch) return graph.falseConst();
+				var and = x.facts & y.facts, or = x.facts | y.facts;
+				if (0 != (and & Facts.V_ZERO)) return graph.trueConst(); // 0 == 0 == true
+				if (ZERO_NON_ZERO == (or & ZERO_NON_ZERO)) return graph.falseConst(); // 0 == nonzero == false
+				if (ABOVE_BELOW_ZERO == (or & ABOVE_BELOW_ZERO)) return graph.falseConst(); // neg == pos == false
 			}
 			NotEqual: {
 				binop(i);
 				if (fold) return graph.boolConst(!Values.equal(xval, yval));
 				if (x == y) return graph.falseConst();
-				if (((x.facts | y.facts) & mismatch) == mismatch) return graph.trueConst();
+				var and = x.facts & y.facts, or = x.facts | y.facts;
+				if (0 != (and & Facts.V_ZERO)) return graph.trueConst(); // 0 == 0 == true
+				if (ZERO_NON_ZERO == (or & ZERO_NON_ZERO)) return graph.trueConst(); // 0 != nonzero == true
+				if (ABOVE_BELOW_ZERO == (or & ABOVE_BELOW_ZERO)) return graph.falseConst(); // neg == pos == false
 			}
 			IntAdd: {
 				var yint = intbinop(i);
