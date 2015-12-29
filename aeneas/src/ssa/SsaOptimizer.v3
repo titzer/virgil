@@ -20,6 +20,23 @@ class SsaOptimizer(context: SsaContext) {
 		context.block = null;
 	}
 	def optGraph() {
+		def mark = ++context.graph.markGen;
+		def queue = Vector<SsaBlock>.new();
+		queue.add(context.graph.startBlock);
+		context.graph.startBlock.mark = mark;
+		for (i < queue.length) {
+			var block = queue.get(i);
+			if (block.checkFact(Facts.O_KILLED)) continue;
+			iopt.resetBlockState();
+			iopt.reduceBlock(block);
+			for (s in block.succ) {
+				var d = s.dest;
+				if (d.mark != mark) {
+					queue.add(d);
+					d.mark = mark;
+				}
+			}
+		}
 	}
 	def optLoop(header: SsaBlock, loopBody: SsaBlock, loopEnd: SsaBlock) {
 	}
@@ -27,12 +44,12 @@ class SsaOptimizer(context: SsaContext) {
 	}
 	def reduceIf(i: SsaIf) {
 		iopt.end = false;
-		iopt.link = i.prev;
+		iopt.prev = i.prev;
 		iopt.reduceIf(i);
 	}
 	def reduceApply(app: SsaApplyOp) -> SsaInstr {
 		iopt.end = false;
-		iopt.link = app.prev;
+		iopt.prev = app.prev;
 		var res = iopt.reduceApplyOp(app);
 		if (res != app) {
 			app.replace(res);
@@ -173,7 +190,8 @@ class SsaInstrMatcher {
 // as const folding, strength reduction, load elimination, and bounds check elimination.
 class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	var graph: SsaGraph;
-	var link: SsaLink;  		// current instruction insertion point
+	var prev: SsaLink;  		// instruction before the current instruction
+	var next: SsaLink;		// instruction after the current instruction
 	var end: bool;			// if the block has ended
 	var optimize_loads: bool;	// activates load elimination
 	var optimize_nullchecks: bool;	// activates null check elimination
@@ -184,7 +202,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	var nonnull: List<SsaInstr>;
 	var inits: List<IrMethod>;
 
-	def reset(graph: SsaGraph, block: SsaBlock, link: SsaLink) {
+	def reset(graph: SsaGraph, block: SsaBlock, prev: SsaLink) {
 		this.context.graph = graph;
 		this.context.block = block;
 		this.graph = graph;
@@ -192,17 +210,23 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		this.nonnull = null;
 		this.inits = null;
 		this.end = false;
-		this.link = link;
+		this.prev = prev;
 	}
-
+	def resetBlockState() {
+		end = false;
+		fields = null;
+		nonnull = null;
+		inits = null;
+	}
 	def reduceBlock(block: SsaBlock) {
+		graph = context.graph;
 		context.block = block;
 		if (block.phis != null) {
 			block.phis.phiInstrs.filter(reducePhi);
 			if (block.phis.phiInstrs.length == 0) block.phis = null;
 		}
 		for (i = block.next; SsaInstr.?(i); ()) {
-			var next = i.next;
+			next = i.next;
 			reduceInstr(SsaInstr.!(i));
 			if (end) break;
 			i = next;
@@ -225,27 +249,29 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 
 	def reduceInstr(i: SsaInstr) -> SsaInstr {
-		link = i.prev;
+		prev = i.prev;
 		if (SsaApplyOp.?(i)) {
 			var app = SsaApplyOp.!(i);
 			var res = reduceApplyOp(app);
 			if (res != app) {
-				link = app.prev;
 				app.replace(res);
 				app.remove();
-			} else {
-				link = app;
 			}
 			return res;
 		}
 		if (SsaIf.?(i)) {
 			return reduceIf(SsaIf.!(i));
 		}
+		if (SsaGoto.?(i)) {
+			var cfopt = SsaCfOptimizer.new(context), block = SsaGoto.!(i).block();
+			if (cfopt.optEdge(block.succ(0))) next = prev.next;
+		}
 		if (SsaSwitch.?(i)) {
 			var sw = SsaSwitch.!(i), val = sw.input0();
 			if (SsaValue.?(val)) {
-				var cfopt = SsaCfOptimizer.new(context);
-				cfopt.replaceWithGoto(sw.block(), i, sw.findSucc(SsaValue.!(val).val));
+				var cfopt = SsaCfOptimizer.new(context), block = sw.block();
+				cfopt.replaceWithGoto(block, i, sw.findSucc(SsaValue.!(val).val));
+				if (cfopt.optEdge(block.succ(0))) next = prev.next;
 			}
 		}
 		if (SsaPhi.?(i)) {
@@ -259,13 +285,13 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		if (SsaValue.?(cond)) {
 			var cfopt = SsaCfOptimizer.new(context);
 			cfopt.replaceWithGoto(block, ifi, block.succ(if(cond.unbox<bool>(), 0, 1)));
+			if (cfopt.optEdge(block.succ(0))) next = prev.next;
 		} else if (SsaApplyOp.?(cond)) {
 			if (SsaApplyOp.!(cond).op.opcode == Opcode.BoolNot) {
 				var cc = cond.input0();
 				block.succ = [block.succ(1), block.succ(0)];
-				var nif = SsaIf.new(cc);
-				ifi.replace(nif);
-				return nif;
+				ifi.inputs(0).update(cc);
+				return ifi;
 			}
 			// XXX: optimize if(x == true|false) and if(x != true|false)
 		}
@@ -277,7 +303,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		def ABOVE_BELOW_ZERO = Facts.V_NON_ZERO | Facts.V_NON_NEGATIVE | Facts.V_BELOW_ZERO;
 		match (i.op.opcode) {
 			Equal: {
-				binop(i);
+				norm_binop(i);
 				if (fold) return graph.boolConst(Values.equal(xval, yval));
 				if (x == y) return graph.trueConst();
 				var and = x.facts & y.facts, or = x.facts | y.facts;
@@ -286,7 +312,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (ABOVE_BELOW_ZERO == (or & ABOVE_BELOW_ZERO)) return graph.falseConst(); // neg == pos == false
 			}
 			NotEqual: {
-				binop(i);
+				norm_binop(i);
 				if (fold) return graph.boolConst(!Values.equal(xval, yval));
 				if (x == y) return graph.falseConst();
 				var and = x.facts & y.facts, or = x.facts | y.facts;
@@ -295,17 +321,17 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (ABOVE_BELOW_ZERO == (or & ABOVE_BELOW_ZERO)) return graph.falseConst(); // neg == pos == false
 			}
 			IntAdd: {
-				var yint = intbinop(i);
+				var yint = norm_intbinop(i);
 				if (fold) return fold2i(int.+, long.+); // K + K == K
 				if (yzero) return x;                    // x + 0 == x
 			}
 			IntSub: {
-				var yint = intbinop(i);
+				var yint = norm_intbinop(i);
 				if (fold) return fold2i(int.-, long.-); // K - K == K
 				if (yzero) return x;                    // x - 0 == x
 			}
 			IntMul: {
-				var yint = intbinop(i);
+				var yint = norm_intbinop(i);
 				if (yzero) return y;                    // x * 0 == 0
 				if (fold) return fold2i(int.*, long.*); // K * K == K
 				if (yconst) {
@@ -319,7 +345,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			IntDiv: {
-				var yint = intbinop(i);
+				var yint = norm_intbinop(i);
 				if (yzero) return addThrow(i.source, V3Exception.DivideByZero); // fold x / 0
 				if (fold) return fold4i(int./, u32./, long./, u64./);
 				if (yconst) {
@@ -333,12 +359,15 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			IntMod: {
-				var yint = intbinop(i);
+				var yint = norm_intbinop(i);
 				if (yzero) return addThrow(i.source, V3Exception.DivideByZero); // fold x % 0
 				if (fold) return fold4i(int.%, u32.%, long.%, u64.%);
 				if (yconst) {
 					i.facts |= Facts.O_SAFE_DIVIDE;
-					if (yis(1) || (yis(-1) && inttype.signed)) return graph.zeroConst(); // x % +/-1 == 0
+					if (yis(1) || (yis(-1) && inttype.signed)) {
+						// x % +/-1 == 0
+						return if(wide, l_const(0), i_const(0));
+					}
 					if (yisPowerOf2() && x.checkFact(Facts.V_NON_NEGATIVE)) {
 						// x % 2^k == x & (2^k - 1)
 						var mask = if(wide, l_const(ylong - 1), i_const(yint - 1));
@@ -348,28 +377,28 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if ((x.facts & y.facts & Facts.V_NON_NEGATIVE) == Facts.V_NON_NEGATIVE) i.facts |= Facts.V_NON_NEGATIVE;
 			}
 			IntAnd: {
-				intbinop(i);
+				norm_intbinop(i);
 				if (yzero) return y;                    // x & 0 == 0
 				if (fold) return fold2i(int.&, long.&); // K & K == K
 				if (yconst && yis(-1)) return x;        // x & -1 == x
 				if (((x.facts | y.facts) & Facts.V_NON_NEGATIVE) == Facts.V_NON_NEGATIVE) i.facts |= Facts.V_NON_NEGATIVE;
 			}
 			IntOr: {
-				intbinop(i);
+				norm_intbinop(i);
 				if (yzero) return x;                    // x | 0 == x
 				if (fold) return fold2i(int.|, long.|); // K | K == K
 				if (yconst && yis(-1)) return y;        // x | -1 == -1
 				if (((x.facts | y.facts) & Facts.V_BELOW_ZERO) == Facts.V_BELOW_ZERO) i.facts |= Facts.V_BELOW_ZERO;
 			}
 			IntXor: {
-				intbinop(i);
+				norm_intbinop(i);
 				if (yzero) return x;                     // x ^ 0 == x
 				if (x == y) return graph.zeroConst();    // x ^ x == 0
 				if (fold) return fold2i(int.^, long.^); // K ^ K == K
 				if ((x.facts & y.facts & Facts.V_NON_NEGATIVE) == Facts.V_NON_NEGATIVE) i.facts |= Facts.V_NON_NEGATIVE;
 			}
 			IntShl: {
-				var yint = intbinop(i);
+				var yint = norm_intbinop(i);
 				if (yzero) return x; // x << 0 == x
 				if (fold) {          // K << K == K
 					if (wide) {
@@ -388,7 +417,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			IntSar: {
-				var yint = intbinop(i);
+				var yint = norm_intbinop(i);
 				if (yzero) return x;  // x >> 0 == x
 				if (fold) {           // K >> K == K
 					if (wide) {
@@ -411,7 +440,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			IntShr: {
-				var yint = intbinop(i);
+				var yint = norm_intbinop(i);
 				if (yzero) return x; // x >>> 0 = x
 				if (fold) {          // K >>> K = K
 					if (wide) {
@@ -433,22 +462,22 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (y.checkFact(Facts.V_NON_ZERO)) i.facts |= Facts.V_NON_NEGATIVE;
 			}
 			IntLt: {
-				intbinop(i);
+				norm_intbinop(i);
 				if (fold) return fold4b(int.<, u32.<, long.<, u64.<);
 				if (xconst) return addBinop(i_infix(V3Infix.Gt), y, x);
 			}
 			IntLteq: {
-				intbinop(i);
+				norm_intbinop(i);
 				if (fold) return fold4b(int.<=, u32.<=, long.<=, u64.<=);
 				if (xconst) return addBinop(i_infix(V3Infix.Gteq), y, x);
 			}
 			IntGt: {
-				intbinop(i);
+				norm_intbinop(i);
 				if (fold) return fold4b(int.>, u32.>, long.>, u64.>);
 				if (xconst) return addBinop(i_infix(V3Infix.Lt), y, x);
 			}
 			IntGteq: {
-				intbinop(i);
+				norm_intbinop(i);
 				if (fold) return fold4b(int.>=, u32.>=, long.>=, u64.>=);
 				if (xconst) return addBinop(i_infix(V3Infix.Lteq), y, x);
 			}
@@ -462,12 +491,12 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			BoolAnd: {
-				binop(i);
+				norm_binop(i);
 				if (fold) return graph.boolConst(Bool.unbox(xval) && Bool.unbox(yval)); // K && K => K
 				if (yconst) return if(Bool.unbox(yval), x, graph.falseConst()); // x && K => x
 			}
 			BoolOr: {
-				binop(i);
+				norm_binop(i);
 				if (fold) return graph.boolConst(Bool.unbox(xval) || Bool.unbox(yval)); // K || K => K
 				if (yconst) return if(Bool.unbox(yval), graph.trueConst(), x);  // x || K => x 
 			}
@@ -506,11 +535,15 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			TypeCast: {
-				var xval = unop(i);
 				var ft = i.op.paramTypes(0), tt = i.op.resultType;
 				var cast = TypeSystem.newTypeCast(ft, tt);
-				if (SsaValue.?(x)) cast = cast.eval(ft, tt, SsaValue.!(x).val);
-				if (xconst) cast = cast.eval(ft, tt, xval);
+				if (i.inputs.length == 0) {
+					// special cast of casting void -> X
+					if (cast.approx == CastOp.FALSE) return addThrow(i.source, V3Exception.TypeCheck); // fold TypeCast
+					return i;
+				}
+				var xval = unop(i);
+				if (xconst && cast.approx != CastOp.UNKNOWN_CAST) cast = cast.eval(ft, tt, xval);
 
 				match (cast.approx) {
 					CastOp.TRUE: return x; // fold TypeCast
@@ -544,10 +577,16 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			TypeQuery: {
-				var xval = unop(i);
 				var ft = i.op.typeArgs(0), tt = i.op.typeArgs(1);
 				var cast = TypeSystem.newTypeQuery(ft, tt);
-				if (xconst) cast = cast.eval(ft, tt, xval);
+				if (i.inputs.length == 0) {
+					// special cast of querying void -> X
+					if (cast.approx == CastOp.TRUE) return graph.trueConst();
+					if (cast.approx == CastOp.FALSE) return graph.falseConst();
+					return i;
+				}
+				var xval = unop(i);
+				if (xconst && cast.approx != CastOp.UNKNOWN_QUERY) cast = cast.eval(ft, tt, xval);
 				if (cast.approx == CastOp.TRUE) return graph.trueConst();
 				if (cast.approx == CastOp.FALSE) return graph.falseConst();
 				if (cast.approx == CastOp.TRUE_X_NULL) return addNotEqual(ft, x, graph.nullConst(ft));
@@ -574,7 +613,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				var receiver = boundscheck(i);
 				if (SsaThrow.?(receiver)) return receiver;
 				if (!i.checkFact(Facts.O_PURE)) return i;
-				var yval = binop(i);
+				var yval = norm_binop(i);
 				// ArrayGetElem(#array, #index) => K
 				if (fold) return graph.valConst(i.getType(), Record.!(xval).values(Int.unbox(yval)));
 			}
@@ -636,21 +675,21 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			ClassGetMethod: {
-				var receiver = nullcheck(i);
+				var meth = extractIrSpec(i.op);
+				var receiver = if(V3.isVariant(meth.container), i.input0(), nullcheck(i));
 				if (SsaThrow.?(receiver)) return receiver;
 				if (i.op.isPolymorphic()) return i;
 				var xval = unop(i);
 				if (xconst) {
 					// ClassGetMethod[m](#K) => (m, #K)
 					var obj = Record.!(xval);
-					var spec = extractIrSpec(i.op);
-					return graph.valConst(spec.getBoundType(), Closure.new(obj, spec));
+					return graph.valConst(meth.getBoundType(), Closure.new(obj, meth));
 				}
 			}
 			ClassGetVirtual: {
-				var receiver = nullcheck(i);
-				if (SsaThrow.?(receiver)) return receiver;
 				var meth = extractIrSpec(i.op);
+				var receiver = if(V3.isVariant(meth.container), i.input0(), nullcheck(i));
+				if (SsaThrow.?(receiver)) return receiver;
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) {
 					var xval = unop(i);
@@ -662,9 +701,9 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 			}
 			ClassGetVirtFunc: {
-				var receiver = nullcheck(i);
-				if (SsaThrow.?(receiver)) return receiver;
 				var meth = extractIrSpec(i.op);
+				var receiver = if(V3.isVariant(meth.container), i.input0(), nullcheck(i));
+				if (SsaThrow.?(receiver)) return receiver;
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) return graph.valConst(dv.getFuncType(), FuncVal.new(dv));
 			}
@@ -733,7 +772,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					var target = nullcheck(i);
 					if (SsaThrow.?(target)) return target;
 				} else {
-					i.facts |= Facts.O_NO_NULL_CHECK;
+					if (i.inputs.length > 0 && i.input0().checkFact(Facts.V_NON_ZERO)) i.facts |= Facts.O_NO_NULL_CHECK;
 				}
 			}
 			CallClassVirtual: {
@@ -742,7 +781,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					receiver = nullcheck(i);
 					if (SsaThrow.?(receiver)) return receiver;
 				} else {
-					i.facts |= Facts.O_NO_NULL_CHECK;
+					if (i.input0().checkFact(Facts.V_NON_ZERO)) i.facts |= Facts.O_NO_NULL_CHECK;
 				}
 				var dv = devirtualize(meth, receiver);
 				if (dv != null) return replaceOp(i, V3Op.newCallMethod(dv));  // CallClassVirtual[m](K) => CallMethod[m](k)
@@ -753,44 +792,55 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				var xval = unop(i);
 				if (xconst) {
 					var d = Closure.!(xval);
+					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
 					if (V3.isComponent(d.memberRef.container)) {
 						// CallClosure(K) => CallMethod
 						var inputs = copyInputs(i, null, 1);
-						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs);
+						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs).setFact(Facts.O_NO_NULL_CHECK);
 					} else {
 						// CallClosure(K) => CallMethod
 						var const = graph.valConst(d.memberRef.container, d.val);
-						var inputs = copyInputs(i, const, 1);
-						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs);
+						var op = V3Op.newCallMethod(d.memberRef);
+						var inputs = normSingleArg(op, copyInputs(i, const, 1));
+						return add(i.source, op, inputs).setFact(Facts.O_NO_NULL_CHECK);
 					}
 				}
 				var opcode = x.opcode();
 				if (opcode == Opcode.ClassGetMethod.tag) {
 					// CallClosure(GetClassMethod) => CallMethod
-					var inputs = copyInputs(i, x.input0(), 1);
-					return add(i.source, V3Op.newCallMethod(extractIrSpecI(x)), inputs);
+					var op = V3Op.newCallMethod(extractIrSpecI(x));
+					var inputs = normSingleArg(op, copyInputs(i, x.input0(), 1));
+					var ni = add(i.source, op, inputs);
+					ni.facts |= i.facts & Facts.O_NO_NULL_CHECK;
+					return ni;
 				}
 				if (opcode == Opcode.ClassGetVirtual.tag) {
 					// CallClosure(GetClassVirtual) => CallClassVirtual
-					var inputs = copyInputs(i, x.input0(), 1);
-					return add(i.source, V3Op.newCallClassVirtual(extractIrSpecI(x)), inputs);
+					var op = V3Op.newCallClassVirtual(extractIrSpecI(x));
+					var inputs = normSingleArg(op, copyInputs(i, x.input0(), 1));
+					var ni = add(i.source, op, inputs);
+					ni.facts |= i.facts & Facts.O_NO_NULL_CHECK;
+					return ni;
 				}
 				if (opcode == Opcode.ComponentGetMethod.tag) {
 					// CallClosure(GetComponentMethod) => CallMethod
 					var inputs = copyInputs(i, null, 1);
-					return add(i.source, V3Op.newCallMethod(extractIrSpecI(x)), inputs);
+					return add(i.source, V3Op.newCallMethod(extractIrSpecI(x)), inputs).setFact(Facts.O_NO_NULL_CHECK);
 				}
 				if (opcode == Opcode.CreateClosure.tag) {
 					var spec = extractIrSpecI(x);
 					if (V3.isComponent(spec.container)) {
 						// CallClosure(CreateClosure[m](), ...) => CallMethod[m](...)
 						var inputs = copyInputs(i, null, 1);
-						return add(i.source, V3Op.newCallMethod(spec), inputs);
+						return add(i.source, V3Op.newCallMethod(spec), inputs).setFact(Facts.O_NO_NULL_CHECK);
 					} else {
 						// CallClosure(CreateClosure[m](p), ...) => CallMethod(p, ...);
 						var receiver = x.input0();
-						var inputs = copyInputs(i, receiver, 1);
-						return add(i.source, V3Op.newCallMethod(spec), inputs);
+						var op = V3Op.newCallMethod(spec);
+						var inputs = normSingleArg(op, copyInputs(i, receiver, 1));
+						var ni = add(i.source, op, inputs);
+						ni.facts |= x.facts & Facts.O_NO_NULL_CHECK;
+						return ni;
 					}
 				}
 			}
@@ -800,14 +850,15 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				var xval = unop(i);
 				if (xconst) {
 					var d = FuncVal.!(xval);
+					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
 					if (V3.isComponent(d.memberRef.container)) {
 						// CallFunction(#K) => CallMethod
 						var inputs = copyInputs(i, null, 2);
-						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs);
+						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs).setFact(Facts.O_NO_NULL_CHECK);
 					} else if (V3.isClass(d.memberRef.container)) {
 						// CallFunction(#K) => CallMethod
 						var inputs = copyInputs(i, null, 1);
-						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs);
+						return add(i.source, V3Op.newCallMethod(d.memberRef), inputs).setFact(Facts.O_NO_NULL_CHECK);
 					}
 				}
 			}
@@ -837,6 +888,27 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			_: ;
 		}
 		return i;
+	}
+	def normSingleArg(op: Operator, args: Array<SsaInstr>) -> Array<SsaInstr> {
+		if (op.paramTypes.length == 1 && args.length > 1) return [args(0)];
+		return args;
+	}
+	def norm_binop(i: SsaApplyOp) -> Val {
+		if (i.inputs.length != 2) norm2(i);
+		return binop(i);
+	}
+	def norm_intbinop(i: SsaApplyOp) -> int {
+		if (i.inputs.length != 2) norm2(i);
+		return intbinop(i);
+	}
+	def norm2(i: SsaApplyOp) {
+		var t = i.input0();
+		var x = SsaApplyOp.new(null, V3Op.newTupleGetElem(t.getType(), 0), [t]);
+		var y = SsaApplyOp.new(null, V3Op.newTupleGetElem(t.getType(), 1), [t]);
+		i.inputs(0).update(null);
+		x.insertBefore(i);
+		y.insertBefore(i);
+		i.setInputs([x, y]);
 	}
 	def fold4b(s: (int, int) -> bool, u: (u32, u32) -> bool, sl: (long, long) -> bool, ul: (u64, u64) -> bool) -> SsaInstr {
 		if (!wide) return graph.boolConst(if(inttype.signed, s(xint, yint), u(u32.!(xint), u32.!(yint))));
@@ -1042,7 +1114,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		if (end) return null;
 		end = true;
 		var t = SsaThrow.new(source, exception);
-		t.insertBefore(link.next);
+		t.insertBefore(prev.next);
 		// kill the rest of the instructions in the block
 		var cfopt = SsaCfOptimizer.new(context);
 		var block: SsaBlock;
@@ -1058,7 +1130,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		}
 		// kill the outgoing control flow edges
 		var succ = block.succ;
-		block.succ = null;
+		block.succ = Ssa.NO_CF_EDGES;
 		for (s in succ) {
 			var d = s.dest;
 			if (d != null) {
@@ -1104,9 +1176,9 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	def add(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
 		if (end) return null;
 		var i = SsaApplyOp.new(source, op, args);
-		i.insertBefore(link.next);
+		i.insertBefore(prev.next);
 		i.facts |= Operators.facts(op.opcode);
-		link = i;
+		prev = i;
 		return i;
 	}
 }
@@ -1482,10 +1554,7 @@ class SsaCfOptimizer(context: SsaContext) {
 			}
 		}
 		edge.update(null);
-		if (dest.predList != null && dest.predList.next == null) {
-			simplifyPhis(dest);
-			optEdge(dest.predList);
-		}
+		if (dest.predList != null && dest.predList.next == null) simplifyPhis(dest);
 	}
 	def simplifyPhis(block: SsaBlock) {
 		if (block.phis != null) {
@@ -1572,8 +1641,6 @@ class SsaCfOptimizer(context: SsaContext) {
 			removeEdge(dead);
 			if (dest.predList == null) killBlock(dest);
 		}
-		// Optimize the goto
-		optEdge(target);
 	}
 
 }
