@@ -24,10 +24,11 @@ class SsaOptimizer(context: SsaContext) {
 		def queue = Vector<SsaBlock>.new();
 		queue.add(context.graph.startBlock);
 		context.graph.startBlock.mark = mark;
+		iopt.state = SsaBlockState.new();
 		for (i < queue.length) {
 			var block = queue.get(i);
 			if (block.checkFact(Facts.O_KILLED)) continue;
-			iopt.resetBlockState();
+			iopt.state.reset();
 			iopt.reduceBlock(block);
 			for (s in block.succ) {
 				var d = s.dest;
@@ -42,19 +43,21 @@ class SsaOptimizer(context: SsaContext) {
 	}
 	def optBlock(block: SsaBlock) {
 	}
-	def reduceIf(i: SsaIf) {
-		iopt.end = false;
+	def reduceIf(state: SsaBlockState, i: SsaIf) {
+		iopt.state = state;
 		iopt.prev = i.prev;
 		iopt.reduceIf(i);
+		iopt.state = null;
 	}
-	def reduceApply(app: SsaApplyOp) -> SsaInstr {
-		iopt.end = false;
+	def reduceApply(state: SsaBlockState, app: SsaApplyOp) -> SsaInstr {
+		iopt.state = state;
 		iopt.prev = app.prev;
 		var res = iopt.reduceApplyOp(app);
 		if (res != app) {
 			app.replace(res);
 			app.remove();
 		}
+		iopt.state = null;
 		return res;
 	}
 }
@@ -186,37 +189,40 @@ class SsaInstrMatcher {
 	}
 }
 
+// Flow-sensitive state for local optimizations.
+class SsaBlockState {
+	var end: bool;
+	var optimize_loads: bool;	// activates load elimination
+	var optimize_nullchecks: bool;	// activates null check elimination
+	var optimize_inits: bool;	// activates init elimination
+	var fields: List<(SsaInstr, IrField, SsaInstr)>;
+	var nonnull: List<SsaInstr>;
+	var inits: List<IrMethod>;
+	def reset() {
+		fields = null;
+		nonnull = null;
+		inits = null;
+		end = false;
+	}
+	def addField(receiver: SsaInstr, field: IrField, value: SsaInstr) {
+		if (optimize_loads) fields = List.new((receiver, field, value), fields);
+	}
+}
+
 // Optimizes SSA instructions one at a time, performing such optimizations
 // as const folding, strength reduction, load elimination, and bounds check elimination.
 class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	var graph: SsaGraph;
-	var prev: SsaLink;  		// instruction before the current instruction
-	var next: SsaLink;		// instruction after the current instruction
-	var end: bool;			// if the block has ended
-	var optimize_loads: bool;	// activates load elimination
-	var optimize_nullchecks: bool;	// activates null check elimination
-	var optimize_inits: bool;	// activates init elimination
-
-	// Flow-sensitive state.
-	var fields: List<(SsaInstr, IrField, SsaInstr)>;
-	var nonnull: List<SsaInstr>;
-	var inits: List<IrMethod>;
+	var prev: SsaLink;  			// instruction before the current instruction
+	var next: SsaLink;			// instruction after the current instruction
+	var state = SsaBlockState.new();	// flow sensitive state
 
 	def reset(graph: SsaGraph, block: SsaBlock, prev: SsaLink) {
 		this.context.graph = graph;
 		this.context.block = block;
 		this.graph = graph;
-		this.fields = null;
-		this.nonnull = null;
-		this.inits = null;
-		this.end = false;
 		this.prev = prev;
-	}
-	def resetBlockState() {
-		end = false;
-		fields = null;
-		nonnull = null;
-		inits = null;
+		this.state.reset();
 	}
 	def reduceBlock(block: SsaBlock) {
 		graph = context.graph;
@@ -228,7 +234,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		for (i = block.next; SsaInstr.?(i); ()) {
 			next = i.next;
 			reduceInstr(SsaInstr.!(i));
-			if (end) break;
+			if (state.end) break;
 			i = next;
 		}
 	}
@@ -595,9 +601,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			ArrayAlloc: {
 				var len = i.input0();
 				if (len.checkFact(Facts.V_NON_NEGATIVE)) i.facts |= Facts.O_NO_LENGTH_CHECK;
-				if (optimize_loads) {
-					fields = List.new((i, ARRAY_LENGTH_FIELD, i.input0()), fields);
-				}
+				state.addField(i, ARRAY_LENGTH_FIELD, i.input0());
 			}
 			ArrayInit: {
 				if (i.op.isPolymorphic()) return i;
@@ -663,16 +667,12 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			}
 			ClassInitField: {
 				var field = getIrField(i);
-				if (field.isConst() && optimize_loads) {
-					fields = List.new((i.input0(), field, i.input1()), fields);  // forward stores
-				}
+				if (field.isConst()) state.addField(i.input0(), field, i.input1());  // forward stores
 			}
 			ClassSetField: {
 				var receiver = nullcheck(i), field = getIrField(i);
 				if (SsaThrow.?(receiver)) return receiver;
-				if (field.isConst() && optimize_loads) {
-					fields = List.new((receiver, field, i.input1()), fields);  // forward stores
-				}
+				if (field.isConst()) state.addField(receiver, field, i.input1());  // forward stores
 			}
 			ClassGetMethod: {
 				var meth = extractIrSpec(i.op);
@@ -708,12 +708,12 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (dv != null) return graph.valConst(dv.getFuncType(), FuncVal.new(dv));
 			}
 			Init: {
-				if (!optimize_inits) return i;
+				if (!state.optimize_inits) return i;
 				var method = i.op.attr<IrMethod>();
-				for (l = inits; l != null; l = l.tail) {
+				for (l = state.inits; l != null; l = l.tail) {
 					if (l.head == method) return null;  // init[m]; init[m] => init[m]
 				}
-				inits = List.new(method, inits);
+				state.inits = List.new(method, state.inits);
 			}
 			ComponentGetField: {
 				var field = getIrField(i), sf = VstField.!(field.source);
@@ -728,9 +728,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			}
 			ComponentSetField: {
 				var field = getIrField(i);
-				if (field.isConst() && optimize_loads) {
-					fields = List.new((null, field, i.input1()), fields);  // forward stores
-				}
+				if (field.isConst()) state.addField(null, field, i.input1());  // forward stores
 			}
 			ComponentGetMethod: {
 				var xval = unop(i);
@@ -1060,23 +1058,23 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			return receiver;
 		}
 		if (receiver.checkFact(Facts.V_ZERO)) return addThrow(i.source, V3Exception.NullCheck);
-		if (!optimize_nullchecks) return receiver;
-		for (l = nonnull; l != null; l = l.tail) {
+		if (!state.optimize_nullchecks) return receiver;
+		for (l = state.nonnull; l != null; l = l.tail) {
 			if (l.head == receiver) {
 				i.facts |= Facts.O_NO_NULL_CHECK;
 				return receiver;
 			}
 		}
-		nonnull = List.new(receiver, nonnull);
+		state.nonnull = List.new(receiver, state.nonnull);
 		return receiver;
 	}	
 	def lookupField(load: SsaInstr, receiver: SsaInstr, field: IrField) -> SsaInstr {
-		if (!optimize_loads) return load;
-		for (l = fields; l != null; l = l.tail) {
+		if (!state.optimize_loads) return load;
+		for (l = state.fields; l != null; l = l.tail) {
 			var h = l.head;
 			if (h.0 == receiver && h.1 == field) return h.2;
 		}
-		fields = List.new((receiver, field, load), fields);
+		state.addField(receiver, field, load);
 		return load;
 	}
 	def devirtualize(m: IrSpec, x: SsaInstr) -> IrSpec {
@@ -1111,8 +1109,8 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	// Editing helpers
 	//======================================================================
 	def addThrow(source: Source, exception: string) -> SsaInstr {
-		if (end) return null;
-		end = true;
+		if (state.end) return null;
+		state.end = true;
 		var t = SsaThrow.new(source, exception);
 		t.insertBefore(prev.next);
 		// kill the rest of the instructions in the block
@@ -1160,10 +1158,10 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return graph.valConst(t, val);
 	}
 	def addEqual(t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
-		return if(!end, addBinop(V3Op.newEqual(t), x, y));
+		return if(!state.end, addBinop(V3Op.newEqual(t), x, y));
 	}
 	def addNotEqual(t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
-		return if(!end, addBinop(V3Op.newNotEqual(t), x, y));
+		return if(!state.end, addBinop(V3Op.newNotEqual(t), x, y));
 	}
 	def addEnumToSet(tc: V3EnumSet_TypeCon, x: SsaInstr) -> SsaInstr {
 		// XXX: reduce duplication with V3EnumSet_TypeCon
@@ -1174,7 +1172,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return i;
 	}
 	def add(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
-		if (end) return null;
+		if (state.end) return null;
 		var i = SsaApplyOp.new(source, op, args);
 		i.insertBefore(prev.next);
 		i.facts |= Operators.facts(op.opcode);
