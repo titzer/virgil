@@ -5,15 +5,14 @@
 class SsaIcGen(context: SsaContext) {
 	def blockInfo = LazyMap<SsaBlock, SsaIcBlock>.new(SsaBlock.uid, SsaBlock.==, SsaIcBlock.new);
 	def code = Vector<IcInstr>.new();
+	def asm = IcAssembler.new(code);
 	var ssaDecon: SsaDeconstructor;
-	var switches: List<(Array<SsaCfEdge>, IcSwitch)>;
-	var branches: List<(SsaBlock, IcBranch)>;
+	var switches: List<(Array<SsaCfEdge>, IcInstr.Switch)>;
+	var branches: List<(SsaBlock, int)>;
 	var stack = Stack<SsaIcBlock>.new();
-	var numRegs: int;
-	var voidReg: int;
 
 	new() {
-		ssaDecon = SsaDeconstructor.new(context, allocReg, moveIR, moveRR);
+		ssaDecon = SsaDeconstructor.new(context, asm.allocReg, moveIR, moveRR);
 	}
 	def generate() -> IcMethod {
 		assignParams();
@@ -26,13 +25,14 @@ class SsaIcGen(context: SsaContext) {
 		Lists.apply(branches, patchBranch);
 		Lists.apply(switches, patchSwitch);
 		ssaDecon.clear();
-		return IcMethod.new(context.spec, code.extract(), context.graph.params.length, numRegs);
+		return IcMethod.new(context.spec, code.extract(), context.graph.params.length, asm.numRegs);
 	}
-	def patchBranch(target: SsaBlock, br: IcBranch) {
+	def patchBranch(target: SsaBlock, offset: int) {
 		// patch the target of the goto
-		br.target = blockInfo.get(target).codeStart;
+		var br = IcInstr.Branch.!(code.get(offset));
+		code.set(offset, IcInstr.Branch(br.always, br.bval, br.arg, blockInfo.get(target).codeStart));
 	}
-	def patchSwitch(s: Array<SsaCfEdge>, m: IcSwitch) {
+	def patchSwitch(s: Array<SsaCfEdge>, m: IcInstr.Switch) {
 		// patch the targets of the match
 		for (i < m.targets.length) {
 			m.targets(i) = blockInfo.get(s(i).dest).codeStart;
@@ -43,11 +43,7 @@ class SsaIcGen(context: SsaContext) {
 		if (SsaApplyOp.?(i)) {
 			// generate an apply instruction
 			var apply = SsaApplyOp.!(i), args = Arrays.map(apply.inputs, genRef);
-			if (apply.op.opcode == Opcode.TypeSubsume) {
-				i.mark = args(0); // subsume is a no-op in ic code; map to same register
-			} else {
-				code.add(Ic.newApply(ssaDecon.mapReg(i), apply.op, args, apply.source));
-			}
+			i.mark = asm.at(apply.source).apply(ssaDecon.mapReg(i), apply.op, args);
 		} else if (SsaIf.?(i)) {
 			// generate a switch
 			var ii = SsaIf.!(i);
@@ -58,20 +54,20 @@ class SsaIcGen(context: SsaContext) {
 		} else if (SsaReturn.?(i)) {
 			// generate a return
 			var ret = SsaReturn.!(i), args = Arrays.map(ret.inputs, genRef);
-			if (args.length == 0) code.add(IcRet.new(voidReg));
-			else if (args.length == 1) code.add(IcRet.new(args(0)));
+			if (args.length == 0) code.add(IcInstr.Ret(asm.voidReg));
+			else if (args.length == 1) code.add(IcInstr.Ret(args(0)));
 			else {
-				var reg = newTmp();
-				code.add(Ic.newApply(reg, V3Op.newTupleCreate(context.spec.getReturnType()), args, null));
-				code.add(IcRet.new(reg));
+				var reg = asm.newTmp();
+				asm.at(null).apply(reg, V3Op.newTupleCreate(context.spec.getReturnType()), args);
+				code.add(IcInstr.Ret(reg));
 			}
 		} else if (SsaThrow.?(i)) {
 			// generate a throw
 			var t = SsaThrow.!(i);
-			code.add(IcThrow.new(t.exception, t.source));
+			code.add(IcInstr.Throw(t.exception, t.source));
 		} else if (SsaSwitch.?(i)) {
 			var sw = SsaSwitch.!(i);
-			var m = IcSwitch.new(genRef(i.inputs(0)), sw.minValue, Array<int>.new(block.succ.length));
+			var m = IcInstr.Switch(genRef(i.inputs(0)), sw.minValue, Array<int>.new(block.succ.length));
 			code.add(m);
 			switches = List.new((block.succ, m), switches);
 			for (i = block.succ.length - 1; i >= 0; i--) {
@@ -86,21 +82,20 @@ class SsaIcGen(context: SsaContext) {
 		var fInfo = blockInfo.get(block.succ(1).dest);
 		if (tInfo.generated) {
 			// generate a simple branch to true target
-			code.add(IcBranch.new(false, true, key).set(tInfo.codeStart));
+			code.add(IcInstr.Branch(false, true, key, tInfo.codeStart));
 			genJump(fInfo);
 		} else {
 			// generate a simple branch to false target
-			var br = IcBranch.new(false, false, key);
-			branches = List.new((fInfo.block, br), branches);
 			push(block.succ(1));
-			code.add(br);
+			branches = List.new((fInfo.block, code.length), branches);
+			code.add(IcInstr.Branch(false, false, key, -1));
 			genJump(tInfo);
 		}
 	}
 	def genJump(info: SsaIcBlock) {
 		if (info.generated) {
 			// code has already been generated for this block, just go there
-			code.add(IcBranch.new(true, true, 0).set(info.codeStart));
+			code.add(IcInstr.Branch(true, true, 0, info.codeStart));
 		} else {
 			// don't generate code, push the block so it is generated next
 			stack.push(info);
@@ -121,23 +116,17 @@ class SsaIcGen(context: SsaContext) {
 	def genRef(ref: SsaDfEdge) -> int {
 		return ssaDecon.mapReg(ref.dest);
 	}
-	def newTmp() -> int {
-		return numRegs++;
-	}
-	def allocReg(i: SsaInstr, t: Type) -> int {
-		return numRegs++;
-	}
 	def assignParams() {
 		// assign registers for parameters
 		for (p in context.graph.params) {
 			ssaDecon.set(p, p.index);
 		}
-		numRegs = numRegs + context.graph.params.length;
+		asm.numRegs = asm.numRegs + context.graph.params.length;
 	}
 	def assignValues() {
 		// assign registers for all (global) constants
-		voidReg = newTmp();
-		code.add(IcValue.new(voidReg, null));
+		asm.voidReg = asm.newTmp();
+		code.add(IcInstr.Value(asm.voidReg, null));
 		if (context.graph.values != null) {
 			for (v in context.graph.values) {
 				if (v != null) assignVal(v);
@@ -147,19 +136,19 @@ class SsaIcGen(context: SsaContext) {
 	def assignVal(i: SsaValue) {
 		if (i.val == null) {
 			// just use the voidReg
-			ssaDecon.set(i, voidReg);
+			ssaDecon.set(i, asm.voidReg);
 			return;
 		}
 		// assign a register for a constant
-		ssaDecon.set(i, numRegs);
+		ssaDecon.set(i, asm.numRegs);
 		// generate code to load the value at the very beginning
-		code.add(IcValue.new(numRegs++, i.val));
+		code.add(IcInstr.Value(asm.numRegs++, i.val));
 	}
 	def moveIR(t: Type, i: SsaInstr, dst: int) {
-		code.add(IcMove.new(dst, ssaDecon.mapReg(i)));
+		code.add(IcInstr.Move(dst, ssaDecon.mapReg(i)));
 	}
 	def moveRR(t: Type, src: int, dst: int) {
-		code.add(IcMove.new(dst, src));
+		code.add(IcInstr.Move(dst, src));
 	}
 	def push(block: SsaCfEdge) {
 		var info = blockInfo.get(block.dest);
