@@ -24,6 +24,8 @@ def RA_BOOL = TypeNorm.new(Bool.TYPE, Bool.TYPE, null);
 def NO_RECORDS = Array<Record>.new(0);
 def MONO_TYPEARGS = [AnyObject.TYPE];
 
+def EQUALS_VST_METHOD = VstMethod.new(false, Token.new(null, "==", 0, 0), null, null, null, null);
+
 // Performs polymorphic reachability analysis over a program.
 class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 	def oldIr = prog.ir;
@@ -171,10 +173,7 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 			for (ml in c.methods) {
 				for (l = ml; l != null; l = l.tail) analyzeVirtual(rc, l.head);
 			}
-			if (0 == (rc.raFacts & RC_EQUALITY) && 0 != (c.raFacts & RC_EQUALITY)) {
-				rc.raFacts = rc.raFacts | RC_EQUALITY;
-				analyzeEquality(rc);
-			}
+			if (0 != (c.raFacts & RC_EQUALITY)) rc.raFacts |= RC_EQUALITY;
 		}
 	}
 	// analyze a possible virtual dispatch of the given method on the given type
@@ -186,27 +185,58 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		rv.addImpl(impl);
 		getMethod(null, impl);
 	}
-	// analyze the use of equality on a given class type
-	def analyzeEquality(rc: RaClass) {
-		if (0 == (rc.raFacts & RC_VARIANT)) return;
-		// variants compare fields for equality.
-		var typeArgs = V3.getTypeArgs(rc.oldType);
-		for (i < rc.fields.length) {
-			var rf = rc.fields(i);
-			if (rf == null) {
-				var f = rc.orig.fields(i);
-				var ftn = makeType(f.fieldType.substitute(typeArgs));
-				rf = rc.makeField(f, ftn, ftn.size);
-			}
-			getField(rf);
-			var ft = if(rf.fieldType == null, rf.orig.fieldType, rf.fieldType.oldType);
-			analyzeEqualOnType(ft);
+	def gatherCaseClasses(vec: Vector<IrClass>, decl: VstClass) -> Vector<IrClass> {
+		if (decl.cases == null) return vec;
+		for (c in decl.cases) {
+			vec.add(oldIr.getIrClass(c.decl.getDeclaredType()));
+			gatherCaseClasses(vec, c.decl);
 		}
+		return vec;
+	}
+	def generateVariantEquals(t: Type) -> RaClass {
+		var rc = makeClass(t);
+		while (rc.parent != null) rc = rc.parent;  // get root declaration.
+		if (rc.orig.methods(IrUtil.EQUALS_METHOD_INDEX) != null) return rc; // done.
+
+		var decl = V3Class_TypeCon.!(rc.orig.ctype.typeCon).classDecl;
+		var cases = gatherCaseClasses(Vector<IrClass>.new(), decl);
+		var polyType = decl.getDeclaredType();
+
+		var method = IrMethod.new(polyType, null, [polyType], Bool.TYPE);
+		method.source = EQUALS_VST_METHOD;
+		method.setFact(Facts.M_EQUALS | Facts.M_INLINE);
+		rc.orig.methods(IrUtil.EQUALS_METHOD_INDEX) = method;
+		method.index = IrUtil.EQUALS_METHOD_INDEX;
+
+		// build overridden methods for each case that has fields
+		for (i < cases.length) {
+			var ic = cases.get(i);
+			var pc = oldIr.getIrClass(V3.getSuperType(ic.ctype));
+			var pm = pc.methods(IrUtil.EQUALS_METHOD_INDEX);
+			if (ic.fields.length > 0) {
+				pm.setFact(Facts.M_OVERRIDDEN);
+				pm = IrMethod.new(ic.ctype, null, [polyType], Bool.TYPE);
+				pm.source = EQUALS_VST_METHOD;
+				pm.setFact(Facts.M_EQUALS);
+				pm.index = IrUtil.EQUALS_METHOD_INDEX;
+			}
+			ic.methods(IrUtil.EQUALS_METHOD_INDEX) = pm;
+		}
+		return rc;
 	}
 	// analyze a method's code
 	def analyzeMethod(rm: RaMethod) {
 		var graph = rm.orig.ssa;
-		if (graph == null) graph = compiler.genSsa(prog, rm.getSpec(), 0);
+		if (graph == null) {
+			if (rm.orig.checkFact(Facts.M_EQUALS)) {
+				var container = oldIr.getIrClass(rm.orig.container);
+				var root = oldIr.getIrClass(V3.getRootType(container.ctype));
+				var context = SsaContext.new(compiler, prog);
+				graph = VariantComparatorGen.new(context, root, container, rm.orig).generate();
+			} else {
+				graph = compiler.genSsa(prog, rm.getSpec(), 0);
+			}
+		}
 		if (rm.spec != null) {
 			// analyze a polymorphic method
 			var polyOps = polyMap.get(rm.orig);
@@ -256,7 +286,9 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 	// analyze an operator
 	def analyzeOp(op: SsaApplyOp, context: IrSpec) {
 		match (op.op.opcode) {
-			Equal: analyzeEqualOnType(mono(op.op.typeArgs(0), context));
+			OverloadedEq,
+			RefEq,
+			VariantEq: analyzeEqualOnType(mono(op.op.typeArgs(0), context), context);
 			ArrayAlloc,
 			ArrayInit: allocation(makeType(mono(op.op.typeArgs(0), context)));
 			ClassAlloc: {
@@ -284,9 +316,17 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		// TODO: system operators, pointer operators, etc
 	}
 	// analyze an equality comparison
-	def analyzeEqualOnType(t: Type) {
+	def analyzeEqualOnType(t: Type, context: IrSpec) {
 		match (t.typeCon.kind) {
-			V3Kind.CLASS, V3Kind.VARIANT: getClassEquality(t);
+			V3Kind.CLASS: {
+				getClassEquality(t);
+			}
+			V3Kind.VARIANT: {
+				var rc = generateVariantEquals(t);
+				getClassEquality(t);
+				var rm = makeMethod([rc.oldType], rc.orig.methods(IrUtil.EQUALS_METHOD_INDEX), context);
+				getVirtual(rm);
+			}
 		}
 	}
 	// analyze an access of a field
@@ -308,15 +348,8 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 	def getClassEquality(t: Type) {
 		var rc = makeClass(t);
 		if ((rc.raFacts & RC_EQUALITY) != 0) return; // already marked.
-		rc.raFacts = rc.raFacts | RC_EQUALITY;
-		queue.add(analyzeEquality, rc);
-		for (l = rc.subtypes; l != null; l = l.tail) {
-			var c = l.head;
-			if (0 == (c.raFacts & RC_EQUALITY)) {
-				c.raFacts = c.raFacts | RC_EQUALITY;
-				queue.add(analyzeEquality, c);
-			}
-		}
+		rc.raFacts |= RC_EQUALITY;
+		for (l = rc.subtypes; l != null; l = l.tail) l.head.raFacts |= RC_EQUALITY;
 	}
 	def getVirtual(rm: RaMethod) {
 		if (rm.isVirtual()) return;
@@ -437,7 +470,7 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		transferFacts(rm);
 	}
 	def transferFacts(rm: RaMethod) {
-		rm.norm.facts = rm.orig.facts & (Facts.M_ABSTRACT | Facts.M_INLINE | Facts.M_OPERATOR | Facts.M_NEW | Facts.M_EMPTY);
+		rm.norm.facts = rm.orig.facts & (Facts.M_ABSTRACT | Facts.M_INLINE | Facts.M_OPERATOR | Facts.M_NEW | Facts.M_EMPTY | Facts.M_EQUALS);
 		rm.norm.source = rm.orig.source;
 	}
 	def makeClass(t: Type) -> RaClass {
@@ -876,7 +909,6 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	}
 	def numberVariantClass(rc: RaClass) {
 		layoutFields(rc);
-		var equality = (rc.raFacts & RC_EQUALITY) != 0;
 		// number variant classes consistently with their tagging order.
 		var isEnum = true;
 		for (l = rc.children; l != null; l = l.tail) {
@@ -890,30 +922,12 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			if (liveClasses.length < c.maxClassId) liveClasses.length = index + 1;
 			liveClasses.set(index, c);
 			if (c.normFields.length > 0) isEnum = false;
-			if ((c.raFacts & RC_EQUALITY) != 0) {
-				// generate an equality method for each live subclass
-				equality = true;
-				if (c.normFields.length > 0) VariantComparatorGen.new(context, c).generate();
-			}
 		}
 		rc.maxClassId = liveClasses.length;
 		if (isEnum) {
 			// this and all children classes will be represented as enums
 			rc.raFacts |= RC_ENUM;
 			for (l = rc.children; l != null; l = l.tail) l.head.raFacts |= RC_ENUM;
-		}
-		if (equality && (!isEnum || context.compiler.GenVariantEqual)) {
-			// generate an equality method for the root
-			var rm = VariantComparatorGen.new(context, rc).generate();
-			// analyze the equality method as a "virtual" dispatch
-			rm.virtual = RaVirtual.new(rm);
-			for (l = rc.subtypes; l != null; l = l.tail) {
-				var list = l.head.methods(IrUtil.EQUALS_METHOD_INDEX);
-				var impl = if(list == null, rm, list.head);
-				rm.virtual.addImpl(impl);
-				if (impl.setFact(RM_LIVE)) continue;
-				ra.liveMethods.add(impl);
-			}
 		}
 	}
 	// map a complex array to an array of records
@@ -1153,10 +1167,6 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		}
 	}
 	def normCode(rm: RaMethod) {
-		if (rm.norm.checkFact(Facts.M_EQUALS)) {
-			// variant equality methods have their IR generated specially
-			return newIr.methods.add(rm.norm);
-		}
 		context.spec = rm.spec;
 		context.enterMethod(rm.orig);
 		if (specializer != null && rm.spec != null) {
@@ -1227,7 +1237,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var orig = app.op, op = app.op, args = app.inputs;
 		if (context.spec != null) op = app.op.subst(context.spec.instantiateType);
 		match (op.opcode) {
-			Equal:			normEqualOp(app, op);
+			OverloadedEq:		normEqualOp(app, op);
+			BoolEq,
+			IntEq,
+			RefEq:			normSimpleEqualOp(app, op);
+			VariantEq:		normVariantEqualOp(app, op);
 			IntAdd,			// fall thru
 			IntSub,			// fall thru
 			IntMul,			// fall thru
@@ -1368,13 +1382,13 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var tn = normTypeArg(op, 0);
 		if (tn.size == 0) {
 			// comparison is a constant for zero-length values
-			return map1(oldApp, newGraph.boolConst(op.opcode == Opcode.Equal));
+			return map1(oldApp, newGraph.trueConst());
 		}
 		var newArgs = genRefs(oldApp.inputs);
 		if (tn.size == 1) {
 			// a simple comparison
 			if (V3.isVariant(tn.newType)) return normVariantEqual(oldApp, tn, newArgs(0), newArgs(1));
-			if (tn.newType != tn.oldType) op = V3Op.newEqual(tn.newType);
+			op = V3Op.newEqual(tn.newType);
 			return map1(oldApp, curBlock.opEqualOf(op, newArgs(0), newArgs(1)));
 		} else {
 			// a complex comparison
@@ -1382,11 +1396,21 @@ class SsaRaNormalizer extends SsaRebuilder {
 			return;
 		}
 	}
+	def normSimpleEqualOp(oldApp: SsaApplyOp, op: Operator) {
+		var tn = normTypeArg(op, 0);
+		var refs = genRefs(oldApp.inputs);
+		return map1(oldApp, curBlock.opEqualOf(op, refs(0), refs(1)));
+	}
+	def normVariantEqualOp(oldApp: SsaApplyOp, op: Operator) {
+		var tn = normTypeArg(op, 0);
+		var newArgs = genRefs(oldApp.inputs);
+		return normVariantEqual(oldApp, tn, newArgs(0), newArgs(1));
+	}
 	def normVariantEqual(oldApp: SsaApplyOp, tn: TypeNorm, x: SsaInstr, y: SsaInstr) {
 		var rc = RaClass.!(tn);
 		if (!context.compiler.GenVariantEqual && (rc.raFacts & RC_ENUM) != 0) {
-			var ni = curBlock.opEqual(tn.newType, x, y);
-			return map1(oldApp, ni);
+			// Enum compare is a simple comparison
+			return map1(oldApp, curBlock.opEqualOf(V3Op.newIntEqual(tn.newType), x, y));
 		}
 		var list = rc.methods(IrUtil.EQUALS_METHOD_INDEX);
 		if (list == null) {
@@ -1406,9 +1430,6 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var call = curBlock.addApply(oldApp.source, newOp, [x, y]);
 		call.setFact(facts);
 		map1(oldApp, call);
-	}
-	def newCompare(opcode: Opcode, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
-		return curBlock.opEqual(t, x, y);
 	}
 	def normTupleGetElem(oldInstr: SsaInstr, args: Array<SsaDfEdge>, op: Operator) {
 		var tn = RaTuple.!(normTypeArg(op, 0)), index = op.attr<int>();
@@ -1705,61 +1726,49 @@ class SsaRaNormalizer extends SsaRebuilder {
 		return mapN(oi, Arrays.map<Type, SsaInstr>(rtn.sub, newGraph.nullConst));
 	}
 }
-// Generates the comparator method for a variant type.
-class VariantComparatorGen(context: SsaContext, rv: RaClass) {
-	def pv = if(rv.parent != null, rv.parent, rv);
+// Generates the comparator method for a (polymorphic) variant type.
+class VariantComparatorGen(context: SsaContext, root: IrClass, container: IrClass, method: IrMethod) {
 	var graph: SsaGraph;
 	var p0: SsaInstr, p1: SsaInstr;
-	def generate() -> RaMethod {
-		var method = IrMethod.new(rv.newType, null, [pv.newType], Bool.TYPE);
-		var spec = IrSpec.new(rv.newType, [rv.newType], method);
-		method.setFact(Facts.M_EQUALS);
-		method.index = 1;
-		// insert the method
-		var rm = RaMethod.new(rv.newType, method, spec);
-		rm.norm = method;
-		rm.raFacts = rm.raFacts;
-		rv.methods(IrUtil.EQUALS_METHOD_INDEX) = List.new(rm, null);
+	def generate() -> SsaGraph {
+		context.enterMethod(method);
 
-		context.enterSpec(spec);
-
-		var tag = V3.classDecl(rv.newType).variantTag;
+		var tag = V3.classDecl(container.ctype).variantTag;
 		var params = Array<SsaParam>.new(2);
-		p0 = params(0) = SsaParam.new(0, rv.newType);
-		p1 = params(1) = SsaParam.new(1, pv.newType);
+		p0 = params(0) = SsaParam.new(0, container.ctype);
+		p1 = params(1) = SsaParam.new(1, root.ctype);
 		if (tag > 0) p0.setFact(Facts.V_NON_ZERO);
 		method.ssa = graph = SsaGraph.new(params, Bool.TYPE);
 
-		if (tag == -1) genCompareTagMethod();
-		else genCompareMethod(tag);
+		if (tag == -1) genCompareTag();
+		else genCompareFields(tag);
 
 		context.printSsa("Generated");
-		return rm;
+		return graph;
 	}
-	def genCompareTagMethod() {
+	def genCompareTag() {
 		var b = newBuilder(graph.startBlock);
-		var op = V3Op.newVariantGetTag(pv.newType);
+		var op = V3Op.newVariantGetTag(root.ctype);
 		var t0 = b.addApply(null, op, [p0]);
 		var t1 = b.addApply(null, op, [p1]);
 		var cmp = b.opEqual(op.resultType, t0, t1);
 		b.addReturn([cmp]);
 	}
-	def genCompareMethod(tag: int) {
+	def genCompareFields(tag: int) {
 		var b = newBuilder(graph.startBlock);
 		var falseBlock = SsaBlock.new();
 		addReturnBool(falseBlock, false);
 
 		var fieldCompare: SsaBlock;
-		var nullConst = graph.nullConst(p0.getType());
 		if (tag == 0) {
 			// check p1 for null
 			var eqNull1 = SsaBlock.new(), neNull1 = SsaBlock.new();
-			b.addIfEqual(p1, nullConst, eqNull1, neNull1);
+			b.addIfNull(p1, eqNull1, neNull1);
 			b = newBuilder(eqNull1);
 			// check p0 for null
 			var neNull0a = SsaBlock.new();
 			var trueBlock = SsaBlock.new();
-			b.addIfEqual(p0, nullConst, trueBlock, neNull0a);
+			b.addIfNull(p0, trueBlock, neNull0a);
 			addReturnBool(trueBlock, true);
 			b = newBuilder(neNull0a);
 			// if p0 is null, compare p1 fields with default
@@ -1767,7 +1776,7 @@ class VariantComparatorGen(context: SsaContext, rv: RaClass) {
 
 			b = newBuilder(neNull1);
 			var eqNull0b = SsaBlock.new(), neNull0b = SsaBlock.new();
-			b.addIfEqual(p0, nullConst, eqNull0b, neNull0b);
+			b.addIfNull(p0, eqNull0b, neNull0b);
 			b = newBuilder(eqNull0b);
 			genFieldComparisonsWithDefault(true, b, p1, falseBlock);
 
@@ -1775,13 +1784,13 @@ class VariantComparatorGen(context: SsaContext, rv: RaClass) {
 		} else {
 			// check p1 for null
 			var neNull1 = SsaBlock.new();
-			b.addIfEqual(p1, nullConst, falseBlock, neNull1);
+			b.addIfNull(p1, falseBlock, neNull1);
 			fieldCompare = neNull1;
 		}
 		// compare tags and all field values
 		b = newBuilder(fieldCompare);
 
-		var op = V3Op.newVariantGetTag(pv.newType);
+		var op = V3Op.newVariantGetTag(root.ctype);
 		var get = b.addApply(null, op, [p1]);
 		get.setFact(Facts.O_NO_NULL_CHECK);
 		var cmp = b.opEqual(op.resultType, get, graph.intConst(tag));
@@ -1789,20 +1798,20 @@ class VariantComparatorGen(context: SsaContext, rv: RaClass) {
 		var eqTag = SsaBlock.new();
 		b.addIf(cmp, eqTag, falseBlock);
 		b = newBuilder(eqTag);
-		p1 = b.opTypeSubsume(pv.newType, rv.newType, p1);
+		p1 = b.opTypeSubsume(root.ctype, container.ctype, p1);
 		p1.setFact(Facts.O_NO_NULL_CHECK | Facts.V_NON_ZERO);
 		genFieldComparisons(b, falseBlock);
 	}
 	def genFieldComparisons(b: SsaBuilder, falseBlock: SsaBlock) {
 		// compare each field
-		for (f in rv.normFields) {
-			var spec = IrSpec.new(rv.newType, [rv.newType], f);
+		for (f in container.fields) {
+			var spec = IrSpec.new(container.ctype, [container.ctype], f);
 			var f0 = b.opClassGetField(spec, p0);
 			var f1 = b.opClassGetField(spec, p1);
 			f0.setFact(Facts.O_NO_NULL_CHECK);
 			f1.setFact(Facts.O_NO_NULL_CHECK);
 			var cmp = b.opEqual(f.fieldType, f0, f1);
-			if (f.index == rv.normFields.length - 1) {
+			if (f.index == container.fields.length - 1) {
 				// last field
 				b.addReturn([cmp]);
 				return;
@@ -1816,27 +1825,27 @@ class VariantComparatorGen(context: SsaContext, rv: RaClass) {
 	def genFieldComparisonsWithDefault(compareTag: bool, b: SsaBuilder, p0: SsaInstr, falseBlock: SsaBlock) {
 		if (compareTag) {
 			var cont = SsaBlock.new();
-			var t0 = V3Op.newVariantGetTag(pv.newType);
+			var t0 = V3Op.newVariantGetTag(root.ctype);
 			var get = b.addApply(null, t0, [p0]);
 			get.setFact(Facts.O_NO_NULL_CHECK);
 			var cmp = b.opEqual(t0.resultType, get, graph.nullConst(t0.resultType));
-			if (rv.normFields.length > 0) {
+			if (container.fields.length > 0) {
 				b.addIf(cmp, cont, falseBlock);
 				b = newBuilder(cont);
-				p0 = b.opTypeSubsume(pv.newType, rv.newType, p0);
+				p0 = b.opTypeSubsume(root.ctype, container.ctype, p0);
 			} else {
 				b.addReturn([cmp]);
 				return;
 			}
 		}
 		// compare each field with the default value
-		for (f in rv.normFields) {
-			var spec = IrSpec.new(rv.newType, [rv.newType], f);
+		for (f in container.fields) {
+			var spec = IrSpec.new(container.ctype, [container.ctype], f);
 			var f0 = b.opClassGetField(spec, p0);
 			var f1 = graph.nullConst(f.fieldType);
 			f0.setFact(Facts.O_NO_NULL_CHECK);
 			var cmp = b.opEqual(f.fieldType, f0, f1);
-			if (f.index == rv.normFields.length - 1) {
+			if (f.index == container.fields.length - 1) {
 				// last field
 				b.addReturn([cmp]);
 				return;
