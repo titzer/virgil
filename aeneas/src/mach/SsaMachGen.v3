@@ -1,33 +1,331 @@
 // Copyright 2011 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Transforms "v3" code in SSA form to "mach" code (i.e. machine-level
-// operations such as memory load/store).
-class SsaMachGen extends SsaRebuilder {
-	def mach: MachProgram;
-	var explicitNullChecks: bool;
+class SsaMachGenConfig {
+	var IntDivZeroTraps = true;             // int division traps on zero
+	var IntDivOverflowMinint = true;        // int division overflow is minint
+	var Int8Arith = false;                  // native support for int8 arithmetic
+	var Int16Arith = false;                 // native support for int16 arithmetic
+	var Int32Arith = true;                  // native support for int32 arithmetic
+	var Int64Arith = false;                 // native support for int64 arithmetic
+	var Int8StoreNarrow = true;             // storing > 8 bits can narrow
+	var Int16StoreNarrow = true;            // storing > 16 bits can narrow
+	var Int32StoreNarrow = true;            // storing > 32 bits can narrow
+	var Int8LoadZeroExtend = true;          // loading 8 bits can zero extend
+	var Int8LoadSignExtend = true;          // loading 8 bits can sign extend
+	var Int16LoadZeroExtend = true;         // loading 16 bits can zero extend
+	var Int16LoadSignExtend = true;         // loading 16 bits can sign extend
+	var Int32LoadZeroExtend = true;         // loading 32 bits can zero extend to 64
+	var Int32LoadSignExtend = true;         // loading 32 bits can sign extend to 64
+	var Int32ShlSaturate = false;           // shift left masks saturates on overflow
+	var Int32ShrSaturate = false;           // shift right masks saturates on overflow
+	var Int32SarSaturate = false;           // shift right masks saturates on overflow
+	var NullcheckAreaSize = 0;              // hardware reserved null check area size
+	var ImplicitNullChecks = true;          // generate implicit null checks
+}
 
-	new(mach, context: SsaContext) super(context) { }
+// Helper for normalizing a graph in place.
+class SsaGraphNormalizer(context: SsaContext) {
+	def buffer = Vector<SsaInstr>.new();  // reusable input buffer
+	def replacements = Vector<Array<SsaInstr>>.new();
+	var singleMark: int;
+	var curBlock: SsaBuilder;
+	var phis: List<SsaPhi>;
 
-	def build() {
-		context.method.ssa = genGraph();
+	// Map {oi} to multiple instructions in {ni}.
+	def mapN(oi: SsaInstr, ni: Array<SsaInstr>) {
+		mapNkeep(oi, ni);
+		oi.kill();
+		oi.remove();
+	}
+	// Map {oi} to multiple instructions in {ni}.
+	def mapNkeep(oi: SsaInstr, ni: Array<SsaInstr>) {
+		if (ni.length == 1) return map1(oi, ni(0));
+		oi.mark = context.graph.markGen++;
+		oi.instrVal = null;
+		var index = oi.mark - singleMark - 1;
+		replacements.grow(index + 1);
+		replacements.set(index, ni);
+		if (index >= replacements.length) replacements.length = index + 1;
+		for (i in ni) i.mark = singleMark;
+	}
+	// Map {oi} 1-1 to {ni}.
+	def map1(oi: SsaInstr, ni: SsaInstr) {
+		oi.mark = singleMark;
+		oi.instrVal = ni;
+		ni.mark = singleMark;
+		ni.facts |= oi.facts;
+		oi.replace(ni);
+		oi.remove();
+	}
+	// Map {oi} 1-1 to {ni} but don't kill or remove.
+	def map1keep(oi: SsaInstr, ni: SsaInstr) {
+		oi.mark = singleMark;
+		oi.instrVal = ni;
+		ni.mark = singleMark;
+		oi.replace(ni);
+	}
+	// Map {oi} 1-0.
+	def map0(oi: SsaInstr) {
+		mapN(oi, Ssa.NO_INSTRS);
+	}
+	// Mark {oi} as a 1-1 mapping with itself.
+	def id(oi: SsaInstr) {
+		oi.mark = singleMark;
+		oi.instrVal = null;
+	}
+	// Reset internal state for a new graph.
+	def reset(graph: SsaGraph) {
+		singleMark = ++graph.markGen;
+		++graph.markGen;
+		replacements.reset();
+		buffer.reset();
+		curBlock = SsaBuilder.new(context, graph, null);
+	}
+	// Get the replacements for a given instruction, if it is not a 1-1 mapping.
+	// Returns {null} if there is a 1-1 mapping.
+	def getReplacements(i: SsaInstr) -> Array<SsaInstr> {
+		if (i.mark == singleMark) return null;
+		if (i.mark > singleMark) return replacements.get(i.mark - singleMark - 1);
+		if (SsaValue.?(i)) normValue(SsaValue.!(i));
+		else if (SsaPhi.?(i)) normPhi(SsaPhi.!(i));
+		else context.fail1("no replacement for @%1", i.uid);
+		if (i.mark == singleMark) return null;
+		if (i.mark > singleMark) return replacements.get(i.mark - singleMark - 1);
+		context.fail1("no replacement for @%1", i.uid);
+		return null;
+	}
+	// Normalizes a phi and updates internal map.
+	def normPhi(oi: SsaPhi) {
+		var tn = normType(oi.vtype);
+		phis = List.new(oi, phis);
+		// Check for common case of no normalization.
+		if (tn == null || tn.newType == oi.vtype) return id(oi);
+		// Degenerate case of zero-width phi.
+		if (tn.size == 0) {
+			oi.kill();
+			oi.remove();
+			return map0(oi);
+		}
+		// Map the old phi new a new phi with the new type.
+		if (tn.size == 1) {
+			var newPhi = SsaPhi.new(tn.newType, oi.block, Ssa.NO_INSTRS);
+			return map1keep(oi, newPhi);
+		}
+		// Complex phi.
+		var phis = Array<SsaInstr>.new(tn.size);
+		for (i < phis.length) {
+			var newPhi = SsaPhi.new(tn.sub(i), oi.block, Ssa.NO_INSTRS);
+			phis(i) = newPhi;
+		}
+		return mapNkeep(oi, phis);
+	}
+	// Normalizes a value and updates internal map.
+	def normValue(oi: SsaValue) {
+		var tn = normType(oi.vtype);
+		// Check for common case of no normalization.
+		if (tn == null) {
+			var nv = genSimpleVal(oi.val, tn);
+			if (nv == oi.val) return id(oi);
+			return map1(oi, context.graph.valConst(oi.vtype, nv));
+		}
+		// Degenerate case of zero-width value.
+		if (tn.size == 0) return map0(oi);
+		// Map the old value to a new value with the new type.
+		if (tn.size == 1) {
+			var nv = genSimpleVal(oi.val, tn);
+			if (nv == oi.val && tn.oldType == tn.newType) return id(oi);
+			return map1(oi, context.graph.valConst(tn.newType, nv));
+		}
+		// Complex value.
+		var vals = Array<Val>.new(tn.size);
+		genValIntoArray(oi.val, tn, vals, 0);
+		var instrs = Array<SsaInstr>.new(tn.size);
+		for (i < vals.length) {
+			instrs(i) = context.graph.valConst(tn.sub(i), vals(i));
+		}
+		return mapN(oi, instrs);
+	}
+	def normRef1(e: SsaDfEdge) -> SsaInstr {
+		var i = e.dest;
+		getReplacements(i);
+		if (i.mark != singleMark) context.fail1("instruction @%1 should map 1-1", i.uid);
+		return if (i.instrVal != null, i.instrVal, i);
+	}
+	def normRefs(a: Array<SsaDfEdge>) -> Array<SsaInstr> {
+		buffer.length = 0;
+		for (i < a.length) {
+			// TODO: kill references?
+			var x = a(i).dest;
+			var r = getReplacements(x);
+			if (r == null) buffer.add(if(x.instrVal != null, x.instrVal, x));
+			else buffer.addN(r);
+		}
+		return buffer.extract();
+	}
+	def normInputs(oi: SsaInstr) -> SsaInstr {
+		var inputs = oi.inputs;
+		for (j < inputs.length) {
+			var i = inputs(j);
+			i.update(normRef1(i));
+		}
+		return oi;
+	}
+	def normType(t: Type) -> TypeNorm;
+	def genSimpleVal(v: Val, tn: TypeNorm) -> Val;
+	def genValIntoArray(v: Val, tn: TypeNorm, dest: Array<Val>, index: int);
+	def normType1(t: Type) -> Type {
+		var tn = normType(t);
+		return if(tn != null, tn.newType, t);
+	}
+	def normTypeQ(t: Type) -> bool {
+		var tn = normType(t);
+		return tn != null && (tn.size != 1 || tn.newType != t);
+	}
+
+	def mapMultiReturn(oi: SsaInstr, ni: SsaInstr, tn: TypeNorm) {
+		if (tn == null || tn.size == 1) return map1(oi, ni);
+		if (tn.size == 0) return map0(oi);
+		var values = Array<SsaInstr>.new(tn.size);
+		for (i < tn.size) {
+			var get = SsaApplyOp.new(null, V3Op.newTupleGetElem(tn.newType, i), [ni]);
+			get.insertBefore(ni.next);
+			values(i) = get;
+		}
+		mapN(oi, values);
+	}
+	def genEqualN(oi: SsaApplyOp, tn: TypeNorm) -> SsaInstr {
+		var expr: SsaInstr, newArgs = normRefs(oi.inputs);
+		for (i < tn.size) {
+			var cmp: SsaInstr, a = newArgs(i), b = newArgs(i + tn.size);
+			cmp = curBlock.opEqual(tn.sub(i), a, b);
+			if (expr == null) expr = cmp;
+			else expr = curBlock.opBoolAnd(V3Op.opBoolAnd, expr, cmp);
+		}
+		map1(oi, expr);
+		return expr;
+	}
+}
+
+// Lowers Virgil code to machine level in-place by replacing object-level operations
+// with loads and stores. Introduces truncations and wrapping for integer operations
+// according to the {config}.
+class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig) extends SsaGraphNormalizer(SsaContext.new(compiler, mach.prog)) {
+	def doMethod(method: IrMethod) {
+		context.enterMethod(method);
+		var graph = method.ssa;
+		reset(graph);
+		// Map parameters.
+		for (p in graph.params) {
+			if (normTypeQ(p.vtype)) {
+				genParams(graph);
+				break;
+			}
+			id(p);
+		}
+		
+		// Map return type.
+		graph.returnType = normType1(graph.returnType);
+
+		var queue = Vector<SsaBlock>.new();
+		queue.add(graph.startBlock);
+		graph.startBlock.mark = singleMark;
+		for (i = 0; i < queue.length; i++) {
+			var block = queue.get(i);
+			doBlock(block);
+			var succs = curBlock.block.succs();
+			for (s in succs) {
+				if (s.dest.mark < singleMark) {
+					queue.add(s.dest);
+					s.dest.mark = singleMark;
+				}
+			}
+		}
+
+		for (l = phis; l != null; l = l.tail) genPhi(l.head);
+		phis = null;
 		context.printSsa("Machine");
 	}
-	def genSimpleVal(v: Val) -> Val {
-		return mach.machVal(v);
-	}
-	def genValN(e: SsaDfEdge, index: int, oi: SsaValue, tn: TypeNorm, vec: Vector<SsaInstr>) {
-		var edgeType = typeFromEdge(e, index);
-		tn = normalize(edgeType);
-		if (tn == null) {
-			vec.add(newGraph.valConst(edgeType, oi.val));
-		} else if (tn.size == 1) {
-			vec.add(newGraph.valConst(tn.newType, oi.val));
-		} else {
-			var vals = Array<Val>.new(tn.size);
-			genValIntoArray(oi.val, tn, vals, 0);
-			for (i < tn.size) vec.add(newGraph.valConst(tn.sub(i), vals(i)));
+	def genParams(graph: SsaGraph) {
+		def buffer = Vector<SsaParam>.new().grow(graph.params.length);
+		for (p in graph.params) {
+			var tn = normType(p.vtype);
+			if (tn == null || (tn.size == 1 && tn.oldType == tn.newType)) {
+				buffer.add(p);
+				id(p);
+			} else if (tn.size == 0) {
+				map0(p);
+			} else if (tn.size == 1) {
+				var np = SsaParam.new(buffer.length, tn.newType);
+				buffer.add(np);
+				map1(p, np);
+			} else {
+				var np = Array<SsaInstr>.new(tn.size);
+				for (j < np.length) {
+					var npx = SsaParam.new(buffer.length, tn.sub(j));;
+					np(j) = npx;
+					buffer.add(npx);
+				}
+				mapN(p, np);
+			}
 		}
+		graph.params = buffer.extract();
+	}
+	def genPhi(phi: SsaPhi) {
+		if (phi.checkFact(Facts.O_KILLED)) return;
+		var r = getReplacements(phi);
+		if (r == null) {
+			if (phi.instrVal == null) {
+				// phi is left in place.
+				for (i < phi.inputs.length) if (phi.inputs(i).dest == null) context.fail1("phi input[%1] is null", i);
+				normInputs(phi);
+			} else {
+				// phi is replaced 1->1.
+				var nphi = SsaPhi.!(phi.instrVal);
+				nphi.insertBefore(phi);
+				nphi.setInputs(normRefs(phi.inputs));
+				phi.remove();
+			}
+		} else {
+			// phi is replaced 1->N.
+			var refs = normRefs(phi.inputs), width = r.length;
+			for (j = 0; j < width; j++) {
+				var nphi = SsaPhi.!(r(j));
+				nphi.insertBefore(phi);
+				var ninputs = Array<SsaInstr>.new(phi.inputs.length);
+				for (k = 0; k < phi.inputs.length; k++) {
+					ninputs(k) = refs(j + k * width);
+				}
+				nphi.setInputs(ninputs);
+			}
+			phi.remove();
+		}
+	}
+	def doBlock(block: SsaBlock) {
+		curBlock.clear();
+		curBlock.block = block;
+		var i = block.next;
+		while (true) {
+			if (i == null) break;
+			if (SsaBlock.?(i)) break;
+			var n = i.next;
+			if (SsaApplyOp.?(i)) {
+				curBlock.pt = i;
+				genApplyOp(SsaApplyOp.!(i));
+				if (curBlock.end) break;
+			} else if (SsaPhi.?(i)) {
+				getReplacements(SsaPhi.!(i));
+			} else if (SsaReturn.?(i)) {
+				var ret = SsaReturn.!(i);
+				ret.setInputs(normRefs(ret.inputs));
+			} else if (SsaInstr.?(i)) {
+				normInputs(SsaInstr.!(i));
+			}
+			i = n;
+		}
+	}
+	def genSimpleVal(v: Val, tn: TypeNorm) -> Val {
+		return mach.machVal(v);
 	}
 	def genValIntoArray(v: Val, tn: TypeNorm, dest: Array<Val>, index: int) {
 		if (tn == null || tn.size == 1) {
@@ -35,28 +333,29 @@ class SsaMachGen extends SsaRebuilder {
 			return;
 		}
 		if (RaIntType.?(tn)) {
-			if (Box<int>.?(v)) mach.intNorm.normalizeIntIntoArray(IntType.!(tn.oldType), Box<int>.!(v).val, dest, index);
-			if (Box<long>.?(v)) mach.intNorm.normalizeLongIntoArray(IntType.!(tn.oldType), Box<long>.!(v).val, dest, index);
+			if (Box<int>.?(v)) mach.intNorm.normIntIntoArray(IntType.!(tn.oldType), Box<int>.!(v).val, dest, index);
+			if (Box<long>.?(v)) mach.intNorm.normLongIntoArray(IntType.!(tn.oldType), Box<long>.!(v).val, dest, index);
 		}
 	}
-	def normalize(t: Type) -> TypeNorm {
+	def normType(t: Type) -> TypeNorm {
 		match (t.typeCon.kind) {
-			V3Kind.ENUM_SET: return mach.intNorm.normalize(V3.getEnumSetType(t));
-			V3Kind.INT: return mach.intNorm.normalize(t);
-			V3Kind.TUPLE: return normalizeTuple(t);
+			V3Kind.ENUM_SET: return mach.intNorm.normType(V3.getEnumSetType(t));
+			V3Kind.INT: return mach.intNorm.normType(t);
+			V3Kind.TUPLE: return normTypeTuple(t);
 		} else {
 			var mt = mach.machType(t);
 			return if(mt != t, TypeNorm.new(t, mt, null));
 		}
 	}
-	def normalizeTuple(t: Type) -> RaTuple {
+
+	def normTypeTuple(t: Type) -> RaTuple {
 		// TODO: cache flattened tuples which occur in returns
 		// flatten tuples
 		var vecT = Vector<Type>.new();
 		var vecO = Vector<int>.new();
 		var vecN = Vector<TypeNorm>.new();
 		for (p = t.nested; p != null; p = p.tail) {
-			var n = normalize(p.head);
+			var n = normType(p.head);
 			vecO.add(vecT.length);
 			vecN.add(n);
 			if (n == null) vecT.add(p.head);
@@ -72,9 +371,6 @@ class SsaMachGen extends SsaRebuilder {
 			IntEq:			ni = genEqualOp(oi);
 			IntLt:			ni = genIntCmp(oi, V3Infix.Lt, V3Infix.Lt);
 			IntLteq:		ni = genIntCmp(oi, V3Infix.Lt, V3Infix.Lteq);
-			BoolAnd,
-			BoolOr,
-			BoolNot: 		ni = genSimple(oi);
 			// Output of integer operations must be normalized
 			IntAdd,
 			IntSub,
@@ -108,30 +404,24 @@ class SsaMachGen extends SsaRebuilder {
 			ComponentGetField: 	return genComponentGetField(oi);
 			ComponentSetField: 	return genComponentSetField(oi);
 			TupleGetElem: 		return genTupleGetElem(oi);
-			NullCheck: {
-				ni = genNullCheck(oi);
-				instrMap.set(oi, ni);
-				return; // don't update SSA facts of the receiver if folded.
-			}
+			NullCheck:		ni = genNullCheck(oi);
 			BoundsCheck: 		ni = genBoundsCheck(oi, true);
 			CallMethod: 		return genCallMethod(oi);
 			CallClassVirtual: 	return genCallClassVirtual(oi);
 			CallFunction: {
 				var funcRep = mach.getFuncRep(oi.op.typeArgs(0));
-				call(oi, funcRep, genRefs(oi.inputs));
+				call(oi, funcRep, normRefs(oi.inputs));
 				return;
 			}
 			VariantGetTag:	{
-				var oobj = oi.inputs(0), nobj = genRef1(oobj);
+				var oobj = oi.inputs(0), nobj = normRef1(oobj);
 				var isEnum = context.prog.ir.isEnum(oi.op.typeArgs(0));
 				ni = if(isEnum, nobj, genIfNull(oi, oi.op.resultType, nobj, null, genVariantGetTag(oi, _)));
 			}
-			ConditionalThrow:	ni = genConditionalThrow(oi);
 			PtrAtContents: {
-				// perform specialized lowering by calling the supplied function
 				var add = MachOp.newPtrAdd(oi.op.resultType, oi.op.resultType);
-				var offset = newGraph.intConst(mach.getArrayElemOffset(oi.op.paramTypes(0)));
-				var array = genRef1(oi.inputs(0));
+				var offset = context.graph.intConst(mach.getArrayElemOffset(oi.op.paramTypes(0)));
+				var array = normRef1(oi.inputs(0));
 				ni = curBlock.addApply(oi.source, add, [array, offset]);
 			}
 			TupleCreate,
@@ -141,24 +431,27 @@ class SsaMachGen extends SsaRebuilder {
 			CallClosure:		return unexpected(oi);
 			MachSystemOp,
 			SystemOp: {
-				var ni = curBlock.addApply(oi.source, oi.op, genRefs(oi.inputs));
+				var ni = curBlock.addApply(oi.source, oi.op, normRefs(oi.inputs));
 				ni.facts = ni.facts | oi.facts;
-				mapNorm(oi, ni, normalize(oi.op.resultType));
+				mapMultiReturn(oi, ni, normType(oi.op.resultType));
 				return;
 			}
-		} else {
-			// assume machine-level and other operators aren't lowered
-			ni = curBlock.addApply(oi.source, oi.op, genRefs(oi.inputs));
+			_: {
+				// By default, normalize inputs to other instructions.
+				normInputs(oi);
+				return id(oi);
+			}
 		}
-		map1(oi, context.nonnull(ni));
+		if (ni != oi) map1(oi, ni);
+		else id(oi);
 	}
 	def unexpected(oi: SsaApplyOp) {
 		context.fail1("unexpected operator %1", V3Op.renderOp(oi.op));
 	}
 	def genIntCmp(oi: SsaApplyOp, infixH: byte, infixL: byte) -> SsaInstr {
-		var tn = mach.intNorm.normalize(oi.op.typeArgs(0));
-		if (tn == null || tn.size == 1) return genSimple(oi);
-		var newArgs = genRefs(oi.inputs);
+		var tn = mach.intNorm.normType(oi.op.typeArgs(0));
+		if (tn == null || tn.size == 1) return normInputs(oi);
+		var newArgs = normRefs(oi.inputs);
 		return genIntCmpRec(oi, tn, newArgs, tn.bigEndIndex(), infixH, infixL);
 	}
 	def genIntCmpRec(oi: SsaApplyOp, tn: RaIntType, newArgs: Array<SsaInstr>, i: int, infixH: byte, infixL: byte) -> SsaInstr {
@@ -177,13 +470,13 @@ class SsaMachGen extends SsaRebuilder {
 		return cmp = apply(oi.source, V3Op.opBoolOr, [cmp, and]);
 	}
 	def genEqualOp(oi: SsaApplyOp) -> SsaInstr {
-		var tn = normalize(oi.op.typeArgs(0));
-		if (tn == null || tn.size == 1) return genSimple(oi);
+		var tn = normType(oi.op.typeArgs(0));
+		if (tn == null || tn.size == 1) return normInputs(oi);
 		return genEqualN(oi, tn);
 	}
 	def genShiftOp(oi: SsaApplyOp) {
 		var tt = IntType.!(oi.op.resultType);
-		var inputs = genRefs(oi.inputs);
+		var inputs = normRefs(oi.inputs);
 		var op = oi.op;
 		if (inputs.length == 2) {
 			// 2 -> 1 operation.
@@ -194,8 +487,8 @@ class SsaMachGen extends SsaRebuilder {
 				if (tt.signed && diff > 0 && !inputs(0).checkFact(Facts.V_NON_NEGATIVE)) {
 					trunc = !inputs(1).checkFact(Facts.V_NON_ZERO);
 					// XXX: constant fold some shifts
-					inputs(0) = apply(oi.source, mach.intNorm.shlOp, [inputs(0), newGraph.intConst(diff)]);
-					inputs(1) = apply(oi.source, mach.intNorm.addOp, [inputs(1), newGraph.intConst(diff)]);
+					inputs(0) = apply(oi.source, mach.intNorm.shlOp, [inputs(0), context.graph.intConst(diff)]);
+					inputs(1) = apply(oi.source, mach.intNorm.addOp, [inputs(1), context.graph.intConst(diff)]);
 				}
 				op = mach.intNorm.shrOp;
 			} else if (op.opcode == Opcode.IntShl) {
@@ -214,7 +507,7 @@ class SsaMachGen extends SsaRebuilder {
 			// Recognize shifts by constants that are a multiple of the word size.
 			var bigEnd = tn.bigEndIndex();
 			inputs = Arrays.range(inputs, 0, tn.size);
-			var zero = newGraph.valConst(mach.intNorm.word, Values.BOTTOM);
+			var zero = context.graph.valConst(mach.intNorm.word, Values.BOTTOM);
 			if (wordCount == 0) {
 				// no-op
 			} else if (op.opcode == Opcode.IntShl) {
@@ -257,22 +550,29 @@ class SsaMachGen extends SsaRebuilder {
 	}
 	def genTruncatingIntOp(oi: SsaApplyOp) {
 		var tt = IntType.!(oi.op.resultType);
-		var inputs = genRefs(oi.inputs);
-		if (inputs.length == 2) {
-			// 2 -> 1 operation.
-			var ni = apply(oi.source, oi.op, inputs);
-			if (tt.width < mach.intNorm.width) {
-				ni = curBlock.opIntConvert0(mach.intNorm.word, oi.op.resultType, ni);
-			}
-			return map1(oi, ni);
+		var tn = mach.intNorm.normType(tt);
+		if (tn == null) {
+			// normal width (i.e. 2 -> 1) operation.
+			normInputs(oi);
+			genTruncateInPlace(oi, tt);
+		} else {
+			// N*2 -> N operation.
+			var ni = apply(oi.source, V3Op.newIntWide(oi.op, tn.sub, tn.newType), normRefs(oi.inputs));
+			mapWide(oi, ni, tn, true);
 		}
-		// N*2 -> N operation.
-		var tn = mach.intNorm.makeType(tt);
-		var ni = apply(oi.source, V3Op.newIntWide(oi.op, tn.sub, tn.newType), inputs);
-		return mapWide(oi, ni, tn, true);
+	}
+	def genTruncateInPlace(oi: SsaApplyOp, tt: IntType) {
+		if (tt.width < mach.intNorm.width) {
+			curBlock.pt = oi.next;
+			var trunc = curBlock.opIntConvert0(mach.intNorm.word, oi.op.resultType, oi);
+			map1keep(oi, trunc);
+			trunc.inputs(0).update(oi);
+		} else {
+			id(oi);
+		}
 	}
 	def genParallelIntOp(oi: SsaApplyOp, infix: byte) {
-		var inputs = genRefs(oi.inputs);
+		var inputs = normRefs(oi.inputs);
 		if (inputs.length == 2) {
 			// 2 -> 1 operation.
 			return map1(oi, apply(oi.source, oi.op, inputs));
@@ -289,15 +589,15 @@ class SsaMachGen extends SsaRebuilder {
 	}
 	def extendBigEnd(bigEnd: SsaInstr, ft: IntType, signed: bool) -> SsaInstr {
 		if (signed) {
-			var shift = newGraph.intConst(mach.intNorm.width - 1);
+			var shift = context.graph.intConst(mach.intNorm.width - 1);
 			var i = apply(null, ft.lookupInfix0(V3Infix.QSar), [bigEnd, shift]);
 			i.setFact(Facts.O_NO_SHIFT_CHECK);
 			return i;
 		}
-		return newGraph.nullConst(mach.intNorm.word);
+		return context.graph.nullConst(mach.intNorm.word);
 	}
 	def genIntConvert(oi: SsaApplyOp) {
-		var inputs = genRefs(oi.inputs);
+		var inputs = normRefs(oi.inputs);
 		var ft = IntType.!(oi.op.paramTypes(0));
 		var tt = IntType.!(oi.op.resultType);
 		if (tt.width > mach.intNorm.width) {
@@ -353,38 +653,35 @@ class SsaMachGen extends SsaRebuilder {
 		}
 		mapN(oi, vals);
 	}
-	def genSimple(oi: SsaApplyOp) -> SsaInstr {
-		return apply(oi.source, oi.op, genRefs(oi.inputs));
-	}
 	def genTypeCast(oi: SsaApplyOp) {
 		var castOp = oi.op.attr<TypeCast>();
 		var ft = oi.op.typeArgs(0), tt = oi.op.typeArgs(1);
 		var ni: SsaInstr;
 		match (castOp.approx) {
-			CastOp.TRUE: ni = genRef1(oi.inputs(0));
-			CastOp.VALUE: ni = newGraph.valConst(tt, castOp.result);
+			CastOp.TRUE: ni = normRef1(oi.inputs(0));
+			CastOp.VALUE: ni = context.graph.valConst(tt, castOp.result);
 			CastOp.CLASS_CAST: ni = genClassCast(ft, tt, oi);
-			CastOp.FALSE: ni = curBlock.addThrow(oi.source, V3Exception.TypeCheck);
+			CastOp.FALSE: ni = addThrow(oi.source, V3Exception.TypeCheck);
 			CastOp.INT_CONVERSION: return genIntConvert(oi);
 		} else {
 			// other kinds of casts should have been removed
 			context.fail1("unexpected cast %1", castOp.name());
-			ni = newGraph.nop();
+			ni = context.graph.nop();
 		}
 		return map1(oi, ni);
 	}
 	def genClassCast(ft: Type, tt: Type, oi: SsaApplyOp) -> SsaInstr {
-		var oobj = oi.inputs(0), nobj = genRef1(oobj);
+		var oobj = oi.inputs(0), nobj = normRef1(oobj);
 		if (context.compiler.DisableTypeChecks) return nobj;
 		var t = mach.classIdRange(tt), low = t.0, high = t.1;
 		if (low == high) {
 			// no live classes can match, only null
 			if (V3Op.needsNullCheck(oi, oobj.dest)) {
-				var cmp = curBlock.opNotEqual(ft, nobj, newGraph.nullConst(ft));
+				var cmp = curBlock.opNotEqual(ft, nobj, context.graph.nullConst(ft));
 				apply(oi.source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp]);
-				return newGraph.nullConst(tt);
+				return context.graph.nullConst(tt);
 			}
-			return curBlock.addThrow(oi.source, V3Exception.TypeCheck);
+			return addThrow(oi.source, V3Exception.TypeCheck);
 		}
 		if (context.prog.ir.isEnum(tt)) {
 			// range check the enum
@@ -399,12 +696,12 @@ class SsaMachGen extends SsaRebuilder {
 	}
 	def genRangeCheck(oi: SsaApplyOp, low: int, high: int, val: SsaInstr) -> SsaInstr {
 		if (high == low + 1) {
-			var cmp = curBlock.opNotEqual(Int.TYPE, val, newGraph.intConst(low));
+			var cmp = curBlock.opNotEqual(Int.TYPE, val, context.graph.intConst(low));
 			apply(oi.source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp]);
 		} else {
-			var cmp1 = curBlock.opIntLt(val, newGraph.intConst(low));
+			var cmp1 = curBlock.opIntLt(val, context.graph.intConst(low));
 			apply(oi.source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp1]);
-			var cmp2 = curBlock.opIntGteq(val, newGraph.intConst(high));
+			var cmp2 = curBlock.opIntGteq(val, context.graph.intConst(high));
 			apply(oi.source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp2]);
 		} 
 		return val;
@@ -412,11 +709,11 @@ class SsaMachGen extends SsaRebuilder {
 	def genTypeQuery(oi: SsaApplyOp) -> SsaInstr {
 		var ft = oi.op.typeArgs(0), tt = oi.op.typeArgs(1);
 		if (V3.isClass(ft) && V3.isClass(tt)) {
-			var oobj = oi.inputs(0), nobj = genRef1(oobj);	
+			var oobj = oi.inputs(0), nobj = normRef1(oobj);	
 			var t = mach.classIdRange(tt), low = t.0, high = t.1;
 			if (low == high) {
 				// no live classes can match, and null is not an instance of
-				return newGraph.falseConst();
+				return context.graph.falseConst();
 			}
 			if (context.prog.ir.isEnum(tt)) {
 				// range check the enum
@@ -424,7 +721,7 @@ class SsaMachGen extends SsaRebuilder {
 			}
 			return genIfNull(oi, Bool.TYPE, nobj, null, genClassIdQuery(oi, low, high, _));
 		}
-		return newGraph.trueConst();
+		return context.graph.trueConst();
 	}
 	def genClassIdQuery(oi: SsaApplyOp, low: int, high: int, nobj: SsaInstr) -> SsaInstr {
 		var tid = ptrLoad(mach.tagType, nobj, 0);
@@ -432,15 +729,15 @@ class SsaMachGen extends SsaRebuilder {
 	}
 	def genRangeQuery(oi: SsaApplyOp, low: int, high: int, val: SsaInstr) -> SsaInstr {
 		if (high == low + 1) {
-			return apply(null, V3Op.newEqual(Int.TYPE), [val, newGraph.intConst(low)]);
+			return apply(null, V3Op.newEqual(Int.TYPE), [val, context.graph.intConst(low)]);
 		} else {
-			var cmp1 = curBlock.opIntGteq(val, newGraph.intConst(low));
-			var cmp2 = curBlock.opIntLt(val, newGraph.intConst(high));
+			var cmp1 = curBlock.opIntGteq(val, context.graph.intConst(low));
+			var cmp2 = curBlock.opIntLt(val, context.graph.intConst(high));
 			return apply(null, V3Op.opBoolAnd, [cmp1, cmp2]);
 		}
 	}
 	def genTypeSubsume(oi: SsaApplyOp) {
-		mapN(oi, genRefs(oi.inputs));  // always a no-op at the machine level
+		mapN(oi, normRefs(oi.inputs));  // always a no-op at the machine level
 	}
 	def genArrayAlloc(oi: SsaApplyOp) -> SsaInstr {
 		var olen = oi.inputs(0), arrayType = oi.op.typeArgs(0);
@@ -448,24 +745,24 @@ class SsaMachGen extends SsaRebuilder {
 		if (SsaValue.?(olen.dest)) {
 			// length is known statically
 			var len = olen.dest.unbox<int>();
-			if (len < 0) return curBlock.addThrow(oi.source, V3Exception.LengthCheck);
+			if (len < 0) return addThrow(oi.source, V3Exception.LengthCheck);
 			return genArrayAllocWithSize(oi.source, arrayType, hsize, len, scale);
 		}
-		var nlen = genRef1(olen);
+		var nlen = normRef1(olen);
 		if (!oi.checkFact(Facts.O_NO_LENGTH_CHECK) && !context.compiler.DisableLengthChecks) {
 			// add a check (length < 0)
-			var check = curBlock.opIntLt(nlen, newGraph.zeroConst());
+			var check = curBlock.opIntLt(nlen, context.graph.zeroConst());
 			apply(oi.source, V3Op.newConditionalThrow(V3Exception.LengthCheck), [check]);
 		}
-		var size: SsaInstr = newGraph.intConst(hsize);
+		var size: SsaInstr = context.graph.intConst(hsize);
 		if (scale > 0) {
 			// scale the length by the element scale
 			var elemsize = nlen;
-			if (scale > 1) elemsize = curBlock.opIntMul(nlen, newGraph.intConst(scale));
+			if (scale > 1) elemsize = curBlock.opIntMul(nlen, context.graph.intConst(scale));
 			if (scale != mach.data.align(scale)) {
 				// alignment is necessary
-				size = curBlock.opIntAdd(elemsize, newGraph.intConst(hsize + mach.data.alignAdd));
-				size = curBlock.opIntAnd(size, newGraph.intConst(mach.data.alignMask));
+				size = curBlock.opIntAdd(elemsize, context.graph.intConst(hsize + mach.data.alignAdd));
+				size = curBlock.opIntAnd(size, context.graph.intConst(mach.data.alignMask));
 			} else {
 				size = curBlock.opIntAdd(elemsize, size);
 			}
@@ -479,9 +776,9 @@ class SsaMachGen extends SsaRebuilder {
 	def genArrayAllocWithSize(source: Source, arrayType: Type, hsize: int, len: int, scale: int) -> SsaInstr {
 		var totalSize = mach.data.align(hsize + len * scale);
 		// allocate the array with the known size
-		var narr = apply(source, MachOp.newAlloc(mach.machType(arrayType)), [newGraph.intConst(totalSize)]);
+		var narr = apply(source, MachOp.newAlloc(mach.machType(arrayType)), [context.graph.intConst(totalSize)]);
 		storeObjectTag(narr, arrayType); // store tag
-		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), newGraph.intConst(len)); // store length
+		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), context.graph.intConst(len)); // store length
 		return narr;
 	}
 	def genArrayInit(oi: SsaApplyOp) -> SsaInstr {
@@ -489,65 +786,67 @@ class SsaMachGen extends SsaRebuilder {
 		var offset = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
 		var narr = genArrayAllocWithSize(oi.source, arrayType, offset, oi.inputs.length, scale);
 		var machType = mach.machType(V3Array.elementType(arrayType));
-		var tn = mach.intNorm.normalize(machType), stride = if(tn == null, 1, tn.size);
-		var inputs = genRefs(oi.inputs);
+		var tn = mach.intNorm.normType(machType), stride = if(tn == null, 1, tn.size);
+		var inputs = normRefs(oi.inputs);
 		for (i = 0; i < inputs.length; (i = i + stride, offset = offset + scale)) {
 			// generate unchecked pointer stores to initialize the array
 			// XXX: cache type normalization across calls to this method
-			genNormalizedStores(oi, false, true, machType, narr, offset, inputs, i);
+			genNormTypedStores(oi, false, true, machType, narr, offset, inputs, i);
 		}
 		return narr;
 	}
 	def genArrayGetElem(oi: SsaApplyOp) {
 		genBoundsCheck(oi, false);
-		var narr = genRef1(oi.inputs(0)), arrayType = oi.op.typeArgs(0);
+		var narr = normRef1(oi.inputs(0)), arrayType = oi.op.typeArgs(0);
 		var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
-		var index = genRef1(oi.inputs(1));
+		var index = normRef1(oi.inputs(1));
 		var offset = genArrayElemOffset(hsize, scale, index);
 		// XXX: fold null check into pointer access if no bounds check
-		genNormalizedLoads(oi, false, false, mach.machType(oi.getType()), ptrAdd(narr, offset), 0);
+		genNormTypedLoads(oi, false, false, mach.machType(oi.getType()), ptrAdd(narr, offset), 0);
 	}
 	def genArraySetElem(oi: SsaApplyOp) {
 		genBoundsCheck(oi, false);
-		var inputs = genRefs(oi.inputs);
+		var inputs = normRefs(oi.inputs);
 		var narr = inputs(0), arrayType = oi.op.typeArgs(0);
 		var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
 		var offset = genArrayElemOffset(hsize, scale, inputs(1));
 		// XXX: fold null check into pointer access if no bounds check
 		var machType = mach.machType(V3Array.elementType(arrayType));
-		genNormalizedStores(oi, false, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
+		genNormTypedStores(oi, false, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
+		oi.kill();
+		oi.remove();
 	}
 	def genArrayElemOffset(headerSize: int, scale: int, index: SsaInstr) -> SsaInstr {
 		if (SsaValue.?(index)) {
 			// fold the offset calculation
-			return newGraph.intConst(headerSize + scale * index.unbox<int>());
+			return context.graph.intConst(headerSize + scale * index.unbox<int>());
 		} else {
 			var offset = index;
-			if (scale > 1) offset = curBlock.opIntMul(index, newGraph.intConst(scale));
-			if (headerSize != 0) offset = curBlock.opIntAdd(offset, newGraph.intConst(headerSize));
+			if (scale > 1) offset = curBlock.opIntMul(index, context.graph.intConst(scale));
+			if (headerSize != 0) offset = curBlock.opIntAdd(offset, context.graph.intConst(headerSize));
 			return offset;
 		}
 	}
 	def genArrayGetLength(oi: SsaApplyOp) -> SsaInstr {
-		var oarr = oi.inputs(0), narr = genRef1(oarr);
+		var oarr = oi.inputs(0), narr = normRef1(oarr);
 		return refLoad(Int.TYPE, oi, oarr, narr, mach.getArrayLengthOffset(oi.op.typeArgs(0)));
 	}
 	def genClassAlloc(oi: SsaApplyOp) {
 		var classType = oi.getType();
 		if (context.prog.ir.isEnum(classType)) {
-			var tag = newGraph.intConst(V3.getVariantTag(classType));
+			var tag = context.graph.intConst(V3.getVariantTag(classType));
 			return map1(oi, tag);
 		}
 		var size = mach.getObjectSize(classType, null);
 		// allocate the object
-		var nobj = apply(oi.source, MachOp.newAlloc(mach.machType(classType)), [newGraph.intConst(size)]);
+		var nobj = apply(oi.source, MachOp.newAlloc(mach.machType(classType)), [context.graph.intConst(size)]);
 		storeObjectTag(nobj, classType);
 		var newRef = V3Op.extractIrSpec(oi.op);
 		if (newRef.member != null) {
 			var funcRep = mach.funcRep(newRef);
 			// nontrivial constructor
-			var func = newGraph.valConst(funcRep.machType, mach.getCodeAddress(newRef));
-			var args = Arrays.prepend(func, Arrays.prepend(nobj, genRefs(oi.inputs)));
+			var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(newRef));
+			var args = Arrays.prepend(func, Arrays.prepend(nobj, normRefs(oi.inputs)));
 			call(oi, funcRep, args);
 			return;
 		}
@@ -555,36 +854,38 @@ class SsaMachGen extends SsaRebuilder {
 	}
 	def genClassGetField(oi: SsaApplyOp) {
 		var fieldRef = V3Op.extractIrSpec(oi.op);
-		var oobj = oi.inputs(0), nobj = genRef1(oobj);
+		var oobj = oi.inputs(0), nobj = normRef1(oobj);
 		var machType = mach.machType(fieldRef.getFieldType());
 		var offset = mach.classFieldOffset(fieldRef);
 		var nullCheck = V3Op.needsNullCheck(oi, oobj.dest);
 		var nullIsBottom = V3.isVariant(fieldRef.container);
-		genNormalizedLoads(oi, nullCheck, nullIsBottom, machType, nobj, offset);
+		genNormTypedLoads(oi, nullCheck, nullIsBottom, machType, nobj, offset);
 	}
 	def genClassSetField(oi: SsaApplyOp, init: bool) {
-		var inputs = genRefs(oi.inputs);
+		var inputs = normRefs(oi.inputs);
 		var fieldRef = V3Op.extractIrSpec(oi.op), nobj = inputs(0);
 		var offset = mach.classFieldOffset(fieldRef);
 		var machType = mach.machType(fieldRef.getFieldType());
-		genNormalizedStores(oi, V3Op.needsNullCheck(oi, nobj), init, machType, nobj, offset, inputs, 1);
+		genNormTypedStores(oi, V3Op.needsNullCheck(oi, nobj), init, machType, nobj, offset, inputs, 1);
+		oi.kill();
+		oi.remove();
 	}
 	def genClassGetMethod(oi: SsaApplyOp) -> SsaInstr {
 		var methodRef = V3Op.extractIrSpec(oi.op);
 		var funcRep = mach.funcRep(methodRef);
-		return newGraph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
 	}
 	def genClassGetVirtual(oi: SsaApplyOp) -> SsaInstr {
 		var methodRef = V3Op.extractIrSpec(oi.op);
 		var funcRep = mach.funcRep(methodRef);
-		var oobj = oi.inputs(0), nobj = genRef1(oobj);
+		var oobj = oi.inputs(0), nobj = normRef1(oobj);
 		if (V3.isVariant(methodRef.container)) {
 			if (context.prog.ir.isEnum(methodRef.container)) {
 				// generate a direct mtable lookup using the enum.
-				var tid = curBlock.opIntMul(nobj, newGraph.intConst(mach.code.addressSize));
+				var tid = curBlock.opIntMul(nobj, context.graph.intConst(mach.code.addressSize));
 				var raw = mach.methodTableRaw(methodRef);
 				var offset = 0 - mach.code.addressSize * V3.getVariantTag(methodRef.container);
-				var mtbl = newGraph.valConst(mach.data.ptrType, raw.add(offset));
+				var mtbl = context.graph.valConst(mach.data.ptrType, raw.add(offset));
 				return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
 			}
 			var defm = mach.getCodeAddress(context.prog.ir.resolveVariantDefaultMethodImpl(methodRef));
@@ -595,50 +896,53 @@ class SsaMachGen extends SsaRebuilder {
 	def genMtableLookup(oi: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, funcRep: Mach_FuncRep, methodRef: IrSpec) -> SsaInstr {
 		// use method-table based dispatch
 		var tid = refLoad(mach.tagType, oi, oobj, nobj, 0);
-		var mtbl = newGraph.valConst(mach.data.ptrType, mach.methodTable(methodRef));
+		var mtbl = context.graph.valConst(mach.data.ptrType, mach.methodTable(methodRef));
 		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
 	}
 	def genComponentGetField(oi: SsaApplyOp) {
 		var fieldRef = V3Op.extractIrSpec(oi.op);
 		var fieldType = mach.machType(fieldRef.getFieldType());
 		var ptr = componentFieldPtr(fieldRef);
-		genNormalizedLoads(oi, false, false, fieldType, ptr, 0);
+		genNormTypedLoads(oi, false, false, fieldType, ptr, 0);
 	}
 	def genComponentSetField(oi: SsaApplyOp) {
 		var fieldRef = V3Op.extractIrSpec(oi.op);
-		var inputs = genRefs(oi.inputs);
+		var inputs = normRefs(oi.inputs);
 		var machType = mach.machType(fieldRef.getFieldType());
 		var ptr = componentFieldPtr(fieldRef);
 		// generate remaining stores for normalized fields.
-		genNormalizedStores(oi, false, false, machType, ptr, 0, inputs, 1);
+		genNormTypedStores(oi, false, false, machType, ptr, 0, inputs, 1);
+		oi.kill();
+		oi.remove();
 	}
 	def genTupleGetElem(oi: SsaApplyOp) {
-		var tn = RaTuple.!(normalize(oi.op.typeArgs(0)));
-		mapN(oi, tn.getElem(genRefs(oi.inputs), oi.op.attr<int>()));
+		var tn = RaTuple.!(normType(oi.op.typeArgs(0)));
+		mapN(oi, tn.getElem(normRefs(oi.inputs), oi.op.attr<int>()));
 	}
 	def genNullCheck(oi: SsaApplyOp) -> SsaInstr {
-		var oobj = oi.inputs(0), nobj = genRef1(oobj);
+		var oobj = oi.inputs(0), nobj = normRef1(oobj);
+		oi.facts = 0;
 		if (context.compiler.DisableNullChecks) return nobj;
 		if (V3Op.needsNullCheck(oi, oobj.dest)) {
 			if (SsaValue.?(nobj)) {
 				var oval = SsaValue.!(nobj).val;
-				if (oval == null) curBlock.addThrow(oi.source, V3Exception.NullCheck);
+				if (oval == null) addThrow(oi.source, V3Exception.NullCheck);
 				return nobj; // constant is non-null
 			}
-			if (explicitNullChecks) return explicitNullCheck(oi.source, mach.machType(oobj.dest.getType()), nobj);
+			if (!config.ImplicitNullChecks) return explicitNullCheck(oi.source, mach.machType(oobj.dest.getType()), nobj);
 			else ptrLoadT(oi.source, Void.TYPE, nobj, 0);
 		}
 		return nobj;
 	}
 	def genBoundsCheck(oi: SsaApplyOp, nullCheck: bool) -> SsaInstr {
-		var oarr = oi.inputs(0), narr = genRef1(oarr);
+		var oarr = oi.inputs(0), narr = normRef1(oarr);
 		if (context.compiler.DisableBoundsChecks || oi.checkFact(Facts.O_NO_BOUNDS_CHECK)) {
-			return if(nullCheck, genNullCheck(oi), newGraph.nullConst(Void.TYPE));
+			return if(nullCheck, genNullCheck(oi), context.graph.nullConst(Void.TYPE));
 		}
 		// load length
 		// XXX: CSE the array length if possible
 		var len = refLoad(Int.TYPE, oi, oarr, narr, mach.getArrayLengthOffset(oi.op.typeArgs(0)));
-		var index = genRef1(oi.inputs(1));
+		var index = normRef1(oi.inputs(1));
 		var throwOp = V3Op.newConditionalThrow(V3Exception.BoundsCheck);
 		// throw BoundsCheckException if ugteq(index, length)
 		apply(oi.source, throwOp, [apply(null, MachOp.opIntUgteq, [index, len])]);
@@ -648,14 +952,14 @@ class SsaMachGen extends SsaRebuilder {
 		var methodRef = V3Op.extractIrSpec(oi.op);
 		if (!oi.checkFact(Facts.O_NO_NULL_CHECK) && methodRef.container.typeCon.kind != V3Kind.VARIANT) genNullCheck(oi);
 		var funcRep = mach.funcRep(methodRef);
-		var func = newGraph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
-		var args = Arrays.prepend(func, genRefs(oi.inputs));
+		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+		var args = Arrays.prepend(func, normRefs(oi.inputs));
 		call(oi, funcRep, args);
 	}
 	def genCallClassVirtual(oi: SsaApplyOp) {
 		var func = genClassGetVirtual(oi);
 		var methodRef = V3Op.extractIrSpec(oi.op);
-		var args = Arrays.prepend(func, genRefs(oi.inputs));
+		var args = Arrays.prepend(func, normRefs(oi.inputs));
 		call(oi, mach.funcRep(methodRef), args);
 	}
 	def genVariantGetTag(oi: SsaApplyOp, nobj: SsaInstr) -> SsaInstr {
@@ -664,45 +968,44 @@ class SsaMachGen extends SsaRebuilder {
 		var min = mach.classIdRange(root).0;
 		if (min != 0) {
 			var sub = IntType.!(mach.tagType).lookupInfix0(V3Infix.Sub);
-			val = apply(oi.source, sub, [val, newGraph.intConst(min)]);
+			val = apply(oi.source, sub, [val, context.graph.intConst(min)]);
 		}
 		var shift = IntOp.log(mach.code.addressSize);
 		if (shift > 0) {
 			var shr = IntType.!(mach.tagType).lookupInfix0(V3Infix.QShr);
-			val = apply(null, shr, [val, newGraph.intConst(shift)]);
+			val = apply(null, shr, [val, context.graph.intConst(shift)]);
 		}
 		var conv = V3Op.newIntConvert(mach.tagType, oi.op.resultType);
 		return apply(null, conv, [val]);
 	}
 	def genConditionalThrow(oi: SsaApplyOp) -> SsaInstr {
-		return apply(oi.source, oi.op, genRefs(oi.inputs));
+		return apply(oi.source, oi.op, normRefs(oi.inputs));
 	}
 
 	def explicitNullCheck(source: Source, t: Type, nobj: SsaInstr) -> SsaInstr {
 		if (context.compiler.DisableNullChecks) return nobj;
-		var check = apply(null, V3Op.newEqual(t), [nobj, newGraph.nullConst(t)]);
+		var check = apply(null, V3Op.newEqual(t), [nobj, context.graph.nullConst(t)]);
 		apply(source, V3Op.newConditionalThrow(V3Exception.NullCheck), [check]);
 		return nobj;
 	}
 	def storeObjectTag(nobj: SsaInstr, t: Type) {
-		var tag = newGraph.valConst(mach.tagType, mach.objectTag(t));
+		var tag = context.graph.valConst(mach.tagType, mach.objectTag(t));
 		ptrStore(mach.tagType, nobj, 0, tag);
 	}
 	def genIfNull(oi: SsaApplyOp, resultType: Type, nobj: SsaInstr, nullVal: Val, gen: SsaInstr -> SsaInstr) -> SsaInstr {
 		if (nobj.checkFact(Facts.V_ZERO)) {
-			return newGraph.valConst(resultType, nullVal);
+			return context.graph.valConst(resultType, nullVal);
 		} else if (V3Op.needsNullCheck(oi, nobj)) {
-			var tblock = newBlock(), fblock = newBlock(), merge = newBlock();
-			curBlock.addIfNull(nobj, tblock.block, fblock.block);
+			var t = addIfNull(nobj);
+			var tblock = t.0, fblock = t.1, merge = t.2;
 			curBlock = fblock;
 			// if (nobj != null) generate the nonnull case
 			var nonNull = gen(nobj);
 			fblock.addGoto(merge.block);
 			tblock.addGoto(merge.block);
 			curBlock = merge;
-			if (blockEndMap != null) blockEndMap.set(context.block, curBlock.block);
 			// if (nobj == null) use the null value
-			return curBlock.addPhi(resultType, [nonNull, newGraph.valConst(resultType, nullVal)]);
+			return curBlock.addPhi(resultType, [nonNull, context.graph.valConst(resultType, nullVal)]);
 		} else {
 			return gen(nobj);
 		}
@@ -712,8 +1015,8 @@ class SsaMachGen extends SsaRebuilder {
 		if (curBlock.end) return;
 		var ni = curBlock.addApply(oi.source, MachOp.newCallAddress(funcRep), args);
 		ni.facts = ni.facts | oi.facts;
-		var tn = normalize(oi.op.resultType);
-		mapNorm(oi, ni, tn);
+		var tn = normType(oi.op.resultType);
+		mapMultiReturn(oi, ni, tn);
 	}
 	def apply(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
 		return curBlock.addApply(source, op, args);
@@ -728,19 +1031,19 @@ class SsaMachGen extends SsaRebuilder {
 				if (SsaValue.?(left)) {
 					// PtrAdd(PtrAdd(#left, right), #offset)
 					var addr = Addr.!(SsaValue.!(left).val);
-					left = newGraph.valConst(pd, addr.add(offset.unbox<int>()));
+					left = context.graph.valConst(pd, addr.add(offset.unbox<int>()));
 					return ptrAdd(left, right);
 				}
 				if (SsaValue.?(right)) {
 					// PtrAdd(PtrAdd(left, #right), #offset)
-					offset = newGraph.valConst(pd, Int.box(right.unbox<int>() + offset.unbox<int>()));
+					offset = context.graph.valConst(pd, Int.box(right.unbox<int>() + offset.unbox<int>()));
 					base = left;
 				}
 			} else if (SsaValue.?(base)) {
 				// fold PtrAdd(#addr, #offset)
 				var addr = Addr.!(SsaValue.!(base).val);
 				if (addr != null) {
-					var addr = newGraph.valConst(pd, addr.add(offset.unbox<int>()));
+					var addr = context.graph.valConst(pd, addr.add(offset.unbox<int>()));
 					addr.setFact(Facts.V_NON_ZERO);
 					return addr;
 				}
@@ -749,41 +1052,66 @@ class SsaMachGen extends SsaRebuilder {
 		return apply(null, MachOp.newPtrAdd(pt, pd), [base, offset]); 
 	}
 	def ptrLoad(vt: Type, p: SsaInstr, offset: int) -> SsaInstr {
-		if (offset != 0) p = ptrAdd(p, newGraph.intConst(offset));
+		if (offset != 0) p = ptrAdd(p, context.graph.intConst(offset));
 		var i = apply(null, MachOp.newPtrLoad(p.getType(), vt), [p]);
 		i.setFact(Facts.O_NO_NULL_CHECK); // this load won't trap
 		return i;
 	}
 	def ptrStore(vt: Type, p: SsaInstr, offset: int, v: SsaInstr) -> SsaInstr {
-		if (offset != 0) p = ptrAdd(p, newGraph.intConst(offset));
+		if (offset != 0) p = ptrAdd(p, context.graph.intConst(offset));
 		var i = apply(null, MachOp.newPtrStore(p.getType(), vt), [p, v]);
 		i.setFact(Facts.O_NO_NULL_CHECK); // this store won't trap
 		return i;
 	}
 	def ptrLoadT(source: Source, t: Type, p: SsaInstr, offset: int) -> SsaInstr {
-		if (offset != 0) p = ptrAdd(p, newGraph.intConst(offset));
+		if (offset != 0) p = ptrAdd(p, context.graph.intConst(offset));
 		return apply(source, MachOp.newPtrLoad(p.getType(), t), [p]); // this load may trap
 	}
 	def ptrStoreT(source: Source, t: Type, p: SsaInstr, offset: int, v: SsaInstr) -> SsaInstr {
-		if (offset != 0) p = ptrAdd(p, newGraph.intConst(offset));
+		if (offset != 0) p = ptrAdd(p, context.graph.intConst(offset));
 		return apply(source, MachOp.newPtrStore(p.getType(), t), [p, v]); // this store may trap
 	}
 	def refLoad(vt: Type, oi: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, offset: int) -> SsaInstr {
 		if (V3Op.needsNullCheck(oi, oobj.dest)) {
-			if (explicitNullChecks) explicitNullCheck(oi.source, mach.machType(oobj.dest.getType()), nobj);
+			if (!config.ImplicitNullChecks) explicitNullCheck(oi.source, mach.machType(oobj.dest.getType()), nobj);
 			else return ptrLoadT(oi.source, vt, nobj, offset);
 		}
 		return ptrLoad(vt, nobj, offset);
 	}
 	def componentFieldPtr(f: IrSpec) -> SsaInstr {
-		return newGraph.valConst(mach.data.ptrType, mach.componentFieldPtr(f));
+		return context.graph.valConst(mach.data.ptrType, mach.componentFieldPtr(f));
+	}
+	def addIfNull(x: SsaInstr) -> (SsaBuilder, SsaBuilder, SsaBuilder) {
+		// Split the current block
+		var tblock = newBlock(), fblock = newBlock(), merge = newBlock();
+		var exit = curBlock.block;
+		var end = exit.end();
+		exit.prev = null;
+		end.next = null;
+
+		var last = curBlock.pt;
+		var first = last.next;
+		last.next = exit;
+		exit.prev = last;
+		curBlock.end = false;
+
+		curBlock.addIfNull(x, tblock.block, fblock.block);
+
+		first.prev = merge.block;
+		merge.block.next = first;
+		merge.pt = first;
+
+		merge.block.prev = end;
+		end.next = merge.block;
+
+		return (tblock, fblock, merge);
 	}
 	def newBlock() -> SsaBuilder {
-		return SsaBuilder.new(context, newGraph, SsaBlock.new());
+		return SsaBuilder.new(context, context.graph, SsaBlock.new());
 	}
 	// Support for normalizing loads and stores.
-	def genNormalizedLoads(oi: SsaApplyOp, nullCheck: bool, nullIsBottom: bool, machType: Type, base: SsaInstr, offset: int) {
-		var tn = mach.intNorm.normalize(machType);
+	def genNormTypedLoads(oi: SsaApplyOp, nullCheck: bool, nullIsBottom: bool, machType: Type, base: SsaInstr, offset: int) {
+		var tn = mach.intNorm.normType(machType);
 		// check for simple case first.
 		if (tn == null) {
 			var result: SsaInstr;
@@ -797,10 +1125,10 @@ class SsaMachGen extends SsaRebuilder {
 		}
 		var tblock: SsaBuilder, fblock: SsaBuilder, merge: SsaBuilder;
 		if (nullCheck && nullIsBottom) {
-			tblock = newBlock();
-			fblock = newBlock();
-			merge = newBlock();
-			curBlock.addIfNull(base, tblock.block, fblock.block);
+			var t = addIfNull(base);
+			tblock = t.0;
+			fblock = t.1;
+			merge = t.2;
 			curBlock = fblock;
 		}
 		// generate multiple loads for normalized fields and array elements.
@@ -818,17 +1146,16 @@ class SsaMachGen extends SsaRebuilder {
 			fblock.addGoto(merge.block);
 			tblock.addGoto(merge.block);
 			curBlock = merge;
-			if (blockEndMap != null) blockEndMap.set(context.block, curBlock.block);
 			// if (nobj == null) emit null values
 			for (i < loads.length) {
-				loads(i) = curBlock.addPhi(tn.sub(i), [loads(i), newGraph.valConst(tn.sub(i), null)]);
+				loads(i) = curBlock.addPhi(tn.sub(i), [loads(i), context.graph.valConst(tn.sub(i), null)]);
 			}
 		}
 
 		return mapN(oi, loads);
 	}
-	def genNormalizedStores(oi: SsaApplyOp, nullCheck: bool, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
-		var tn = mach.intNorm.normalize(machType);
+	def genNormTypedStores(oi: SsaApplyOp, nullCheck: bool, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
+		var tn = mach.intNorm.normType(machType);
 		// check for simple case first.
 		if (tn == null) {
 			var val = vals(start);
@@ -850,5 +1177,26 @@ class SsaMachGen extends SsaRebuilder {
 			if (SsaValue.?(v)) return !Values.equal(SsaValue.!(v).val, null);
 		}
 		return true;
+	}
+	def addThrow(source: Source, exception: string) -> SsaInstr {
+		if (curBlock.end) return null;
+		curBlock.end = true;
+		var t = SsaThrow.new(source, exception);
+		t.insertBefore(curBlock.pt);
+		// kill the rest of the instructions in the block
+		var cfopt = SsaCfOptimizer.new(context);
+		for (p = t.next; !SsaBlock.?(p); ()) {
+			var n = p.next;
+			p.remove();
+			if (SsaEnd.?(p)) {
+				var end = SsaEnd.!(p);
+				cfopt.killSuccs(end.succs);
+				cfopt.killInstr(end);
+				break;
+			}
+			if (SsaInstr.?(p)) cfopt.killInstr(SsaInstr.!(p));
+			p = n;
+		}
+		return t;
 	}
 }

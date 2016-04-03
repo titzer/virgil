@@ -133,6 +133,7 @@ function run_native_tests() {
 	C=$OUT/$target/compile.out
 	R=$OUT/$target/run.out
 	print_compiling $1
+	echo run_v3c "" -multiple -set-exec=false -target=$testtarget -output=$OUT/$target $TESTS &> $C
 	run_v3c "" -multiple -set-exec=false -target=$testtarget -output=$OUT/$target $TESTS &> $C
 	check_red $C
 
