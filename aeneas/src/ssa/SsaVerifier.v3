@@ -1,10 +1,79 @@
 // Copyright 2016 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-class SsaGraphVerifier(context: SsaContext) {
+def newMap<T>() -> HashMap<SsaLink, T> {
+	return HashMap<SsaLink, T>.new(SsaLink.uid, SsaLink.==);
+}
+class SsaGraphVerifier(prog: Program, graph: SsaGraph) {
+	def context = SsaContext.new(null, prog);
+	def seen = newMap<bool>();
+	def blocks = Vector<SsaBlock>.new();
+	def instrs = Vector<SsaLink>.new();
+	def marks = newMap<int>();
+	var markGen = 1;
+	def verify() {
+		context.graph = graph;
+		// Mark constants.
+		if (graph.values != null) {
+			for (v in graph.values) {
+				if (v != null) {
+					instrs.add(v);
+					marks.set(v, instrs.length);
+				}
+			}
+		}
+		// Mark parameters.
+		for (p in graph.params) checkAndMark(p);
+
+		// Traverse blocks in breadth-first order.
+		var seen = newMap<bool>();
+		seen.set(graph.startBlock, true);
+		blocks.add(graph.startBlock);
+		for (i = 0; i < blocks.length; i++) {
+			var block = blocks.get(i);
+			verifyBlock(block);
+			for (s in block.succs()) {
+				var d = s.dest;
+				if (seen.get(d)) continue;
+				seen.set(d, true);
+				blocks.add(d);
+			}
+		}
+
+		// Check that all links point to marked nodes.
+		for (j < instrs.length) {
+			var i = instrs.get(j);
+			var inputs = Ssa.NO_DF_EDGES;
+			if (SsaInstr.?(i)) inputs = SsaInstr.!(i).inputs;
+			for (e in inputs) {
+				check(marks.get(e.dest) > 0, "instr @%1 references unreachable input", i);
+			}
+		}
+
+		// TODO: quality warnings: check for references from dead nodes to live nodes.
+		if (false) for (j < instrs.length) {
+			var i = instrs.get(j);
+			if (!SsaInstr.?(i)) continue;
+			for (l: Edge<SsaInstr> = SsaInstr.!(i).useList; l != null; l = l.next) {
+				check(marks.get(l.src) == 0, "instr @%1 used by dead instruction", i);
+			}
+		}
+	}
+	def checkAndMark(i: SsaLink) {
+		check(!i.checkFact(Facts.O_KILLED), "@%1 has been marked as killed", i);
+		check(marks.get(i) == 0, "@%1 is already marked", i);
+		instrs.add(i);
+		marks.set(i, instrs.length);
+	}
 	def verifyBlock(block: SsaBlock) {
 		context.block = block;
+		checkAndMark(block);
 
+		// Verify that no predecessors are null.
+		for (p in block.preds) {
+			check(p != null, "null predecessor", block);
+			check(p.dest == block, "predecessor has wrong destination", block);
+		}
 		// Verify that if the block is empty, it points to itself in a cycle.
 		if (block.next == block) {
 			check(block.prev == block, "block.next == block but block.prev != block", block);
@@ -13,41 +82,70 @@ class SsaGraphVerifier(context: SsaContext) {
 		// Otherwise, check the last instruction is an end.
 		check(SsaEnd.?(block.prev), "block.prev @%1 is not an SsaEnd", block.prev);
 		// Gather the instructions in the block.
-		var mark = context.graph.markGen++;
-		var vector = Vector<SsaLink>.new();
+		var start = instrs.length;
 		for (i: SsaLink = block; true; i = i.next) {
 			check(i != null, "null link in block", i);
 			if (i == null) break;
-			if (i.mark >= mark) {
+			if (marks.get(i) > 0) {
 				check(i == block, "block head should complete cycle, instead @%1 did", i);
 				break;
 			}
-			i.mark = context.graph.markGen++;
-			vector.add(i);
+			checkAndMark(i);
 		}
 		// Verify the forward and backward directions of the links.
-		for (i < vector.length) {
-			var instr = vector.get(i), prev: SsaLink;
-			if (i > 0) prev = vector.get(i - 1);
-			else prev = vector.get(vector.length - 1);
+		for (i = start; i < instrs.length; i++) {
+			var instr = instrs.get(i), prev: SsaLink;
+			if (i > start) prev = instrs.get(i - 1);
+			else prev = instrs.get(instrs.length - 1);
 			check(prev == instr.prev, "backward link integrity @%1", instr);
 			check(prev.next == instr, "forward link integrity @%1", prev);
 		}
-		// Verify the dataflow references direction.
-		for (i < vector.length) {
-			var instr = vector.get(i);
-			var inputs: Array<SsaDfEdge>;
-			if (SsaInstr.?(instr)) inputs = SsaInstr.!(instr).inputs;
-			else if (SsaEnd.?(instr)) inputs = SsaEnd.!(instr).inputs;
-			else inputs = [];
-			for (x in inputs) {
-				check(x.dest.mark < instr.mark, "dataflow edge direction", instr);
+		// Verify the instructions in the block.
+		var nonphi = false;
+		for (i = start; i < instrs.length; i++) {
+			var instr = instrs.get(i);
+			if (SsaPhi.?(instr)) {
+				check(!nonphi, "phi @%1 is preceded by non-phi instruction", instr);
+				verifyPhi(block, SsaPhi.!(instr));
+			} else if (SsaInstr.?(instr)) {
+				verifyInstr(SsaInstr.!(instr));
+				nonphi = true;
+			} else if (SsaEnd.?(instr)) {
+				verifyEnd(SsaEnd.!(instr));
+				check(i == instrs.length - 1, "end @%1 is in middle of block", instr);
+				nonphi = true;
+			} else {
+				nonphi = true;
 			}
+		}
+		// Verify the control edges.
+		var end = block.end();
+		for (s in end.succs) {
+			check(s.dest != null, "control edge has null destination", block);
+			var found = false;
+			for (p in s.dest.preds) {
+				if (p == s) { found = true; break; }
+			}
+			check(found, "control edge not found in preds of #%1", s.dest);
+		}
+	}
+	def verifyPhi(block: SsaBlock, phi: SsaPhi) {
+		check(phi.inputs.length == block.preds.length, "phi @%1 has the wrong number of inputs", phi);
+	}
+	def verifyInstr(instr: SsaInstr) {
+		for (x in instr.inputs) {
+			check(marks.get(x.dest) < marks.get(instr), "input does not dominate @%1", instr);
+		}
+	}
+	def verifyEnd(end: SsaEnd) {
+		for (x in end.inputs) {
+			check(marks.get(x.dest) < marks.get(end), "input does not dominate @%1", end);
 		}
 	}
 	def check(cond: bool, msg: string, i: SsaLink) {
+		if (cond) return;
 		var p = SsaPrinter.new(context.prog);
-		p.printBlock(context.block);
-		if (!cond) context.fail1(msg, if(i == null, -1, i.uid));
+		if (context.block != null) p.printBlock(context.block);
+		context.fail1(msg, if(i == null, -1, i.uid));
 	}
 }
