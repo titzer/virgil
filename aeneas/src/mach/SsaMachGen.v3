@@ -8,6 +8,7 @@ class SsaMachGenConfig {
 	var Int16Arith = false;                 // native support for int16 arithmetic
 	var Int32Arith = true;                  // native support for int32 arithmetic
 	var Int64Arith = false;                 // native support for int64 arithmetic
+	var StoreNarrow = true;			// enables store narrowing optimization
 	var Int8StoreNarrow = true;             // storing > 8 bits can narrow
 	var Int16StoreNarrow = true;            // storing > 16 bits can narrow
 	var Int32StoreNarrow = true;            // storing > 32 bits can narrow
@@ -212,6 +213,7 @@ class SsaGraphNormalizer(context: SsaContext) {
 // with loads and stores. Introduces truncations and wrapping for integer operations
 // according to the {config}.
 class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig) extends SsaGraphNormalizer(SsaContext.new(compiler, mach.prog)) {
+	var maybeDead: List<SsaInstr>;
 	def doMethod(method: IrMethod) {
 		context.enterMethod(method);
 		var graph = method.ssa;
@@ -245,6 +247,13 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 
 		for (l = phis; l != null; l = l.tail) genPhi(l.head);
 		phis = null;
+
+		for (l = maybeDead; l != null; l = l.tail) {
+			if (l.head.useList == null) {
+				l.head.kill();
+				l.head.remove();
+			}
+		}
 		context.printSsa("Machine");
 	}
 	def genParams(graph: SsaGraph) {
@@ -659,7 +668,7 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		var ft = oi.op.typeArgs(0), tt = oi.op.typeArgs(1);
 		var ni: SsaInstr;
 		match (castOp.approx) {
-			CastOp.TRUE: ni = normRef1(oi.inputs(0));
+			CastOp.TRUE: ni = normRef1(oi.inputs(0));  // XXX: maybe dead?
 			CastOp.VALUE: ni = context.graph.valConst(tt, castOp.result);
 			CastOp.CLASS_CAST: ni = genClassCast(ft, tt, oi);
 			CastOp.FALSE: ni = addThrow(oi.source, V3Exception.TypeCheck);
@@ -771,7 +780,7 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		// allocate the array, store tag, and store length
 		var narr = apply(oi.source, MachOp.newAlloc(mach.machType(arrayType)), [size]);
 		storeObjectTag(narr, arrayType);
-		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), nlen);
+		ptrStoreNoTrap(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), nlen);
 		return narr;
 	}
 	def genArrayAllocWithSize(source: Source, arrayType: Type, hsize: int, len: int, scale: int) -> SsaInstr {
@@ -779,7 +788,7 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		// allocate the array with the known size
 		var narr = apply(source, MachOp.newAlloc(mach.machType(arrayType)), [context.graph.intConst(totalSize)]);
 		storeObjectTag(narr, arrayType); // store tag
-		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), context.graph.intConst(len)); // store length
+		ptrStoreNoTrap(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), context.graph.intConst(len)); // store length
 		return narr;
 	}
 	def genArrayInit(oi: SsaApplyOp) -> SsaInstr {
@@ -991,7 +1000,7 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 	}
 	def storeObjectTag(nobj: SsaInstr, t: Type) {
 		var tag = context.graph.valConst(mach.tagType, mach.objectTag(t));
-		ptrStore(mach.tagType, nobj, 0, tag);
+		ptrStoreNoTrap(mach.tagType, nobj, 0, tag);
 	}
 	def genIfNull(oi: SsaApplyOp, resultType: Type, nobj: SsaInstr, nullVal: Val, gen: SsaInstr -> SsaInstr) -> SsaInstr {
 		if (nobj.checkFact(Facts.V_ZERO)) {
@@ -1058,9 +1067,8 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		i.setFact(Facts.O_NO_NULL_CHECK); // this load won't trap
 		return i;
 	}
-	def ptrStore(vt: Type, p: SsaInstr, offset: int, v: SsaInstr) -> SsaInstr {
-		if (offset != 0) p = ptrAdd(p, context.graph.intConst(offset));
-		var i = apply(null, MachOp.newPtrStore(p.getType(), vt), [p, v]);
+	def ptrStoreNoTrap(vt: Type, p: SsaInstr, offset: int, v: SsaInstr) -> SsaInstr {
+		var i = ptrStore(null, vt, p, offset, v);
 		i.setFact(Facts.O_NO_NULL_CHECK); // this store won't trap
 		return i;
 	}
@@ -1068,9 +1076,30 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		if (offset != 0) p = ptrAdd(p, context.graph.intConst(offset));
 		return apply(source, MachOp.newPtrLoad(p.getType(), t), [p]); // this load may trap
 	}
-	def ptrStoreT(source: Source, t: Type, p: SsaInstr, offset: int, v: SsaInstr) -> SsaInstr {
+	def ptrStore(source: Source, vt: Type, p: SsaInstr, offset: int, v: SsaInstr) -> SsaInstr {
 		if (offset != 0) p = ptrAdd(p, context.graph.intConst(offset));
-		return apply(source, MachOp.newPtrStore(p.getType(), t), [p, v]); // this store may trap
+		if (config.StoreNarrow && vt.typeCon.kind == V3Kind.INT) {
+			v = eliminateStoreNarrow(IntType.!(vt), v);
+		}
+		var i = apply(source, MachOp.newPtrStore(p.getType(), vt), [p, v]); // this store may trap
+		return i;
+	}
+	def eliminateStoreNarrow(tt: IntType, v: SsaInstr) -> SsaInstr {
+		if (!SsaApplyOp.?(v)) return v;
+		var apply = SsaApplyOp.!(v);
+		if (apply.op.opcode != Opcode.IntConvert) return v;
+		var ft = IntType.!(apply.op.typeArgs(0));
+		if (ft.width <= tt.width) return v;
+		if (IntType.!(apply.op.typeArgs(1)).width < tt.width) return v;
+		if (tt.width == 8 && config.Int8StoreNarrow) return getInputAndMaybeDead(apply);
+		if (tt.width == 16 && config.Int16StoreNarrow) return getInputAndMaybeDead(apply);
+		if (tt.width == 32 && config.Int32StoreNarrow) return getInputAndMaybeDead(apply);
+		return v;
+	}
+	def getInputAndMaybeDead(v: SsaApplyOp) -> SsaInstr {
+		var i = v.input0();
+		maybeDeadCodeLater(v);
+		return i;
 	}
 	def refLoad(vt: Type, oi: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, offset: int) -> SsaInstr {
 		if (V3Op.needsNullCheck(oi, oobj.dest)) {
@@ -1160,16 +1189,16 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		// check for simple case first.
 		if (tn == null) {
 			var val = vals(start);
-			if (nullCheck) ptrStoreT(oi.source, machType, base, offset, val);
-			else if (isNonTrivialStore(init, val)) ptrStore(machType, base, offset, val);
+			if (nullCheck) ptrStore(oi.source, machType, base, offset, val);
+			else if (isNonTrivialStore(init, val)) ptrStoreNoTrap(machType, base, offset, val);
 			return;
 		}
 		// generate multiple stores for normalized fields and array elements.
 		var check = if(nullCheck, 0, -1);
 		for (i < tn.size) {
 			var et = tn.sub(i), val = vals(start + i);
-			if (i == check) ptrStoreT(oi.source, et, base, offset, val);
-			else if (isNonTrivialStore(init, val)) ptrStore(et, base, offset, val);
+			if (i == check) ptrStore(oi.source, et, base, offset, val);
+			else if (isNonTrivialStore(init, val)) ptrStoreNoTrap(et, base, offset, val);
 			offset = offset + mach.sizeOf(et);
 		}
 	}
@@ -1178,6 +1207,10 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 			if (SsaValue.?(v)) return !Values.equal(SsaValue.!(v).val, null);
 		}
 		return true;
+	}
+	def maybeDeadCodeLater(i: SsaInstr) {
+		// XXX: this is a cheap way of dead code elimination
+		maybeDead = List.new(i, maybeDead);
 	}
 	def addThrow(source: Source, exception: string) -> SsaInstr {
 		if (curBlock.end) return null;
