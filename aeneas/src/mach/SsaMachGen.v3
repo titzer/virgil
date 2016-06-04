@@ -18,9 +18,7 @@ class SsaMachGenConfig {
 	var Int16LoadSignExtend = true;         // loading 16 bits can sign extend
 	var Int32LoadZeroExtend = true;         // loading 32 bits can zero extend to 64
 	var Int32LoadSignExtend = true;         // loading 32 bits can sign extend to 64
-	var Int32ShlSaturate = false;           // shift left masks saturates on overflow
-	var Int32ShrSaturate = false;           // shift right masks saturates on overflow
-	var Int32SarSaturate = false;           // shift right masks saturates on overflow
+	var Int32ShiftSaturate = false;         // shift saturates on overflow
 	var NullcheckAreaSize = 0;              // hardware reserved null check area size
 	var ImplicitNullChecks = true;          // generate implicit null checks
 }
@@ -486,6 +484,52 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 	}
 	def genShiftOp(oi: SsaApplyOp) {
 		var op = oi.op, tt = IntType.!(op.resultType);
+		// Introduce an explicit if-then-else for shift overflow.
+		if (!oi.checkFact(Facts.O_NO_SHIFT_CHECK)) {
+			// XXX: check the config for saturating shifts (e.g. arm32).
+			var t = splitCurBlock(), tblock = t.0, fblock = t.1, merge = t.2;
+			var lt = Byte.TYPE.lookupInfix0(V3Infix.Lteq);
+			var max = context.graph.intConst(tt.width - 1);
+			var ok = curBlock.add(lt, [normRef1(oi.inputs(1)), max], Facts.O_PURE);
+			// Split the block
+			oi.remove();
+			curBlock.pt = null;
+			curBlock.addIf(ok, tblock.block, fblock.block);
+			// Move shift to true case
+			tblock.append(oi);
+			oi.setFact(Facts.O_NO_SHIFT_CHECK);
+			// Construct false case
+			var fval: SsaInstr;
+			if (op.opcode == Opcode.IntSar) fval = fblock.add(op, [oi.input0(), max], Facts.O_PURE);
+			else fval = context.graph.valConst(tt, null);
+			// construct the merge and phi
+			tblock.addGoto(merge.block);
+			fblock.addGoto(merge.block);
+			// replace all uses with the phi
+			var phi = merge.addPhi(tt, [fval, fval]);
+			oi.replace(phi);
+			phi.inputs(0).update(oi);
+			// lower the original shift
+			curBlock = tblock;
+			curBlock.end = false;
+			curBlock.pt = oi;
+			doShift(oi, op, tt);
+			// lower the false shift
+			if (SsaApplyOp.?(fval)) {
+				curBlock = fblock;
+				curBlock.end = false;
+				curBlock.pt = fval;
+				doShift(SsaApplyOp.!(fval), op, tt);
+			}
+			// continue at the merge
+			curBlock = merge;
+			curBlock.pt = null;
+			getReplacements(phi);
+		} else {
+			doShift(oi, op, tt);
+		}
+	}
+	def doShift(oi: SsaApplyOp, op: Operator, tt: IntType) {
 		if (tt.width <= mach.intNorm.width) {
 			// 2 -> 1 operation.
 			normInputs(oi);
@@ -496,8 +540,10 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 				if (tt.signed && diff > 0 && !i0.checkFact(Facts.V_NON_NEGATIVE)) {
 					trunc = !i1.checkFact(Facts.V_NON_ZERO);
 					// XXX: constant fold some shifts
+					Terminal.put3(" %1 SHR %2 %3\n", oi.uid, i0.uid, i1.uid);
 					oi.inputs(0).update(apply(oi.source, mach.intNorm.shlOp, [i0, context.graph.intConst(diff)]));
 					oi.inputs(1).update(apply(oi.source, mach.intNorm.addOp, [i1, context.graph.intConst(diff)]));
+					Terminal.put3("=%1 SHR %2 %3\n", oi.uid, oi.input0().uid, oi.input1().uid);
 				}
 				op = mach.intNorm.shrOp;
 			} else if (op.opcode == Opcode.IntShl) {
@@ -1110,7 +1156,11 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		return context.graph.valConst(mach.data.ptrType, mach.componentFieldPtr(f));
 	}
 	def addIfNull(x: SsaInstr) -> (SsaBuilder, SsaBuilder, SsaBuilder) {
-		// Split the current block
+		var t = splitCurBlock();
+		curBlock.addIfNull(x, t.0.block, t.1.block);
+		return t;
+	}
+	def splitCurBlock() -> (SsaBuilder, SsaBuilder, SsaBuilder) {
 		var tblock = newBlock(), fblock = newBlock(), merge = newBlock();
 		var exit = curBlock.block;
 		var end = exit.end();
@@ -1122,8 +1172,6 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		last.next = exit;
 		exit.prev = last;
 		curBlock.end = false;
-
-		curBlock.addIfNull(x, tblock.block, fblock.block);
 
 		first.prev = merge.block;
 		merge.block.next = first;
