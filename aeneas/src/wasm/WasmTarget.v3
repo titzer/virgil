@@ -1,0 +1,245 @@
+// Copyright 2016 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def WASM_PAGE_SIZE = 65536;
+def WASM_MAGIC = 0x6d736100;
+def WASM_VERSION = 0xC;
+
+// TODO: use an enum
+def UNKNOWN_SECTION_CODE: byte = 0;   // code for unknown sections
+def TYPE_SECTION_CODE: byte = 1;      // Function signature declarations
+def IMPORT_SECTION_CODE: byte = 2;    // Import declarations
+def FUNCTION_SECTION_CODE: byte = 3;  // Function declarations
+def TABLE_SECTION_CODE: byte = 4;     // Indirect function table and other tables
+def MEMORY_SECTION_CODE: byte = 5;    // Memory attributes
+def GLOBAL_SECTION_CODE: byte = 6;    // Global declarations
+def EXPORT_SECTION_CODE: byte = 7;    // Exports
+def START_SECTION_CODE: byte = 8;     // Start function declaration
+def ELEMENT_SECTION_CODE: byte = 9;   // Elements section
+def CODE_SECTION_CODE: byte = 10;     // Function code
+def DATA_SECTION_CODE: byte = 11;     // Data segments
+def NAME_SECTION_CODE: byte = 12;     // Name section (encoded as a string)
+
+def EXTERNAL_FUNCTION: byte = 0;
+def EXTERNAL_TABLE: byte = 1;
+def EXTERNAL_MEMORY: byte = 2;
+def EXTERNAL_GLOBAL: byte = 3;
+
+// Install targets into registry for the compiler
+component WasmComponent {
+	new() {
+		Aeneas.registerTarget(WasmTarget.new("wasm-js-test", true));
+		Aeneas.registerTarget(WasmTarget.new("wasm-js", false));
+		Aeneas.registerTarget(WasmTarget.new("wasm", false));
+	}
+}
+// Common code for all WASM targets
+class WasmTarget extends Target {
+	def test: bool;
+	def space = AddressSpace.new("mem", false, 32, 4, 4);
+	def intNorm = IntNormalizer.new(32, false);
+	def ciRtName = "CiRuntime"; // CiRuntime provided by compiler
+
+	new(name: string, test) super(name) { }
+
+	def emit(compiler: Compiler, prog: Program) {
+		var rt = getRuntime(prog);
+		// Lower to machine level from V3 level
+		rt.mach.build(compiler);
+		def encoder = MachDataEncoder.new(WASM_PAGE_SIZE, 0, false, 300);
+
+		// (1) Encode the WASM header
+		//--------------------------------------------------------------------------------
+		encoder.i4(WASM_MAGIC);
+		encoder.i4(WASM_VERSION);
+
+		var sizepos: int, start: int;
+
+		// Add all the method signatures to the signatures vector
+		def wasm = WasmProgram.new(rt.mach);
+		def methods = prog.ir.methods;
+		methods.apply(wasm.addSig);
+
+		// (2) Emit signatures (types)
+		//--------------------------------------------------------------------------------
+		sizepos = emitSection(encoder, TYPE_SECTION_CODE);
+		start = encoder.pos;
+		u4v(encoder, u32.!(wasm.signatures.length));
+		for (i < wasm.signatures.length) {
+			var sig = wasm.signatures.get(i);
+			u4v(encoder, 0x40u);
+			var params = sig.0;
+			u4v(encoder, u32.!(params.length));
+			for (p in params) encoder.i1(p);
+			var rets = sig.1;
+			u4v(encoder, u32.!(rets.length));
+			for (p in rets) encoder.i1(p);
+		}
+		patchSectionSize(encoder, sizepos, encoder.pos - start);
+
+		// (3) Emit imports
+		//--------------------------------------------------------------------------------
+
+		var main = IrMethod.!(prog.getMain().member), main_index = -1;
+
+		// (4) Emit function signature declarations
+		//--------------------------------------------------------------------------------
+		sizepos = emitSection(encoder, FUNCTION_SECTION_CODE);
+		start = encoder.pos;
+		u4v(encoder, u32.!(methods.length));
+		for (i < methods.length) {
+			var m = methods.get(i);
+	                if (m == main) main_index = i;
+			u4v(encoder, wasm.getSigIndex(m));
+		}
+		patchSectionSize(encoder, sizepos, encoder.pos - start);
+
+		// (5) Emit indirect function table
+		//--------------------------------------------------------------------------------
+
+		// (6) Emit memory section
+		//--------------------------------------------------------------------------------
+		sizepos = emitSection(encoder, MEMORY_SECTION_CODE);
+		start = encoder.pos;
+	        encoder.i8(1);       // 1 memory
+		var pages = u32.!((rt.heapSize + (WASM_PAGE_SIZE - 1)) / WASM_PAGE_SIZE);
+                encoder.i8(1);       // flags = contains maximum
+		u4v(encoder, pages); // initial memory size
+		u4v(encoder, pages); // maximum memory size
+		patchSectionSize(encoder, sizepos, encoder.pos - start);
+
+		// (7) Emit the export section
+		//--------------------------------------------------------------------------------
+		if (main_index >= 0) {
+                	sizepos = emitSection(encoder, EXPORT_SECTION_CODE);
+                        start = encoder.pos;
+                        encoder.i8(1);                  // 1 export
+//                        var str = main.source.renderLong(StringBuffer.new()).toString();
+                        encoder.i8(4);
+                        encoder.iN("main");
+                        encoder.i8(EXTERNAL_FUNCTION);  // export function
+			u4v(encoder, u32.!(main_index));                        
+			patchSectionSize(encoder, sizepos, encoder.pos - start);
+                }
+
+		// (8) Emit the function bodies
+		//--------------------------------------------------------------------------------
+		sizepos = emitSection(encoder, CODE_SECTION_CODE);
+		start = encoder.pos;
+		u4v(encoder, u32.!(methods.length));
+		for (i < methods.length) {
+			var m = methods.get(i);
+			emitMethodBody(encoder, m);
+		}
+		patchSectionSize(encoder, sizepos, encoder.pos - start);
+
+		// (9) Emit the data section
+		//--------------------------------------------------------------------------------
+
+		// (10) Emit the names section
+		//--------------------------------------------------------------------------------
+
+		// Dump the bytes to the file.
+		var fileName = compiler.getOutputFileName(prog.name(), "wasm");
+		var fd = System.fileOpen(fileName, false);
+		if (fd >= 0) {
+			System.fileWriteK(fd, encoder.array, 0, encoder.end());
+			System.fileClose(fd);
+		} else {
+			prog.ERROR.OutputError(fileName);
+		}
+	}
+	def configure(compiler: Compiler, prog: Program) {
+		var mach = MachProgram.new(prog, space, space, intNorm);
+		var rt = MachRuntime.new(mach);
+		mach.runtime = rt;
+		compiler.Reachability = true;
+		MachModule.install(prog);
+		prog.typeEnv.add(rt.typeCon);
+	}
+	def computeFieldOffsets(prog: Program, b: Vector<IrField>, start: int) {
+		getRuntime(prog).mach.computeFieldOffsets(prog, b, start);
+	}
+	def addRoots(compiler: Compiler, prog: Program, add: IrSpec -> RaRoot) {
+		getRuntime(prog).addRoots(prog, add);
+	}
+	private def getRuntime(prog: Program) -> MachRuntime {
+		return CiRuntime_TypeCon.!(prog.typeEnv.lookup(ciRtName)).runtime;
+	}
+	def emitSection(encoder: MachDataEncoder, code: int) -> int {
+                encoder.i8(code);
+		var pos = encoder.pos;
+		encoder.skipN(5);
+		return pos;
+	}
+	def patchSectionSize(encoder: MachDataEncoder, offset: int, size: int) {
+		encoder.at(offset);
+		var val = size;
+		for (i < 4) {
+			encoder.i1(val | 0x80);
+			val >>= 7;
+		}
+		encoder.i1(val);
+		encoder.atEnd();
+	}
+	def u4v(encoder: MachDataEncoder, val: u32) {
+		var out = val & 0x7F;
+		if (out != val) out |= 0x80;
+		encoder.i1(int.!(out));
+		val >>= 7;
+		while (val != 0) {
+			out = val & 0x7F;
+			if (out != val) out |= 0x80;
+			encoder.i1(int.!(out));
+			val >>= 7;
+		}
+	}
+	def emitMethodBody(encoder: MachDataEncoder, m: IrMethod) {
+		encoder.i1(2);
+		encoder.i1(0);
+		def WASM_UNREACHABLE = 0xa;
+		encoder.i1(WASM_UNREACHABLE);
+	}
+}
+class WasmProgram(mach: MachProgram) {
+	def map = HashMap<(Array<Type>, Type), int>.new(hashSig, equalSig);
+	def signatures = Vector<(Array<byte>, Array<byte>)>.new();
+	var buffer = Array<byte>.new(10);
+
+	def addSig(m: IrMethod) {
+		var index = map.get(m.paramTypes, m.returnType);
+		if (index > 0) return;
+		var params = Arrays.map(m.paramTypes, toWasmType);
+		var rets = Arrays.map(Tuple.toTypeArray(m.returnType), toWasmType);
+		signatures.add(params, rets);
+		map.set((m.paramTypes, m.returnType), signatures.length);
+	}
+	def getSigIndex(m: IrMethod) -> u32 {
+		var index = map.get(m.paramTypes, m.returnType);
+		if (index == 0) return V3.fail("method signature not found");
+		return u32.!(index - 1);
+	}
+}
+
+def WASM_TYPE_I32: byte = 1;
+def WASM_TYPE_I64: byte = 2;
+def WASM_TYPE_F32: byte = 3;
+def WASM_TYPE_F64: byte = 4;
+
+def toWasmType(t: Type) -> byte {
+	match (t.typeCon.kind) {
+		V3Kind.INT: return toWasmIntType(IntType.!(t));
+		V3Kind.ENUM: return toWasmIntType(V3.getVariantTagType(t));
+		V3Kind.ENUM_SET: return toWasmIntType(V3.getEnumSetType(t));
+		_: return WASM_TYPE_I32;
+	}
+}
+def toWasmIntType(t: IntType) -> byte {
+	return if (t.width <= 32, WASM_TYPE_I32, WASM_TYPE_I64);
+}
+def hashSig(p: (Array<Type>, Type)) -> int {
+	return 0;
+}
+def equalSig(a: (Array<Type>, Type), b: (Array<Type>, Type)) -> bool {
+	return Arrays.equal(a.0, b.0) && a.0 == b.0;
+}
