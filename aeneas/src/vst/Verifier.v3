@@ -443,6 +443,12 @@ class VstCompoundVerifier {
 	}
 	def checkMethod(decl: VstMethod) {
 		typeEnv = compound.typeEnv;
+		if (decl.isIndexed() && VstComponent.?(compound)) {
+			var msg = if (compound.isFileScope,
+				"index operation cannot be declared at top level",
+				"index operation cannot be declared in component");
+			IndexDeclError(decl, msg);
+		}
 		if (compound.isVariantCase() && EmptyStmt.?(decl.body)) {
 			UnimplementedError(decl.body, "variant method must have a body");
 		}
@@ -630,6 +636,9 @@ class VstCompoundVerifier {
 	}
 	def FieldDeclError(f: VstField, msg: string) {
 		error(f.token.range(), "FieldDeclError", msg);
+	}
+	def IndexDeclError(m: VstMethod, msg: string) {
+		error(m.token.rangeOf(0), "IndexDeclError", msg);
 	}
 	def CaseDeclError(f: VstCaseMember, msg: string) {
 		error(f.token.range(), "CaseDeclError", msg);
@@ -1690,8 +1699,8 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return if(outer == null, getErrorType(), outer);
 	}
 	def visitAutoExpr(expr: AutoExpr, outer: Type) -> Type {
-		var t = inferClosedType(expr.expr);
-		checkAssignable(expr.expr);
+		var t = checkWrite(expr.expr);
+		if (IndexExpr.?(expr.expr)) t = visitIndexReadOrWrite(IndexExpr.!(expr.expr), outer, false);
 		var op = expr.op;
 		if (Member_TypeCon.?(t.typeCon)) {
 			op = Member_TypeCon.!(t.typeCon).lookupInfix(expr.infix, t);
@@ -1798,17 +1807,52 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return getErrorType();
 	}
 	def visitIndex(expr: IndexExpr, outer: Type) -> Type {
+		return visitIndexReadOrWrite(expr, outer, false);
+	}
+	def getIndexedWriteType(container: Type, member: VstMethod) -> Type {
+		// trim last parameter, which is the written value
+		var rev = Lists.reverse(member.params.list);
+		var list = Lists.reverse(rev.tail);
+		var typeList = Lists.map(list, TypeUtil.getParamType);
+		var funcType = Function.newType(Tuple.newType(typeList), rev.head.vtype);
+		var typeArgs = V3.getTypeArgs(container);
+		if (typeArgs != null) funcType = funcType.substitute(typeArgs);
+		return funcType;
+	}
+	def visitIndexReadOrWrite(expr: IndexExpr, outer: Type, write: bool) -> Type {
 		// infer an open type for the array
 		var arrayType = if(outer != null, V3Array.newType(outer));
 		var exprType = inferType(expr.expr, arrayType);
 		if (V3.isArray(exprType)) {
+			if (expr.exprs.length() != 1) {
+				error(expr.exprs.range(), "TypeError", Strings.format1("type %1 must be indexed by a single expression", TYPE(exprType)));
+			} else {
+				typeCheckExpr(expr.exprs.first(), Int.TYPE, "index");
+			}
 			exprType = elim(exprType);
-			typeCheckExpr(expr.arg, Int.TYPE, "index");
 			return V3Array.elementType(exprType);
-		} else {
-			error(expr.expr.range(), "TypeError", Strings.format1("expected array expression and found %1", TYPE(exprType)));
-			return getErrorType();
+		} else if (ClassType.?(exprType)) {
+			var varExpr = VarExpr.new(expr, null, VstIdent<TypeRef>.new(null, 0, null));
+			var member = methodEnv.resolveClassMember(varExpr, ClassType.!(exprType), if(write, "[]=", "[]"));
+			if (member != null) {
+				if (write) {
+					var method = member.getMethod();
+					var funcType = getIndexedWriteType(member.container, method);
+					expr.write = VarBinding.ObjectMethod(member.container, method, null);
+					typeCheckArgs("index expression", expr.exprs, funcType, outer);
+					return Function.getReturnType(funcType);
+				} else {
+					var funcType = member.memberType;
+					expr.read = VarBinding.ObjectMethod(member.container, member.getMethod(), null);
+					typeCheckArgs("index expression", expr.exprs, funcType, outer);
+					return Function.getReturnType(funcType);
+				}
+			}
 		}
+		var err = if(write, "AssignError", "TypeError");
+		var msg = if(write, "type %1 has no [] assignment operator", "type %1 has no [] operator");
+		error(expr.exprs.range(), err, Strings.format1(msg, TYPE(exprType)));
+		return getErrorType();
 	}
 	def typeCheckArrayAccess(expr: AppExpr, arrayType: Type, outer: Type) -> Type {
 		arrayType = elim(arrayType);
@@ -1817,11 +1861,10 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		expr.appbind = AppBinding.ArrayElem(arrayType);
 		return V3Array.elementType(arrayType);
 	}
-	def typeCheckMethodApp(expr: AppExpr, funcType: Type, outer: Type) -> Type {
-		def op = "function application";
+	def typeCheckArgs(op: string, args: VstList<Expr>, funcType: Type, outer: Type) -> List<Type> {
 		// get the parameter type and parameter type list
-		var paramType = Function.getParamType(funcType);
-		var argList = expr.args.exprs.list, ptlist: List<Type>;
+		var paramType = Function.getParamType(funcType), ptlist: List<Type>;
+		var argList = args.list;
 		if (argList == null || argList.tail != null) ptlist = Tuple.toTypeList(paramType);
 		else ptlist = List.new(paramType, null); // one arg -> use tuple type
 
@@ -1832,7 +1875,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			if (tl == null) {
 				// too many parameters
 				inferClosedType(arg);
-				ArityMismatch(arg.range(), op, Lists.length(ptlist), expr.args.exprs.length());
+				ArityMismatch(arg.range(), op, Lists.length(ptlist), args.length());
 				continue;
 			}
 			var paramType = tl.head;
@@ -1851,28 +1894,36 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 		if (tl != null) {
 			// too few parameters
-			ArityMismatch(expr.args.exprs.range().lastByte(), op, Lists.length(ptlist), expr.args.exprs.length());
+			ArityMismatch(args.range().lastByte(), op, Lists.length(ptlist), args.length());
 		}
-		// unify return type with outer
-		var returnType = Function.getReturnType(funcType);
-		var resultType: Type;
+		// Unify the return type with the expected type
+		if (partialParamTypes == null && outer != null) {
+			TypeSystem.unifyWiden(Function.getReturnType(funcType), outer);
+		}
+		// typecheck expressions that where the corresponding param type was not closed
+		for (cl = checkList; cl != null; cl = cl.tail) {
+			typeCheckExpr(cl.head.0, elim(cl.head.1), op);
+		}
+		return partialParamTypes;
+	}
+	def typeCheckMethodApp(expr: AppExpr, funcType: Type, outer: Type) -> Type {
+		var partialParamTypes = typeCheckArgs("function application", expr.args.exprs, funcType, outer);
+		var resultType = Function.getReturnType(funcType);
 		if (partialParamTypes != null) {
 			// this is a partial application, result is a function
 			var boundMap = Vector<int>.new(), i = 1;
 			boundMap.add(0);
 			var paramTypes: List<Type>;
-			for (el = argList; el != null; (el = el.tail, i++)) {
+			for (el = expr.args.exprs.list; el != null; (el = el.tail, i++)) {
 				if (ParamExpr.?(el.head)) continue;
 				boundMap.add(i);
 			}
-			resultType = Function.newType(Tuple.newType(Lists.reverse(partialParamTypes)), returnType);
+			resultType = Function.newType(Tuple.newType(Lists.reverse(partialParamTypes)), resultType);
 			if (outer != null) TypeSystem.unifyWiden(resultType, outer);
 			expr.boundMap = boundMap.extract();
 			expr.appbind = AppBinding.Partial(expr.boundMap);
 		} else {
 			// this is a complete application, its result is the return type
-			if (outer != null) TypeSystem.unifyWiden(returnType, outer);
-			resultType = returnType;
 			var varbind: VarBinding, receiver: Expr;
 			if (VarExpr.?(expr.func)) {
 				var v = VarExpr.!(expr.func);
@@ -1919,12 +1970,6 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			}
 		}
 
-		// typecheck remaining expressions against the inferred (closed) type
-		tl = ptlist;
-		for (cl = checkList; cl != null; cl = cl.tail) {
-			typeCheckExpr(cl.head.0, elim(cl.head.1), "function application");
-		}
-
 		expr.func.exactType = elim(funcType);
 		return elim(resultType);
 	}
@@ -1942,13 +1987,32 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 		return t;
 	}
+	def checkWrite(left: Expr) -> Type {
+		if (IndexExpr.?(left)) {
+			var t = visitIndexReadOrWrite(IndexExpr.!(left), null, true);
+			left.exactType = t;
+			return t;
+		}
+		var result = inferClosedType(left);
+		var expr: VarExpr;
+		if (VarExpr.?(left) && (expr = VarExpr.!(left)).isAssignable()) {
+			match (expr.varbind) {
+				Local(decl): setAssigned(decl.ssa);
+				_: ;
+			}
+			return result;
+		}
+		if (AppExpr.?(left) && AppExpr.!(left).isAssignable()) return result;
+		AssignError(left.range());
+		return result;
+	}
 	def visitAssign(expr: AssignExpr, outer: Type) -> Type {
 		var left = expr.target;
-		var ltype = inferClosedType(left);
+		var ltype = checkWrite(left);
 		var result = ltype;
-		checkAssignable(left);
 		var infix = expr.infix;
 		if (infix != null) {
+			if (IndexExpr.?(left)) ltype = visitIndexReadOrWrite(IndexExpr.!(left), outer, false);
 			if (Member_TypeCon.?(ltype.typeCon)) {
 				infix.op = Member_TypeCon.!(ltype.typeCon).lookupInfix(infix.infix, null);
 			}
@@ -1962,20 +2026,6 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			typeCheckExpr(expr.expr, result, "assignment");
 		}
 		return result;
-	}
-	def checkAssignable(left: Expr) {
-		var expr: VarExpr;
-		if (VarExpr.?(left) && (expr = VarExpr.!(left)).isAssignable()) {
-			match (expr.varbind) {
-				Local(decl): return setAssigned(decl.ssa);
-				_: return;
-			}
-		}
-		if (IndexExpr.?(left)) return;
-		if (AppExpr.?(left) && AppExpr.!(left).isAssignable()) return;
-
-		// Only variables and assignable app expressions allowed
-		AssignError(left.range());
 	}
 	def setAssigned(ssa: VstSsaVar) {
 		// update info for an assigned var variable
