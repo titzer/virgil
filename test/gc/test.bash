@@ -9,7 +9,7 @@ if [ "$target" == x86-darwin ]; then
 elif [ "$target" == x86-linux ]; then
     RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/linux/*.v3 $VIRGIL_LOC/rt/gc/*.v3"
 else
-    echo "  GC tests not supported for $target"
+    echo "  GC tests not supported for TEST_TARGET=$target"
     exit 0
 fi
 

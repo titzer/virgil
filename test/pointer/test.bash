@@ -4,7 +4,7 @@
 
 target=$TEST_TARGET
 if [[ "$target" != x86-darwin && "$target" != x86-linux ]]; then
-    echo "  Pointer tests not supported on $target"
+    echo "  Pointer tests not supported on TEST_TARGET=$target"
     exit 0
 fi
 
