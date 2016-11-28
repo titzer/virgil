@@ -12,7 +12,7 @@ if [ "$target" == x86-darwin ]; then
 elif [ "$target" == x86-linux ]; then
     OS_SOURCES="$RT/linux/*.v3"
 else
-    echo "  Pointer tests not supported on $target"
+    echo "  Runtime tests not supported on TEST_TARGET=$target"
     exit 0
 fi
 
