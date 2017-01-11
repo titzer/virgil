@@ -41,9 +41,11 @@
 
   (define-key virgil-mode-map [remap comment-dwim] 'virgil-comment-dwim)
 
-  (modify-syntax-entry ?\/ ". 12b" virgil-mode-syntax-table)
+  (modify-syntax-entry ?_ "w" virgil-mode-syntax-table)
+  (modify-syntax-entry ?\/ ". 124b" virgil-mode-syntax-table)
+  (modify-syntax-entry ?* ". 23" virgil-mode-syntax-table)
   (modify-syntax-entry ?\n "> b" virgil-mode-syntax-table)
-
+  
   (setq mode-name "Virgil mode")
 )
 
