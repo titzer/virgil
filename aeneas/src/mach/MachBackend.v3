@@ -1,0 +1,1114 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A machine-independent representation of an instruction.
+class MachInstr(name: string) {
+	var live: bool;		// used for marking dead code
+	var useStart: int;	// index into code describing use/def info
+	var useEnd: int;	// end index into code describing use/def info
+	var moves: MachMoves;	// moves to be inserted before instruction
+
+	def render(buf: StringBuffer) -> StringBuffer;
+	def emit();
+}
+// Moves inserted before/after an instruction, either due to SSA deconstruction,
+// spilling, register moves, calling conventions, etc
+class MachMoves {
+	var before: MoveResolver;	// phys -> phys moves, before
+	var varMoves: List<(int, int)>; // usepos -> defpos moves, before
+	var valMoves: List<(Val, int)>; // value -> usepos moves, before
+	var after: MoveResolver;	// phys -> phys moves, after
+}
+// Machine-independent representation of a variable (virtual register).
+class MachVar {
+	// -- state for code gen --------------------------------
+	def ssa: SsaInstr;		// corresponding ssa instruction (if any)
+	def varNum: int;		// virtual register number
+	def varSize: int;		// number of virtual registers this var represents
+	var start: int = -1;		// start position of code that defines this var
+	var end: int = -1;		// end position of code that defines this var
+	var live: bool;			// true if live
+	// -- state for register allocation ---------------------
+	var hint: byte;			// physical register hint
+	var reg: byte;			// assigned physical register
+	var block: SsaBlock;
+	var canLoad: bool;
+	var canStore: bool;
+	var effect: int;
+	var prev: MachVar;		// prev link for list management
+	var next: MachVar;		// next link for list management
+	var spill: int;			// assigned spill slot (< 0 indicates a constant)
+	var endPos: int;		// last live position
+
+	new(ssa, varNum, varSize, isConst: bool) {
+		if (isConst) spill = -2 - varNum; // constants have invalid spill slots
+	}
+	def loc() -> int {
+		return if(reg != 0, reg, spill);
+	}
+	def isConst() -> bool {
+		return spill < 0;
+	}
+}
+// Representation of a machine frame, including spill slots and space for outgoing params
+class MachFrame(conv: MachCallConv) {
+	var spillVars: int;		// spilled variables
+	var spillArgs: int;		// space for outgoing spilled arguments
+	var frameSize: int = -1;	// architecture-specific total frame size
+
+	def allocSpill() -> int {
+		return conv.regSet.spillStart + spillVars++;
+	}
+	def allocCallerSpace(conv: MachCallConv) -> MachCallConv {
+		allocOverflow(conv.overflow);
+		return conv;
+	}
+	def allocOverflow(overflow: int) {
+		if (overflow > spillArgs) spillArgs = overflow;
+	}
+	def slots() -> int {
+		return spillVars + spillArgs;
+	}
+	def size() -> int {
+		return if(frameSize >= 0, frameSize, V3.fail("frame size not set"));
+	}
+}
+// Defines physical locations (registers, register sets, and stack locations).
+// 1. 0 means an unassigned location.
+// 2. Physical registers have low numbers in the range [1 ... physregs].
+// 3. Sets of registers have numbers in the range (physregs ... spillStart).
+// 4. Spill locations have numbers [spillStart ... callerStart).
+// 5. Caller locations have numbers [callerStart ... calleeStart).
+// 6. Callee locations have numbers [calleeStart ... MAX_INT).
+class MachRegSet {
+	def physRegs: int;			// number of physical registers
+	def regSets: Array<Array<byte>>;	// registers in each set
+	def names: Array<string>;		// names of each register and set
+	def scratch: int;
+	def spillStart: int = regSets.length;	
+	def callerStart: int;
+	def calleeStart: int;
+	def matrix = BitMatrix.new(physRegs + 1, regSets.length);
+	new(physRegs, regSets, names, scratch, callerStart, calleeStart) {
+		// compute the matrix of physical register / register set membership
+		for (i < regSets.length) {
+			var rs = regSets(i);
+			if (rs == null) continue;
+			for (r in rs) matrix.set(r, i);
+		}
+	}
+	def isInRegSet(loc: int, snum: int) -> bool {
+		if (loc < 1 || loc >= regSets.length) return false;
+		return matrix.get(loc, snum);
+	}
+	def isReg(loc: int) -> bool {
+		return loc > 0 && loc <= physRegs;
+	}
+	def isRegSet(loc: int) -> bool {
+		return loc > 0 && loc <= regSets.length;
+	}
+	def isStack(loc: int) -> bool {
+		return loc >= spillStart;
+	}
+	def isCallerStack(loc: int) -> bool {
+		return loc >= callerStart && loc < calleeStart;
+	}
+	def isMultiple(loc: int) -> bool {
+		if (loc == 0) return true;
+		if (loc <= physRegs) return false;
+		return loc < spillStart;
+	}
+	def identify(loc: int) -> string {
+		if (loc < 0) return Strings.format1("invalid#%1", loc);
+		if (loc == 0) return "unassigned";
+		if (loc < spillStart) {
+			var name = names(loc);
+			if (name != null) return name;
+			if (loc <= physRegs) return Strings.format1("r#%1", loc);
+			else return Strings.format1("set#%1", loc);
+		}
+		if (loc < callerStart) return Strings.format1("spill#%1", loc - spillStart);
+		if (loc < calleeStart) return Strings.format1("caller#%1", loc - callerStart);
+		return Strings.format1("callee#%1", loc - calleeStart);
+	}
+}
+// Machine-independent representation of the calling convention for a specific call.
+class MachCallConv {
+	def regSet: MachRegSet;	        // associated register set
+	def paramTypes: Array<Type>;    // parameter types
+	def paramLocs: Array<int>;	// locations of parameters
+	def returnTypes: Array<Type>;	// return types
+	def retLocs: Array<int>;	// locations of return value(s)
+	def overflow: int;		// number of overflow stack arguments
+	new(regSet, paramTypes, paramLocs, returnTypes, retLocs, overflow) { }
+	def callerParam(i: int) -> int {
+		return adjust(paramLocs(i), regSet.callerStart);
+	}
+	def callerRet(i: int) -> int {
+		return adjust(retLocs(i), regSet.callerStart);
+	}
+	def calleeParam(i: int) -> int {
+		return adjust(paramLocs(i), regSet.calleeStart);
+	}
+	def calleeRet(i: int) -> int {
+		return adjust(retLocs(i), regSet.calleeStart);
+	}
+	private def adjust(loc: int, adjust: int) -> int {
+		if (loc <= regSet.physRegs) return loc;
+		return loc - regSet.spillStart + adjust;
+	}
+}
+
+// Base class for machine code generators. 
+class MachCodeGen(mach: MachProgram, context: SsaContext) {
+	def rt = mach.runtime;
+	def rtsrc = rt.src;
+	def rtgc = rt.gc;
+	def code = Vector<MachInstr>.new();
+	def vars = Vector<MachVar>.new();
+	def uses  = Vector<int>.new();
+	def markQueue = Vector<MachVar>.new();
+	def blocks = SsaBlockOrder.new(context.graph);
+
+	var multiBlock: bool;
+	var frame: MachFrame;
+	var phiList: List<SsaPhi>;
+	var lsra: LinearScanRegAlloc;
+	var varRefSlotIndex: Array<int>; // XXX: move to MachVar directly?
+	// current position in the uses array
+	var curUse: int;
+	var curBlockStart: int;
+	var curValMoves: List<(Val, int)>;
+	var numLivePoints: int;
+	// constants for encoding the used mach vars
+	def USE  = 0x0;
+	def DEF  = 0x1;
+	def LIVE = 0x2;
+	def KILL = 0x3;
+	def TYPE_MASK = 0x3;
+	def UNUSED_MASK   = 0x8;
+	def ASSIGNED_MASK = 0x4;
+	def VAR_SHIFT: u3 = 4;
+
+	new() {
+		multiBlock = context.graph.isMultiBlock();
+	}
+
+	def makeVar(i: SsaInstr) -> MachVar {
+		var max = context.graph.markGen;
+		if (i.mark >= max) return vars.get(i.mark - max); // already has a variable
+		var isConst = SsaValue.?(i);
+		var num = numVars(i), machVar = MachVar.new(i, vars.length, num, isConst);
+		vars.add(machVar);
+		while (--num > 0) vars.add(MachVar.new(i, vars.length, 1, isConst));
+		i.mark = machVar.varNum + max; // maps instruction to var
+		return machVar;
+	}
+	def val(i: SsaInstr) -> Val {
+		return SsaValue.!(i).val;
+	}
+	def id(i: SsaInstr, machVar: MachVar) -> MachVar {
+		i.mark = machVar.varNum + context.graph.markGen;
+		return machVar;
+	}
+	def info(b: SsaBlock) -> SsaBlockInfo {
+		return blocks.order.get(b.mark);
+	}
+	def markLive(v: MachVar) {
+		if (!v.live) {
+			markQueue.add(v);
+			v.live = true;
+		}
+	}
+	def markAllLiveVars() {
+		for (j < markQueue.length) {
+			var v = markQueue.get(j);
+			if (v.start >= 0) {
+				markUsesLive(v);
+			} else {
+				var inputs = v.ssa.inputs;
+				for (k = 0; k < inputs.length; k++) markLive(makeVar(inputs(k).dest));
+			}
+		}
+	}
+	def markUsesLive(v: MachVar) {
+		if (SsaPhi.?(v.ssa)) {
+			// mark all inputs to the SsaPhi as live
+			for (i in v.ssa.inputs) markLive(makeVar(i.dest));
+			return;
+		}
+		for (i = v.start; i < v.end; i++) {
+			// for each instruction corresponding to this instruction
+			var c = code.get(i);
+			c.live = true;
+			for (j = c.useStart; j < c.useEnd; j = j + 2) {
+				// for every input to the instruction, mark it live
+				var u = uses.get(j), uv = u & TYPE_MASK;
+				if (uv == USE) markLive(vars.get(u >>> VAR_SHIFT));
+			}
+		}
+	}
+	def genPhis() {
+		// for each block that has phis
+		for (l = phiList; l != null; l = l.tail) {
+			var phi = l.head, firstInstr = code.get(info(phi.block).start);
+
+			// define the live phis
+			firstInstr.useStart = uses.length;
+			var livePhis = definePhis(phi);
+			firstInstr.useEnd = uses.length; // update defs of first instruction
+
+			// add moves at control flow predecessors
+			if (livePhis != null) addPhiMoves(livePhis, phi.block.preds);
+		}
+	}
+	def definePhis(phi: SsaPhi) -> List<(SsaPhi, int)> {
+		// for each live phi in this block, define it at this instruction
+		var livePhis: List<(SsaPhi, int)>;
+		while (true) {
+			if (phi.mark >= context.graph.markGen) {
+				var machVar = vars.get(phi.mark - context.graph.markGen);
+				// define the phi at the beginning of the block
+				if (machVar.live) {
+					var defpos = dfnAt(machVar, 0);
+					livePhis = List.new((phi, defpos), livePhis);
+				}
+			}
+			var next = phi.next;
+			if (!SsaPhi.?(next)) break;
+			phi = SsaPhi.!(next);
+		}
+		return livePhis;
+	}
+	def addPhiMoves(livePhis: List<(SsaPhi, int)>, edges: Array<SsaCfEdge>) {
+		// for each incoming edge to this block
+		for (j < edges.length) {
+			var e = edges(j), endInstr = code.get(info(e.src.block()).end - 2);
+			if (endInstr.moves != null) failCriticalEdge(e);
+			if (e.src.succs.length > 1) failCriticalEdge(e);
+			var m = MachMoves.new();
+			endInstr.moves = m;
+			endInstr.useStart = uses.length;
+			// for each live phi
+			for (lp = livePhis; lp != null; lp = lp.tail) {
+				// use phi input at end of respective predecessor
+				var input = lp.head.0.inputs(j).dest, defpos = lp.head.1;
+				var phivar = makeVar(lp.head.0);
+				if (SsaValue.?(input)) {
+					// add a value move
+					m.valMoves = List.new((val(input), defpos), m.valMoves);
+				} else {
+					// add a var-var move, and a hint
+					var inputvar = makeVar(input);
+					m.varMoves = List.new((useAt(inputvar, 0), defpos), m.varMoves);
+					hintVar(inputvar, phivar);
+				}
+			}
+			endInstr.useEnd = uses.length;
+		}
+	}
+	def failCriticalEdge(e: SsaCfEdge) {
+		context.fail(Strings.format2("critical edge #%1 -> #%2", e.src.uid, e.dest.uid));
+	}
+	def kill(fixed: int) -> int {
+		return record(KILL, -1, fixed);
+	}
+	def livePoint() -> int {
+		var lp = numLivePoints++;
+		record(LIVE, lp, 0);
+		return lp;
+	}
+	def useAt(v: MachVar, fixed: int) -> int {
+		var usepos = record(USE, v.varNum, fixed);
+		if (v.isConst()) curValMoves = List.new((val(v.ssa), usepos), curValMoves);
+		return usepos;
+	}
+	def dfnAt(v: MachVar, fixed: int) -> int {
+		return record(DEF, v.varNum, fixed);
+	}
+	def hintVar(src: MachVar, dest: MachVar) {
+		// XXX: record a register hint
+	}
+	def hint(src: SsaInstr, dest: MachVar) {
+		// XXX: record a register hint
+	}
+	private def record(mode: int, num: int, fixed: int) -> int {
+		var pos = uses.length;
+		uses.add(mode | (num << VAR_SHIFT));
+		uses.add(fixed);
+		return pos;
+	}
+	def addInstr(i: MachInstr) -> MachInstr {
+		if (curValMoves != null) {
+			i.moves = MachMoves.new();
+			i.moves.valMoves = curValMoves;
+			curValMoves = null;
+		}
+		i.useStart = curUse;
+		i.useEnd = uses.length;
+		curUse = uses.length;
+		code.add(i);
+		return i;
+	}
+	def renderInstr(i: MachInstr, buf: StringBuffer) -> StringBuffer {
+		var p = buf.length;
+		if (!i.live) return buf; // nothing to print
+		buf.puts(i.name).pad(' ', p + 8);
+		for (j = i.useStart; j < i.useEnd; j = j + 2) {
+			buf.puts(" ");
+			renderUse(j, buf);
+		}
+		return buf;
+	}
+	def renderUse(use: int, buf: StringBuffer) {
+		var u = uses.get(use), v = u >>> VAR_SHIFT;
+		buf.puts(useType(u));
+		buf.putc(':');
+		if (v >= 0 && v < (-1 >>> VAR_SHIFT)) {
+			var mv = vars.get(v);
+			if (mv != null && mv.ssa != null) buf.putc('@').puti(mv.ssa.uid);
+			buf.putc('#').puti(v);
+		}
+		buf.putc('u').puti(use);
+		// render the constraint of the use
+		var fixed = uses.get(use + 1);
+		if (fixed != 0) {
+			if ((u & ASSIGNED_MASK) != 0) buf.putc('=');
+			else buf.putc('@');
+			buf.puts(frame.conv.regSet.identify(fixed));
+		}
+	}
+	def varOfUse(use: int) -> MachVar {
+		return vars.get(uses.get(use) >>> VAR_SHIFT);
+	}
+	def numVars(i: SsaInstr) -> int;
+	def useType(u: int) -> string {
+		u = u & TYPE_MASK;
+		if (u == USE) return "use";
+		if (u == DEF) return "def";
+		if (u == KILL) return "kill";
+		if (u == LIVE) return "live";
+		return "??";
+	}
+	def matchEdge(e: SsaDfEdge, opcode: Opcode) -> bool {
+		return soleEdge(e) && e.dest.opcode() == opcode.tag;
+	}
+	def soleEdge(e: SsaDfEdge) -> bool {
+		if (e.next != null) return false; // not the only use
+		var i = e.dest;
+		if (i.useList != e) return false; // not the only use
+		return inSameBlock(i);
+	}
+	def inSameBlock(i: SsaInstr) -> bool {
+		if (multiBlock) {
+			if (i.mark < context.graph.markGen) return false;
+			return vars.get(i.mark - context.graph.markGen).start >= curBlockStart;
+		}
+		return true;
+	}
+}
+
+type Operand {
+	case Scratch;
+	case Immediate(val: Val);
+	case Use(i: SsaInstr, vreg: MachVar, constraint: int);
+	case Def(i: SsaInstr, vreg: MachVar, constraint: int);
+	case Kill(constraint: int);
+	case Overwrite(i: SsaInstr, vreg: MachVar, constraint: int);
+	case Label(block: SsaBlock, label: Label);
+	case ExSource(ex: string, source: Source);
+
+	def as<T>() -> T { return T.!(this); }
+	def isImm() -> bool { return tag == 1; }
+}
+
+class ArchInstr(opcode: int, operands: Array<Operand>) {
+	var prev: ArchInstr;
+	var next: ArchInstr;
+}
+
+enum ArchInstrFlag {
+	NO_GAP,
+	REMATERALIZE,
+	LOAD,
+	STORE
+}
+
+// Constants for Arch instructions.
+component ArchInstrs {
+	def FLAG_NO_GAP = 0x80000000;
+	def FLAG_REMAT  = 0x40000000;
+	def FLAG_LOAD   = 0x20000000;
+	def FLAG_STORE  = 0x10000000;
+
+	def ARCH_BLOCK   = 0x00;
+	def ARCH_ENTRY   = 0x01;
+	def ARCH_RESOLVE = 0x02;
+	def ARCH_END     = 0x03;
+	def ARCH_RET     = 0x04;
+}
+
+def CACHED_INT_IMMEDIATES = [
+	Operand.Immediate(Box<int>.new(-1)),
+	Operand.Immediate(Box<int>.new(0)),
+	Operand.Immediate(Box<int>.new(1)),
+	Operand.Immediate(Box<int>.new(2)),
+	Operand.Immediate(Box<int>.new(3)),
+	Operand.Immediate(Box<int>.new(4)),
+	Operand.Immediate(Box<int>.new(5)),
+	Operand.Immediate(Box<int>.new(6)),
+	Operand.Immediate(Box<int>.new(7)),
+	Operand.Immediate(Box<int>.new(8))
+];
+
+// Basic algorithm for code generation.
+class ArchCodeGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet) {
+	def operands = Vector<Operand>.new();
+	def vars = Vector<MachVar>.new();
+	var lowestMark: int;
+	var blocks: SsaBlockOrder;
+	var order: Vector<SsaBlockInfo>;
+	var liveness: BitMatrix;
+	var anyReg: int;
+	var codePos: int;
+	var current: ArchInstr;
+	var frame: MachFrame;
+	var effectLevel = 0;
+	var curBlock: SsaBlock;
+
+	def reset(graph: SsaGraph, blocks: SsaBlockOrder, frame: MachFrame) {
+		this.context.graph = graph;
+		this.context.block = null;
+		this.blocks = blocks;
+		this.order = blocks.computeOrder();
+		this.lowestMark = graph.markGen++;
+		this.current = null;
+		this.liveness = BitMatrix.new(order.length, 32);
+		this.operands.length = 0;
+		this.frame = frame;
+		this.effectLevel = 0;
+		this.curBlock = null;
+	}
+
+	def test() {
+		selectInstructionsForGraph();
+		if (Aeneas.PRINT_MACH.get()) print();
+		current = null;
+	}
+	def print() {
+		var buf = ArchInstrRenderer.new(context.prog, regSet);
+		buf.puts("Arch instructions for: ");
+		var render = if(context.spec != null, context.spec.render, context.method.renderLong);
+		render(buf);
+		Terminal.putbln(buf);
+		buf.reset();
+		for (i = current; i != null; i = i.next) {
+			renderN(buf, i.opcode, i.operands);
+			Terminal.putbln(buf);
+			buf.reset();
+		}
+	}
+	def selectInstructionsForGraph() {
+		current = ArchInstr.new(ArchInstrs.ARCH_END, []);
+		// Process blocks in reverse order.
+		for (i = order.length - 1; i >= 0; i--) {
+			var info = order.get(i), block = info.block;
+			context.block = block;
+			info.end = codePos;
+			gatherLivenessForBlock(block);
+			selectInstructionsForBlock(block);
+			info.start = codePos;
+		}
+		// emit the entry instruction.
+		visitEntry(context.graph.params);
+	}
+	def gatherLivenessForBlock(block: SsaBlock) {
+		for (e in block.succs()) {
+			var succ = e.dest;
+			// union the succesor's live-in set into this.
+			liveness.or(block.mark, succ.mark);
+		}
+	}
+	def selectInstructionsForBlock(block: SsaBlock) {
+		curBlock = block;
+		// Pre-process instructions in forward order.
+		// Mark instructions in this block and compute effect levels.
+		for (i = block.next; i != block; i = i.next) {
+			if (!SsaInstr.?(i)) break;
+			var instr = SsaInstr.!(i);
+			var vreg = getVreg(instr);
+			vreg.block = block;
+			vreg.effect = effectLevel;
+			vreg.canLoad = canLoad(instr);
+			if (canStore(instr)) {
+				vreg.canStore = true;
+				effectLevel++;
+			}
+		}
+		// Select instructions in reverse order.
+		for (i = block.prev; i != block; i = i.prev) {
+			// Skip instructions that are not live.
+			if (!isLive(i, block) && i.facts.O_PURE) continue;
+			selectInstructions(block, i);
+			advanceCurrent();
+		}
+		// Cap the top of the block with a special instruction.
+		emit1(ArchInstrs.ARCH_BLOCK, useLabel(block));
+		advanceCurrent();
+	}
+	def canLoad(instr: SsaInstr) -> bool {
+		if (!SsaApplyOp.?(instr)) return false;
+		var apply = SsaApplyOp.!(instr);
+		match (apply.op.opcode) {
+			NullCheck,
+			PtrLoad,
+			PtrCmpSwp,
+			ClassGetField,
+			ComponentGetField,
+			CallAddress,
+			CallFunction,
+			CallMethod,
+			CallClosure,
+			CallClassVirtual,
+			MachSystemOp: return true;
+			_: return false;
+		}
+	}
+	def canStore(instr: SsaInstr) -> bool {
+		if (!SsaApplyOp.?(instr)) return false;
+		var apply = SsaApplyOp.!(instr);
+		match (apply.op.opcode) {
+			PtrStore,
+			PtrCmpSwp,
+			ClassSetField,
+			ClassInitField,
+			ComponentSetField,
+			CallAddress,
+			CallFunction,
+			CallMethod,
+			CallClosure,
+			CallClassVirtual,
+			MachSystemOp: return true;
+			_: return false;
+		}
+	}
+	def advanceCurrent() {
+		while (current.prev != null) current = current.prev;
+	}
+	def selectInstructions(block: SsaBlock, i: SsaLink) {
+		// Dispatch to appropriate architecture-specific routine.
+		if (SsaApplyOp.?(i)) return visitApply(block, SsaApplyOp.!(i));
+		if (SsaGoto.?(i)) {
+			// Emit SSA-resolution moves for the successor if necessary.
+			var succ = block.succ(0).dest;
+			emitPhiResolutionMoves(block, succ);
+			visitGoto(block, SsaGoto.!(i));
+			return;
+		}
+		if (SsaIf.?(i)) return visitIf(block, SsaIf.!(i));
+		if (SsaReturn.?(i)) return visitReturn(block, SsaReturn.!(i));
+		if (SsaSwitch.?(i)) return visitSwitch(block, SsaSwitch.!(i));
+		if (SsaThrow.?(i)) return visitThrow(block, SsaThrow.!(i));
+		return context.fail("invalid instruction type");
+	}
+	def emitPhiResolutionMoves(block: SsaBlock, succ: SsaBlock) {
+		// Find the successor input index.
+		var index = -1;
+		var edges = succ.preds;
+		for (i < edges.length) {
+			if (edges[i].src == block) { index = i; break; }
+		}
+		// Add dest/src pairs as parallel moves.
+		var i = succ.next;
+		while (true) {
+			if (!SsaPhi.?(i)) break;
+			var phi = SsaPhi.!(i);
+			dfn(phi);
+			use(phi.inputs(index).dest);
+		}
+		emitN(ArchInstrs.ARCH_RESOLVE);
+	}
+	// Mark {i} as live in {block}
+	def setLive(i: SsaInstr, block: SsaBlock) {
+		liveness.set(block.mark, getVreg(i).varNum);
+	}
+	// Check if {i} is live in {block}
+	def isLive(i: SsaLink, block: SsaBlock) -> bool {
+		if (i.mark >= context.graph.markGen) {
+			context.fail1("mark @%1 invalid", i.uid);
+			return false;
+		}
+		if (i.mark <= lowestMark) return false;
+		return liveness.get(block.mark, i.mark - lowestMark);
+	}
+
+	def getVreg(i: SsaInstr) -> MachVar {
+		if (i.mark >= context.graph.markGen) {
+			context.fail1("mark @%1 invalid", i.uid);
+			return null;
+		}
+		if (i.mark <= lowestMark) {
+			var next = context.graph.markGen++;
+			i.mark = next;
+			var id = next - lowestMark;
+			liveness.widen(id + 1);
+			vars.grow(id + 1);
+			var n = MachVar.new(i, id, 1, false);
+			vars.set(id, n);
+			return n;
+		}
+		return vars.get(i.mark - lowestMark);
+	}
+	def updateLivenessDef(o: Operand) {
+		match (o) {
+			Def(i, vreg, constraint): liveness.clear(context.block.mark, vreg.varNum);
+			Overwrite(i, vreg, constraint): liveness.clear(context.block.mark, vreg.varNum);
+			_: ;
+		}
+	}
+	def updateLivenessUse(o: Operand) {
+		match (o) {
+			Use(i, vreg, constraint): liveness.set(context.block.mark, vreg.varNum);
+			Overwrite(i, vreg, constraint): liveness.set(context.block.mark, vreg.varNum);
+			_: ;
+		}
+	}
+
+	//======================================================================
+	// Helper routines for emitting instructions.
+	//======================================================================
+	def matchAddImm(i: SsaInstr) -> (SsaInstr, Val) {
+		// TODO: check covering condition: in same block and single use
+		if (!SsaApplyOp.?(i)) return (i, null);
+		var apply = SsaApplyOp.!(i);
+		if (apply.op.opcode == Opcode.IntAdd || apply.op.opcode == Opcode.PtrAdd) {
+			var x = apply.input0(), y = apply.input1();
+			if (SsaValue.?(y)) return (x, SsaValue.!(y).val);
+			if (SsaValue.?(x)) return (y, SsaValue.!(x).val);
+		}
+		return (i, null);
+	}
+	def vregOf(i: SsaInstr) -> int;
+	def cover(opcode: Opcode, i: SsaInstr) -> SsaApplyOp {
+		if (!SsaApplyOp.?(i)) return null;
+		var apply = SsaApplyOp.!(i);
+		// TODO: check block same block condition
+		if (apply.op.opcode != opcode) return null;
+		return apply;
+	}
+	def emitId(i: SsaInstr, o: SsaInstr) {
+		// TODO: emit a move.
+	}
+	def emit0(opcode: int) {
+		if (operands.length != 0) return context.fail("expected 0 operands");
+		emitN(opcode);
+	}
+	def emit1(opcode: int, a: void) {
+		if (operands.length != 1) return context.fail("expected 1 operand");
+		emitN(opcode);
+	}
+	def emit2(opcode: int, a: void, b: void) {
+		if (operands.length != 2) return context.fail("expected 2 operands");
+		emitN(opcode);
+	}
+	def emit3(opcode: int, a: void, b: void, c: void) {
+		if (operands.length != 3) return context.fail("expected 3 operands");
+		emitN(opcode);
+	}
+	def emitN(opcode: int) {
+		var x = operands.extract();
+		var i = ArchInstr.new(opcode, x);
+		// insert {i} between {current.prev} and {current}
+		i.next = current;
+		var prev = current.prev;
+		if (prev != null) {
+			prev.next = i;
+			i.prev = prev;
+		}
+		current.prev = i;
+		for (o in x) updateLivenessDef(o);
+		for (o in x) updateLivenessUse(o);
+	}
+	def useLabel(block: SsaBlock) {
+		operands.add(Operand.Label(block, order.get(block.mark).label));
+	}
+	def dfn(i: SsaInstr) {
+		operands.add(Operand.Def(i, getVreg(i), 0));
+	}
+	def kill(constraint: int) {
+		operands.add(Operand.Kill(constraint));
+	}
+	def use(i: SsaInstr) {
+		operands.add(Operand.Use(i, getVreg(i), 0));
+	}
+	def useReg(i: SsaInstr) {
+		operands.add(Operand.Use(i, getVreg(i), anyReg));
+	}
+	def useImm(val: Val) {
+		operands.add(Operand.Immediate(val));
+	}
+	def useInt(val: int) {
+		var x = val + 1;
+		if (x >= 0 && x < CACHED_INT_IMMEDIATES.length) {
+			return operands.add(CACHED_INT_IMMEDIATES(x));
+		}
+		operands.add(Operand.Immediate(Int.box(val)));
+	}
+	def useFixed(i: SsaInstr, constraint: int) {
+		operands.add(Operand.Use(i, getVreg(i), constraint));
+	}
+	def useConstant(i: SsaValue, constraint: int) {
+		operands.add(Operand.Use(i, getVreg(i), constraint));
+	}
+	def dfnFixed(i: SsaInstr, constraint: int) {
+		operands.add(Operand.Def(i, getVreg(i), constraint));
+	}
+	def dfnReg(i: SsaInstr) {
+		operands.add(Operand.Def(i, getVreg(i), anyReg));
+	}
+	def ovwReg(i: SsaInstr) {
+		operands.add(Operand.Overwrite(i, getVreg(i), anyReg));
+	}
+	def useScratch() {
+		operands.add(Operand.Scratch);
+	}
+	def newTmp(t: Type) -> SsaInstr {
+		return SsaParam.new(-1, t);
+	}
+	def id(i: SsaInstr, machVar: MachVar) -> MachVar {
+		i.mark = machVar.varNum;
+		return machVar;
+	}
+	def useExSource(ex: string, source: Source) {
+		operands.add(Operand.ExSource(ex, source));
+	}
+
+	def toLabel(o: Operand) -> Label {
+		match (o) {
+			Label(block, label): return label;
+			_: context.fail("expected label");
+		}
+		return null;
+	}
+	def toBlock(o: Operand) -> SsaBlock {
+		match (o) {
+			Label(block, label): return block;
+			_: context.fail("expected block");
+		}
+		return null;
+	}
+	def toInt(o: Operand) -> int {
+		return Int.unbox(toImm(o));
+	}
+	def toImm(o: Operand) -> Val {
+		match (o) {
+			Immediate(val): return val;
+			_: context.fail("expected immediate");
+		}
+		return null;
+	}
+	def toExSource(o: Operand) -> (string, Source) {
+		match (o) {
+			ExSource(ex, source): return (ex, source);
+			_: context.fail("expected exception + source");
+		}
+		return (null, null);
+	}
+	def inSameBlock(i: SsaInstr) -> bool {
+		if (order.length == 1) return true;
+		return getVreg(i).block == curBlock;
+	}
+
+	//======================================================================
+	// Architecture-specific routines.
+	//======================================================================
+
+	// Instruction selection.
+	def visitEntry(params: Array<SsaParam>) {
+		for (i < params.length) {
+			if (!isLive(params(i), context.block)) continue;
+			dfnFixed(params(i), frame.conv.callerParam(i));
+		}
+		emitN(ArchInstrs.ARCH_ENTRY);
+		advanceCurrent();
+	}
+	def visitApply(block: SsaBlock, i: SsaApplyOp);
+	def visitThrow(block: SsaBlock, i: SsaThrow);
+	def visitIf(block: SsaBlock, i: SsaIf);
+	def visitSwitch(block: SsaBlock, i: SsaSwitch);
+	def visitGoto(block: SsaBlock, target: SsaGoto);
+	def visitReturn(block: SsaBlock, i: SsaReturn) {
+		for (j < i.inputs.length) useFixed(i.inputs(j).dest, frame.conv.callerRet(j));
+		emitN(ArchInstrs.ARCH_RET);
+	}
+
+	def getProjections(i: SsaInstr) -> Array<SsaInstr> {
+		return [i];  // TODO
+	}
+
+	// Code generation.
+	def assemble(opcode: int, x: Array<Operand>);
+
+	// Debugging / printing.
+	def renderN(buf: ArchInstrRenderer, opcode: int, x: Array<Operand>) {
+		buf.putc('\t');
+		match (opcode) {
+			ArchInstrs.ARCH_ENTRY: {
+				buf.puts("entry ");
+				buf.putOperands(x);
+			}
+			ArchInstrs.ARCH_BLOCK: {
+				buf.puts("block ");
+				buf.putBlock(toBlock(x(0)));
+			}
+			ArchInstrs.ARCH_RESOLVE: {
+				buf.puts("\tresolve-phis");
+				for (i = 0; i < x.length; i += 2) {
+					var dst = x(i), src = x(i + 1);
+					buf.puts("\n\t\t\t");
+					buf.putOperand(dst);
+					buf.puts(" <- ");
+					buf.putOperand(src);
+				}
+			}
+			ArchInstrs.ARCH_END: {
+				buf.puts("end");
+			}
+			_: {
+				if (renderSpecific(buf, opcode, x)) return;
+				buf.puts("\topcode: ").putx(opcode).sp();
+				buf.putOperands(x);
+			}
+		}
+	}
+	def renderSpecific(buf: ArchInstrRenderer, opcode: int, x: Array<Operand>) -> bool {
+		return false;
+	}
+}
+// Helper class for rendering architecture-specific machine instructions.
+class ArchInstrRenderer(prog: Program, regSet: MachRegSet) extends TerminalBuffer {
+	def putBlock(block: SsaBlock) {
+		blue().putc('#').puti(block.uid).end();
+	}
+	def putInstr(i: SsaInstr) {
+		cyan().putc('@').puti(i.uid).end();
+		if (SsaValue.?(i)) {
+			V3.renderResult(SsaValue.!(i).val, null, green().putc('#'));
+			end();
+		}
+	}
+	def putVreg(vreg: int) {
+		putc('v').puti(vreg);
+	}
+	def putArchWithI(name: string, x: Array<Operand>) {
+		var y = x(x.length - 1);
+		putc('\t').puts(name);
+		if (y.isImm()) putc('i');
+		sp();
+		putOperands(x);
+	}
+	def putArch(name: string, x: Array<Operand>) {
+		putc('\t').puts(name).sp();
+		putOperands(x);
+	}
+	def putOperands(x: Array<Operand>) {
+		for (j < x.length) {
+			if (j > 0) puts(", ");
+			putOperand(x(j));
+		}
+	}
+	def putConstraint(constraint: int) {
+		yellow().puts(regSet.identify(constraint)).end();
+	}
+	def putOperand(o: Operand) {
+		match (o) {
+			Scratch: puts("<scratch>");
+			Immediate(val): {
+				puts("imm:");
+				green();
+				V3.renderResult(val, null, this);
+				end();
+			}
+			Use(i, vreg, constraint): {
+				putInstr(i);
+				format1("u%1", vreg);
+				if (constraint != 0) putConstraint(constraint);
+			}
+			Def(i, vreg, constraint): {
+				putInstr(i);
+				format1("d%1", vreg);
+				if (constraint != 0) putConstraint(constraint);
+			}
+			Kill(constraint): {
+				putc('k');
+				putConstraint(constraint);
+			}
+			Overwrite(i, vreg, constraint): {
+				putInstr(i);
+				format1("v%1", vreg);
+				if (constraint != 0) putConstraint(constraint);
+			}
+			Label(block, label): {
+				puts("lbl:");
+				putBlock(block);
+			}
+			ExSource(ex, source): {
+				if (ex != null) {
+					puts("ex:");
+					green().puts(ex).end();
+					sp();
+				}
+				if (source != null) {
+					puts("src:");
+					green();
+					source.render(this).end();
+				}
+			}
+		}
+	}
+}
+
+class LivenessAnalyzer(prog: Program, method: IrMethod) {
+	def graph = method.ssa;
+	def blocks = SsaBlockOrder.new(graph).computeOrder().extract();
+	def live = Array<List<SsaInstr>>.new(blocks.length);
+	def liveness = BitMatrix.new(live.length + 1, 1);
+	def lowestMark = graph.markGen++;
+	var dead = 0;
+	def analyze() {
+		for (i = blocks.length - 1; i >= 0; i--) {
+			var block = blocks(i);
+			gatherLiveness(block);
+			analyzeLiveness(block);
+		}
+		var instrs = liveness.numcols, global = liveness.count(blocks.length);
+		Terminal.put3("\n %1: %2 blocks, %3 instructions, ", method.render, blocks.length, instrs);
+		Terminal.put2("%1 global, %2", global, (global * 100) / instrs);
+		Terminal.put(" %");
+		Terminal.put1(", dead %1\n", dead);
+	}
+	def analyzeLiveness(info: SsaBlockInfo) {
+		var block = info.block;
+//		Terminal.put2("block #%1: liveout = %2\n", block.uid, liveness.count(block.mark));
+		for (i: SsaLink = block.end(); i != block; i = i.prev) {
+//			Terminal.put2("  @%1: pressure = %2\n", i.uid, liveness.count(block.mark));
+			analyzeInstr(block, i);
+		}
+//		Terminal.put2("block #%1: livein  = %2\n", block.uid, liveness.count(block.mark));
+	}
+	def analyzeInstr(block: SsaBlock, i: SsaLink) {
+		if (SsaApplyOp.?(i)) {
+			var apply = SsaApplyOp.!(i);
+			analyzeDef(block, apply);
+			analyzeUses(block, apply.inputs);
+			return;
+		}
+		if (SsaIf.?(i)) {
+			var iff = SsaIf.!(i);
+			analyzeUses(block, iff.inputs);
+			return;
+		}
+		if (SsaReturn.?(i)) {
+			var ret = SsaReturn.!(i);
+			analyzeUses(block, ret.inputs);
+			return;
+		}
+		if (SsaSwitch.?(i))  {
+			var sw = SsaSwitch.!(i);
+			analyzeUses(block, sw.inputs);
+			return;
+		}
+	}
+	def analyzeDef(block: SsaBlock, instr: SsaInstr) {
+		if (!liveness.get(block.mark, getIndex(instr))) {
+			// might be dead
+			var effect = false;
+			match (SsaApplyOp.!(instr).op.opcode) {
+				CallClassVirtual,
+				CallMethod,
+				CallAddress,
+				CallClosure,
+				ConditionalThrow,
+				NullCheck,
+				SystemOp,
+				MachSystemOp,
+				ClassSetField,
+				ArraySetElem,
+				ClassInitField,
+				PtrStore,
+				PtrCmpSwp,
+				ComponentSetField: effect = true;
+				_: ;
+			}
+			if (!effect) dead++;
+		}
+		clearLive(instr, block);
+	}
+	def analyzeUses(block: SsaBlock, inputs: Array<SsaDfEdge>) -> int {
+		var increase = 0;
+		for (i in inputs) {
+			if (!isLive(i.dest, block)) increase++;
+			if (!SsaValue.?(i.dest)) setLive(i.dest, block);
+		}
+		return increase;
+	}
+	def gatherLiveness(info: SsaBlockInfo) {
+		var succs = info.block.succs(), block = info.block;
+		for (e in succs) {
+			var succ = e.dest;
+			propagateLiveness(succ, block);
+			gatherLivenessOfPhiInputs(block, succ);
+		}
+		liveness.or(blocks.length, block.mark);  // record globalness
+	}
+	def gatherLivenessOfPhiInputs(block: SsaBlock, succ: SsaBlock) {
+		// Find the successor input index.
+		var index = -1;
+		var edges = succ.preds;
+		for (i < edges.length) {
+			if (edges(i).src == block) { index = i; break; }
+		}
+		// Add dest/src pairs as parallel moves.
+		var i = succ.next;
+		while (true) {
+			if (!SsaPhi.?(i)) break;
+			var phi = SsaPhi.!(i);
+			var input = phi.inputs(index).dest;
+			setLive(input, block);
+		}
+	}
+
+	def isLive(instr: SsaInstr, block: SsaBlock) -> bool {
+		return liveness.get(block.mark, getIndex(instr));
+	}
+	def setLive(instr: SsaInstr, block: SsaBlock) {
+		liveness.set(block.mark, getIndex(instr));
+	}
+	def clearLive(instr: SsaInstr, block: SsaBlock) {
+		liveness.clear(block.mark, getIndex(instr));
+	}
+	def propagateLiveness(from: SsaBlock, to: SsaBlock) {
+		liveness.or(to.mark, from.mark);
+	}
+	def getIndex(i: SsaInstr) -> int {
+		if (i.mark <= lowestMark) {
+			i.mark = graph.markGen++;
+			liveness.widen(i.mark + 1);
+		}
+		return i.mark;
+	}
+}
+
+//def liveness = Aeneas.registerTarget(LivenessTarget.new());
+class LivenessTarget extends Target("liveness") {
+	def configure(compiler: Compiler, prog: Program) {
+		SystemModule.install(prog);
+		compiler.Reachability = true;
+	}
+	def emit(compiler: Compiler, prog: Program) {
+		for (i < prog.ir.methods.length) {
+			var m = prog.ir.methods.get(i);
+			LivenessAnalyzer.new(prog, m).analyze();
+		}
+	}
+}
