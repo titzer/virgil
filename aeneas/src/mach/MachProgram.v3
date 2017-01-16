@@ -10,12 +10,20 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	def refSize = data.addressSize;
 
 	var runtime: MachRuntime;
-	var layout: MachProgramLayout;
+	def codeRegion    = Region.new("code", code);
+	def metaRegion    = Region.new("meta", code);
+	def runtimeRegion = Region.new("runtime", code);
+	def dataRegion    = Region.new("data", data);
+	def mtableMap     = IrUtil.newIrItemMap<Addr>();
+	def methodMap     = IrUtil.newIrItemMap<Address<IrMethod>>();
+	def fieldMap      = IrUtil.newIrItemMap<Address<IrField>>();
+	def recordMap     = V3.newRecordMap<Address<Record>>();
+	var recordQueue   = Vector<Record>.new();
+	var stubMap       = Strings.newMap<(Addr, (Addr, MachDataEncoder) -> void)>();
 	var stackAlign: int;
 	var numMethods: int;
 
 	new() {
-		layout = MachProgramLayout.new(this);
 		stackAlign = data.alignment;
 	}
 	def build(compiler: Compiler) {
@@ -64,13 +72,13 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	def processComponent(ic: IrClass) {
 		// queue component record for processing
 		var r = getComponentRecord(ic.ctype);
-		if (r != null) layout.recordQueue.add(r);
+		if (r != null) recordQueue.add(r);
 		for (i < ic.fields.length) {
 			// XXX: could segregate component fields into refs and nonrefs
 			var f = ic.fields(i);
 			var size = sizeOf(f.fieldType);
-			layout.dataRegion.align(size);
-			layout.fieldMap.set(f, layout.dataRegion.allocate(f, size));
+			dataRegion.align(size);
+			fieldMap.set(f, dataRegion.allocate(f, size));
 		}
 	}
 	def makeMachArray(utype: Type) -> Mach_V3Array {
@@ -154,9 +162,9 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 				// check for variants represented as enums
 				if (prog.ir.isEnum(r.rtype)) return Int.box(V3.getVariantTag(r.rtype));
 			}
-			return layout.mapRecord(r);
+			return mapRecord(r);
 		}
-		if (FuncVal.?(val)) return layout.addrOfMethod(FuncVal.!(val).memberRef.asMethod());
+		if (FuncVal.?(val)) return addrOfMethod(FuncVal.!(val).memberRef.asMethod());
 		return val;
 	}
 	def machTypeList(list: List<Type>) -> List<Type> {
@@ -175,7 +183,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		return if(head == list.head && sub == list.tail, list, List.new(head, sub));
 	}
 	def getCodeAddress(methodRef: IrSpec) -> Val {
-		return layout.addrOfMethod(methodRef.asMethod());
+		return addrOfMethod(methodRef.asMethod());
 	}
 	def getArrayLengthOffset(arrayType: Type) -> int {
 		return arrayRep(arrayType).lengthOffset;
@@ -210,7 +218,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		return (r.minClassId * code.addressSize, r.maxClassId * code.addressSize);
 	}
 	def componentFieldPtr(f: IrSpec) -> Val {
-		return layout.fieldMap.get(f.asField());
+		return fieldMap.get(f.asField());
 	}
 	def classFieldOffset(f: IrSpec) -> int {
 		return f.asField().machOffset;
@@ -218,13 +226,13 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	def methodTable(spec: IrSpec) -> Addr {
 		var mtable = IrSelector.!(spec.member).mtable;
 		if (mtable == null) return V3.fail1("mtable is null for %1", spec.render);
-		var mtaddr = layout.mtableMap.get(mtable);
+		var mtaddr = mtableMap.get(mtable);
 		if (mtaddr == null) { // allocate space in method region for mtable
 			var size = mtable.table.length * code.addressSize;
-			mtaddr = layout.metaRegion.allocate(mtable, size);
+			mtaddr = metaRegion.allocate(mtable, size);
 			// return a pointer to a table indexed starting from 0
 			mtaddr = mtaddr.add(0 - mtable.rootId * code.addressSize);
-			layout.mtableMap.set(mtable, mtaddr);
+			mtableMap.set(mtable, mtaddr);
 		}
 		return mtaddr;
 	}
@@ -312,7 +320,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	def encodeMtable(u: DataEncoder, mtable: IrMtable) {
 		for (m in mtable.table) {
 			if (m == null) u.i4(0); // XXX: encode null
-			else encodeAddr(u, layout.addrOfMethod(m));
+			else encodeAddr(u, addrOfMethod(m));
 		}
 	}
 	def encodeVal(u: DataEncoder, v: Val, t: Type) {
@@ -347,7 +355,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		}
 	}
 	def encodeAddr(u: DataEncoder, addr: Addr) {
-		var abs = layout.absolute(addr);
+		var abs = absolute(addr);
 		if (Aeneas.PRINT_MACH.get()) {
 			var buf = V3.renderResult(addr, null, Strings.toBuffer("encode "));
 			Terminal.putb(buf.puts(" = 0x").putx(abs).format1(" @ %1\n", u.pos));
@@ -364,6 +372,131 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 			V3Kind.SET: return isRefType(t.nested.head); // Use kind of first element of set.
 		}
 		return false;
+	}
+	def addrOfMethod(m: IrMethod) -> Address<IrMethod> {
+		var a = methodMap.get(m);
+		if (a == null) methodMap.set(m, a = Address.new(codeRegion, m));
+		return a;
+	}
+	def absolute(a: Addr) -> int {
+		if (a == null) return 0;
+		if (a.base != null) return absolute(a.base) + a.offset;
+		if (CiRuntime_Address.?(a)) return CiRuntime_Address.!(a).getAbs(runtime);
+		if (a.absolute == -1) error(a);
+		return a.absolute;
+	}
+	def error(a: Addr) {
+		var buf = Strings.toBuffer("address ");
+		V3.renderResult(a, null, buf);
+		buf.puts(" not fixed");
+		fail(buf.toString());
+	}
+	// compile each method into the encoder at its final address
+	def layoutCode(u: MachDataEncoder, genCode: IrMethod -> void) {
+		u.atEnd();
+		var methods = prog.ir.methods;
+		for (i < methods.length) {
+			// generate code for each method
+			var m = methods.get(i);
+			u.atEnd().align(code.alignment);
+			var methodStart = u.endAddr();
+			addrOfMethod(m).absolute = methodStart;
+			if (Aeneas.PRINT_MACH.get()) IrPrinter.new(prog).printMethodName(m, null);
+			genCode(m);
+			if (Aeneas.PRINT_BIN.get()) {
+				printBin(m, methodStart, u);
+			} else if (Aeneas.PRINT_SIZE.get()) {
+				Terminal.put2("%1: %2\n", m.renderLong, u.endAddr() - methodStart);
+			}
+		}
+		stubMap.apply(genStub(u, _));
+	}
+	def printBin(irm: IrMethod, methodStart: int, u: MachDataEncoder) {
+		var buf = StringBuffer.new();
+		var size = u.endAddr() - methodStart;
+		irm.renderLong(buf).puts(": ").puti(size).ln();
+		u.render(methodStart, u.max - size, size, buf);
+		Terminal.putbln(buf);
+	}
+	// generate each stub after the code
+	def genStub(u: MachDataEncoder, t: (string, (Addr, (Addr, MachDataEncoder) -> void))) {
+		u.atEnd().align(code.alignment);
+		var addr = t.1.0, gen = t.1.1;
+		addr.absolute = u.endAddr();
+		gen(addr, u);
+	}
+	// layout the method tables
+	def layoutMeta(u: MachDataEncoder) {
+		u.atEnd().align(data.addressSize);
+		metaRegion.setStartAddr(u.endAddr());
+		encodeRegion(metaRegion, u);
+	}
+	// layout all runtime datastructures
+	def layoutRuntime(u: MachDataEncoder) {
+		// have to finish laying out the data section to know its size
+		u.atEnd().align(data.addressSize);
+		Vectors.drain(recordQueue, 0, layoutRecord);
+		if (runtime.gc != null) {
+			// record the data size and the locations of mutable refs
+			runtime.gc.recordDataSize(dataRegion.mark);
+			dataRegion.apply(recordDataRefs);
+		}
+		runtime.encode(u);
+	}
+	// layout all records into the data region
+	def layoutData(u: MachDataEncoder) {
+		// compute addresses for all objects in the data region
+		dataRegion.setStartAddr(u.endAddr());
+		// encode all records into the encoder
+		encodeRegion(dataRegion, u);
+	}
+	private def recordDataRefs(a: Addr, off: int, size: int) {
+		if (a.is<IrField>()) {
+			// a global field in the data section
+			var f = a.get<IrField>();
+			if (!f.facts.F_VALUE) {
+				if (isRefType(f.fieldType)) runtime.gc.recordRootRef(off);
+			}
+		} else if (a.is<Record>()) {
+			// an object in the data section
+			runtime.gc.recordRootObject(off, a.get<Record>());
+		}
+	}
+	private def layoutRecord(r: Record) {
+		for (i < r.values.length) layoutVal(r.values(i));
+	}
+	private def layoutVal(val: Val) {
+		if (Record.?(val)) mapRecord(Record.!(val));
+		else if (Closure.?(val)) layoutVal(Closure.!(val).val);
+		else if (Tuple_Value.?(val)) for(e in Tuple_Value.!(val).values) layoutVal(e);
+	}
+	private def encodeRegion(region: Region, u: MachDataEncoder) {
+		// encode region contents at the end of this encoder
+		var start = u.atEnd().pos;
+		u.skipN(region.mark);
+		var c = region.contents;
+		for (i < c.length) {
+			var t = c.get(i);
+			encodeData(region, u.at(start + t.1), t.0);
+		}
+	}
+	def isValid(addr: Addr) -> bool {
+		// XXX: return true for all invalid addresses
+		if (addr == null) return false;
+		if (addr.equals(null)) return false;
+		return true;
+	}
+	def mapRecord(r: Record) -> Val {
+		var addr = recordMap.get(r);
+		if (addr == null) {
+			// allocate space in the data region
+			dataRegion.align(data.alignment);
+			addr = dataRegion.allocate(r, getObjectSize(r.rtype, r));
+			recordMap.set(r, addr);
+			// queue for later processing
+			recordQueue.add(r);
+		}
+		return addr;
 	}
 }
 // Machine representation of a type.
@@ -402,149 +535,13 @@ class MachLayout(mach: MachProgram) {
 // Manages the program regions and maps objects and code in those regions.
 // Guarantees that each item has a unique Address object representing it.
 class MachProgramLayout(mach: MachProgram) {
-	def codeRegion    = Region.new("code", mach.code);
-	def metaRegion    = Region.new("meta", mach.code);
-	def runtimeRegion = Region.new("runtime", mach.code);
-	def dataRegion    = Region.new("data", mach.data);
-	def mtableMap     = IrUtil.newIrItemMap<Addr>();
-	def methodMap     = IrUtil.newIrItemMap<Address<IrMethod>>();
-	def fieldMap      = IrUtil.newIrItemMap<Address<IrField>>();
-	def recordMap     = V3.newRecordMap<Address<Record>>();
-	var recordQueue   = Vector<Record>.new();
-	var stubMap       = Strings.newMap<(Addr, (Addr, MachDataEncoder) -> void)>();
-
-	def addrOfMethod(m: IrMethod) -> Address<IrMethod> {
-		var a = methodMap.get(m);
-		if (a == null) methodMap.set(m, a = Address.new(codeRegion, m));
-		return a;
-	}
-	def absolute(a: Addr) -> int {
-		if (a == null) return 0;
-		if (a.base != null) return absolute(a.base) + a.offset;
-		if (CiRuntime_Address.?(a)) return CiRuntime_Address.!(a).getAbs(mach.runtime);
-		if (a.absolute == -1) error(a);
-		return a.absolute;
-	}
-	def error(a: Addr) {
-		var buf = Strings.toBuffer("address ");
-		V3.renderResult(a, null, buf);
-		buf.puts(" not fixed");
-		mach.fail(buf.toString());
-	}
-	// compile each method into the encoder at its final address
-	def layoutCode(u: MachDataEncoder, genCode: IrMethod -> void) {
-		u.atEnd();
-		var methods = mach.prog.ir.methods;
-		for (i < methods.length) {
-			// generate code for each method
-			var m = methods.get(i);
-			u.atEnd().align(mach.code.alignment);
-			var methodStart = u.endAddr();
-			addrOfMethod(m).absolute = methodStart;
-			if (Aeneas.PRINT_MACH.get()) IrPrinter.new(mach.prog).printMethodName(m, null);
-			genCode(m);
-			if (Aeneas.PRINT_BIN.get()) {
-				printBin(m, methodStart, u);
-			} else if (Aeneas.PRINT_SIZE.get()) {
-				Terminal.put2("%1: %2\n", m.renderLong, u.endAddr() - methodStart);
-			}
-		}
-		stubMap.apply(genStub(u, _));
-	}
-	def printBin(irm: IrMethod, methodStart: int, u: MachDataEncoder) {
-		var buf = StringBuffer.new();
-		var size = u.endAddr() - methodStart;
-		irm.renderLong(buf).puts(": ").puti(size).ln();
-		u.render(methodStart, u.max - size, size, buf);
-		Terminal.putbln(buf);
-	}
-	// generate each stub after the code
-	def genStub(u: MachDataEncoder, t: (string, (Addr, (Addr, MachDataEncoder) -> void))) {
-		u.atEnd().align(mach.code.alignment);
-		var addr = t.1.0, gen = t.1.1;
-		addr.absolute = u.endAddr();
-		gen(addr, u);
-	}
-	// layout the method tables
-	def layoutMeta(u: MachDataEncoder) {
-		u.atEnd().align(mach.data.addressSize);
-		metaRegion.setStartAddr(u.endAddr());
-		encodeRegion(metaRegion, u);
-	}
-	// layout all runtime datastructures
-	def layoutRuntime(u: MachDataEncoder) {
-		// have to finish laying out the data section to know its size
-		u.atEnd().align(mach.data.addressSize);
-		Vectors.drain(recordQueue, 0, layoutRecord);
-		if (mach.runtime.gc != null) {
-			// record the data size and the locations of mutable refs
-			mach.runtime.gc.recordDataSize(dataRegion.mark);
-			dataRegion.apply(recordDataRefs);
-		}
-		mach.runtime.encode(u);
-	}
-	// layout all records into the data region
-	def layoutData(u: MachDataEncoder) {
-		// compute addresses for all objects in the data region
-		dataRegion.setStartAddr(u.endAddr());
-		// encode all records into the encoder
-		encodeRegion(dataRegion, u);
-	}
-	private def recordDataRefs(a: Addr, off: int, size: int) {
-		if (a.is<IrField>()) {
-			// a global field in the data section
-			var f = a.get<IrField>();
-			if (!f.facts.F_VALUE) {
-				if (mach.isRefType(f.fieldType)) mach.runtime.gc.recordRootRef(off);
-			}
-		} else if (a.is<Record>()) {
-			// an object in the data section
-			mach.runtime.gc.recordRootObject(off, a.get<Record>());
-		}
-	}
-	private def layoutRecord(r: Record) {
-		for (i < r.values.length) layoutVal(r.values(i));
-	}
-	private def layoutVal(val: Val) {
-		if (Record.?(val)) mapRecord(Record.!(val));
-		else if (Closure.?(val)) layoutVal(Closure.!(val).val);
-		else if (Tuple_Value.?(val)) for(e in Tuple_Value.!(val).values) layoutVal(e);
-	}
-	private def encodeRegion(region: Region, u: MachDataEncoder) {
-		// encode region contents at the end of this encoder
-		var start = u.atEnd().pos;
-		u.skipN(region.mark);
-		var c = region.contents;
-		for (i < c.length) {
-			var t = c.get(i);
-			mach.encodeData(region, u.at(start + t.1), t.0);
-		}
-	}
-	def isValid(addr: Addr) -> bool {
-		// XXX: return true for all invalid addresses
-		if (addr == null) return false;
-		if (addr.equals(null)) return false;
-		return true;
-	}
-	def mapRecord(r: Record) -> Val {
-		var addr = recordMap.get(r);
-		if (addr == null) {
-			// allocate space in the data region
-			dataRegion.align(mach.data.alignment);
-			addr = dataRegion.allocate(r, mach.getObjectSize(r.rtype, r));
-			recordMap.set(r, addr);
-			// queue for later processing
-			recordQueue.add(r);
-		}
-		return addr;
-	}
 }
 // Represents all runtime data structures exposed to the Virgil runtime code.
 class MachRuntime(mach: MachProgram) {
 	def codePageSize = 4096;
 	def codePageMask = 4095;
 	def codePageShift: byte = 12;
-	def codeRegion = mach.layout.codeRegion;
+	def codeRegion = mach.codeRegion;
 	def addrs = Array<int>.new(CiRuntimeModule.max); // CiRuntime absolute addresses
 	var typeCon: CiRuntime_TypeCon;
 
@@ -616,10 +613,10 @@ class MachRuntime(mach: MachProgram) {
 	def genAlloc(gen: MachCodeGen, i: SsaApplyOp, mv: MachVar);
 	def genSystemOp(gen: MachCodeGen, i: SsaApplyOp, mv: MachVar);
 	def getFatalAddress(ex: string) -> Addr {
-		var addr = mach.layout.stubMap.get(ex).0;
+		var addr = mach.stubMap.get(ex).0;
 		if (addr == null) {
 			addr = Address.new(codeRegion, Strings.concat("fatal_", ex));
-			mach.layout.stubMap.set(ex, (addr, genFatalStub(ex, _, _)));
+			mach.stubMap.set(ex, (addr, genFatalStub(ex, _, _)));
 		}
 		return addr;
 	}
