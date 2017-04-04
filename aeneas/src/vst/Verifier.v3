@@ -1532,122 +1532,93 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return Void.TYPE;
 	}
 	def visitMatch(stmt: MatchStmt, outer: Type) -> Type {
-		var etype = inferClosedType(stmt.expr);
-		checkSingleDefaultCase(stmt);
-		if (etype.typeCon.kind == V3Kind.VARIANT) {
-			var vt = ClassType.!(etype);
-			while (vt.classDecl.isVariantCase()) vt = vt.getSuperType();
-			checkCaseMatch(stmt, vt);
-		} else if (etype.typeCon.kind == V3Kind.ENUM) {
-			checkCaseMatch(stmt, ClassType.!(etype));
-		} else {
-			checkPrimMatch(stmt, etype);
-		}
-		return Void.TYPE;
-	}
-	def checkSingleDefaultCase(stmt: MatchStmt) {
-		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
-			var c = cases.head;
-			if (c.default != null) {
-				if (stmt.defcase != null) MatchError(c.default, "Default match case already defined");
-				stmt.defcase = c;
-			}
-		}
-	}
-	def checkPrimMatch(stmt: MatchStmt, etype: Type) {
-		var check = checkPrimPattern(_, etype);
+		var mv = MatchStmtVerifier.new(inferClosedType(stmt.expr), this);
 		var bf = FLOW_NONE;
 		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
 			var c = cases.head;
-			if (c.default != null) continue;  // check default case last
-			for (p = c.patterns.list; p != null; p = p.tail) {
-				checkPrimPattern(p.head, etype);
+			if (c.default != null) { // check default case last
+				mv.addDefaultCase(c);
+				stmt.defcase = c;
+				continue;
 			}
+			var count = 0;
+			for (p = c.patterns.list; p != null; p = p.tail) {
+				visitMatchPattern(mv, p.head);
+				count++;
+			}
+			var p = if(count == 1, c.patterns.list.head);
 			flow = FLOW_THRU;
+			var bound = bindPatternVariables(mv, p);
 			bf = mergeFlow(bf, typeCheckStmt(c.stmt));
+			if (bound) methodEnv.exitScope();
 		}
 		if (stmt.defcase != null) {
 			flow = FLOW_THRU;
-			bf = flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
+			mv.addDefaultCase(stmt.defcase);
+			flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
 		} else {
-			flow = FLOW_THRU;
+			flow = if(mv.allCovered(), bf, FLOW_THRU);
 		}
+		mv.end(stmt);
+		return Void.TYPE;
 	}
-	def checkPrimPattern(pattern: MatchPattern, etype: Type) {
-		var e = pattern.expr;
-		if (pattern.params != null) MatchError(pattern.params.range(), "match value cannot have parameters");
-		typeCheckExpr(e, etype, "match case");
-		if (Literal.?(e)) {
-			return assignPatternVal(pattern, Literal.!(e).val);
+	def visitMatchPattern(mv: MatchStmtVerifier, pat: MatchPattern) {
+		if (pat.vdecl != null) {
+			if (pat.params != null) MatchError(pat.params.range(), "match type cannot have parameters");
+			var ttype = methodEnv.resolveType(pat.vdecl.tref);
+			pat.vdecl.vtype = ttype;
+			return mv.addTypePattern(pat, ttype);
 		}
+		if (mv.variantType != null) return checkVariantPattern(mv, pat);
+		if (pat.params != null) return MatchError(pat.params.range(), "match pattern cannot have parameters");
+		var e = pat.expr;
+		typeCheckExpr(e, mv.etype, "match case");
+		if (Literal.?(e)) return assignPatternVal(mv, pat, Literal.!(e).val);
 		if (!VarExpr.?(e)) return MatchError(e.range(), "match expression is not a constant");
 		var ve = VarExpr.!(e);
 		match (ve.varbind) {
 			ComponentField(field) => {
 				if (Literal.?(field.init) && field.isReadOnly) {
-					return assignPatternVal(pattern, Literal.!(field.init).val);
+					return assignPatternVal(mv, pat, Literal.!(field.init).val);
 				}
 			}
 			Value(val, vtype) => {
-				return assignPatternVal(pattern, val);
+				return assignPatternVal(mv, pat, val);
 			}
 			_ => ;
 		}
 		MatchError(ve.range(), "match expression is not a value");
 	}
-	def assignPatternVal(pattern: MatchPattern, val: Val) {
-		if (pattern.expr.implicitType != null) {
+	def assignPatternVal(mv: MatchStmtVerifier, pat: MatchPattern, val: Val) {
+		if (pat.expr.implicitType != null) {
 			// perform an implicit conversion of the value if necessary
-			var r = TypeSystem.evalTypeCast(pattern.expr.exactType, pattern.expr.implicitType, val);
+			var r = TypeSystem.evalTypeCast(pat.expr.exactType, pat.expr.implicitType, val);
 			if (r.approx == CastOp.VALUE) val = r.result;
 		}
-		pattern.val = val;
+		mv.addValue(pat, val);
 	}
-	def checkCaseMatch(stmt: MatchStmt, vt: ClassType) {
-		var bf = FLOW_NONE;
-		var covered = Array<bool>.new(vt.classDecl.cases.length);
-		for (cases = stmt.cases.list; cases != null; cases = cases.tail) {
-			var c = cases.head;
-			if (c.default != null) continue;  // check default case last
-			var p = checkVariantPatterns(c, vt, covered);
-			flow = FLOW_THRU;
-			if (p != null) {
-				methodEnv.enterScope();
-				bindVariantParams(p, vt);
-			}
-			bf = mergeFlow(bf, typeCheckStmt(c.stmt));
-			if (p != null) {
-				methodEnv.exitScope();
-			}
+	def bindPatternVariables(mv: MatchStmtVerifier, pat: MatchPattern) -> bool {
+		if (pat == null) return false;
+		if (pat.vdecl != null) {
+			methodEnv.enterScope();
+			methodEnv.bindVar(pat.vdecl);
+			return true;
 		}
-		if (stmt.defcase != null) {
-			flow = bf;
-			for (c in covered) if (!c) flow = FLOW_THRU;
-			bf = flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
-		} else {
-			var buf: StringBuffer;
-			for (i < covered.length) {
-				if (!covered[i]) {
-					if (buf == null) buf = StringBuffer.new().format1("match on type %1 does not cover:", vt.render);
-					buf.puts(" ").puts(vt.classDecl.cases[i].name());
-				}
-			}
-			if (buf != null) MatchError(stmt.range(), buf.toString());
-			flow = bf;
+		if (pat.params == null) return false;
+		methodEnv.enterScope();
+		var vt = mv.variantType;
+		if (vt == null) return true;
+		if (pat.decl().params == null) {
+			MatchError(pat.params.range(), Strings.format2("case %1.%2 has no declared parameters", vt.render, pat.decl().name()));
+			return true;
 		}
-	}
-	def bindVariantParams(p: MatchPattern, vt: ClassType) {
-		if (p.params == null) return;
-		if (p.decl().params == null) {
-			var msg = Strings.format2("case %1.%2 has no declared parameters", vt.render, p.decl().name());
-			return MatchError(p.params.range(), msg);
-		}
-		var ll = p.params.list, pl = p.decl().params.list;
+		var ll = pat.params.list, pl = pat.decl().params.list;
 		var typeArgs = vt.getTypeArgs();
 		while (ll != null) {
 			if (pl == null) {
-				var msg = Strings.format2("case %1.%2", vt.render, p.decl().name());
-				return ArityMismatch(ll.head.token.range(), msg, Lists.length(p.decl().params.list), Lists.length(p.params.list));
+				var msg = Strings.format2("case %1.%2", vt.render, pat.decl().name());
+				ArityMismatch(ll.head.token.range(), msg, Lists.length(pat.decl().params.list), Lists.length(pat.params.list));
+				return true;
 			}
 			ll.head.vtype = pl.head.vtype.substitute(typeArgs);
 			methodEnv.bindVar(ll.head);
@@ -1655,33 +1626,23 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			pl = pl.tail;
 		}
 		if (pl != null) {
-			var msg = Strings.format2("case %1.%2", vt.render, p.decl().name());
-			return ArityMismatch(p.params.range().lastByte(), msg, Lists.length(p.decl().params.list), Lists.length(p.params.list));
+			var msg = Strings.format2("case %1.%2", vt.render, pat.decl().name());
+			ArityMismatch(pat.params.range().lastByte(), msg, Lists.length(pat.decl().params.list), Lists.length(pat.params.list));
 		}
+		return true;
 	}
-	def checkVariantPatterns(c: MatchCase, vt: ClassType, covered: Array<bool>) -> MatchPattern {
-		var p: MatchPattern, count = 0;
-		for (l = c.patterns.list; l != null; l = l.tail) {
-			p = l.head;
-			if (!VarExpr.?(p.expr)) continue;
-			var ve = VarExpr.!(p.expr);
-			if (ve.expr != null) {
-				var msg = Strings.format1("match on type %1 requires unqualified case", vt.render);
-				MatchError(ve.range(), msg);
-			}
-			var vc = p.variantCase = vt.lookupCase(ve.ident.name.image);
-			if (vc == null) {
-				var msg = Strings.format2("unresolved case %1.%2", vt.render, ve.ident.name.image);
-				MatchError(ve.range(), msg);
-				p = null;
-			} else {
-				if (covered[vc.tag]) MatchError(ve.range(), "duplicate match pattern");
-				else covered[vc.tag] = true;
-				p.val = Int.box(vc.tag);
-			}
-			count++;
+	def checkVariantPattern(mv: MatchStmtVerifier, pat: MatchPattern) {
+		if (!VarExpr.?(pat.expr)) return;
+		var ve = VarExpr.!(pat.expr), vt = mv.variantType;
+		if (ve.expr != null) {
+			return MatchError(ve.range(), Strings.format1("match on type %1 requires unqualified case", vt.render));
 		}
-		return if(count == 1, p);
+		var vc = pat.variantCase = vt.lookupCase(ve.ident.name.image);
+		if (vc == null) {
+			return MatchError(ve.range(), Strings.format2("unresolved case %1.%2", vt.render, ve.ident.name.image));
+		}
+		mv.addVariantPattern(pat, vc);
+		pat.val = Int.box(vc.tag);
 	}
 	def visitEmpty(stmt: EmptyStmt, outer: Type) -> Type {
 		return Void.TYPE;
@@ -2307,4 +2268,86 @@ class ResolvedMember(container: Type, member: VstMember, typeArgs: TypeArgs, mem
 
 def newNotEqual(t: Type) -> Operator {
 	return V3Op.newVstSugar(VstOperator.NotEqual, [t], [t, t], Bool.TYPE);
+}
+// A stateful helper to check various statement-wide properties (e.g. coverage)
+// for match statements.
+class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
+	var variantType: ClassType;
+	var valueMap: PartialMap<Val, MatchPattern>;
+	var covered: Array<MatchPattern>;
+	var default: MatchCase;
+	new() {
+		if (etype.typeCon.kind == V3Kind.VARIANT) {
+			var vt = ClassType.!(etype);
+			while (vt.classDecl.isVariantCase()) vt = vt.getSuperType();
+			variantType = vt;
+			covered = Array.new(variantType.classDecl.cases.length);
+		}
+		else if (etype.typeCon.kind == V3Kind.ENUM) {
+			variantType = ClassType.!(etype);
+			covered = Array.new(variantType.classDecl.cases.length);
+		}
+	}
+	def addValue(pat: MatchPattern, val: Val) {
+		if (valueMap == null) {
+			valueMap = HashMap.new(Val.hash, Val.equals);
+		} else if (valueMap.has(val)) {
+			MatchError(pat.expr.range(), "duplicate value", valueMap[val].expr.range());
+		}
+		pat.val = val;
+		valueMap[val] = pat;
+	}
+	def addVariantPattern(pat: MatchPattern, vc: VstCaseMember) {
+		if (covered[vc.tag] != null) {
+			MatchError(pat.expr.range(), "duplicate variant pattern", covered[vc.tag].expr.range());
+		}
+		covered[vc.tag] = pat;
+	}
+	def addTypePattern(pat: MatchPattern, t: Type) {
+		var cast = TypeSystem.newTypeCast(etype, t);
+		match (cast.approx) {
+			CastOp.FALSE, CastOp.FALSE_X_NULL => {
+				MatchError(pat.vdecl.tref.range(), Strings.format2("key of type %1 can never match type %2", etype.render, t.render), null);
+			}
+		}
+	}
+	def addDefaultCase(c: MatchCase) {
+		if (default != null && default != c) {
+			MatchError(c.range(), "duplicate default case", c.range());
+		}
+		default = c;
+	}
+	def end(stmt: MatchStmt) {
+		if (covered == null) return;
+		if (default != null) {
+			for (p in covered) {
+				if (p == null) return;
+			}
+			tc.error(default.range(), "UnreachableCode", "unreachable default case");
+			return;			
+		}
+		var buf: StringBuffer;
+		for (i < covered.length) {
+			if (covered[i] == null) {
+				if (buf == null) buf = StringBuffer.new().format1("match on type %1 does not cover:", variantType.render);
+				buf.puts(" ").puts(variantType.classDecl.cases[i].name());
+			}
+		}
+		if (buf != null) MatchError(stmt.range(), buf.toString(), null);
+	}
+	def isVariant() -> bool {
+		return etype.typeCon.kind == V3Kind.VARIANT;
+	}
+	def isEnum() -> bool {
+		return etype.typeCon.kind == V3Kind.ENUM;
+	}
+	def allCovered() -> bool {
+		if (covered == null) return false;
+		for (p in covered) if (p == null) return false;
+		return true;
+	}
+	def MatchError(range: FileRange, msg: string, prev: FilePoint) {
+		if (prev != null) msg = Strings.format3("%1 (previous at %2:%3)", msg, prev.beginLine, prev.beginColumn);
+		tc.error(range, "MatchError", msg);
+	}
 }
