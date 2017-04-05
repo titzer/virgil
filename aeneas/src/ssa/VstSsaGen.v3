@@ -487,109 +487,117 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			key = env.addApply(null, V3Op.newVariantGetTag(keyType), [key]); // XXX: constant fold
 			keyType = V3.classDecl(keyType).tagType;
 		}
-		var cases = stmt.cases.asArray();
-		if (context.compiler.VstBranchOpt && SsaValue.?(key)) {
-			// the key for the match is a value, fold the match
-			var val = SsaValue.!(key).val;
-			for (c in cases) {
-				if (c.default != null) continue;
-				for (pl = c.patterns.list; pl != null; pl = pl.tail) {
-					if (Values.equal(val, pl.head.val)) {
-						genCaseBody(origKey, c, env);
-						return null;
-					}
-				}
-			}
-			// no values matched
-			if (stmt.defcase != null) env.genStmt(stmt.defcase.stmt);
-			return null;
-		}
-
-		// generate control flow for a match statement
-		var end = VstSsaMerge.new(this);
-		var vvec = Vector<Val>.new(), bvec = Vector<SsaBlock>.new();
-		for (c in cases) {
-			// generate code for each clause of the match, except the default.
-			if (c.default != null) continue;
-			var benv = env.split();
-			var block = benv.block;
-			genCaseBody(origKey, c, benv);
-			end.merge(benv);
-			for (vl = c.patterns.list; vl != null; vl = vl.tail) {
-				vvec.add(vl.head.val);
-				bvec.add(block);
-			}
-		}
-		if (vvec.length == 0) {
-			// no patterns, just generate the default case if there is one
-			if (stmt.defcase != null) env.genStmt(stmt.defcase.stmt);
-			return null;
+		// gather all the cases, putting the default at the end
+		var cases = Vector<MatchCase>.new().grow(stmt.cases.length());
+		for (l = stmt.cases.list; l != null; l = l.tail) {
+			if (l.head.default != null) continue;
+			cases.add(l.head);
 		}
 		if (stmt.defcase != null) {
-			// patterns and default case, generate default case and merge it
-			var benv = env.split();
-			var defblock = benv.block;
-			benv.genStmt(stmt.defcase.stmt);
-			end.merge(benv);
-			addSwitch(key, keyType, vvec, bvec, defblock, env);
-		} else if (isEnum) {
-			// variants/enums cover all possible cases; no fallthru
-			addSwitch(key, keyType, vvec, bvec, null, env);
-		} else {
-			// end.block is the default case; merge the env before the switch into end
-			var edge = addSwitch(key, keyType, vvec, bvec, end.block, env);
-			end.mergeEdge(env, edge);
+			cases.add(stmt.defcase);
+		} else if (!isEnum) {
+			// materialize an empty default case if not exhaustive
+			var defcase = MatchCase.new(null, null, EmptyStmt.new(null));
+			cases.add(defcase);
+		}
+		if (context.compiler.VstBranchOpt && SsaValue.?(key)) {
+			// the key for the match is a value, fold the match
+			var val = SsaValue.!(key).val, limit = cases.length - 1;
+			for (i < limit) {
+				var c = cases[i];
+				if (matchPatterns(keyType, c.patterns.list, val)) {
+					if (c.patterns.length() == 1) genCaseBindings(key, c, env);
+					env.genStmt(c.stmt);
+					return null;
+				}
+			}
+			// no values matched, generate the default case
+			env.genStmt(cases[limit].stmt);
+			return null;
+		}
+		// generate an if cascade for the switch statement
+		var end = VstSsaMerge.new(this);
+		var cur: SsaBuilder = env;
+		for (i < cases.length) {
+			var c = cases[i], cenv = env.split();
+			var pat: MatchPattern;
+			if (i < cases.length - 1) {
+				// generate comparisons for all patterns
+				var pats = c.patterns.asArray();
+				for (pat in pats) {
+					var fblock = SsaBuilder.new(context, graph, SsaBlock.new());
+					cur.addIf(genPatternCond(keyType, cur, pat, origKey, key), cenv.block, fblock.block);
+					cur = fblock;
+				}
+				if (pats.length == 1) pat = pats[0];
+			} else {
+				// last case
+				cenv.block = cur.block;
+				if (c.patterns != null && c.patterns.length() == 1) pat = c.patterns.list.head;
+			}
+			// generate the body of the case and merge to end
+			if (pat != null) genCaseBindings(origKey, c, cenv);
+			cenv.genStmt(c.stmt);
+			end.merge(cenv);
 		}
 		end.setEnv(env);
 		return null;
 	}
-	def addSwitch(key: SsaInstr, keyType: Type, vvec: Vector<Val>, cvec: Vector<SsaBlock>, d: SsaBlock, env: VstSsaEnv) -> SsaCfEdge {
-		// Otherwise, Generate a cascade of ifs.
-		var eq = V3Op.newEqual(keyType), last = vvec.length - 1;
-		var cur: SsaBuilder = env;
-		for (i < last) {
-			var const = graph.valConst(keyType, vvec[i]);
-			var cond = cur.addApply(null, eq, [key, const]);
-			var fblock = SsaBuilder.new(context, graph, SsaBlock.new());
-			cur.addIf(cond, cvec[i], fblock.block);
-			cur = fblock;
-		}
-		if (d != null) {
-			var const = graph.valConst(keyType, vvec[last]);
-			var cond = cur.addApply(null, eq, [key, const]);
-			cur.addIf(cond, cvec[last], d);
-			return cur.block.succs()[1];
+	def genPatternCond(keyType: Type, cur: SsaBuilder, pat: MatchPattern, origKey: SsaInstr, key: SsaInstr) -> SsaInstr {
+		if (pat.vdecl != null && pat.variantCase == null) {
+			// type case, generate "T.?(key)"
+			var query = V3Op.newTypeQuery(keyType, pat.vdecl.tref.rtype);
+			return cur.addApply(null, query, [key]);
 		} else {
-			cur.addGoto(cvec[last]);
-			return null;
+			// this is a value / tag case, generate "key == const"
+			var const = graph.valConst(keyType, pat.val);
+			return cur.addApply(null, V3Op.newEqual(keyType), [key, const]); // XXX: cache equality operator
 		}
 	}
-	def genCaseBody(key: SsaInstr, c: MatchCase, env: VstSsaEnv) {
-		if (c.patterns.length() == 1) {
-			// bind variant parameters in the body if necessary
-			var p = c.patterns.first();
-			if (p.params != null) {
-				var keyType = key.getType(), newKeyType = V3.getSyntheticVariantType(keyType, p.variantCase);
-				var newKey = env.opTypeSubsume(keyType, newKeyType, key); // XXX: a cast is just to satisfy the typesystem of the JVM
-				if (newKey.inputs.length > 0 && newKey.input0() == key) {
-					// type subsume shouldn't have been folded away
-					if (p.decl().variantTag > 0) newKey.facts |= Fact.O_NO_NULL_CHECK;
-				}
-				var ta = [keyType], args = [newKey], i = 0;
-				var ic = ir.makeIrClass(newKeyType);
-				for (pl = p.params.list; pl != null; pl = pl.tail) {
-					var fieldRef = IrSpec.new(newKeyType, ta, ic.fields[i++]);
-					pl.head.ssa = VstSsaVar.new();
-					var load = env.opClassGetField(fieldRef, newKey);
-					pl.head.ssa.instr = load;
-					if (load.inputs.length == 1 && load.input0() == newKey) {
-						// loads of non-default variants don't need null checks
-						if (p.decl().variantTag > 0) load.facts |= Fact.O_NO_NULL_CHECK;
-					}
+	def matchPatterns(keyType: Type, pl: List<MatchPattern>, val: Val) -> bool {
+		while (pl != null) {
+			var pat = pl.head;
+			if (pat.vdecl != null) {
+				var cast = TypeSystem.evalTypeQuery(keyType, pat.vdecl.tref.rtype, val);
+				if (cast.approx == CastOp.TRUE) return true;
+			} else if (Values.equal(val, pat.val)) {
+				return true;
+			}
+			pl = pl.tail;
+		}
+		return false;
+	}
+	def genCaseBindings(key: SsaInstr, c: MatchCase, env: VstSsaEnv) {
+		// bind variant parameters in the body if necessary
+		var p = c.patterns.first(), keyType = key.getType();
+		var newKey: SsaInstr, newKeyType: Type;
+		if (p.vdecl != null) {
+			newKeyType = p.vdecl.tref.rtype;
+			newKey = env.opTypeSubsume(keyType, newKeyType, key);
+			p.vdecl.ssa.instr = newKey;
+		}
+		if (p.params != null) {
+			if (newKey == null) {
+				newKeyType = V3.getSyntheticVariantType(keyType, p.variantCase);
+				newKey = env.opTypeSubsume(keyType, newKeyType, key);
+			}
+			if (newKey.inputs.length > 0 && newKey.input0() == key) {
+				// type subsume shouldn't have been folded away
+				if (p.decl().variantTag > 0) newKey.facts |= Fact.O_NO_NULL_CHECK;
+			}
+			var ta = [keyType], args = [newKey], i = 0;
+			var ic = ir.makeIrClass(newKeyType);
+			for (pl = p.params.list; pl != null; pl = pl.tail) {
+				var fieldRef = IrSpec.new(newKeyType, ta, ic.fields[i++]);
+				pl.head.ssa = VstSsaVar.new();
+				var load = env.opClassGetField(fieldRef, newKey);
+				pl.head.ssa.instr = load;
+				if (load.inputs.length == 1 && load.input0() == newKey) {
+					// loads of non-default variants don't need null checks
+					if (p.decl().variantTag > 0) load.facts |= Fact.O_NO_NULL_CHECK;
 				}
 			}
 		}
-		env.genStmt(c.stmt);
 	}
 	def visitEmpty(stmt: EmptyStmt, env: VstSsaEnv) -> SsaInstr {
 		return null; // nothing
