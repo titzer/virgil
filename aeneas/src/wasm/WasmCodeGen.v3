@@ -1,249 +1,418 @@
 // Copyright 2017 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+def TRUNCATE = true;
+def NO_TRUNCATE = false;
 class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 	def vars = Vector<MachVar>.new();
-	var curBlockStart = 0;
 	def code = Vector<byte>.new();
-	var markingGen: int;
+	def blockMapping = Vector<int>.new();
+	var graphMarkGen: int;
+	var blockMarkGen: int;
+	def context: SsaContext; // TODO
 	def generate(m: IrMethod, buffer: DataBuffer) {
-		if (false) {
-			// Simply emit unreachable.
-			buffer.i1(3);
-			buffer.i1(0);
-			buffer.i1(WasmOp.UNREACHABLE);
-			buffer.i1(WasmOp.END);
-			return;
+		var graph = m.ssa;
+		graphMarkGen = graph.markGen;
+		vars.grow(graph.params.length);
+		vars.length = graph.params.length;
+		for (i < graph.params.length) {
+			var p = graph.params[i];
+			p.mark = graph.markGen++;
+			vars[i] = MachVar.new(p, p.mark - graphMarkGen, 1, false);
 		}
-		markingGen = m.ssa.markGen;
-		def blocks = SsaBlockOrder.new(m.ssa).computeOrder();
+		def blocks = SsaBlockOrder.new(graph).computeOrder();
 		for (i < blocks.length) {
+			var block = blocks[i];
+			markInstrsInBlock(graph, block.block);
 			genBlock(i, blocks[i]);
 		}
 	}
-	def genBlock(index: int, block: SsaBlockInfo) {
-		// generate code for each instruction in a block
-		curBlockStart = code.length;
-		var next = block.block.next;
-		while (SsaPhi.?(next)) next = next.next;  // skip phis
+	def markInstrsInBlock(graph: SsaGraph, block: SsaBlock) {
+		blockMarkGen = ++graph.markGen;
+		blockMapping.length = 0;
+		var next = block.next;
+		while (SsaPhi.?(next)) next = next.next;
 		for (i = next; SsaInstr.?(i); i = i.next) {
-			var mv = makeVar(SsaInstr.!(i));
-			mv.start = code.length;
-			if (SsaApplyOp.?(i)) genApply(SsaApplyOp.!(i), mv);
+			i.mark = ++graph.markGen;
+		}
+	}
+	def genInputs(inputs: Array<SsaDfEdge>, commutative: bool) {
+		for (j = inputs.length - 1; j >= 0; j--) {
+			var e = inputs[j], i = e.dest;
+			if (SsaValue.?(i)) {
+				// TODO: generate constant
+				var v = SsaValue.!(i);
+			} else if (e.isOnlyEdge() && i.mark >= blockMarkGen) {
+				// TODO: generate the instruction here
+			} else {
+				// TODO: generate a load of the instruction
+				emit1v(WasmOp.GET_LOCAL, varOf(i));
+			}
+		}
+	}
+	def varOf(i: SsaInstr) -> int {
+		if (i.mark >= blockMarkGen) {
+			// The instruction is in this basic block.
+			var index = i.mark - blockMarkGen;
+			if (index < blockMapping.length) {
+				var vnum = blockMapping[index];
+				if (vnum >= 0 && vnum < vars.length) return vars[vnum].varNum;
+			}
+			Vectors.growAndSet(blockMapping, -1, index, vars.length);
+		} else if (i.mark >= graphMarkGen) {
+			// The instruction has been visited before.
+			return vars[i.mark - graphMarkGen].varNum;
+		} else {
+			// The instruction has never been seen before.
+		}
+		return 0;
+	}
+	def genBlock(index: int, block: SsaBlockInfo) {
+		// Traverse SSA in reverse, selecting WASM instructions.
+		var next = block.block.prev;
+		for (i = block.block.prev; SsaInstr.?(i); i = i.prev) {
+			if (i.mark < 0) continue; // already covered
+			if (SsaApplyOp.?(i)) genApply(SsaApplyOp.!(i));
 			else if (SsaReturn.?(i)) genReturn(SsaReturn.!(i));
 			else if (SsaIf.?(i)) genIf(SsaIf.!(i));
 			else if (SsaGoto.?(i)) genGoto(SsaGoto.!(i).target());
 			else if (SsaSwitch.?(i)) genSwitch(SsaSwitch.!(i));
 			else if (SsaThrow.?(i)) genThrow(SsaThrow.!(i));
-			mv.end = code.length;
-			if (mv.varSize > 0) {
-				for (i = mv.varNum; i < mv.varNum + mv.varSize; i++) {
-					var ov = vars[i];
-					ov.start = mv.start;
-					ov.end = mv.end;
-				}
-			}
+			else if (SsaPhi.?(i)) break; // reached top of block
+			else if (SsaBlock.?(i)) break; // reached top of block
 		}
 	}
-	def genApply(i: SsaApplyOp, mv: MachVar) {
+	def compareIntType(t: Type) -> IntType {
+		match (t.typeCon.kind) {
+			V3Kind.INT => return IntType.!(t);
+			V3Kind.VARIANT,
+			V3Kind.ENUM => return V3Class_TypeCon.!(t.typeCon).classDecl.tagType;
+			V3Kind.ENUM_SET => return V3EnumSet_TypeCon.!(t.typeCon).intType;
+		}
+		context.fail("expected integral type");
+		return Int.TYPE;
+	}
+	def emitIntBinop(i: SsaApplyOp, iop: WasmOp, lop: WasmOp, trunc: bool) {
+		var tt = IntType.!(i.op.resultType);
+		emit1(if(tt.width <= 32, iop, lop));
+		if (trunc) emitIntTrunc(tt);
+	}
+	def emitIntTrunc(tt: IntType) {
+		if (tt.signed) emitSignExtend(tt);
+		else emitZeroExtend(tt);
+	}
+	def emitZeroExtend(tt: IntType) {
+		if (tt.width < 32) {
+			emiti(Int.unbox(tt.max));
+			emit1(WasmOp.I32_AND);
+		} else if (tt.width > 32 && tt.width < 64) {
+			emitl(Long.unboxSU(tt.max, tt.signed));
+			emit1(WasmOp.I64_AND);
+		}
+	}
+	def emitSignExtend(tt: IntType) {
+		if (tt.width < 32) {
+			emiti(32 - tt.width);
+			emit1(WasmOp.I32_SHL);
+			emiti(32 - tt.width);
+			emit1(WasmOp.I32_SHR_S);
+		} else if (tt.width > 32 && tt.width < 64) {
+			emiti(64 - tt.width);
+			emit1(WasmOp.I64_SHL);
+			emiti(64 - tt.width);
+			emit1(WasmOp.I64_SHR_S);
+		}
+	}
+	def emitIntCmp(i: SsaApplyOp, iop: WasmOp, lop: WasmOp) {
+		var tt = compareIntType(i.op.typeArgs[0]);
+		if (!tt.signed) {
+			// TODO iop++;
+			// TODO lop++;
+		}
+		emit1(if(tt.width <= 32, iop, lop));
+	}
+	def emitIntConvert(i: SsaApplyOp) {
+		var ft = IntType.!(i.op.paramTypes[0]), tt = IntType.!(i.op.resultType);
+		if (ft.width > 32 && tt.width <= 32) {
+			ft = Int.TYPE;
+			emit1(WasmOp.I32_WRAP_I64);
+		} else if (ft.width <= 32 && tt.width > 32) {
+			emit1(if(tt.signed, WasmOp.I64_EXTEND_S_I32, WasmOp.I64_EXTEND_U_I32));
+			return;
+		}
+		if (tt.width == 32) return;
+		if (tt.signed) emitSignExtend(tt);
+		else emitZeroExtend(tt);
+	}
+	def genApply(i: SsaApplyOp) {
+		// TODO
+		def op = i.op;
+		match (op.opcode) {
+			IntEq => {
+				var tt = compareIntType(op.typeArgs[0]);
+				emit1(if(tt.width > 32, WasmOp.I64_EQ, WasmOp.I32_EQ));
+			}
+			BoolEq, RefEq => emit1(WasmOp.I32_EQ);
+			IntAdd =>	emitIntBinop(i, WasmOp.I32_ADD, WasmOp.I64_ADD, TRUNCATE);
+			IntSub =>	emitIntBinop(i, WasmOp.I32_SUB, WasmOp.I64_SUB, TRUNCATE);
+			IntMul =>	emitIntBinop(i, WasmOp.I32_MUL, WasmOp.I64_MUL, TRUNCATE);
+			IntDiv => {
+				var tt = IntType.!(op.typeArgs[0]);
+				if (tt.signed) emitIntBinop(i, WasmOp.I32_DIV_S, WasmOp.I64_DIV_S, TRUNCATE);
+				else emitIntBinop(i, WasmOp.I32_DIV_U, WasmOp.I64_DIV_U, TRUNCATE);
+			}
+			IntMod =>  {
+				var tt = IntType.!(op.typeArgs[0]);
+				if (tt.signed) emitIntBinop(i, WasmOp.I32_REM_S, WasmOp.I64_REM_S, TRUNCATE);
+				else emitIntBinop(i, WasmOp.I32_REM_U, WasmOp.I64_REM_U, TRUNCATE);
+			}
+			IntAnd =>		emitIntBinop(i, WasmOp.I32_AND, WasmOp.I64_AND, NO_TRUNCATE);
+			IntOr =>		emitIntBinop(i, WasmOp.I32_OR, WasmOp.I64_OR, NO_TRUNCATE);
+			IntXor =>		emitIntBinop(i, WasmOp.I32_XOR, WasmOp.I64_XOR, NO_TRUNCATE);
+			IntShl =>		emitIntBinop(i, WasmOp.I32_SHL, WasmOp.I64_SHL, NO_TRUNCATE);
+			IntSar =>		emitIntBinop(i, WasmOp.I32_SHR_S, WasmOp.I64_SHR_S, TRUNCATE);
+			IntShr =>		emitIntBinop(i, WasmOp.I32_SHR_U, WasmOp.I64_SHR_U, TRUNCATE);
+			IntLt =>		emitIntCmp(i, WasmOp.I32_LT_S, WasmOp.I64_LT_S);
+			IntLteq =>		emitIntCmp(i, WasmOp.I32_LE_S, WasmOp.I64_LE_S);
+			IntConvert => 		emitIntConvert(i);
+			BoolAnd =>		emit1(WasmOp.I32_AND);
+			BoolOr =>		emit1(WasmOp.I32_OR);
+			BoolNot => {
+				emiti(1);
+				emit1(WasmOp.I32_XOR);
+			}
+			PtrLoad =>	; // TODO
+			PtrStore =>	; // TODO
+			PtrCmpSwp =>	; // TODO
+			PtrAdd =>	; // TODO
+			PtrSub =>	; // TODO
+			Alloc => 	; // TODO
+			CallAddress =>	; // TODO
+			SystemOp => {
+				var name = op.attr<string>();
+				// TODO
+			}
+			ConditionalThrow => {
+				var except = op.attr<string>();
+				// TODO var b = emitBranchFw();
+				emitThrow(except);
+				// TODO patchBranch(b);
+			}
+			_ => context.fail1("unexpected opcode in SSA->WASM: %1", op.opcode.name);
+		}
+		genInputs(i.inputs, i.facts.O_COMMUTATIVE);
 	}
 	def genReturn(i: SsaReturn) {
+		emit1(WasmOp.RETURN);
+		genInputs(i.inputs, false);
 	}
 	def genIf(i: SsaIf) {
+		// TODO
+		genInputs(i.inputs, false);
 	}
 	def genGoto(i: SsaBlock) {
+		// TODO
 	}
 	def genSwitch(i: SsaSwitch) {
+		// TODO
+		genInputs(i.inputs, false);
 	}
 	def genThrow(i: SsaThrow) {
+		// TODO
 	}
-	def makeVar(i: SsaInstr) -> MachVar {
-		var max = markingGen;
-		if (i.mark >= max) return vars[i.mark - max]; // already has a variable
-		var isConst = SsaValue.?(i);
-		var num = numVars(i), machVar = MachVar.new(i, vars.length, num, isConst);
-		vars.add(machVar);
-		while (--num > 0) vars.add(MachVar.new(i, vars.length, 1, isConst));
-		i.mark = machVar.varNum + max; // maps instruction to var
-		return machVar;
+	def emit1(opcode: WasmOp) {
+		// TODO
+		Terminal.put1("emit1(%1)\n", opcode.name);
 	}
-	def numVars(i: SsaInstr) -> int {
-		return 1; // TODO
+	def emit1v(opcode: WasmOp, vnum: int) {
+		// TODO
+		Terminal.put2("emit1v(%1, %2)\n", opcode.name, vnum);
+	}
+	def emiti(val: int) {
+		// TODO: 
+		Terminal.put1("emiti(%1)\n", int.!(val));
+	}
+	def emitl(val: long) {
+		// TODO: 
+		Terminal.put1("emitl(%1)\n", long.!(val));
+	}
+	def emitThrow(except: string) {
+		// TODO:
 	}
 }
 
 // Constants for wasm opcodes.
-component WasmOp {
-	def UNREACHABLE: byte 	= 0x00;
-	def NOP: byte 		= 0x01;
-	def BLOCK: byte 	= 0x02;
-	def LOOP: byte 		= 0x03;
-	def IF: byte 		= 0x04;
-	def ELSE: byte 		= 0x05;
-	def END: byte 		= 0x0b;
-	def BR: byte 		= 0x0c;
-	def BR_IF: byte 	= 0x0d;
-	def BR_TABLE: byte 	= 0x0e;
-	def RETURN: byte 	= 0x0f;
-	def CALL: byte 		= 0x10;
-	def CALL_INDIRECT: byte = 0x11;
-	def DROP: byte 		= 0x1a;
-	def SELECT: byte 	= 0x1b;
-	def GET_LOCAL: byte 	= 0x20;
-	def SET_LOCAL: byte 	= 0x21;
-	def TEE_LOCAL: byte 	= 0x22;
-	def GET_GLOBAL: byte 	= 0x23;
-	def SET_GLOBAL: byte 	= 0x24;
-	def I32_LOAD: byte 	= 0x28;
-	def I64_LOAD: byte 	= 0x29;
-	def F32_LOAD: byte 	= 0x2a;
-	def F64_LOAD: byte 	= 0x2b;
-	def I32_LOAD8_S: byte 	= 0x2c;
-	def I32_LOAD8_U: byte 	= 0x2d;
-	def I32_LOAD16_S: byte 	= 0x2e;
-	def I32_LOAD16_U: byte 	= 0x2f;
-	def I64_LOAD8_S: byte 	= 0x30;
-	def I64_LOAD8_U: byte 	= 0x31;
-	def I64_LOAD16_S: byte 	= 0x32;
-	def I64_LOAD16_U: byte 	= 0x33;
-	def I64_LOAD32_S: byte 	= 0x34;
-	def I64_LOAD32_U: byte 	= 0x35;
-	def I32_STORE: byte 	= 0x36;
-	def I64_STORE: byte 	= 0x37;
-	def F32_STORE: byte 	= 0x38;
-	def F64_STORE: byte 	= 0x39;
-	def I32_STORE8: byte 	= 0x3a;
-	def I32_STORE16: byte 	= 0x3b;
-	def I64_STORE8: byte 	= 0x3c;
-	def I64_STORE16: byte 	= 0x3d;
-	def I64_STORE32: byte 	= 0x3e;
-	def CURRENT_MEMORY: byte = 0x3f;
-	def GROW_MEMORY: byte 	= 0x40;
-	def I32_CONST: byte 	= 0x41;
-	def I64_CONST: byte 	= 0x42;
-	def F32_CONST: byte 	= 0x43;
-	def F64_CONST: byte 	= 0x44;
-	def I32_EQZ: byte	= 0x45;
-	def I32_EQ: byte	= 0x46;
-	def I32_NE: byte	= 0x47;
-	def I32_LT_S: byte	= 0x48;
-	def I32_LT_U: byte	= 0x49;
-	def I32_GT_S: byte	= 0x4a;
-	def I32_GT_U: byte	= 0x4b;
-	def I32_LE_S: byte	= 0x4c;
-	def I32_LE_U: byte	= 0x4d;
-	def I32_GE_S: byte	= 0x4e;
-	def I32_GE_U: byte	= 0x4f;
-	def I64_EQZ: byte	= 0x50;
-	def I64_EQ: byte	= 0x51;
-	def I64_NE: byte	= 0x52;
-	def I64_LT_S: byte	= 0x53;
-	def I64_LT_U: byte	= 0x54;
-	def I64_GT_S: byte	= 0x55;
-	def I64_GT_U: byte	= 0x56;
-	def I64_LE_S: byte	= 0x57;
-	def I64_LE_U: byte	= 0x58;
-	def I64_GE_S: byte	= 0x59;
-	def I64_GE_U: byte	= 0x5a;
-	def F32_EQ: byte	= 0x5b;
-	def F32_NE: byte	= 0x5c;
-	def F32_LT: byte	= 0x5d;
-	def F32_GT: byte	= 0x5e;
-	def F32_LE: byte	= 0x5f;
-	def F32_GE: byte	= 0x60;
-	def F64_EQ: byte	= 0x61;
-	def F64_NE: byte	= 0x62;
-	def F64_LT: byte	= 0x63;
-	def F64_GT: byte	= 0x64;
-	def F64_LE: byte	= 0x65;
-	def F64_GE: byte	= 0x66;
-	def I32_CLZ: byte	= 0x67;
-	def I32_CTZ: byte	= 0x68;
-	def I32_POPCNT: byte	= 0x69;
-	def I32_ADD: byte	= 0x6a;
-	def I32_SUB: byte	= 0x6b;
-	def I32_MUL: byte	= 0x6c;
-	def I32_DIV_S: byte	= 0x6d;
-	def I32_DIV_U: byte	= 0x6e;
-	def I32_REM_S: byte	= 0x6f;
-	def I32_REM_U: byte	= 0x70;
-	def I32_AND: byte	= 0x71;
-	def I32_OR: byte	= 0x72;
-	def I32_XOR: byte	= 0x73;
-	def I32_SHL: byte	= 0x74;
-	def I32_SHR_S: byte	= 0x75;
-	def I32_SHR_U: byte	= 0x76;
-	def I32_ROTL: byte	= 0x77;
-	def I32_ROTR: byte	= 0x78;
-	def I64_CLZ: byte	= 0x79;
-	def I64_CTZ: byte	= 0x7a;
-	def I64_POPCNT: byte	= 0x7b;
-	def I64_ADD: byte	= 0x7c;
-	def I64_SUB: byte	= 0x7d;
-	def I64_MUL: byte	= 0x7e;
-	def I64_DIV_S: byte	= 0x7f;
-	def I64_DIV_U: byte	= 0x80;
-	def I64_REM_S: byte	= 0x81;
-	def I64_REM_U: byte	= 0x82;
-	def I64_AND: byte	= 0x83;
-	def I64_OR: byte	= 0x84;
-	def I64_XOR: byte	= 0x85;
-	def I64_SHL: byte	= 0x86;
-	def I64_SHR_S: byte	= 0x87;
-	def I64_SHR_U: byte	= 0x88;
-	def I64_ROTL: byte	= 0x89;
-	def I64_ROTR: byte	= 0x8a;
-	def F32_ABS: byte	= 0x8b;
-	def F32_NEG: byte	= 0x8c;
-	def F32_CEIL: byte	= 0x8d;
-	def F32_FLOOR: byte	= 0x8e;
-	def F32_TRUNC: byte	= 0x8f;
-	def F32_NEAREST: byte	= 0x90;
-	def F32_SQRT: byte	= 0x91;
-	def F32_ADD: byte	= 0x92;
-	def F32_SUB: byte	= 0x93;
-	def F32_MUL: byte	= 0x94;
-	def F32_DIV: byte	= 0x95;
-	def F32_MIN: byte	= 0x96;
-	def F32_MAX: byte	= 0x97;
-	def F32_COPYSIGN: byte	= 0x98;
-	def F64_ABS: byte	= 0x99;
-	def F64_NEG: byte	= 0x9a;
-	def F64_CEIL: byte	= 0x9b;
-	def F64_FLOOR: byte	= 0x9c;
-	def F64_TRUNC: byte	= 0x9d;
-	def F64_NEAREST: byte	= 0x9e;
-	def F64_SQRT: byte	= 0x9f;
-	def F64_ADD: byte	= 0xa0;
-	def F64_SUB: byte	= 0xa1;
-	def F64_MUL: byte	= 0xa2;
-	def F64_DIV: byte	= 0xa3;
-	def F64_MIN: byte	= 0xa4;
-	def F64_MAX: byte	= 0xa5;
-	def F64_COPYSIGN: byte	= 0xa6;
-	def I32_WRAP_I64: byte	= 0xa7;
-	def I32_TRUNC_S_F32: byte	= 0xa8;
-	def I32_TRUNC_U_F32: byte	= 0xa9;
-	def I32_TRUNC_S_F64: byte	= 0xaa;
-	def I32_TRUNC_U_F64: byte	= 0xab;
-	def I64_EXTEND_S_I32: byte	= 0xac;
-	def I64_EXTEND_U_I32: byte	= 0xad;
-	def I64_TRUNC_S_F32: byte	= 0xae;
-	def I64_TRUNC_U_F32: byte	= 0xaf;
-	def I64_TRUNC_S_F64: byte	= 0xb0;
-	def I64_TRUNC_U_F64: byte	= 0xb1;
-	def F32_CONVERT_S_I32: byte	= 0xb2;
-	def F32_CONVERT_U_I32: byte	= 0xb3;
-	def F32_CONVERT_S_I64: byte	= 0xb4;
-	def F32_CONVERT_U_I64: byte	= 0xb5;
-	def F32_DEMOTE_F64: byte	= 0xb6;
-	def F64_CONVERT_S_I32: byte	= 0xb7;
-	def F64_CONVERT_U_I32: byte	= 0xb8;
-	def F64_CONVERT_S_I64: byte	= 0xb9;
-	def F64_CONVERT_U_I64: byte	= 0xba;
-	def F64_PROMOTE_F32: byte	= 0xbb;
-	def I32_REINTERPRET_F32: byte	= 0xbc;
-	def I64_REINTERPRET_F64: byte	= 0xbd;
-	def F32_REINTERPRET_I32: byte	= 0xbe;
-	def F64_REINTERPRET_I64: byte	= 0xbf;
+enum WasmOp(opcode: byte) {
+	UNREACHABLE(0x00),
+	NOP(0x01),
+	BLOCK(0x02),
+	LOOP(0x03),
+	IF(0x04),
+	ELSE(0x05),
+	END(0x0b),
+	BR(0x0c),
+	BR_IF(0x0d),
+	BR_TABLE(0x0e),
+	RETURN(0x0f),
+	CALL(0x10),
+	CALL_INDIRECT(0x11),
+	DROP(0x1a),
+	SELECT(0x1b),
+	GET_LOCAL(0x20),
+	SET_LOCAL(0x21),
+	TEE_LOCAL(0x22),
+	GET_GLOBAL(0x23),
+	SET_GLOBAL(0x24),
+	I32_LOAD(0x28),
+	I64_LOAD(0x29),
+	F32_LOAD(0x2a),
+	F64_LOAD(0x2b),
+	I32_LOAD8_S(0x2c),
+	I32_LOAD8_U(0x2d),
+	I32_LOAD16_S(0x2e),
+	I32_LOAD16_U(0x2f),
+	I64_LOAD8_S(0x30),
+	I64_LOAD8_U(0x31),
+	I64_LOAD16_S(0x32),
+	I64_LOAD16_U(0x33),
+	I64_LOAD32_S(0x34),
+	I64_LOAD32_U(0x35),
+	I32_STORE(0x36),
+	I64_STORE(0x37),
+	F32_STORE(0x38),
+	F64_STORE(0x39),
+	I32_STORE8(0x3a),
+	I32_STORE16(0x3b),
+	I64_STORE8(0x3c),
+	I64_STORE16(0x3d),
+	I64_STORE32(0x3e),
+	CURRENT_MEMORY(0x3f),
+	GROW_MEMORY(0x40),
+	I32_CONST(0x41),
+	I64_CONST(0x42),
+	F32_CONST(0x43),
+	F64_CONST(0x44),
+	I32_EQZ(0x45),
+	I32_EQ(0x46),
+	I32_NE(0x47),
+	I32_LT_S(0x48),
+	I32_LT_U(0x49),
+	I32_GT_S(0x4a),
+	I32_GT_U(0x4b),
+	I32_LE_S(0x4c),
+	I32_LE_U(0x4d),
+	I32_GE_S(0x4e),
+	I32_GE_U(0x4f),
+	I64_EQZ(0x50),
+	I64_EQ(0x51),
+	I64_NE(0x52),
+	I64_LT_S(0x53),
+	I64_LT_U(0x54),
+	I64_GT_S(0x55),
+	I64_GT_U(0x56),
+	I64_LE_S(0x57),
+	I64_LE_U(0x58),
+	I64_GE_S(0x59),
+	I64_GE_U(0x5a),
+	F32_EQ(0x5b),
+	F32_NE(0x5c),
+	F32_LT(0x5d),
+	F32_GT(0x5e),
+	F32_LE(0x5f),
+	F32_GE(0x60),
+	F64_EQ(0x61),
+	F64_NE(0x62),
+	F64_LT(0x63),
+	F64_GT(0x64),
+	F64_LE(0x65),
+	F64_GE(0x66),
+	I32_CLZ(0x67),
+	I32_CTZ(0x68),
+	I32_POPCNT(0x69),
+	I32_ADD(0x6a),
+	I32_SUB(0x6b),
+	I32_MUL(0x6c),
+	I32_DIV_S(0x6d),
+	I32_DIV_U(0x6e),
+	I32_REM_S(0x6f),
+	I32_REM_U(0x70),
+	I32_AND(0x71),
+	I32_OR(0x72),
+	I32_XOR(0x73),
+	I32_SHL(0x74),
+	I32_SHR_S(0x75),
+	I32_SHR_U(0x76),
+	I32_ROTL(0x77),
+	I32_ROTR(0x78),
+	I64_CLZ(0x79),
+	I64_CTZ(0x7a),
+	I64_POPCNT(0x7b),
+	I64_ADD(0x7c),
+	I64_SUB(0x7d),
+	I64_MUL(0x7e),
+	I64_DIV_S(0x7f),
+	I64_DIV_U(0x80),
+	I64_REM_S(0x81),
+	I64_REM_U(0x82),
+	I64_AND(0x83),
+	I64_OR(0x84),
+	I64_XOR(0x85),
+	I64_SHL(0x86),
+	I64_SHR_S(0x87),
+	I64_SHR_U(0x88),
+	I64_ROTL(0x89),
+	I64_ROTR(0x8a),
+	F32_ABS(0x8b),
+	F32_NEG(0x8c),
+	F32_CEIL(0x8d),
+	F32_FLOOR(0x8e),
+	F32_TRUNC(0x8f),
+	F32_NEAREST(0x90),
+	F32_SQRT(0x91),
+	F32_ADD(0x92),
+	F32_SUB(0x93),
+	F32_MUL(0x94),
+	F32_DIV(0x95),
+	F32_MIN(0x96),
+	F32_MAX(0x97),
+	F32_COPYSIGN(0x98),
+	F64_ABS(0x99),
+	F64_NEG(0x9a),
+	F64_CEIL(0x9b),
+	F64_FLOOR(0x9c),
+	F64_TRUNC(0x9d),
+	F64_NEAREST(0x9e),
+	F64_SQRT(0x9f),
+	F64_ADD(0xa0),
+	F64_SUB(0xa1),
+	F64_MUL(0xa2),
+	F64_DIV(0xa3),
+	F64_MIN(0xa4),
+	F64_MAX(0xa5),
+	F64_COPYSIGN(0xa6),
+	I32_WRAP_I64(0xa7),
+	I32_TRUNC_S_F32(0xa8),
+	I32_TRUNC_U_F32(0xa9),
+	I32_TRUNC_S_F64(0xaa),
+	I32_TRUNC_U_F64(0xab),
+	I64_EXTEND_S_I32(0xac),
+	I64_EXTEND_U_I32(0xad),
+	I64_TRUNC_S_F32(0xae),
+	I64_TRUNC_U_F32(0xaf),
+	I64_TRUNC_S_F64(0xb0),
+	I64_TRUNC_U_F64(0xb1),
+	F32_CONVERT_S_I32(0xb2),
+	F32_CONVERT_U_I32(0xb3),
+	F32_CONVERT_S_I64(0xb4),
+	F32_CONVERT_U_I64(0xb5),
+	F32_DEMOTE_F64(0xb6),
+	F64_CONVERT_S_I32(0xb7),
+	F64_CONVERT_U_I32(0xb8),
+	F64_CONVERT_S_I64(0xb9),
+	F64_CONVERT_U_I64(0xba),
+	F64_PROMOTE_F32(0xbb),
+	I32_REINTERPRET_F32(0xbc),
+	I64_REINTERPRET_F64(0xbd),
+	F32_REINTERPRET_I32(0xbe),
+	F64_REINTERPRET_I64(0xbf),
 }
