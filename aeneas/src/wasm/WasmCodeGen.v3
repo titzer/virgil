@@ -3,23 +3,30 @@
 
 def TRUNCATE = true;
 def NO_TRUNCATE = false;
-class WasmCodeGen(prog: Program, wasm: WasmProgram) {
+def TRACE = true;
+def ZERO_PHI = SsaPhi.new(Int.TYPE, null, Ssa.NO_INSTRS);
+def ZERO_EDGE = SsaDfEdge.new(ZERO_PHI, SsaConst.new(Int.TYPE, null));
+class WasmCodeGen(context: SsaContext, wasm: WasmProgram) {
+	var buf: MachDataBuffer;
 	def vars = Vector<MachVar>.new();
-	def code = Vector<byte>.new();
 	def blockMapping = Vector<int>.new();
 	var graphMarkGen: int;
 	var blockMarkGen: int;
-	def context: SsaContext; // TODO
-	def generate(m: IrMethod, buffer: DataBuffer) {
+	def generate(m: IrMethod, buffer: MachDataBuffer) {
 		var graph = m.ssa;
+		this.buf = buffer;
+		context.enterMethod(m);
+		vars.length = 0;
 		graphMarkGen = graph.markGen;
 		vars.grow(graph.params.length);
 		vars.length = graph.params.length;
+		// Map parameters to variables first.
 		for (i < graph.params.length) {
 			var p = graph.params[i];
 			p.mark = graph.markGen++;
 			vars[i] = MachVar.new(p, p.mark - graphMarkGen, 1, false);
 		}
+		// Compute the block order and generate code.
 		def blocks = SsaBlockOrder.new(graph).computeOrder();
 		for (i < blocks.length) {
 			var block = blocks[i];
@@ -37,18 +44,21 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 		}
 	}
 	def genInputs(inputs: Array<SsaDfEdge>, commutative: bool) {
-		for (j = inputs.length - 1; j >= 0; j--) {
-			var e = inputs[j], i = e.dest;
-			if (SsaConst.?(i)) {
-				// TODO: generate constant
-				var v = SsaConst.!(i);
-			} else if (e.isOnlyEdge() && i.mark >= blockMarkGen) {
-				// TODO: generate the instruction here
-			} else {
-				// TODO: generate a load of the instruction
-				emit1v(WasmOp.GET_LOCAL, varOf(i));
-			}
+		for (j = inputs.length - 1; j >= 0; j--) genInput(inputs[j]);
+	}
+	def genInput(e: SsaDfEdge) {
+		var i = e.dest;
+		if (SsaConst.?(i)) {
+			// generate the constant inline
+			var k = SsaConst.!(i);
+			return emitk(k.vtype, k.val);
 		}
+		if (e.isOnlyEdge() && i.mark >= blockMarkGen) {
+			// generate the instruction here
+			if (SsaApplyOp.?(i)) return genApply(SsaApplyOp.!(i));
+		}
+		// generate a load of the instruction
+		emit1v(WasmOp.GET_LOCAL, varOf(i));
 	}
 	def varOf(i: SsaInstr) -> int {
 		if (i.mark >= blockMarkGen) {
@@ -69,6 +79,7 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 	}
 	def genBlock(index: int, block: SsaBlockInfo) {
 		// Traverse SSA in reverse, selecting WASM instructions.
+		context.block = block.block;
 		var next = block.block.prev;
 		for (i = block.block.prev; SsaInstr.?(i); i = i.prev) {
 			if (i.mark < 0) continue; // already covered
@@ -81,6 +92,7 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 			else if (SsaPhi.?(i)) break; // reached top of block
 			else if (SsaBlock.?(i)) break; // reached top of block
 		}
+		context.block = null;
 	}
 	def compareIntType(t: Type) -> IntType {
 		match (t.typeCon.kind) {
@@ -123,13 +135,10 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 			emit1(WasmOp.I64_SHR_S);
 		}
 	}
-	def emitIntCmp(i: SsaApplyOp, iop: WasmOp, lop: WasmOp) {
+	def emitIntCmp(i: SsaApplyOp, s32: WasmOp, u32: WasmOp, s64: WasmOp, u64: WasmOp) {
 		var tt = compareIntType(i.op.typeArgs[0]);
-		if (!tt.signed) {
-			// TODO iop++;
-			// TODO lop++;
-		}
-		emit1(if(tt.width <= 32, iop, lop));
+		if (tt.width <= 32) emit1(if(tt.signed, s32, u32));
+		else emit1(if(tt.signed, s64, u64));
 	}
 	def emitIntConvert(i: SsaApplyOp) {
 		var ft = IntType.!(i.op.paramTypes[0]), tt = IntType.!(i.op.resultType);
@@ -145,17 +154,14 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 		else emitZeroExtend(tt);
 	}
 	def genApply(i: SsaApplyOp) {
-		// TODO
+		if (TRACE) Terminal.put1("@%1 gen\n", i.uid);
 		def op = i.op;
+		var inputs = i.inputs;
 		match (op.opcode) {
 			IntEq => {
 				var tt = compareIntType(op.typeArgs[0]);
 				emit1(if(tt.width > 32, WasmOp.I64_EQ, WasmOp.I32_EQ));
 			}
-			BoolEq, RefEq => emit1(WasmOp.I32_EQ);
-			IntAdd =>	emitIntBinop(i, WasmOp.I32_ADD, WasmOp.I64_ADD, TRUNCATE);
-			IntSub =>	emitIntBinop(i, WasmOp.I32_SUB, WasmOp.I64_SUB, TRUNCATE);
-			IntMul =>	emitIntBinop(i, WasmOp.I32_MUL, WasmOp.I64_MUL, TRUNCATE);
 			IntDiv => {
 				var tt = IntType.!(op.typeArgs[0]);
 				if (tt.signed) emitIntBinop(i, WasmOp.I32_DIV_S, WasmOp.I64_DIV_S, TRUNCATE);
@@ -166,14 +172,18 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 				if (tt.signed) emitIntBinop(i, WasmOp.I32_REM_S, WasmOp.I64_REM_S, TRUNCATE);
 				else emitIntBinop(i, WasmOp.I32_REM_U, WasmOp.I64_REM_U, TRUNCATE);
 			}
+			BoolEq, RefEq =>	emit1(WasmOp.I32_EQ);
+			IntAdd =>		emitIntBinop(i, WasmOp.I32_ADD, WasmOp.I64_ADD, TRUNCATE);
+			IntSub =>		emitIntBinop(i, WasmOp.I32_SUB, WasmOp.I64_SUB, TRUNCATE);
+			IntMul =>		emitIntBinop(i, WasmOp.I32_MUL, WasmOp.I64_MUL, TRUNCATE);
 			IntAnd =>		emitIntBinop(i, WasmOp.I32_AND, WasmOp.I64_AND, NO_TRUNCATE);
 			IntOr =>		emitIntBinop(i, WasmOp.I32_OR, WasmOp.I64_OR, NO_TRUNCATE);
 			IntXor =>		emitIntBinop(i, WasmOp.I32_XOR, WasmOp.I64_XOR, NO_TRUNCATE);
 			IntShl =>		emitIntBinop(i, WasmOp.I32_SHL, WasmOp.I64_SHL, NO_TRUNCATE);
 			IntSar =>		emitIntBinop(i, WasmOp.I32_SHR_S, WasmOp.I64_SHR_S, TRUNCATE);
 			IntShr =>		emitIntBinop(i, WasmOp.I32_SHR_U, WasmOp.I64_SHR_U, TRUNCATE);
-			IntLt =>		emitIntCmp(i, WasmOp.I32_LT_S, WasmOp.I64_LT_S);
-			IntLteq =>		emitIntCmp(i, WasmOp.I32_LE_S, WasmOp.I64_LE_S);
+			IntLt =>		emitIntCmp(i, WasmOp.I32_LT_S, WasmOp.I32_LT_U, WasmOp.I64_LT_S, WasmOp.I64_LT_U);
+			IntLteq =>		emitIntCmp(i, WasmOp.I32_LE_S, WasmOp.I32_LE_U, WasmOp.I64_LE_S, WasmOp.I64_LE_U);
 			IntConvert => 		emitIntConvert(i);
 			BoolAnd =>		emit1(WasmOp.I32_AND);
 			BoolOr =>		emit1(WasmOp.I32_OR);
@@ -181,11 +191,36 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 				emiti(1);
 				emit1(WasmOp.I32_XOR);
 			}
-			PtrLoad =>	; // TODO
-			PtrStore =>	; // TODO
-			PtrCmpSwp =>	; // TODO
-			PtrAdd =>	; // TODO
-			PtrSub =>	; // TODO
+			PtrLoad => {
+				var ty = op.typeArgs[1];
+				var wop: WasmOp, align = wasm.mach.sizeOf(ty);
+				match (align) {
+					1 => wop = if(wasm.mach.isSigned(ty), WasmOp.I32_LOAD8_S, WasmOp.I32_LOAD8_U);
+					2 => wop = if(wasm.mach.isSigned(ty), WasmOp.I32_LOAD16_S, WasmOp.I32_LOAD16_U);
+					4 => wop = WasmOp.I32_LOAD;
+					8 => wop = WasmOp.I64_LOAD;
+					_ => context.fail("invalid load size"); // TODO: zero length loads
+				}
+				var t = coverAddress(i.inputs[0]);
+				emit1ol(wop, t.0, align);
+				inputs = if(t.1 == null, Ssa.NO_DF_EDGES, [t.1]);
+			}
+			PtrStore => {
+				var wop: WasmOp, align = wasm.mach.sizeOf(op.typeArgs[1]);
+				match (align) {
+					1 => wop = WasmOp.I32_STORE8;
+					2 => wop = WasmOp.I32_STORE16;
+					4 => wop = WasmOp.I32_STORE;
+					8 => wop = WasmOp.I64_STORE;
+					_ => context.fail("invalid store size");
+				}
+				var t = coverAddress(i.inputs[0]);
+				emit1ol(wop, null, align);
+				var val = i.inputs[1];
+				inputs = if(t.1 == null, [ZERO_EDGE, val], [t.1, val]);
+			}
+			PtrAdd => emit1(WasmOp.I32_ADD);
+			PtrSub => emit1(WasmOp.I32_SUB);
 			Alloc => 	; // TODO
 			CallAddress =>	; // TODO
 			SystemOp => {
@@ -200,7 +235,8 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 			}
 			_ => context.fail1("unexpected opcode in SSA->WASM: %1", op.opcode.name);
 		}
-		genInputs(i.inputs, i.facts.O_COMMUTATIVE);
+		genInputs(inputs, i.facts.O_COMMUTATIVE);
+		cover(i);
 	}
 	def genReturn(i: SsaReturn) {
 		emit1(WasmOp.RETURN);
@@ -218,29 +254,94 @@ class WasmCodeGen(prog: Program, wasm: WasmProgram) {
 		genInputs(i.inputs, false);
 	}
 	def genThrow(i: SsaThrow) {
-		// TODO
+		// TODO: metadata for which exception is thrown
+		emit1(WasmOp.UNREACHABLE);
+	}
+	def emitk(t: Type, val: Val) {
+		if (TRACE) Terminal.put2("emitk(%1, %2) = ", t.render, V3.renderVal(val));
+		if (val == null) { // TODO
+			emiti(0);
+		} else if (Box<int>.?(val)) { // TODO
+			emiti(Box<int>.!(val).val);
+		} else if (Box<long>.?(val)) { // TODO
+			emitl(Box<long>.!(val).val);
+		} else if (Box<bool>.?(val)) {
+			emiti(if(Box<bool>.!(val).val, 1, 0));
+		} else if (Addr.?(val)) { // TODO
+		} else if (Record.?(val)) { // TODO
+		}
 	}
 	def emit1(opcode: WasmOp) {
-		// TODO
-		Terminal.put1("emit1(%1)\n", opcode.name);
+		buf.i1(opcode.opcode);
+		if (TRACE) Terminal.put1("emit1(%1)\n", opcode.name);
 	}
 	def emit1v(opcode: WasmOp, vnum: int) {
-		// TODO
-		Terminal.put2("emit1v(%1, %2)\n", opcode.name, vnum);
+		buf.i1(opcode.opcode);
+		buf.i4(vnum);
+		if (TRACE) Terminal.put2("emit1v(%1, %2)\n", opcode.name, vnum);
 	}
 	def emiti(val: int) {
-		// TODO: 
-		Terminal.put1("emiti(%1)\n", int.!(val));
+		buf.i1(WasmOp.I32_CONST.opcode);
+		buf.i4(val); // TODO
+		if (TRACE) Terminal.put1("emiti(%1)\n", int.!(val));
 	}
 	def emitl(val: long) {
-		// TODO: 
-		Terminal.put1("emitl(%1)\n", long.!(val));
+		buf.i1(WasmOp.I64_CONST.opcode);
+		buf.i8(val); // TODO
+		if (TRACE) Terminal.put1("emitl(%1)\n", long.!(val));
 	}
 	def emitThrow(except: string) {
+		// TODO: metadata for throw
+		buf.i1(WasmOp.UNREACHABLE.opcode);
+	}
+	def emit1ol(opcode: WasmOp, offset: Val, align: int) {
 		// TODO:
+		buf.i1(WasmOp.I64_CONST.opcode);
+		buf.i4(0);  // TODO: encode offset
+		buf.i8(0); // TODO: encode alignment
+		if (TRACE) Terminal.put3("emit1ol(%1, %2, %3)\n", opcode.name, V3.renderVal(offset), align);
+	}
+	def assemble() {
+		// TODO:
+		for (i = 0; i < buf.max; ()) {
+			var b = buf.array[i], len = 1;
+			match (b) {
+				WasmOp.GET_LOCAL.opcode,
+				WasmOp.SET_LOCAL.opcode,
+				WasmOp.TEE_LOCAL.opcode => {
+					// TODO: read variable number and rewrite it
+					len = 5;
+				}
+				WasmOp.I32_CONST.opcode => {
+					// TODO: read constant and rewrite it
+					len = 5;
+				}
+			}
+			i += len;
+		}
+	}
+	def coverAddress(e: SsaDfEdge) -> (Val, SsaDfEdge) {
+		var d = e.dest;
+		if (SsaConst.?(d)) return (SsaConst.!(d).val, null);
+		if (canCover(e) && SsaApplyOp.?(d)) {
+			var apply = SsaApplyOp.!(d);
+			if (apply.op.opcode == Opcode.PtrAdd) {
+				var r = apply.input1();
+				if (SsaConst.?(r)) {
+					cover(d);
+					return (SsaConst.!(r).val, apply.inputs[0]);
+				}
+			}
+		}
+		return (null, e);
+	}
+	def canCover(i: SsaDfEdge) -> bool {
+		return i.isOnlyEdge() && i.dest.mark >= blockMarkGen;
+	}
+	def cover(d: SsaInstr) {
+		d.mark = -1;
 	}
 }
-
 // Constants for wasm opcodes.
 enum WasmOp(opcode: byte) {
 	UNREACHABLE(0x00),
