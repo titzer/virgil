@@ -44,13 +44,13 @@ class WasmCodeGen extends ArchCodeGen {
 			UnsignedGteq => emitBinop(i, WasmOp.I32_GE_U);
 			PtrLoad => {
 				var ty = i.op.typeArgs[1];
-				var wop: WasmOp, align = mach.sizeOf(ty);
-				match (align) {
+				var wop: WasmOp, size = mach.sizeOf(ty);
+				match (size) {
 					1 => wop = if(mach.isSigned(ty), WasmOp.I32_LOAD8_S, WasmOp.I32_LOAD8_U);
 					2 => wop = if(mach.isSigned(ty), WasmOp.I32_LOAD16_S, WasmOp.I32_LOAD16_U);
 					4 => wop = WasmOp.I32_LOAD;
 					8 => wop = WasmOp.I64_LOAD;
-					_ => context.fail("invalid load size"); // TODO: zero size loads
+					_ => context.fail("invalid load size");
 				}
 				var t = matchAddress(i.input0()), opcode = archOp(wop) | ArchInstrs.FLAG_LOAD;
 				if (t.1 == null) {
@@ -60,13 +60,13 @@ class WasmCodeGen extends ArchCodeGen {
 				}
 			}
 			PtrStore => {
-				var wop: WasmOp, align = mach.sizeOf(i.op.typeArgs[1]);
-				match (align) {
+				var wop: WasmOp, size = mach.sizeOf(i.op.typeArgs[1]);
+				match (size) {
 					1 => wop = WasmOp.I32_STORE8;
 					2 => wop = WasmOp.I32_STORE16;
 					4 => wop = WasmOp.I32_STORE;
 					8 => wop = WasmOp.I64_STORE;
-					_ => context.fail("invalid store size");  // TODO: zero size stores
+					_ => context.fail("invalid store size");
 				}
 				var t = matchAddress(i.input0()), opcode = archOp(wop) | ArchInstrs.FLAG_STORE;
 				if (t.1 == null) {
@@ -77,15 +77,45 @@ class WasmCodeGen extends ArchCodeGen {
 			}
 			PtrAdd => emitBinop(i, WasmOp.I32_ADD);
 			PtrSub => emitBinop(i, WasmOp.I32_SUB);
-			ConditionalThrow => ; // TODO
-			CallAddress => ; // TODO
+			ConditionalThrow => {
+				emit1(ARCH_IF, use(i.inputs[0].dest));
+				emitN(ARCH_UNREACHABLE);
+				emitN(ARCH_END);
+			}
+			CallAddress => {
+				for (j = 1; j < i.inputs.length; j++) {
+					use(i.inputs[j].dest);  // use arguments
+				}
+				var target = i.inputs[0].dest;
+				if (SsaConst.?(target)) {
+					var val = SsaConst.!(target).val, m: IrMethod;
+					if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+					else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+					else context.fail("constant target is not an address or function value");
+					var index = wasm.getMethodIndex(m);
+					useInt(int.!(index));
+					emitN(ARCH_CALL);
+				} else {
+					var paramTypes = Arrays.range(i.op.paramTypes, 1, i.op.paramTypes.length);
+					var sigIndex = wasm.getSigIndexByType(paramTypes, i.op.resultType);
+					useInt(int.!(sigIndex));
+					use(i.inputs[0].dest); // use destination
+					emitN(ARCH_CALL_INDIRECT);
+				}
+				// XXX: match Call(PtrLoad(PtrAdd(#meta, x))
+			}
 			Alloc => ;      // TODO
 			MachSystemOp => ; // TODO
 			_ => return context.fail("unexpected opcode in WASM codegen");
 		}
 	}
-	def visitThrow(block: SsaBlock, i: SsaThrow) {} // TODO
-	def visitIf(block: SsaBlock, i: SsaIf) {} // TODO
+	def visitThrow(block: SsaBlock, i: SsaThrow) {
+		emitN(ARCH_UNREACHABLE); // TODO: record exception location
+	}
+	def visitIf(block: SsaBlock, i: SsaIf) {
+		var depth = 0;
+		emit2(ARCH_BR_IF, use(i.inputs[0].dest), useInt(depth));  // TODO
+	}
 	def visitSwitch(block: SsaBlock, i: SsaSwitch) {} // TODO
 	def visitGoto(block: SsaBlock, target: SsaGoto) {} // TODO
 	def visitReturn(block: SsaBlock, i: SsaReturn) {
@@ -142,9 +172,80 @@ class WasmCodeGen extends ArchCodeGen {
 	def emitBinop(i: SsaApplyOp, op: WasmOp) {
 		emit3(archOp(op), dfn(i), use(i.input0()), use(i.input1()));
 	}
-	def archOp(op: WasmOp) -> int {
-		return op.opcode + ArchInstrs.ARCH_COUNT;
+	// Assembling support
+	def assemble(opcode: int, a: Array<Operand>) {
+		var masked = opcode & 0x1ff;
+		match (masked) {
+			ArchInstrs.ARCH_RET => return buffer.i1(WasmOp.RETURN.opcode);
+		}
+		var op = masked - ArchInstrs.ARCH_COUNT;
+		if (op > 0 && WasmOpNames.array[op] != null) buffer.i1(op);
+		else context.fail1("cannot assemble WASM opcode %1", op);
+		// emit immediates for specific opcodes
+		match (op) {
+			WasmOp.BLOCK.opcode,
+			WasmOp.IF.opcode => buffer.i1(WASM_VOID_TYPE);
+
+			WasmOp.I32_LOAD8_S.opcode,
+			WasmOp.I32_LOAD8_U.opcode,
+			WasmOp.I64_LOAD8_S.opcode,
+			WasmOp.I64_LOAD8_U.opcode,
+			WasmOp.I32_STORE8.opcode,
+			WasmOp.I64_STORE8.opcode => asmls(1, a);
+
+			WasmOp.I32_LOAD16_S.opcode,
+			WasmOp.I32_LOAD16_U.opcode,
+			WasmOp.I64_LOAD16_S.opcode,
+			WasmOp.I64_LOAD16_U.opcode,
+			WasmOp.I32_STORE16.opcode,
+			WasmOp.I64_STORE16.opcode => asmls(2, a);
+
+			WasmOp.I32_LOAD.opcode,
+			WasmOp.F32_LOAD.opcode,
+			WasmOp.I64_LOAD32_S.opcode,
+			WasmOp.I64_LOAD32_U.opcode,
+			WasmOp.I32_STORE.opcode,
+			WasmOp.F32_STORE.opcode,
+			WasmOp.I64_STORE32.opcode => asmls(3, a);
+
+			WasmOp.I64_LOAD.opcode,
+			WasmOp.F64_LOAD.opcode,
+			WasmOp.I64_STORE.opcode,
+			WasmOp.F64_STORE.opcode => asmls(4, a);
+
+			WasmOp.CALL.opcode => {
+				buffer.i4leb(asInt(a[a.length - 1])); // function_index
+			}
+			WasmOp.CALL_INDIRECT.opcode => {
+				buffer.i4leb(asInt(a[a.length - 1])); // type_index
+				buffer.i1(0);                         // reserved
+			}
+		}
 	}
+	def asInt(o: Operand) -> int {
+		return Int.unbox(Operand.Immediate.!(o).val);
+	}
+	def asmls(logAlign: int, a: Array<Operand>) {
+		buffer.i1(logAlign);       // flags = alignment
+		buffer.i4leb(asInt(a[0])); // offset
+	}
+	// Printing support
+	def renderSpecific(buf: ArchInstrRenderer, opcode: int, a: Array<Operand>) -> bool {
+		var n = WasmOpNames.array[(opcode & 0x1ff) - ArchInstrs.ARCH_COUNT];
+		if (n == null) return false;
+		buf.putArch(n, a);
+		return true;
+	}
+}
+def ARCH_IF = archOp(WasmOp.IF);
+def ARCH_BR_IF = archOp(WasmOp.BR_IF);
+def ARCH_UNREACHABLE = archOp(WasmOp.UNREACHABLE);
+def ARCH_END = archOp(WasmOp.END);
+def ARCH_CALL = archOp(WasmOp.CALL);
+def ARCH_CALL_INDIRECT = archOp(WasmOp.CALL_INDIRECT);
+def WASM_VOID_TYPE = 0;
+def archOp(op: WasmOp) -> int {
+	return op.opcode + ArchInstrs.ARCH_COUNT;
 }
 // Constants for wasm opcodes.
 enum WasmOp(opcode: byte) {
@@ -320,4 +421,182 @@ enum WasmOp(opcode: byte) {
 	I64_REINTERPRET_F64(0xbd),
 	F32_REINTERPRET_I32(0xbe),
 	F64_REINTERPRET_I64(0xbf),
+}
+component WasmOpNames {
+	def array = Array<string>.new(256);
+	new() {
+		var n = array;
+		n[WasmOp.UNREACHABLE.opcode] = "unreachable";
+		n[WasmOp.NOP.opcode] = "nop";
+		n[WasmOp.BLOCK.opcode] = "block";
+		n[WasmOp.LOOP.opcode] = "loop";
+		n[WasmOp.IF.opcode] = "if";
+		n[WasmOp.ELSE.opcode] = "else";
+		n[WasmOp.END.opcode] = "end";
+		n[WasmOp.BR.opcode] = "br";
+		n[WasmOp.BR_IF.opcode] = "br_if";
+		n[WasmOp.BR_TABLE.opcode] = "br_table";
+		n[WasmOp.RETURN.opcode] = "return";
+		n[WasmOp.CALL.opcode] = "call";
+		n[WasmOp.CALL_INDIRECT.opcode] = "call_indirect";
+		n[WasmOp.DROP.opcode] = "drop";
+		n[WasmOp.SELECT.opcode] = "select";
+		n[WasmOp.GET_LOCAL.opcode] = "get_local";
+		n[WasmOp.SET_LOCAL.opcode] = "set_local";
+		n[WasmOp.TEE_LOCAL.opcode] = "tee_local";
+		n[WasmOp.GET_GLOBAL.opcode] = "get_global";
+		n[WasmOp.SET_GLOBAL.opcode] = "set_global";
+		n[WasmOp.I32_LOAD.opcode] = "i32.load";
+		n[WasmOp.I64_LOAD.opcode] = "i64.load";
+		n[WasmOp.F32_LOAD.opcode] = "f32.load";
+		n[WasmOp.F64_LOAD.opcode] = "f64.load";
+		n[WasmOp.I32_LOAD8_S.opcode] = "i32.load8_s";
+		n[WasmOp.I32_LOAD8_U.opcode] = "i32.load8_u";
+		n[WasmOp.I32_LOAD16_S.opcode] = "i32.load16_s";
+		n[WasmOp.I32_LOAD16_U.opcode] = "i32.load16_u";
+		n[WasmOp.I64_LOAD8_S.opcode] = "i64.load8_s";
+		n[WasmOp.I64_LOAD8_U.opcode] = "i64.load8_u";
+		n[WasmOp.I64_LOAD16_S.opcode] = "i64.load16_s";
+		n[WasmOp.I64_LOAD16_U.opcode] = "i64.load16_u";
+		n[WasmOp.I64_LOAD32_S.opcode] = "i64.load32_s";
+		n[WasmOp.I64_LOAD32_U.opcode] = "i64.load32_u";
+		n[WasmOp.I32_STORE.opcode] = "i32.store";
+		n[WasmOp.I64_STORE.opcode] = "i64.store";
+		n[WasmOp.F32_STORE.opcode] = "f32.store";
+		n[WasmOp.F64_STORE.opcode] = "f64.store";
+		n[WasmOp.I32_STORE8.opcode] = "i32.store8";
+		n[WasmOp.I32_STORE16.opcode] = "i32.store16";
+		n[WasmOp.I64_STORE8.opcode] = "i64.store8";
+		n[WasmOp.I64_STORE16.opcode] = "i64.store16";
+		n[WasmOp.I64_STORE32.opcode] = "i64.store32";
+		n[WasmOp.CURRENT_MEMORY.opcode] = "current_memory";
+		n[WasmOp.GROW_MEMORY.opcode] = "grow_memory";
+		n[WasmOp.I32_CONST.opcode] = "i32.const";
+		n[WasmOp.I64_CONST.opcode] = "i64.const";
+		n[WasmOp.F32_CONST.opcode] = "f32.const";
+		n[WasmOp.F64_CONST.opcode] = "f64.const";
+		n[WasmOp.I32_EQZ.opcode] = "i32.eqz";
+		n[WasmOp.I32_EQ.opcode] = "i32.eq";
+		n[WasmOp.I32_NE.opcode] = "i32.ne";
+		n[WasmOp.I32_LT_S.opcode] = "i32.lt_s";
+		n[WasmOp.I32_LT_U.opcode] = "i32.lt_u";
+		n[WasmOp.I32_GT_S.opcode] = "i32.gt_s";
+		n[WasmOp.I32_GT_U.opcode] = "i32.gt_u";
+		n[WasmOp.I32_LE_S.opcode] = "i32.le_s";
+		n[WasmOp.I32_LE_U.opcode] = "i32.le_u";
+		n[WasmOp.I32_GE_S.opcode] = "i32.ge_s";
+		n[WasmOp.I32_GE_U.opcode] = "i32.ge_u";
+		n[WasmOp.I64_EQZ.opcode] = "i64.eqz";
+		n[WasmOp.I64_EQ.opcode] = "i64.eq";
+		n[WasmOp.I64_NE.opcode] = "i64.ne";
+		n[WasmOp.I64_LT_S.opcode] = "i64.lt_s";
+		n[WasmOp.I64_LT_U.opcode] = "i64.lt_u";
+		n[WasmOp.I64_GT_S.opcode] = "i64.gt_s";
+		n[WasmOp.I64_GT_U.opcode] = "i64.gt_u";
+		n[WasmOp.I64_LE_S.opcode] = "i64.le_s";
+		n[WasmOp.I64_LE_U.opcode] = "i64.le_u";
+		n[WasmOp.I64_GE_S.opcode] = "i64.ge_s";
+		n[WasmOp.I64_GE_U.opcode] = "i64.ge_u";
+		n[WasmOp.F32_EQ.opcode] = "f32.eq";
+		n[WasmOp.F32_NE.opcode] = "f32.ne";
+		n[WasmOp.F32_LT.opcode] = "f32.lt";
+		n[WasmOp.F32_GT.opcode] = "f32.gt";
+		n[WasmOp.F32_LE.opcode] = "f32.le";
+		n[WasmOp.F32_GE.opcode] = "f32.ge";
+		n[WasmOp.F64_EQ.opcode] = "f64.eq";
+		n[WasmOp.F64_NE.opcode] = "f64.ne";
+		n[WasmOp.F64_LT.opcode] = "f64.lt";
+		n[WasmOp.F64_GT.opcode] = "f64.gt";
+		n[WasmOp.F64_LE.opcode] = "f64.le";
+		n[WasmOp.F64_GE.opcode] = "f64.ge";
+		n[WasmOp.I32_CLZ.opcode] = "i32.clz";
+		n[WasmOp.I32_CTZ.opcode] = "i32.ctz";
+		n[WasmOp.I32_POPCNT.opcode] = "i32.popcnt";
+		n[WasmOp.I32_ADD.opcode] = "i32.add";
+		n[WasmOp.I32_SUB.opcode] = "i32.sub";
+		n[WasmOp.I32_MUL.opcode] = "i32.mul";
+		n[WasmOp.I32_DIV_S.opcode] = "i32.div_s";
+		n[WasmOp.I32_DIV_U.opcode] = "i32.div_u";
+		n[WasmOp.I32_REM_S.opcode] = "i32.rem_s";
+		n[WasmOp.I32_REM_U.opcode] = "i32.rem_u";
+		n[WasmOp.I32_AND.opcode] = "i32.and";
+		n[WasmOp.I32_OR.opcode] = "i32.or";
+		n[WasmOp.I32_XOR.opcode] = "i32.xor";
+		n[WasmOp.I32_SHL.opcode] = "i32.shl";
+		n[WasmOp.I32_SHR_S.opcode] = "i32.shr_s";
+		n[WasmOp.I32_SHR_U.opcode] = "i32.shr_u";
+		n[WasmOp.I32_ROTL.opcode] = "i32.rotl";
+		n[WasmOp.I32_ROTR.opcode] = "i32.rotr";
+		n[WasmOp.I64_CLZ.opcode] = "i64.clz";
+		n[WasmOp.I64_CTZ.opcode] = "i64.ctz";
+		n[WasmOp.I64_POPCNT.opcode] = "i64.popcnt";
+		n[WasmOp.I64_ADD.opcode] = "i64.add";
+		n[WasmOp.I64_SUB.opcode] = "i64.sub";
+		n[WasmOp.I64_MUL.opcode] = "i64.mul";
+		n[WasmOp.I64_DIV_S.opcode] = "i64.div_s";
+		n[WasmOp.I64_DIV_U.opcode] = "i64.div_u";
+		n[WasmOp.I64_REM_S.opcode] = "i64.rem_s";
+		n[WasmOp.I64_REM_U.opcode] = "i64.rem_u";
+		n[WasmOp.I64_AND.opcode] = "i64.and";
+		n[WasmOp.I64_OR.opcode] = "i64.or";
+		n[WasmOp.I64_XOR.opcode] = "i64.xor";
+		n[WasmOp.I64_SHL.opcode] = "i64.shl";
+		n[WasmOp.I64_SHR_S.opcode] = "i64.shr_s";
+		n[WasmOp.I64_SHR_U.opcode] = "i64.shr_u";
+		n[WasmOp.I64_ROTL.opcode] = "i64.rotl";
+		n[WasmOp.I64_ROTR.opcode] = "i64.rotr";
+		n[WasmOp.F32_ABS.opcode] = "f32.abs";
+		n[WasmOp.F32_NEG.opcode] = "f32.neg";
+		n[WasmOp.F32_CEIL.opcode] = "f32.ceil";
+		n[WasmOp.F32_FLOOR.opcode] = "f32.floor";
+		n[WasmOp.F32_TRUNC.opcode] = "f32.trunc";
+		n[WasmOp.F32_NEAREST.opcode] = "f32.nearest";
+		n[WasmOp.F32_SQRT.opcode] = "f32.sqrt";
+		n[WasmOp.F32_ADD.opcode] = "f32.add";
+		n[WasmOp.F32_SUB.opcode] = "f32.sub";
+		n[WasmOp.F32_MUL.opcode] = "f32.mul";
+		n[WasmOp.F32_DIV.opcode] = "f32.div";
+		n[WasmOp.F32_MIN.opcode] = "f32.min";
+		n[WasmOp.F32_MAX.opcode] = "f32.max";
+		n[WasmOp.F32_COPYSIGN.opcode] = "f32.copysign";
+		n[WasmOp.F64_ABS.opcode] = "f64.abs";
+		n[WasmOp.F64_NEG.opcode] = "f64.neg";
+		n[WasmOp.F64_CEIL.opcode] = "f64.ceil";
+		n[WasmOp.F64_FLOOR.opcode] = "f64.floor";
+		n[WasmOp.F64_TRUNC.opcode] = "f64.trunc";
+		n[WasmOp.F64_NEAREST.opcode] = "f64.nearest";
+		n[WasmOp.F64_SQRT.opcode] = "f64.sqrt";
+		n[WasmOp.F64_ADD.opcode] = "f64.add";
+		n[WasmOp.F64_SUB.opcode] = "f64.sub";
+		n[WasmOp.F64_MUL.opcode] = "f64.mul";
+		n[WasmOp.F64_DIV.opcode] = "f64.div";
+		n[WasmOp.F64_MIN.opcode] = "f64.min";
+		n[WasmOp.F64_MAX.opcode] = "f64.max";
+		n[WasmOp.F64_COPYSIGN.opcode] = "f64.copysign";
+		n[WasmOp.I32_WRAP_I64.opcode] = "i32.wrap_i64";
+		n[WasmOp.I32_TRUNC_S_F32.opcode] = "i32.trunc_s_f32";
+		n[WasmOp.I32_TRUNC_U_F32.opcode] = "i32.trunc_u_f32";
+		n[WasmOp.I32_TRUNC_S_F64.opcode] = "i32.trunc_s_f64";
+		n[WasmOp.I32_TRUNC_U_F64.opcode] = "i32.trunc_u_f64";
+		n[WasmOp.I64_EXTEND_S_I32.opcode] = "i64.extend_s_i32";
+		n[WasmOp.I64_EXTEND_U_I32.opcode] = "i64.extend_u_i32";
+		n[WasmOp.I64_TRUNC_S_F32.opcode] = "i64.trunc_s_f32";
+		n[WasmOp.I64_TRUNC_U_F32.opcode] = "i64.trunc_u_f32";
+		n[WasmOp.I64_TRUNC_S_F64.opcode] = "i64.trunc_s_f64";
+		n[WasmOp.I64_TRUNC_U_F64.opcode] = "i64.trunc_u_f64";
+		n[WasmOp.F32_CONVERT_S_I32.opcode] = "f32.convert_s_i32";
+		n[WasmOp.F32_CONVERT_U_I32.opcode] = "f32.convert_u_i32";
+		n[WasmOp.F32_CONVERT_S_I64.opcode] = "f32.convert_s_i64";
+		n[WasmOp.F32_CONVERT_U_I64.opcode] = "f32.convert_u_i64";
+		n[WasmOp.F32_DEMOTE_F64.opcode] = "f32.demote_f64";
+		n[WasmOp.F64_CONVERT_S_I32.opcode] = "f64.convert_s_i32";
+		n[WasmOp.F64_CONVERT_U_I32.opcode] = "f64.convert_u_i32";
+		n[WasmOp.F64_CONVERT_S_I64.opcode] = "f64.convert_s_i64";
+		n[WasmOp.F64_CONVERT_U_I64.opcode] = "f64.convert_u_i64";
+		n[WasmOp.F64_PROMOTE_F32.opcode] = "f64.promote_f32";
+		n[WasmOp.I32_REINTERPRET_F32.opcode] = "i32.reinterpret_f32";
+		n[WasmOp.I64_REINTERPRET_F64.opcode] = "i64.reinterpret_f64";
+		n[WasmOp.F32_REINTERPRET_I32.opcode] = "f32.reinterpret_i32";
+		n[WasmOp.F64_REINTERPRET_I64.opcode] = "f64.reinterpret_i64";
+	}
 }
