@@ -61,7 +61,9 @@ do_test System_ticksNs1.v3 "" "success"
 do_test Params01.v3 "a bakedFDA c -def" "0:a 1:bakedFDA 2:c 3:-def"
 do_test Params02.v3 "" ""
 do_test Params02.v3 "a b c" ""
-
+do_test System_fileWriteK_oob1.v3 "" "!BoundsCheckException"
+do_test System_fileWriteK_oob2.v3 "" "!BoundsCheckException"
+do_test System_fileWriteK_oob3.v3 "" "!BoundsCheckException"
 }
 
 if [ $# -gt 0 ]; then
