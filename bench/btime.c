@@ -97,6 +97,7 @@ int run(int run, int numruns, int nstdout, int nstderr, char *argv[]) {
 
 void print_stats(int runs) {
   double total = 0;
+  double min = 1.0 / 0.0;
   int i = 0;
   for (i = 0; i < runs; i++) {
     total += times[i];
@@ -104,9 +105,10 @@ void print_stats(int runs) {
   double average = total / runs, dev = 0;
   for (i = 0; i < runs; i++) {
     dev += (times[i] - average) * (times[i] - average);
+    if (times[i] < min) min = times[i];
   }
   double stddev = sqrt(dev / (runs - 1));
-  printf("  avg=%.6lf  stddev=%.6lf", average, stddev);
+  printf("  min=%.6lf  avg=%.6lf  stddev=%.6lf", min, average, stddev);
 }
 
 int do_fail_run(char* argv[]) {
