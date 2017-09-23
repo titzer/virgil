@@ -444,3 +444,316 @@ component WasmOpNames {
                 for (op in WasmOp) array[op.opcode] = op.text_name;
 	}
 }
+
+type CfgInstr {
+	case Block(t: byte, bi: SsaBlockInfo);
+	case Loop(bi: SsaBlockInfo);
+	case Body(bi: SsaBlockInfo);
+	case If(t: byte, join: SsaBlockInfo);
+	case Else;
+	case End;
+	case Br(bi: SsaBlockInfo, depth: int);
+	case BrIf(bi: SsaBlockInfo, depth: int);
+	case BrTable(min: int, depths: Array<int>);
+}
+
+// Restructures an a reducible control flow graph into WASM
+// structured control flow by using the dominator tree.
+class CfgRestructurer(order: SsaBlockOrder) {
+	def blocks = order.order;
+	def code = Vector<CfgInstr>.new();
+	def stack = Vector<SsaBlockInfo>.new();
+	def gen() -> Vector<CfgInstr> {
+		order.computeDominators();
+		hoistLoopRemaindersInDomTree(blocks[0]);
+		visit(blocks[0]);
+		optimize();
+		return code;
+	}
+	def visit(bi: SsaBlockInfo) {
+		var loopRemainder: List<SsaBlockInfo>;
+		if (bi.loop != null) {
+			loopRemainder = findLoopRemainder(bi);
+			emitJoinBlocks(loopRemainder);
+			emit(CfgInstr.Loop(bi));
+		}
+		// skip blocks bodies that are empty with no phis
+		if (bodyNotEmpty(bi)) emit(CfgInstr.Body(bi));
+		var end = bi.block.end();
+		if (SsaIf.?(end)) {
+			var si = SsaIf.!(end);
+			var tt = blocks[si.trueBlock().mark], ft = blocks[si.falseBlock().mark];
+			if (tt.dom_parent != bi) {
+				// true block is part of a loop remainder.
+				emit(CfgInstr.BrIf(tt, getRelDepth(tt)));
+				visitOrBranchTo(bi, ft);
+			} else {
+				// emit extra blocks for joins
+				var joins = findJoins(bi);
+				var join: SsaBlockInfo;
+				var blocks: List<SsaBlockInfo>;
+				// emit an if-then-else
+				if (joins == null) {
+					emit(CfgInstr.If(WasmType.Void, null));
+					blocks = null;
+					join = null;
+				} else {
+					emitJoinBlocks(blocks = joins.tail);
+					emit(CfgInstr.If(WasmType.Void, join = joins.head));
+				}
+				visitOrBranchTo(bi, tt);
+				emit(CfgInstr.Else);
+				visitOrBranchTo(bi, ft);
+				emit(CfgInstr.End);
+				// emit the ends for previous blocks
+				if (join != null) visit(join);
+				emitJoinEnds(blocks);
+			}
+
+		} else if (SsaGoto.?(end)) {
+			var target = blocks[end.succs[0].dest.mark];
+			if (target.dom_parent == bi) {
+				visit(target);  // inline the block if dominated
+			} else {
+				emit(CfgInstr.Br(target, getRelDepth(target)));
+			}
+		} else if (SsaSwitch.?(end)) {
+			// Emit a series of nested blocks and a br_table
+			var list: List<SsaBlockInfo>;
+			for (ci = bi.dom_child; ci != null; ci = ci.dom_sibling) {
+				list = List.new(ci, list);
+			}
+			emitJoinBlocks(list);
+			var succs = bi.block.succs();
+			var depths = Array<int>.new(succs.length);
+			for (i < depths.length) {
+				depths[i] = getRelDepth(blocks[succs[i].dest.mark]);
+			}
+			emit(CfgInstr.BrTable(SsaSwitch.!(end).minValue, depths));
+			emitJoinEnds(list);
+		}
+		if (bi.loop != null) {
+			emit(CfgInstr.End);
+			emitJoinEnds(loopRemainder);
+		}
+	}
+	def bodyNotEmpty(bi: SsaBlockInfo) -> bool {
+		var b = bi.block, end = b.end();
+		if (b.next != end) return true;
+		if (SsaGoto.?(end)) {
+			return b.succs()[0].dest.hasPhis();
+		}
+		return true;
+	}
+	def visitOrBranchTo(pi: SsaBlockInfo, target: SsaBlockInfo) {
+		if (target.dom_parent == pi && target.block.preds.length == 1) {
+			visit(target);
+		} else {
+			emit(CfgInstr.Br(target, getRelDepth(target)));
+		}
+	}
+	def emit(i: CfgInstr) {
+		match (i) {
+			Loop(bi) => stack.add(bi);
+			Block(t, bi) => stack.add(bi);
+			If(t, join) => stack.add(join);
+			End => stack.length--;
+			_ => ;
+		}
+		code.add(i);
+	}
+	def emitJoinBlocks(list: List<SsaBlockInfo>) {
+		for (j = Lists.reverse(list); j != null; j = j.tail) {
+			emit(CfgInstr.Block(WasmType.Void, j.head));
+		}
+	}
+	def emitJoinEnds(list: List<SsaBlockInfo>) {
+		for (j = list; j != null; j = j.tail) {
+			emit(CfgInstr.End);
+			visit(j.head);
+		}
+	}
+	def getRelDepth(bi: SsaBlockInfo) -> int {
+		for (depth = 0; depth < stack.length; depth++) {
+			if (stack[stack.length - depth - 1] == bi) return depth;
+		}
+		return V3.fail1("block @%1 not found on stack", bi.block.uid);
+	}
+	def recurseOnChildren(f: SsaBlockInfo -> void, block: SsaBlockInfo) {
+		for (bi = block.dom_child; bi != null; bi = bi.dom_sibling) {
+			f(bi);
+		}
+	}
+	def findJoins(bi: SsaBlockInfo) -> List<SsaBlockInfo> {
+		var list: List<SsaBlockInfo>;
+		for (c = bi.dom_child; c != null; c = c.dom_sibling) {
+			if (c.block.preds.length > 1) list = List.new(c, list);
+		}
+		return list;
+	}
+	def findLoopRemainder(bi: SsaBlockInfo) -> List<SsaBlockInfo> {
+		var list: List<SsaBlockInfo>;
+		for (c = bi.dom_child; c != null; c = c.dom_sibling) {
+//			if (!bi.loop.contains(c)) list = List.new(c, list);
+			if (c.dom_parent == null) list = List.new(c, list);
+		}
+		return list;
+	}
+
+	// Adjust the dominator tree so that loop bodies do not dominate
+	// blocks that are not in the loop. Only loop headers may
+	// immediately dominate blocks not in the loop (i.e. after an exit).
+	def loopStack = Vector<SsaLoopInfo>.new();
+	def loopRemainder = Vector<List<SsaBlockInfo>>.new();
+	def hoistLoopRemaindersInDomTree(bi: SsaBlockInfo) {
+		if (bi.loop != null) {  // encountered a new loop
+			loopStack.add(bi.loop);
+			loopRemainder.add(null);
+		}
+		var top = loopStack.length - 1;
+		for (ci = bi.dom_child; ci != null; ci = ci.dom_sibling) {
+			// Recurse on immediately dominated children.
+			if (top < 0 || loopStack[top].contains(ci) || isEndBlock(ci)) {
+				// If not in a loop, or the child is in the loop, or the block
+				// is a trivial end block, simply recurse.
+				hoistLoopRemaindersInDomTree(ci);
+				continue;
+			}
+			// Find the outermost loop of which the child is not a member
+			// and add this child to that loop's remainder.
+			for (i = top; i >= 0; i--) {
+				if (!loopStack[i].contains(ci)) {
+					loopRemainder[i] = List.new(ci, loopRemainder[i]);
+					break;
+				}
+			}
+		}
+		if (bi.loop != null) {
+			// Pop a loop off the loop stack and process the loop remainder.
+			loopStack.length--;
+			var remainder = loopRemainder[--loopRemainder.length];
+			// Hoist the remainder nodes to be children of the loop header.
+			for (l = remainder; l != null; l = l.tail) {
+				moveToDomList(bi, l.head);
+			}
+			// Loop remainder nodes may still dominate other nodes that are
+			// in the loop remainder of outer loops.
+			for (l = remainder; l != null; l = l.tail) {
+				hoistLoopRemaindersInDomTree(l.head);
+			}
+		}
+	}
+	def moveToDomList(bi: SsaBlockInfo, ci: SsaBlockInfo) {
+		Terminal.put2("move @%1 to loop remainder of @%2\n", ci.block.uid, bi.block.uid);
+		var prev: SsaBlockInfo;
+		for (pl = ci.dom_parent.dom_child; pl != null; (prev = pl, pl = pl.dom_sibling)) {
+			if (ci == pl) {
+				if (prev != null) prev.dom_sibling = ci.dom_sibling;
+				else ci.dom_parent.dom_child = ci.dom_sibling;
+				break;
+			}
+		}
+		ci.dom_sibling = bi.dom_child;
+		bi.dom_child = ci;
+		ci.dom_parent = null;
+	}
+	def isEndBlock(bi: SsaBlockInfo) -> bool {
+		return bi.block.succs().length == 0;
+	}
+
+	def print() {
+		var buf = StringBuffer.new();
+		var depth = 0;
+		for (i < code.length) {
+			for (i < depth) buf.sp().sp();
+			match (code[i]) {
+				Block(t, bi) => {
+					buf.format1("block[@%1]: ", bi.block.uid); // TODO: type
+					depth++;
+				}
+				Loop(bi) => {
+					buf.format1("loop[head=@%1]: ", bi.block.uid); // TODO: type
+					depth++;
+				}
+				Body(bi) => {
+					buf.format1("instrs[@%1]", bi.block.uid);
+				}
+				If(t, join) => {
+					var jid = if(join != null, join.block.uid, -1);
+					buf.format1("if[join=@%1]: ", jid); // TODO: type
+					depth++;
+				}
+				Else => {
+					buf.length -= 2;  // TODO: ugly
+					buf.puts("else");
+				}
+				End => {
+					buf.length -= 2; // TODO: ugly
+					buf.puts("end");
+					depth--;
+				}
+				Br(bi, reldepth) => {
+					buf.format2("br[target=@%1] depth-%2", bi.block.uid, reldepth);
+				}
+				BrIf(bi, reldepth) => {
+					buf.format2("br_if[target=@%1] depth-%2", bi.block.uid, reldepth);
+				}
+				BrTable(min, reldepths) => {
+					buf.format1("br_table[min=%1] ", min);
+					for (i < reldepths.length) {
+						if (i > 0) buf.putc(',');
+						buf.putc('-');
+						buf.puti(reldepths[i]);
+					}
+				}
+			}
+			Terminal.putbln(buf);
+			buf.reset();
+		}
+	}
+
+	// Simple optimizer removes redundant constructs.
+	def optimize() {
+		var i = 0;
+		for (p < code.length) {
+			var c = code[p];
+			code[i++] = c;
+			if (c == CfgInstr.End) i = optimizeEnd(i);
+			else if (c == CfgInstr.Else) i = optimizeElse(i);
+		}
+		code.length = i;
+	}
+	def optimizeEnd(i: int) -> int {
+		match (code[i - 2]) {
+			If,			// if end => 
+			Loop,			// loop end =>
+			Block => return i - 2;	// block end =>
+			Else => return optimizeEnd(removeSecondToLast(i));	// else end => end
+			Br(bi, depth) => {
+				if (redundantBranch(bi, depth)) return optimizeEnd(removeSecondToLast(i));
+			}
+			_ => ;
+		}
+		return i;
+	}
+	def optimizeElse(i: int) -> int {
+		match (code[i - 2]) {
+			If(t, join) => { // if else => block
+				code[i - 2] = CfgInstr.Block(t, join);
+				return i - 1;
+			}
+			Br(bi, depth) => {
+				if (redundantBranch(bi, depth)) return optimizeElse(removeSecondToLast(i));
+			}
+			_ => ;
+		}
+		return i;
+	}
+	def redundantBranch(bi: SsaBlockInfo, depth: int) -> bool {
+		return (depth == 0 && bi.loop == null);
+	}
+	def removeSecondToLast(i: int) -> int {
+		code[i - 2] = code[i - 1];
+		return i - 1;
+	}
+}
