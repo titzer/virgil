@@ -7,13 +7,94 @@ class WasmCodeGen extends ArchCodeGen {
 	def wasm: WasmProgram;
 	def buffer: MachDataBuffer;
 	def rt: MachRuntime;
-	def m = SsaInstrMatcher.new();
+	def stackifier = MachStackifier.new(WasmStackInstrGen.new());
 
 	def MATCH_NEG = true;
 	def MATCH_OP_I = true;
 
 	new(context: SsaContext, wasm: WasmProgram, rt) super(context, wasm.mach, ArmMachRegs.regs) {
 		anyReg = ArmMachRegs.GPR;
+	}
+	def generateWasm(m: IrMethod) {
+		context.enterMethod(m);
+		var blocks = SsaBlockOrder.new(m.ssa);
+		reset(m.ssa, blocks, null);
+		var r = CfgRestructurer.new(blocks);
+		var code = r.gen();
+		// Select instructions for CFG code.
+		current = ArchInstr.new(ArchInstrs.ARCH_END, []);
+		for (i = code.length - 1; i >= 0; i--) {
+			selectInstructionsForCfgInstr(code[i]);
+			advanceCurrent();
+		}
+		if (Aeneas.PRINT_MACH.get()) {
+			printWasm(r, code);
+			print();
+		}
+		current = null;
+	}
+	def selectInstructionsForCfgInstr(c: CfgInstr) {
+		match (c) {
+			Block(t, bi) => {
+				emit1(WasmOp.BLOCK.opcode, useInt(t));
+			}
+			Loop(bi) => {
+				emit1(WasmOp.LOOP.opcode, useInt(0));
+			}
+			Body(bi) => {
+				var block = bi.block;
+				context.block = block;
+				gatherLivenessForBlock(block);
+				selectInstructionsForBlock(block);
+				stackifier.stackify(current.next, blockEnd, false);
+			}
+			If(val, t, join) => {
+				emit1(WasmOp.IF.opcode, use(val));
+				blockEnd = current;
+			}
+			Else => {
+				emit0(WasmOp.ELSE.opcode);
+				blockEnd = current;
+			}
+			End => {
+				blockEnd = current;
+				emit0(WasmOp.END.opcode);
+			}
+			Br(bi, reldepth) => {
+				blockEnd = current;
+				// TODO: phi moves
+				emit1(WasmOp.BR.opcode, useInt(reldepth));
+			}
+			BrIf(val, bi, reldepth) => {
+				blockEnd = current;
+				emit2(WasmOp.BR_IF.opcode, use(val), useInt(reldepth));
+			}
+			BrTable(val, min, reldepths) => {
+				blockEnd = current;
+				emit2(WasmOp.I32_SUB.opcode, use(val), use(context.graph.intConst(min)));
+				emit1(WasmOp.BR_TABLE.opcode, use(val)); // TODO: add keys
+			}
+		}
+	}
+	def printWasm(r: CfgRestructurer, code: Vector<CfgInstr>) {
+		var buf = ArchInstrRenderer.new(context.prog, regSet);
+		// print header
+		buf.puts("Wasm CFG instructions for: ");
+		var render: StringBuffer -> StringBuffer;
+		if (context.spec != null) render = context.spec.render;
+		else if (context.method != null) render = context.method.renderLong;
+		else render = Strings.nop;
+		render(buf);
+		Terminal.putbln(buf);
+		buf.reset();
+
+		var depth = 0;
+		for (i < code.length) {
+			var c = code[i];
+			depth += r.render(buf, c);
+			Terminal.putbln(buf);
+			buf.reset();
+		}
 	}
 	def visitApply(block: SsaBlock, i: SsaApplyOp) {
 		match (i.op.opcode) {
@@ -113,11 +194,14 @@ class WasmCodeGen extends ArchCodeGen {
 		emitN(WasmOp.UNREACHABLE.opcode); // TODO: record exception location
 	}
 	def visitIf(block: SsaBlock, i: SsaIf) {
-		var depth = 0;
-		emit2(WasmOp.BR_IF.opcode, use(i.inputs[0].dest), useInt(depth));  // TODO
+		// do nothing; handled by CfgRestructurer
 	}
-	def visitSwitch(block: SsaBlock, i: SsaSwitch) {} // TODO
-	def visitGoto(block: SsaBlock, target: SsaGoto) {} // TODO
+	def visitSwitch(block: SsaBlock, i: SsaSwitch) {
+		// do nothing; handled by CfgRestructurer
+	}
+	def visitGoto(block: SsaBlock, target: SsaGoto) {
+		// do nothing; handled by CfgRestructurer
+	}
 	def visitReturn(block: SsaBlock, i: SsaReturn) {
 		for (j < i.inputs.length) use(i.inputs[j].dest);
 		emitN(ArchInstrs.ARCH_RET);
@@ -449,12 +533,12 @@ type CfgInstr {
 	case Block(t: byte, bi: SsaBlockInfo);
 	case Loop(bi: SsaBlockInfo);
 	case Body(bi: SsaBlockInfo);
-	case If(t: byte, join: SsaBlockInfo);
+	case If(val: SsaInstr, t: byte, join: SsaBlockInfo);
 	case Else;
 	case End;
 	case Br(bi: SsaBlockInfo, depth: int);
-	case BrIf(bi: SsaBlockInfo, depth: int);
-	case BrTable(min: int, depths: Array<int>);
+	case BrIf(val: SsaInstr, bi: SsaBlockInfo, depth: int);
+	case BrTable(val: SsaInstr, min: int, depths: Array<int>);
 }
 
 // Restructures an a reducible control flow graph into WASM
@@ -468,6 +552,23 @@ class CfgRestructurer(order: SsaBlockOrder) {
 		hoistLoopRemaindersInDomTree(blocks[0]);
 		visit(blocks[0]);
 		optimize();
+		// Verify block references are still topologically sorted
+		var pos = Array<int>.new(blocks.length);
+		for (i < pos.length) pos[i] = int.max;
+		for (i < code.length) {
+			var c = code[i];
+			if (!CfgInstr.Body.?(c)) continue;
+			var block = CfgInstr.Body.!(c).bi.block;
+			pos[block.mark] = i;
+			for (s in block.succs()) {
+				if (s.dest.mark <= block.mark) continue;  // backedge
+				if (pos[s.dest.mark] < i) {
+					Terminal.put2("not topologicaly sorted: @%1 -> @%2", block.uid, s.dest.uid);
+					return V3.fail("");
+				}
+			}
+		}
+
 		return code;
 	}
 	def visit(bi: SsaBlockInfo) {
@@ -477,15 +578,14 @@ class CfgRestructurer(order: SsaBlockOrder) {
 			emitJoinBlocks(loopRemainder);
 			emit(CfgInstr.Loop(bi));
 		}
-		// skip blocks bodies that are empty with no phis
-		if (bodyNotEmpty(bi)) emit(CfgInstr.Body(bi));
+		emit(CfgInstr.Body(bi));
 		var end = bi.block.end();
 		if (SsaIf.?(end)) {
 			var si = SsaIf.!(end);
 			var tt = blocks[si.trueBlock().mark], ft = blocks[si.falseBlock().mark];
 			if (tt.dom_parent != bi) {
 				// true block is part of a loop remainder.
-				emit(CfgInstr.BrIf(tt, getRelDepth(tt)));
+				emit(CfgInstr.BrIf(si.input0(), tt, getRelDepth(tt)));
 				visitOrBranchTo(bi, ft);
 			} else {
 				// emit extra blocks for joins
@@ -494,12 +594,12 @@ class CfgRestructurer(order: SsaBlockOrder) {
 				var blocks: List<SsaBlockInfo>;
 				// emit an if-then-else
 				if (joins == null) {
-					emit(CfgInstr.If(WasmType.Void, null));
+					emit(CfgInstr.If(si.input0(), WasmType.Void, null));
 					blocks = null;
 					join = null;
 				} else {
 					emitJoinBlocks(blocks = joins.tail);
-					emit(CfgInstr.If(WasmType.Void, join = joins.head));
+					emit(CfgInstr.If(si.input0(), WasmType.Void, join = joins.head));
 				}
 				visitOrBranchTo(bi, tt);
 				emit(CfgInstr.Else);
@@ -529,21 +629,14 @@ class CfgRestructurer(order: SsaBlockOrder) {
 			for (i < depths.length) {
 				depths[i] = getRelDepth(blocks[succs[i].dest.mark]);
 			}
-			emit(CfgInstr.BrTable(SsaSwitch.!(end).minValue, depths));
+			var sw = SsaSwitch.!(end);
+			emit(CfgInstr.BrTable(sw.input0(), sw.minValue, depths));
 			emitJoinEnds(list);
 		}
 		if (bi.loop != null) {
 			emit(CfgInstr.End);
 			emitJoinEnds(loopRemainder);
 		}
-	}
-	def bodyNotEmpty(bi: SsaBlockInfo) -> bool {
-		var b = bi.block, end = b.end();
-		if (b.next != end) return true;
-		if (SsaGoto.?(end)) {
-			return b.succs()[0].dest.hasPhis();
-		}
-		return true;
 	}
 	def visitOrBranchTo(pi: SsaBlockInfo, target: SsaBlockInfo) {
 		if (target.dom_parent == pi && target.block.preds.length == 1) {
@@ -556,7 +649,7 @@ class CfgRestructurer(order: SsaBlockOrder) {
 		match (i) {
 			Loop(bi) => stack.add(bi);
 			Block(t, bi) => stack.add(bi);
-			If(t, join) => stack.add(join);
+			If(val, t, join) => stack.add(join);
 			End => stack.length--;
 			_ => ;
 		}
@@ -661,57 +754,49 @@ class CfgRestructurer(order: SsaBlockOrder) {
 		return bi.block.succs().length == 0;
 	}
 
-	def print() {
-		var buf = StringBuffer.new();
-		var depth = 0;
-		for (i < code.length) {
-			for (i < depth) buf.sp().sp();
-			match (code[i]) {
-				Block(t, bi) => {
-					buf.format1("block[@%1]: ", bi.block.uid); // TODO: type
-					depth++;
-				}
-				Loop(bi) => {
-					buf.format1("loop[head=@%1]: ", bi.block.uid); // TODO: type
-					depth++;
-				}
-				Body(bi) => {
-					buf.format1("instrs[@%1]", bi.block.uid);
-				}
-				If(t, join) => {
-					var jid = if(join != null, join.block.uid, -1);
-					buf.format1("if[join=@%1]: ", jid); // TODO: type
-					depth++;
-				}
-				Else => {
-					buf.length -= 2;  // TODO: ugly
-					buf.puts("else");
-				}
-				End => {
-					buf.length -= 2; // TODO: ugly
-					buf.puts("end");
-					depth--;
-				}
-				Br(bi, reldepth) => {
-					buf.format2("br[target=@%1] depth-%2", bi.block.uid, reldepth);
-				}
-				BrIf(bi, reldepth) => {
-					buf.format2("br_if[target=@%1] depth-%2", bi.block.uid, reldepth);
-				}
-				BrTable(min, reldepths) => {
-					buf.format1("br_table[min=%1] ", min);
-					for (i < reldepths.length) {
-						if (i > 0) buf.putc(',');
-						buf.putc('-');
-						buf.puti(reldepths[i]);
-					}
+	// Renders an instruction into a buffer and returns the control stack delta.
+	def render(buf: StringBuffer, c: CfgInstr) -> int {
+		match (c) {
+			Block(t, bi) => {
+				buf.format2("block[@%1]: %2", bi.block.uid, WasmType.name(t));
+				return 1;
+			}
+			Loop(bi) => {
+				buf.format1("loop[head=@%1]: void", bi.block.uid);
+				return 1;
+			}
+			Body(bi) => {
+				buf.format1("instrs[@%1]", bi.block.uid);
+			}
+			If(val, t, join) => {
+				var jid = if(join != null, join.block.uid, -1);
+				buf.format3("if(cond=#%1)[join=@%2]: %3", val.uid, jid, WasmType.name(t));
+				return 1;
+			}
+			Else => {
+				buf.puts("else");
+			}
+			End => {
+				buf.puts("end");
+				return -1;
+			}
+			Br(bi, reldepth) => {
+				buf.format2("br[target=@%1] depth-%2", bi.block.uid, reldepth);
+			}
+			BrIf(val, bi, reldepth) => {
+				buf.format3("br_if(cond=#%1)[target=@%2] depth-%3", val.uid, bi.block.uid, reldepth);
+			}
+			BrTable(val, min, reldepths) => {
+				buf.format2("br_table(cond=#%1)[min=%2] ", val.uid, min);
+				for (i < reldepths.length) {
+					if (i > 0) buf.putc(',');
+					buf.putc('-');
+					buf.puti(reldepths[i]);
 				}
 			}
-			Terminal.putbln(buf);
-			buf.reset();
 		}
+		return 0;
 	}
-
 	// Simple optimizer removes redundant constructs.
 	def optimize() {
 		var i = 0;
@@ -738,7 +823,7 @@ class CfgRestructurer(order: SsaBlockOrder) {
 	}
 	def optimizeElse(i: int) -> int {
 		match (code[i - 2]) {
-			If(t, join) => { // if else => block
+			If(val, t, join) => { // if else => block
 				code[i - 2] = CfgInstr.Block(t, join);
 				return i - 1;
 			}
