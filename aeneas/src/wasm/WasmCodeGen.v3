@@ -5,32 +5,34 @@ def TRUNCATE = true;
 def NO_TRUNCATE = false;
 class WasmCodeGen extends ArchCodeGen {
 	def wasm: WasmProgram;
-	def buffer: MachDataBuffer;
 	def rt: MachRuntime;
 	def stackifier = MachStackifier.new(WasmStackInstrGen.new());
+	def cfgr = CfgRestructurer.new();
 
 	def MATCH_NEG = true;
 	def MATCH_OP_I = true;
 
-	new(context: SsaContext, wasm: WasmProgram, rt) super(context, wasm.mach, ArmMachRegs.regs) {
+	new(context: SsaContext, wasm: WasmProgram, rt, buffer: MachDataBuffer) super(context, wasm.mach, ArmMachRegs.regs, buffer) {
 		anyReg = ArmMachRegs.GPR;
 	}
 	def generateWasm(m: IrMethod) {
 		context.enterMethod(m);
-		var blocks = SsaBlockOrder.new(m.ssa);
-		reset(m.ssa, blocks, null);
-		var r = CfgRestructurer.new(blocks);
-		var code = r.gen();
+		var order = SsaBlockOrder.new(m.ssa);
+		reset(m.ssa, order, null);
+		var code = cfgr.gen(order);
 		// Select instructions for CFG code.
 		current = ArchInstr.new(ArchInstrs.ARCH_END, []);
 		for (i = code.length - 1; i >= 0; i--) {
 			selectInstructionsForCfgInstr(code[i]);
 			advanceCurrent();
 		}
+		// TODO: spill live references onto the shadow stack.
 		if (Aeneas.PRINT_MACH.get()) {
-			printWasm(r, code);
+			printWasm(code);
 			print();
 		}
+		// Assemble WASM bytecode into the buffer.
+		assembleInstrs();
 		current = null;
 	}
 	def selectInstructionsForCfgInstr(c: CfgInstr) {
@@ -49,7 +51,7 @@ class WasmCodeGen extends ArchCodeGen {
 				stackifier.stackify(current.next, blockEnd, false);
 			}
 			If(val, t, join) => {
-				emit1(WasmOp.IF.opcode, use(val));
+				emit2(WasmOp.IF.opcode, useInt(t), use(val));
 				blockEnd = current;
 			}
 			Else => {
@@ -76,7 +78,7 @@ class WasmCodeGen extends ArchCodeGen {
 			}
 		}
 	}
-	def printWasm(r: CfgRestructurer, code: Vector<CfgInstr>) {
+	def printWasm(code: Vector<CfgInstr>) {
 		var buf = ArchInstrRenderer.new(context.prog, regSet);
 		// print header
 		buf.puts("Wasm CFG instructions for: ");
@@ -91,7 +93,7 @@ class WasmCodeGen extends ArchCodeGen {
 		var depth = 0;
 		for (i < code.length) {
 			var c = code[i];
-			depth += r.render(buf, c);
+			depth += cfgr.render(buf, c);
 			Terminal.putbln(buf);
 			buf.reset();
 		}
@@ -159,7 +161,7 @@ class WasmCodeGen extends ArchCodeGen {
 			PtrAdd => emitBinop(i, WasmOp.I32_ADD);
 			PtrSub => emitBinop(i, WasmOp.I32_SUB);
 			ConditionalThrow => {
-				emit1(WasmOp.IF.opcode, use(i.inputs[0].dest));
+				emit2(WasmOp.IF.opcode, useInt(WasmType.Void), use(i.inputs[0].dest));
 				emitN(WasmOp.UNREACHABLE.opcode);
 				emitN(WasmOp.END.opcode);
 			}
@@ -260,14 +262,20 @@ class WasmCodeGen extends ArchCodeGen {
 	def assemble(opcode: int, a: Array<Operand>) {
 		match (opcode) {
 			ArchInstrs.ARCH_RET => return buffer.i1(WasmOp.RETURN.opcode);
+			ArchInstrs.ARCH_BLOCK => {
+				context.block = toBlock(a[0]);
+				return;
+			}
+			ArchInstrs.ARCH_END => return buffer.i1(WasmOp.END.opcode);
+			ArchInstrs.ARCH_RESOLVE => return context.fail("phi resolution instructions should be removed by stackifier");
 		}
 		if (opcode > 0 && WasmOpNames.array[opcode] != null) buffer.i1(opcode);
 		else context.fail1("cannot assemble WASM opcode %1", opcode);
 		// emit immediates for specific opcodes
 		match (opcode) {
-			ArchInstrs.ARCH_RET => return buffer.i1(WasmOp.RETURN.opcode);
+			WasmOp.LOOP.opcode,
 			WasmOp.BLOCK.opcode,
-			WasmOp.IF.opcode => buffer.i1(WASM_VOID_TYPE);
+			WasmOp.IF.opcode => buffer.i1(toInt(a[0]));
 
 			WasmOp.I32_LOAD8_S.opcode,
 			WasmOp.I32_LOAD8_U.opcode,
@@ -337,6 +345,10 @@ class WasmStackInstrGen extends StackInstrGen {
 			V3Kind.INT => {
 				var opcode = if(IntType.!(t).width > 32, WasmOp.I64_CONST.opcode, WasmOp.I32_CONST.opcode);
 				insertBefore(ArchInstr.new(opcode, [Operand.Immediate(val)]), next);
+			}
+			V3Kind.BOOL => {
+				var truth = if(Values.equal(Bool.TRUE, val), Int.ONE);
+				insertBefore(ArchInstr.new(WasmOp.I32_CONST.opcode, [Operand.Immediate(truth)]), next);
 			}
 			// TODO: reference constants
 			_ => return V3.fail("unimplemented");
@@ -543,11 +555,14 @@ type CfgInstr {
 
 // Restructures an a reducible control flow graph into WASM
 // structured control flow by using the dominator tree.
-class CfgRestructurer(order: SsaBlockOrder) {
-	def blocks = order.order;
+class CfgRestructurer {
 	def code = Vector<CfgInstr>.new();
 	def stack = Vector<SsaBlockInfo>.new();
-	def gen() -> Vector<CfgInstr> {
+	var blocks: Vector<SsaBlockInfo>;
+	def gen(order: SsaBlockOrder) -> Vector<CfgInstr> {
+		blocks = order.order;
+		code.length = 0;
+		stack.length = 0;
 		order.computeDominators();
 		hoistLoopRemaindersInDomTree(blocks[0]);
 		visit(blocks[0]);
