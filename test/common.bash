@@ -157,9 +157,23 @@ function run_jvm_tests() {
 	fi
 }
 
+function run_wasm_tests() {
+	mkdir -p $OUT/wasm
+	C=$OUT/wasm/compile.out
+	R=$OUT/wasm/run.out
+	print_compiling wasm
+	run_v3c "" -verbose=1 -multiple -target=wasm-js-test -output=$OUT/wasm -wasm.rt-path=../../rt/wasm/bin $TESTS > $C
+	check_red $C
+
+	print_status Running wasm
+        echo 
+}
+
 function run_exec_tests() {
 	run_int_tests "int" ""
 	run_int_tests "int-ra" "-ra"
+
+#        run_wasm_tests
 
         run_jvm_tests
 
