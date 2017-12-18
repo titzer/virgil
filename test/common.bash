@@ -166,7 +166,8 @@ function run_wasm_tests() {
 	check_red $C
 
 	print_status Running wasm
-        echo 
+        (cd $OUT/wasm/; $TEST_D8 $VIRGIL_LOC/test/wasm-js-tester.js -- $TESTS > $R)
+	check_red $R
 }
 
 function run_exec_tests() {

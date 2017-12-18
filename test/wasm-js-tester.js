@@ -1,7 +1,8 @@
-var GREEN='[0;32m';
-var YELLOW='[0;33m';
-var RED='[0;31m';
-var NORM='[0;00m';
+var color = true;
+var GREEN=color ? '[0;32m' : '';
+var YELLOW=color ? '[0;33m' : '';
+var RED=color ? '[0;31m' : '';
+var NORM=color ? '[0;00m' : '';
 var verbose = 2;
 var cmdLineArgs = arguments;  // D8 specific ?
 var globalTestRuns = undefined;
@@ -77,4 +78,5 @@ function runTest(testname) {
     for (var i = 0; i < tests.length; i++) {
         runTest(tests[i]);
     }
+    print(tests.length + " passed");
 })();
