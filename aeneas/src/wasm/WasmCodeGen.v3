@@ -22,11 +22,8 @@ class WasmCodeGen extends ArchCodeGen {
 		var order = SsaBlockOrder.new(m.ssa);
 		reset(m.ssa, order, null);
 		var code = cfgr.gen(order);
-		// Assign parameter spill slots.
-		var slot = if(V3.isComponent(m.container), -1, 0);
-		for (p in context.graph.params) {
-			getVreg(p).spill = slot++;
-		}
+		// Reset locals and assign parameter spill slots.
+		stackgen.reset(m, context.graph.params, getVreg);
 		// Select instructions for CFG code.
 		current = ArchInstr.new(ArchInstrs.ARCH_END, []);
 		for (i = code.length - 1; i >= 0; i--) {
@@ -41,7 +38,7 @@ class WasmCodeGen extends ArchCodeGen {
 		// Assemble WASM bytecode into the buffer.
 		var sizepos = buffer.skip_u4leb();
 		var start = buffer.pos;
-		buffer.i1(0);  // TODO: locals count
+		stackgen.emitVarDecls(buffer);
 		assembleInstrs();
 		buffer.overwrite_u4leb(sizepos, buffer.pos - start);
 		current = null;
@@ -288,7 +285,9 @@ class WasmCodeGen extends ArchCodeGen {
 			WasmOp.GET_LOCAL.opcode,
 			WasmOp.SET_LOCAL.opcode,
 			WasmOp.TEE_LOCAL.opcode => {
-				buffer.i4leb(toVar(a[0]).spill);
+				var mv = toVar(a[0]), slot = stackgen.slotOf(mv);
+				if (slot < 0) context.fail1("variable @%1 not allocated a spill slot", mv.ssa.uid);
+				buffer.i4leb(slot);
 			}
 			WasmOp.LOOP.opcode,
 			WasmOp.BLOCK.opcode,
@@ -357,14 +356,77 @@ class WasmCodeGen extends ArchCodeGen {
 	}
 }
 // A stack instruction generator specifically for WASM.
+// Since it may dynamically assign locals for machine variables, it manages this mapping
+// as well.
 class WasmStackInstrGen extends StackInstrGen {
 	var context: SsaContext;
+	var params = 0;
+	var i32_count = 0;
+	var i64_count = 0;
+	var f32_count = 0;
+	var f64_count = 0;
+	def reset(m: IrMethod, params: Array<SsaParam>, getVreg: SsaInstr -> MachVar) {
+		i32_count = 0;
+		i64_count = 0;
+		f32_count = 0;
+		f64_count = 0;
+		
+		var slot = if(V3.isComponent(m.container), 0, 1);
+		for (p in context.graph.params) {
+			var mv = getVreg(p);
+			mv.spill = slot++;
+			mv.hint = WasmType.of(p.vtype);
+//			Terminal.put2("var @%1 = slot #%2\n", mv.ssa.uid, mv.spill);
+		}
+		this.params = slot - 1;
+	}
+	def mapVar(mv: MachVar) -> MachVar {
+		if (mv.hint != 0) return mv;
+		var index = 0;
+		match (mv.hint = WasmType.of(mv.ssa.getType())) {
+			WasmType.I32 => index = ++i32_count;
+			WasmType.I64 => index = ++i64_count;
+			WasmType.F32 => index = ++f32_count;
+			WasmType.F64 => index = ++i64_count;
+			_ => return V3.fail1("invalid WasmType for variable @%1", mv.ssa.uid);
+		}
+		mv.spill = params + index;
+//		Terminal.put2("var @%1 = slot #%2\n", mv.ssa.uid, mv.spill);
+		return mv;
+	}
+	def slotOf(mv: MachVar) -> int {
+		var slot = mv.spill - 1;
+		if (mv.spill < 0) return -1;
+		if (slot < params) return slot;
+		if (mv.hint == WasmType.I32) return slot;
+		slot += i32_count;
+		if (mv.hint == WasmType.I64) return slot;
+		slot += i64_count;
+		if (mv.hint == WasmType.F32) return slot;
+		slot += f32_count;
+		if (mv.hint != WasmType.F64) return V3.fail1("invalid WasmType for variable @%1", mv.ssa.uid);
+		return slot;
+	}
+	def emitVarDecls(buffer: MachDataBuffer) {
+		var count = 0;
+		if (i32_count > 0) count++;
+		if (i64_count > 0) count++;
+		if (f32_count > 0) count++;
+		if (f64_count > 0) count++;
+		buffer.i1(count);
+		if (i32_count > 0) { buffer.i4leb(i32_count); buffer.i1(WasmType.I32); }
+		if (i64_count > 0) { buffer.i4leb(i64_count); buffer.i1(WasmType.I64); }
+		if (f32_count > 0) { buffer.i4leb(f32_count); buffer.i1(WasmType.F32); }
+		if (f64_count > 0) { buffer.i4leb(f64_count); buffer.i1(WasmType.F64); }
+	}
 	def insertLoadLocal(v: MachVar, next: ArchInstr) {
-		insertBefore(ArchInstr.new(WasmOp.GET_LOCAL.opcode, [Operand.Use(v.ssa, v, 0)]), next);
+		var u = Operand.Use(v.ssa, mapVar(v), 0);
+		insertBefore(ArchInstr.new(WasmOp.GET_LOCAL.opcode, [u]), next);
 	}
 	def insertStoreLocal(v: MachVar, pop: bool, next: ArchInstr) {
 		var opcode = if(pop, WasmOp.SET_LOCAL.opcode, WasmOp.TEE_LOCAL.opcode);
-		insertBefore(ArchInstr.new(opcode, [Operand.Def(v.ssa, v, 0)]), next);
+		var d = Operand.Def(v.ssa, mapVar(v), 0);
+		insertBefore(ArchInstr.new(opcode, [d]), next);
 	}
 	def insertPop(v: MachVar, next: ArchInstr) {
 		insertBefore(ArchInstr.new(WasmOp.DROP.opcode, []), next);
@@ -816,7 +878,7 @@ class CfgRestructurer {
 				return 1;
 			}
 			Body(bi) => {
-				buf.format1("instrs[@%1]", bi.block.uid);
+				buf.format1("body[@%1]", bi.block.uid);
 			}
 			If(val, t, join) => {
 				var jid = if(join != null, join.block.uid, -1);

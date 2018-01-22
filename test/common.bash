@@ -1,5 +1,7 @@
 #!/bin/bash
 
+RUN_WASM=0
+
 GREEN='[0;32m'
 YELLOW='[0;33m'
 RED='[0;31m'
@@ -174,7 +176,9 @@ function run_exec_tests() {
 	run_int_tests "int" ""
 	run_int_tests "int-ra" "-ra"
 
-#        run_wasm_tests
+        if [ "RUN_WASM" = 1 ]; then
+            run_wasm_tests
+        fi
 
         run_jvm_tests
 
