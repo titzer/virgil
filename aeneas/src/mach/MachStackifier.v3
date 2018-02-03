@@ -5,10 +5,11 @@
 // between instructions, for arch code that targets stack machines, such
 // as WASM and the JVM.
 class MachStackifier(gen: StackInstrGen) {
-	def VERBOSE = false;
+	private def VERBOSE = false;
 	private def stack = Vector<Operand.Def>.new();
 	private def last = Vector<ArchInstr>.new();
 	private def loads = Vector<Operand.Use>.new();
+	private def phiMoves = Vector<(VReg, List<Operand.Def>)>.new();
 	private var firstLoad = 0;
 	private var deferredLoads: List<(ArchInstr, int, int)>;
 	private var possibleStores: List<(ArchInstr, Operand.Def)>;
@@ -25,7 +26,7 @@ class MachStackifier(gen: StackInstrGen) {
 			if (VERBOSE) printStack();
 			if (VERBOSE) Terminal.put("begin ");
 			if (i.opcode() == ArchInstrs.ARCH_RESOLVE) {
-				resolvePhis(i.operands);
+				resolvePhis(i);
 			} else {
 				computeLoads(i.operands, dumpRefsOnKill);
 				addDefs(i);
@@ -40,6 +41,7 @@ class MachStackifier(gen: StackInstrGen) {
 		stack.clear();  // cleanup
 		last.clear();   // cleanup
 		loads.clear();  // cleanup
+		phiMoves.clear();
 		while (start.prev != prev) start = start.prev;
 		return start;
 	}
@@ -59,6 +61,7 @@ class MachStackifier(gen: StackInstrGen) {
 			}
 			var found = false;
 			// search for a definition on the abstract stack
+			// XXX: store stackPos in VReg to avoid an O(stack_depth) search here.
 			while (s < stack.length) {
 				var x = stack[s];
 				if (x.vreg == use.vreg) {
@@ -87,37 +90,80 @@ class MachStackifier(gen: StackInstrGen) {
 		stack.length = nextHeight;
 		if (dumpRefsOnKill && kill) ;  // TODO: insert spills for ref values
 	}
-	private def resolvePhis(operands: Array<Operand>) {
-		// TODO: The operands come in (def, use) pairs. Use the SsaDeconstructor
-		// to resolve dependencies between the moves properly. Let this instruction
-		// (the phi resolve instruction) be R, which should occur at the end of the
-		// current block.
-
-		// Consider a phi definition P in R and its corresponding input use V in R.
-		// If V is defined in this block, then we can either:
-		//   1.) If P is a join-value phi, then we must leave V on the stack at the
-		//       end of the block. Either:
-		//       a.) implicitly leave on stack if it is at the bottom
-		//       b.) emit @ R: get_local V if V has a variable
-		//       c.) emit @ V: tee_local to a temporary
-		//   2.) emit @ V either
-		//       a.) tee_local P, if P is not live out of this block
-		//       b.) tee_local T for some temporary
-		//   3.) reuse V's local variable, if it has one, and emit @ R:
-		//        get_local V
-		//        set_local P
-		//   4.) leave V on the stack, and either:
-		//       a.) emit @ R: set_local P
-
-		// If V is defined outside this block, it already has a local. We emit
-		// @ R the same as 2.) above.
-
-		// If we don't have liveness for P, then we can be conservative and not do 1.a.).
-
-		// Note that P cannot be live at V unless it is a _loop phi_.
-
-		// Other than SSA resolution moves, WASM locals will be in SSA form if we
-		// do not reuse them.
+	private def resolvePhis(resolve: ArchInstr) {
+		// XXX: reusing {VReg.endPos} as the index into the phi moves here.
+		// Create a mapping from vreg -> List<def>
+		var operands = resolve.operands;
+		for (i = 0; i < operands.length; i += 2) {
+			var d = Operand.Def.!(operands[i]), u = Operand.Use.!(operands[i + 1]);
+			var v = u.vreg;
+			Terminal.put3("phi_def #%1 = #%2(endPos = %3)\n", d.vreg.varNum, v.varNum, v.endPos);
+			if (v.endPos <= 0) {
+				var index = phiMoves.length;
+				v.endPos = 1 + index;
+				phiMoves.add(v, List.new(d, null));
+			} else {
+				var index = v.endPos - 1;
+				var prev = phiMoves[index].1;
+				phiMoves[index] = (v, List.new(d, prev));
+			}
+		}
+		// process any moves for phi operands already on the stack
+		for (s = stack.length - 1; s >= 0; s--) {
+			var d = stack[s];
+			if (d.vreg.endPos > 0) {
+				d.vreg.consumedFromStack = true;
+				var t = phiMoves[d.vreg.endPos - 1], vreg = t.0, dest = t.1;
+				recursePhiMoves(vreg, dest, resolve);
+				stack.length = s;  // trim stack back
+			}
+		}
+		// process remaining moves for phi operands not on stack
+		for (i < phiMoves.length) {
+			var t = phiMoves[i], vreg = t.0, dest = t.1;
+			if (vreg.endPos > 0) {
+				loadOnStack(Operand.Def(vreg.ssa, vreg, 0), resolve);
+				recursePhiMoves(vreg, dest, resolve);
+			}
+		}
+		phiMoves.clear();
+		// Remove the resolution instruction altogether.
+		resolve.prev.next = resolve.next;
+		resolve.next.prev = resolve.prev;
+	}
+	def recursePhiMoves(vreg: VReg, dest: List<Operand.Def>, resolve: ArchInstr) {
+		while (true) {
+			var d = dest.head, last = dest.tail == null;
+			if (d.vreg.endPos <= 0 || onStack(d.vreg)) {
+				// The destination {d} either has no outgoing assignments, or is on the stack.
+				// We can simply overwrite it and we are done.
+				emitMove(vreg, d.vreg, last, resolve);
+			} else {
+				// The destination {d} must be loaded onto the stack and recursed upon.
+				loadOnStack(d, resolve);
+				var t = phiMoves[d.vreg.endPos - 1], vreg = t.0, dest = t.1;
+				recursePhiMoves(vreg, dest, resolve);
+			}
+			if (last) break;
+			dest = dest.tail;
+		}
+		vreg.endPos = 0;
+	}
+	def emitMove(vreg: VReg, dest: VReg, last: bool, next: ArchInstr) {
+		gen.insertStoreLocal(dest, last, next);
+	}
+	def onStack(vreg: VReg) -> bool {
+		for (i < stack.length) if (stack[i].vreg == vreg) return true;
+		return false;
+	}
+	def loadOnStack(d: Operand.Def, next: ArchInstr) {
+		if (SsaConst.?(d.ssa)) {
+			var const = SsaConst.!(d.ssa);
+			gen.insertLoadConst(const.vtype, const.val, next);
+		} else {
+			gen.insertLoadLocal(d.vreg, next);
+		}
+		stack.add(d);
 	}
 	private def ssaOf(i: ArchInstr) -> SsaInstr {
 		for (o in i.operands) {
@@ -144,10 +190,10 @@ class MachStackifier(gen: StackInstrGen) {
 				var use = loads[i];
 				if (SsaConst.?(use.ssa)) {
 					var const = SsaConst.!(use.ssa);
-//					Terminal.put1("  LK@%1", use.ssa.uid);
+					if (VERBOSE) Terminal.put1("  LK@%1", use.ssa.uid);
 					gen.insertLoadConst(const.vtype, const.val, next);
 				} else {
-//					Terminal.put1("  LL@%1", use.ssa.uid);
+					if (VERBOSE) Terminal.put1("  LL@%1", use.ssa.uid);
 					gen.insertLoadLocal(use.vreg, next);
 				}
 			}
@@ -171,8 +217,7 @@ class MachStackifier(gen: StackInstrGen) {
 		return 2;
 	}
 	private def markAsStackConsumed(d: Operand.Def, u: Operand.Use) {
-		// mark {d} as not needing a flush to a local, if used
-		// only once as {u}
+		// mark {d} as not needing a flush to a local, if used only once as {u}
 		d.vreg.consumedFromStack = true;
 	}
 	private def printStack() {
@@ -184,6 +229,7 @@ class MachStackifier(gen: StackInstrGen) {
 		Terminal.ln();
 	}
 }
+// The interface between MachStackifier and the (architecture-specific) code generator.
 class StackInstrGen {
 	def insertLoadLocal(v: VReg, next: ArchInstr);
 	def insertStoreLocal(v: VReg, pop: bool, next: ArchInstr);
