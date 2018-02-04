@@ -176,7 +176,7 @@ function run_exec_tests() {
 	run_int_tests "int" ""
 	run_int_tests "int-ra" "-ra"
 
-        if [ "RUN_WASM" = 1 ]; then
+        if [ "$RUN_WASM" = 1 ]; then
             run_wasm_tests
         fi
 
