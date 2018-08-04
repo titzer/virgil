@@ -1,6 +1,8 @@
 #!/bin/bash
 
-RUN_WASM=0
+if [ -z "$RUN_WASM" ]; then
+    RUN_WASM=0
+fi
 
 GREEN='[0;32m'
 YELLOW='[0;33m'
