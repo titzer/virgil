@@ -24,6 +24,11 @@ if [ $# != 1 ]; then
         exit 1
 fi
 
+if [ ! -e "$1" ]; then
+	echo "File not found: $1"
+        exit 1
+fi
+
 if [ "$AENEAS_TEST" = "" ]; then
     AENEAS_TEST=$V3C_DEV
 fi
@@ -55,9 +60,9 @@ if [ "$jvm" = 1 ]; then
     execute java -classpath $rtpath:$T V3S_Tester $tests | tee $T/$test.run.jvm.out
 elif [ "$wasm" = 1 ]; then
     line
-    execute $AENEAS_TEST $V3C_OPTS -target=wasm-js-test -output=$T -print-mach -print-ssa $tests | tee $T/$test.compile.wasm.out
+    execute $AENEAS_TEST $V3C_OPTS -target=wasm-js-test -output=$T -print-stackify -print-mach -print-ssa $tests | tee $T/$test.compile.wasm.out
     line
     execute cd $T
-    execute $TEST_D8 --trace-wasm-decoder $VIRGIL_LOC/test/wasm-js-tester.js -- $tests | tee $T/$test.run.wasm.out
+    execute $TEST_D8 --trace-wasm-decoder --trace-wasm-interpreter --wasm-interpret-all $VIRGIL_LOC/test/wasm-js-tester.js -- $tests | tee $T/$test.run.wasm.out
     
 fi
