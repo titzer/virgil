@@ -5,17 +5,12 @@
 // TODO(wasm): shadow stack handling
 // TODO(wasm): indirect function table
 // TODO(wasm): size of initialized heap
-// TODO(wasm): codegen returns
 // TODO(wasm): codegen multiple return values
-// TODO(wasm): codegen brtable
 // TODO(wasm): codegen allocation
 // TODO(wasm): codegen system ops
-// TODO(wasm): codegen exceptions/throws
 // TODO(wasm): codegen explicit nullchecks
 // TODO(wasm): stacktrace reconstruction
-// TODO(wasm): reference constants
-// TODO(wasm): unittest control flow restructuring
-// TODO(wasm): default init of locals
+// XXX(wasm): default init of locals
 // XXX(wasm): use wasm globals for component fields
 
 def WASM_PAGE_SIZE = 65536;
@@ -65,23 +60,27 @@ class WasmTarget extends Target {
 		var mach = MachProgram.new(prog, space, space, intNorm);
 		compiler.Reachability = true;
 		MachModule.install(prog);
-		var cirt = CiRuntime_TypeCon.new(MachModule.PTR_32.create0(), MachRuntime.new(mach));
+		mach.runtime = MachRuntime.new(mach);
+		var cirt = CiRuntime_TypeCon.new(MachModule.PTR_32.create0(), mach.runtime);
 		prog.typeEnv.add(cirt);
 	}
 	def emit(compiler: Compiler, prog: Program) {
-		if (emitWasmModule(compiler, prog)) {
-			if (test) emitJsTestWrapper(compiler, prog);
+		var context = SsaContext.new(compiler, prog);
+		var rt = getRuntime(prog);
+		var vals = rt.parseTestInputs(prog, prog.ERROR, 0);
+		if (emitWasmModule(context, rt)) {
+			if (test) emitJsTestWrapper(context);
 		}
 	}
-	def emitWasmModule(compiler: Compiler, prog: Program) -> bool {
-		var rt = getRuntime(prog);
+	def emitWasmModule(context: SsaContext, rt: MachRuntime) -> bool {
+		def prog = context.prog;
 		// Lower to machine level from V3 level
-		var config = SsaMachGenConfig.new();
+		def config = SsaMachGenConfig.new();
 		config.Int0LoadAsNullcheck = false;
 		config.ImplicitNullChecks = false;
 		config.Int32Arith = true;
 		config.Int64Arith = true;
-		rt.mach.build(compiler, config);
+		rt.mach.build(context.compiler, config);
 		def buffer = MachDataBuffer.new(WASM_PAGE_SIZE, 0, false, 300);
 
 		// (1) Encode the WASM header
@@ -92,12 +91,19 @@ class WasmTarget extends Target {
 		var sizepos: int, start: int;
 
 		// Add all the method signatures to the signatures vector
-		def wasm = WasmProgram.new(rt.mach);
+		def wasm = WasmProgram.new(rt.mach), m = rt.mach;
 		def methods = prog.ir.methods;
+		var allocateStubSigIndex = 0u, numFunctions = 0;
+		if (m.allocates) {  // add allocation stub
+			allocateStubSigIndex = wasm.addSig(Int.TYPE_ARRAY, Int.TYPE);
+			numFunctions = 1;
+		}
+		var main = IrMethod.!(prog.getMain().member), main_index = -1;
 		for (i < methods.length) {
 			var m = methods[i];
-			wasm.addSig(m);
-			m.machIndex = i;
+			wasm.addSig(m.paramTypes, m.returnType);
+			m.machIndex = numFunctions++;
+			if (m == main) main_index = m.machIndex;
 		}
 
 		// (2) Emit signatures (types)
@@ -119,31 +125,35 @@ class WasmTarget extends Target {
 
 		// (3) Emit imports
 		//--------------------------------------------------------------------------------
-		var main = IrMethod.!(prog.getMain().member), main_index = -1;
 
 		// (4) Emit function signature declarations
 		//--------------------------------------------------------------------------------
 		sizepos = emitSection(buffer, WasmSection.FUNCTION);
 		start = buffer.pos;
-		buffer.u4leb(u32.!(methods.length));
+		buffer.u4leb(u32.!(numFunctions));
+		if (m.allocates) {  // add allocation stub
+			buffer.u4leb(allocateStubSigIndex);
+		}
 		for (i < methods.length) {
 			var m = methods[i];
-	                if (m == main) main_index = i;
 			buffer.u4leb(wasm.getSigIndex(m));
 		}
 		patchSectionSize(buffer, sizepos, buffer.pos - start);
 
 		// (5) Emit indirect function table
 		//--------------------------------------------------------------------------------
+		// TODO: build the indirect function table from the mtables
 
 		// (6) Emit memory section
 		//--------------------------------------------------------------------------------
 		sizepos = emitSection(buffer, WasmSection.MEMORY);
 		start = buffer.pos;
-	        buffer.i1(1);        // 1 memory
-		// TODO: add the size of initialized memory and runtime to the heap size
-		var pages = 2u + u32.!((rt.heapSize + (WASM_PAGE_SIZE - 1)) / WASM_PAGE_SIZE);
-                buffer.i1(1);        // flags = contains maximum
+		buffer.i1(1);	// 1 memory
+		// add the size of initialized memory and runtime to the heap size
+		m.layoutAllRecords();
+		var initSize = m.metaRegion.mark + m.dataRegion.mark;
+		var pages = 2u + u32.!((rt.heapSize + initSize + (WASM_PAGE_SIZE - 1)) / WASM_PAGE_SIZE);
+		buffer.i1(1);	// flags = contains maximum
 		buffer.u4leb(pages); // initial memory size
 		buffer.u4leb(pages); // maximum memory size
 		patchSectionSize(buffer, sizepos, buffer.pos - start);
@@ -151,24 +161,42 @@ class WasmTarget extends Target {
 		// (7) Emit the export section
 		//--------------------------------------------------------------------------------
 		if (main_index >= 0) {
-                	sizepos = emitSection(buffer, WasmSection.EXPORT);
-                        start = buffer.pos;
-                        buffer.i1(1);                  // 1 export: main
-//                        var str = main.source.renderLong(StringBuffer.new()).toString();
-                        buffer.i1(4);
-                        buffer.iN("main");
-                        buffer.i1(WasmExternal.FUNCTION);  // export function
+			sizepos = emitSection(buffer, WasmSection.EXPORT);
+			start = buffer.pos;
+			buffer.i1(1);		  // 1 export: main
+//			var str = main.source.renderLong(StringBuffer.new()).toString();
+			buffer.i1(4);
+			buffer.iN("main");
+			buffer.i1(WasmExternal.FUNCTION);  // export function
 			buffer.u4leb(u32.!(main_index));
 			patchSectionSize(buffer, sizepos, buffer.pos - start);
-                }
+		}
 
 		// (8) Emit the function bodies
 		//--------------------------------------------------------------------------------
 		sizepos = emitSection(buffer, WasmSection.CODE);
 		start = buffer.pos;
-		buffer.u4leb(u32.!(methods.length));
-		var context = SsaContext.new(compiler, prog);
+		buffer.u4leb(u32.!(numFunctions));
 		var codegen = WasmCodeGen.new(context, wasm, rt, buffer);
+		if (m.allocates) { // add allocation stub body
+			def b = buffer.i1, cl = CiRuntimeModule.HEAP_CUR_LOC;
+			var sizepos = buffer.pos;
+			b(/*body_size=*/0);
+			var start = buffer.pos;
+			b(/*locals_count=*/0);
+			b(WasmOp.I32_CONST.opcode); codegen.emitAddr(cl);
+			b(WasmOp.I32_LOAD.opcode); b(/*align=*/2); b(/*offset=*/0);
+			b(WasmOp.I32_CONST.opcode); codegen.emitAddr(cl);
+			b(WasmOp.I32_CONST.opcode); codegen.emitAddr(cl);
+			b(WasmOp.I32_LOAD.opcode); b(/*align=*/2); b(/*offset=*/0);
+			b(WasmOp.GET_LOCAL.opcode); b(0);
+			b(WasmOp.I32_ADD.opcode);
+			b(WasmOp.I32_STORE.opcode); b(/*align=*/2); b(/*offset=*/0);
+			b(WasmOp.END.opcode);
+			var bodysize = buffer.pos - start;
+			buffer.at(sizepos).i1(bodysize);
+			buffer.atEnd();
+		}
 		for (i < methods.length) {
 			codegen.generateWasm(methods[i]);
 		}
@@ -185,15 +213,18 @@ class WasmTarget extends Target {
 		buffer.i1(WasmOp.END.opcode);
 		var data_sizepos = buffer.skip_u4leb(); // data size
 		var data_start = buffer.pos;
-		buffer.startAddr = WASM_PAGE_SIZE;
+		buffer.startAddr = WASM_PAGE_SIZE - buffer.end();
 		// Encode meta region
-		var m = wasm.mach;
+		if (Aeneas.PRINT_MACH.get()) Terminal.put1("META_START=%1\n", buffer.endAddr());
 		m.metaRegion.setStartAddr(buffer.endAddr());
 		m.encodeRegion(m.metaRegion, buffer);
 		// Encode data region
+		if (Aeneas.PRINT_MACH.get()) Terminal.put1("DATA_START=%1\n", buffer.endAddr());
 		m.dataRegion.setStartAddr(buffer.endAddr());
-		m.layoutAllRecords();
 		m.encodeRegion(m.dataRegion, buffer);
+		if (Aeneas.PRINT_MACH.get()) Terminal.put1("DATA_END=%1\n", buffer.endAddr());
+		// Add the heap pointers after the initialized data. XXX: use WASM globals.
+		if (m.allocates) rt.addHeapPointers(buffer);
 
 		patchSectionSize(buffer, data_sizepos, buffer.pos - data_start);
 		patchSectionSize(buffer, sizepos, buffer.pos - start);
@@ -218,7 +249,7 @@ class WasmTarget extends Target {
 		}
 
 		// Dump the bytes to the file
-		var fileName = compiler.getOutputFileName(prog.name(), "wasm");
+		var fileName = context.compiler.getOutputFileName(prog.name(), "wasm");
 		var fd = System.fileOpen(fileName, false);
 		if (fd < 0) {
 			prog.ERROR.OutputError(fileName);
@@ -238,8 +269,9 @@ class WasmTarget extends Target {
 		}
 		u.overwrite_u4leb(pos, abs);
 	}
-	def emitJsTestWrapper(compiler: Compiler, prog: Program) -> bool {
-		var fileName = compiler.getOutputFileName(prog.name(), "expect.js");
+	def emitJsTestWrapper(context: SsaContext) -> bool {
+		var prog = context.prog;
+		var fileName = context.compiler.getOutputFileName(prog.name(), "expect.js");
 		var fd = System.fileOpen(fileName, false);
 		if (fd < 0) {
 			prog.ERROR.OutputError(fileName);
@@ -287,7 +319,7 @@ class WasmTarget extends Target {
 		return CiRuntime_TypeCon.!(prog.typeEnv.lookup(CiRuntimeModule.NAME)).runtime;
 	}
 	def emitSection(buffer: MachDataBuffer, code: int) -> int {
-                buffer.i1(code);
+		buffer.i1(code);
 		return buffer.skip_u4leb();
 	}
 	def patchSectionSize(buffer: MachDataBuffer, offset: int, size: int) {
@@ -305,13 +337,16 @@ class WasmProgram(mach: MachProgram) {
 	def map = HashMap<(Array<Type>, Type), int>.new(hashSig, equalSig);
 	def signatures = Vector<(Array<byte>, Array<byte>)>.new();
 
-	def addSig(m: IrMethod) {
-		var index = map[(m.paramTypes, m.returnType)];
-		if (index > 0) return;
-		var params = Arrays.map(m.paramTypes, WasmType.of);
-		var rets = Arrays.map(Tuple.toTypeArray(m.returnType), WasmType.of);
-		signatures.add(params, rets);
-		map[(m.paramTypes, m.returnType)] = signatures.length;
+	def addSig(paramTypes: Array<Type>, returnType: Type) -> u32 {
+		var index = map[(paramTypes, returnType)];
+		if (index <= 0) {
+			var params = Arrays.map(paramTypes, WasmType.of);
+			var rets = Arrays.map(Tuple.toTypeArray(returnType), WasmType.of);
+			signatures.add(params, rets);
+			index = signatures.length;
+			map[(paramTypes, returnType)] = index;
+		}
+		return u32.!(index - 1);
 	}
 	def getSigIndex(m: IrMethod) -> u32 {
 		return getSigIndexByType(m.paramTypes, m.returnType);

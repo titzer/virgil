@@ -21,6 +21,7 @@
     (,virgil-builtins-regexp . font-lock-type-face)
 ))
 
+(setq indent-tabs-mode t)
 (set-face-foreground 'font-lock-comment-face "yellow") 
 (set-face-foreground 'font-lock-string-face "red") 
 (set-variable font-lock-comment-face 'font-lock-comment-face)
