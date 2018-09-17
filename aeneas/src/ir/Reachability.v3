@@ -20,8 +20,7 @@ enum RaFact {
 
 def NONE: RaFact.set;
 def countVals(facts: RaFact.set) -> int {
-	if (facts.RF_VAL_MANY) return 2;
-        return if(facts.RF_VAL_ONE, 1, 0);
+	return if(facts.RF_VAL_MANY, 2, if(facts.RF_VAL_ONE, 1));
 }
 def live(facts: RaFact.set) -> bool {
        	return (facts & (RaFact.RC_LIVE | RaFact.RC_ALLOC)) != NONE;
@@ -46,7 +45,6 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 	def heapTypes = Vector<TypeNorm>.new();
 	var liveMethods = Vector<RaMethod>.new();
 	var roots: List<RaRoot>;
-	var uniqueCounter = 1;
 	def setTypeCon = TypeSet_TypeCon.new(prog.typeCache);
 
 	// perform the analysis, starting from the roots
@@ -596,9 +594,6 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 	def mono(t: Type, spec: IrSpec) -> Type {
 		return if(spec != null, spec.instantiateType(t), t);
 	}
-	def uniquify<T>(v: T) -> int {
-		return ++uniqueCounter;
-	}
 }
 // represents a root method, i.e. an entrypoint. Updated to point to normalized code after RMA.
 class RaRoot {
@@ -776,7 +771,7 @@ class RaField(container: Type, orig: IrField, fieldType: TypeNorm, size: int) ex
 		else wfacts = Fact.V_NON_ZERO;
 		writeFacts = writeFacts & wfacts;
 	}
-	def isValue() -> bool {
+	def isConst() -> bool {
         	var f = raFacts, count = countVals(f);
 		if (count == 1) {
 			if (f.RF_INIT) return true; // initialized and a value
@@ -827,6 +822,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	def liveClasses = Vector<RaClass>.new();
 	def allClasses = Vector<RaClass>.new();
 	def context = SsaContext.new(ra.compiler, ra.prog);
+	def fields = Vector<IrField>.new();
 	var recordMap = V3.newRecordMap<Record>(); // XXX: canonicalize equivalent variant records
 	var complexRecordMap = V3.newRecordMap<Array<Record>>();
 	var newIr = IrModule.new();
@@ -946,55 +942,47 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	}
 	// layout fields for classes and components
 	def layoutFields(rc: RaClass) {
-		var b = Vector<IrField>.new();
-		// add all fields
+		fields.length = 0;
+		fields.grow(rc.fields.length);  // gather fields into vector
 		for (rf in rc.fields) {
 			if (rf == null) continue;
 			if (rf.norm != null) {
 				// inherited this field from superclass
-				for (f in rf.norm) b.add(IrField.!(f.member));
-			} else if (requiresStorage(rf)) {
-				// this field requires storage to be allocated
-				rf.normIndex = b.length;
-				if (rf.fieldType == null) addMonoField(rc, rf, b);
-				else addPolyField(rc, rf, b);
+				for (f in rf.norm) fields.add(IrField.!(f.member));
+				continue;
 			}
+			if (rf.isConst()) continue;
+			if (!rf.raFacts.RF_READ) continue;
+			// add normalized field(s)
+			rf.normIndex = fields.length;
+			addField(rc, rf);
 		}
 		if (ra.compiler.target != null) {
 			var start = if(rc.parent != null, rc.parent.normFields.length);
-			ra.compiler.target.computeFieldOffsets(ra.prog, b, start);
+			ra.compiler.target.computeFieldOffsets(ra.prog, fields, start);
 		}
-		rc.normFields = b.extract();
+		rc.normFields = fields.extract();
 	}
-	// check if a field can be optimized away
-	def requiresStorage(rf: RaField) -> bool {
-		if (rf.isValue()) return false; // field is a value
-		if (!rf.raFacts.RF_READ) return false; // field is never read
-		return true;
-	}
-	// add a monomorphic field to the builder
-	def addMonoField(rc: RaClass, rf: RaField, b: Vector<IrField>) {
-		b.add(rf.orig);
-		rf.norm = [IrSpec.new(rc.oldType, [rc.oldType], rf.orig)];
-	}
-	// add a polymorphic field to the builder
-	def addPolyField(rc: RaClass, rf: RaField, b: Vector<IrField>) {
-		var norms = Array<IrSpec>.new(rf.fieldType.size);
-		for (i < norms.length) {
-			var ft = if(rf.fieldType.sub == null, rf.fieldType.newType, rf.fieldType.sub[i]);
+	def addField(rc: RaClass, rf: RaField) {
+		if (rf.fieldType == null) {
+			// add single monomorphic field to the vector
+			fields.add(rf.orig);
+			rf.norm = [IrSpec.new(rc.oldType, [rc.oldType], rf.orig)];
+		} else {
+			// add normalized field(s) to the vector
+			var norms = Array<IrSpec>.new(rf.fieldType.size);
 			var facts = if(rf.fieldType.size > 1, Fact.F_NORM, Facts.NONE);
-			var nf = setSourceAndFacts(rf, IrField.new(rc.oldType, ft), facts);
-			norms[i] = IrSpec.new(rc.oldType, [rc.oldType], nf);
-			b.add(nf);
+			if (!rf.raFacts.RF_WRITTEN) facts |= (Fact.F_VALUE | Fact.O_FOLDABLE);
+			for (i < norms.length) {
+				var ft = if(rf.fieldType.sub == null, rf.fieldType.newType, rf.fieldType.sub[i]);
+				var nf = IrField.new(rc.oldType, ft);
+				nf.setFact(facts);
+				nf.source = rf.orig.source;
+				norms[i] = IrSpec.new(rc.oldType, [rc.oldType], nf);
+				fields.add(nf);
+			}
+			rf.norm = norms;
 		}
-		rf.norm = norms;
-	}
-	// set the source and the facts for a newly allocated IrField
-	def setSourceAndFacts(rf: RaField, nf: IrField, facts: Fact.set) -> IrField {
-		if (!rf.raFacts.RF_WRITTEN) nf.setFact(Fact.F_VALUE | Fact.O_FOLDABLE);
-		nf.setFact(facts);
-		nf.source = rf.orig.source;
-		return nf;
 	}
 	// normalize a live instance of a class
 	def normClassRecord(rc: RaClass, oldRecord: Record, newRecord: Record) {
@@ -1010,10 +998,8 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	}
 	// normalize the live instances of a simple (i.e. size-1 element) array type
 	def normSimpleArrayRecord(record: Record) {
-		var old = record.values;
-		for (i < old.length) {
-			record.values[i] = normSimpleVal(old[i]);
-		}
+		def v = record.values;
+		for (i < v.length) v[i] = normSimpleVal(v[i]);
 	}
 	// normalize the live instances of a complex (i.e. size-N element) array type
 	def normComplexArrayRecord(rt: RaArray, oldRecord: Record, newRecords: Array<Record>) {
@@ -1569,7 +1555,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 	def normComponentGetField(oldApp: SsaApplyOp, op: Operator) {
 		if (oldApp.useList == null) return; // remove unused reads of fields
 		var raField = extractFieldRef(oldApp);
-		if (raField.isValue()) {
+		if (raField.isConst()) {
 			// OPT: inline the field as a constant
 			mapValue(oldApp, raField.val, normReturnType(oldApp.op));
 			return;
@@ -1620,7 +1606,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			// OPT: remove read of zero-width field
 			addNullCheck(oldApp, receiver);
 			return map0(oldApp);
-		} else if (raField.isValue()) {
+		} else if (raField.isConst()) {
 			// OPT: inline the field as a constant
 			addNullCheck(oldApp, receiver);
 			mapValue(oldApp, raField.val, normReturnType(oldApp.op));
