@@ -9,20 +9,27 @@ class SsaInliner extends SsaRebuilder {
 	def callerBlock: SsaBlock;
 	def call: SsaApplyOp;
 	def inlinee: IrSpec;
-	def remnant = call.next;
-	var continuation: SsaBuilder;
+	def contInstrs = call.next;
+	def contEnd = callerBlock.end();
+	var contBlock: SsaBuilder;
 	var inlinedInstrs: int;
 	var retVal: SsaInstr;
 	var returns: List<(SsaCfEdge, SsaInstr)>;
 
 	new(context: SsaContext, callerBlock, call, inlinee) super(context) {
-		var end = callerBlock.end(), prev = call.prev;
+		// ==== Before ===========================================
+		// block ... prev <-> call <-> contInstrs ... contEnd
+		// ^-----------------------------------------------^
+		var prev = call.prev;
 		prev.next = callerBlock;
 		callerBlock.prev = prev;
 		call.next = null;
 		call.prev = null;
-		remnant.prev = null;
-		end.next = null;
+		contInstrs.prev = null;
+		contEnd.next = null;
+		// ==== After ===========================================
+		// block ... prev     call    contInstrs ... contEnd
+		// ^-----------^
 	}
 
 	def inline() {
@@ -91,34 +98,21 @@ class SsaInliner extends SsaRebuilder {
 	}
 	// inline a simple, straight-line method directly into this block
 	def inlineSimple(targetStart: SsaBlock) {
-		continuation = curBlock;
-		var i = targetStart.next;
-		while (i != targetStart) {
-			// translate each instruction in the block
-			if (SsaApplyOp.?(i)) genApplyOp(SsaApplyOp.!(i));
-			else if (SsaThrow.?(i)) genThrow(SsaThrow.!(i));
-			else if (SsaReturn.?(i)) break;
-			if (curBlock.end) return killContinuation();
-			i = i.next;
-		}
-
-		// create the appropriate return value
-		var inputs = SsaReturn.!(i).inputs, rv: SsaInstr;
-		if (inputs.length == 0) rv = newGraph.nop();
-		else if (inputs.length == 1) rv = genRef1(inputs[0]);
-		else rv = curBlock.addApply(null, V3Op.newTupleCreate(inlinee.getReturnType()), genRefs(inputs));
-
-		// replace call instruction with return value
+		contBlock = curBlock;
+		genInstrs(targetStart);
+		if (returns == null) return killContinuation();
+		// replace call instruction with return value(s)
+		var rv = returns.head.1;
 		call.replace(rv);
 		call.kill();
 		// Add the previous instructions at the end of this block.
-		callerBlock.appendN(remnant);
+		callerBlock.appendN(contInstrs);
 	}
 	// inline a method with more than one block into this method
 	def inlineComplex(targetStart: SsaBlock) {
 		// build a block for the continuation
 		var cb = SsaBlock.new();
-		continuation = SsaBuilder.new(context, newGraph, cb);
+		contBlock = SsaBuilder.new(context, newGraph, cb);
 
 		var intoBlock = callerBlock; // start inlining into the callerblock
 		if (targetStart.preds.length > 0) {
@@ -142,26 +136,26 @@ class SsaInliner extends SsaRebuilder {
 			// return value is a phi merging all possible returns from method
 			var inputs = Array<SsaInstr>.new(count), i = 0;
 			for (l = returns; l != null; (l = l.tail, i++)) {
-				if (continuation.block.preds[i] != l.head.0) context.fail("mismatched return");
+				if (contBlock.block.preds[i] != l.head.0) context.fail("mismatched return");
 				inputs[i] = l.head.1;
 			}
 			var phi = SsaPhi.new(inlinee.getReturnType(), cb, inputs);
-			continuation.block.prepend(phi);
+			contBlock.block.prepend(phi);
 			retVal = phi;
 		}
 		// replace call instruction with return value
 		call.replace(retVal);
 		call.kill();
-		// copy the remnant instructions after the inlinee code
-		cb.appendN(remnant);
+		// copy the contInstrs instructions after the inlinee code
+		cb.appendN(contInstrs);
 	}
 	def killContinuation() {
-		if (continuation == null) return;
-		for (i = remnant; i != null; i = i.next) {
+		if (contBlock == null) return;
+		for (i = contInstrs; i != null; i = i.next) {
 			if (SsaInstr.?(i)) SsaInstr.!(i).kill();
 		}
-		SsaCfOptimizer.new(context).killSuccs(continuation.block.succs());
-		continuation = null;
+		SsaCfOptimizer.new(context).killSuccs(contEnd.succs);
+		contBlock = null;
 	}
 	def genApplyOp(oi: SsaApplyOp) {
 		var op = oi.op.subst(inlinee.instantiateType);
@@ -178,25 +172,22 @@ class SsaInliner extends SsaRebuilder {
 			instrMap[oi] = newGraph.nullConst(vtype);
 		}
 	}
-	def normalize_(t: Type) -> TypeNorm {
-		return if (t.open(), TypeNorm.new(t, inlinee.instantiateType(t), null));
-	}
 	def genReturn(oi: SsaReturn) {
-		var edge: SsaCfEdge;
-		if (curBlock.block != callerBlock) {
-			curBlock.addGoto(continuation.block);
-			edge = curBlock.block.succ(0);
-		}
-		// create return value
 		var inputs = oi.inputs, rv: SsaInstr;
-		if (inputs.length == 0) rv = newGraph.nop();
-		else if (inputs.length == 1) rv = genRef1(inputs[0]);
-		else {
+		if (inputs.length == 0) {
+			rv = newGraph.nop();
+		} else if (inputs.length == 1) {
+			rv = genRef1(inputs[0]);
+		} else {
 			rv = curBlock.addApply(null, V3Op.newTupleCreate(inlinee.getReturnType()), genRefs(inputs));
 			inlinedInstrs++;
 		}
-		// generate an (edge, return value) pair
-		returns = List.new((edge, rv), returns);
+		if (curBlock.block != callerBlock) {
+			curBlock.addGoto(contBlock.block);
+			returns = List.new((curBlock.block.succ(0), rv), returns);
+		} else {
+			returns = List.new((null, rv), returns);
+		}
 	}
 	def genThrow(oi: SsaThrow) {
 		curBlock.addThrow(newSource(oi.source), oi.exception);
@@ -204,6 +195,10 @@ class SsaInliner extends SsaRebuilder {
 	}
 	def newSource(source: Source) -> Source {
 		return if(source == null, call.source, Source.new(source.mdecl, source.line, source.column, newSource(source.tail)));
+	}
+	def normType(t: Type) -> TypeNorm {
+		var s = inlinee.instantiateType(t);
+		return if(s != t, TypeNorm.new(t, s, null));
 	}
 }
 // Implements the inlining strategy for early inlining, which occurs right
@@ -244,7 +239,7 @@ class SsaEarlyInliner(context: SsaContext, gen: VstSsaGen) {
 				var loc = if (inliner.call.source != null, inliner.call.source.render, context.spec.render);
 				Terminal.put3("Inlined %1 instructions from %2 into %3\n", inliner.inlinedInstrs, inlinee.render, loc);
 			}
-			if (inliner.continuation == null) return;
+			if (inliner.contBlock == null) return;
 		}
 	}
 	def shouldInline(inlinee: IrSpec) -> bool {
