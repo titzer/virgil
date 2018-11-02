@@ -55,13 +55,17 @@ function runTest(testname) {
     // 4. Perform the runs
     var i = 0;
     for (run of globalTestRuns) {
+        let expect = run[0];
         try  {
-            let expect = run[0];
             let result = main(...run[1]);
             if (result != expect) throw new Error("expected " + expect + ", but got " + result);
-            // TODO: handle testcases that expect to throw an exception
         } catch (e) {
-            return fail(testname, "Run " + i + " failed: " + e);
+            if (expect == WebAssembly.RuntimeError && e instanceof WebAssembly.RuntimeError) {
+                // Successfully caught exception expected to be thrown.
+                // TODO: check the specific error thrown.
+            } else {
+                return fail(testname, "Run " + i + " failed: " + e);
+            }
         }
         i++;
     }
