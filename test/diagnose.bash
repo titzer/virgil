@@ -3,6 +3,7 @@
 debug=1
 jvm=0
 wasm=0
+x86_darwin=1
 
 if [ "-d" = "$1" ]; then
 	debug=1
@@ -11,6 +12,11 @@ fi
 
 if [ "-jvm" = "$1" ]; then
 	jvm=1
+	shift
+fi
+
+if [ "-x86-darwin" = "$1" ]; then
+	x86_darwin=1
 	shift
 fi
 
@@ -64,5 +70,10 @@ elif [ "$wasm" = 1 ]; then
     line
     execute cd $T
     execute $TEST_D8 --trace-wasm-decoder --trace-wasm-interpreter --wasm-interpret-all $VIRGIL_LOC/test/wasm-js-tester.js -- $tests | tee $T/$test.run.wasm.out
-    
+elif [ "$x86_darwin" = 1 ]; then
+    line
+    execute $AENEAS_TEST $V3C_OPTS -fatal -target=x86-darwin-test -output=$T -print-bin -print-mach -print-ssa $tests | tee $T/$test.compile.wasm.out
+    line
+    execute cd $T
+    execute $VIRGIL_LOC/test/testexec-x86-darwin $T $tests
 fi
