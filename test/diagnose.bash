@@ -74,6 +74,5 @@ elif [ "$x86_darwin" = 1 ]; then
     line
     execute $AENEAS_TEST $V3C_OPTS -fatal -target=x86-darwin-test -output=$T -print-bin -print-mach -print-ssa $tests | tee $T/$test.compile.wasm.out
     line
-    execute cd $T
     execute $VIRGIL_LOC/test/testexec-x86-darwin $T $tests
 fi
