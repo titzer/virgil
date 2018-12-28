@@ -404,11 +404,12 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 			ArraySetElem => 	return genArraySetElem(oi);
 			ArrayGetLength => 	ni = genArrayGetLength(oi);
 			ClassAlloc => 		return genClassAlloc(oi);
-			ClassGetField => 	return genClassGetField(oi);
+			ClassGetField => 	return genObjectGetField(false, oi);
 			ClassInitField =>	return genClassSetField(oi, true);
 			ClassSetField => 	return genClassSetField(oi, false);
 			ClassGetMethod => 	ni = genClassGetMethod(oi);
 			ClassGetVirtFunc => 	ni = genClassGetVirtual(oi);
+			VariantGetField => 	return genObjectGetField(true, oi);
 			ComponentGetField => 	return genComponentGetField(oi);
 			ComponentSetField => 	return genComponentSetField(oi);
 			TupleGetElem => 	return genTupleGetElem(oi);
@@ -868,7 +869,8 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		var index = normRef1(oi.inputs[1]);
 		var offset = genArrayElemOffset(hsize, scale, index);
 		// XXX: fold null check into pointer access if no bounds check
-		genNormTypedLoads(oi, false, false, mach.machType(oi.getType()), ptrAdd(narr, offset), 0);
+		var loads = genNormTypedLoads(oi.source, false, mach.machType(oi.getType()), ptrAdd(narr, offset), 0);
+		mapN(oi, loads);
 	}
 	def genArraySetElem(oi: SsaApplyOp) {
 		genBoundsCheck(oi, false);
@@ -919,14 +921,39 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		}
 		return map1(oi, nobj);
 	}
-	def genClassGetField(oi: SsaApplyOp) {
+	def genObjectGetField(isVariant: bool, oi: SsaApplyOp) {
 		var fieldRef = V3Op.extractIrSpec(oi.op);
 		var oobj = oi.inputs[0], nobj = normRef1(oobj);
 		var machType = mach.machType(fieldRef.getFieldType());
 		var offset = mach.classFieldOffset(fieldRef);
 		var nullCheck = V3Op.needsNullCheck(oi, oobj.dest);
-		var nullIsBottom = V3.isVariant(fieldRef.receiver);
-		genNormTypedLoads(oi, nullCheck, nullIsBottom, machType, nobj, offset);
+		if (isVariant) {
+			var tblock: SsaBuilder, fblock: SsaBuilder, merge: SsaBuilder;
+			var sub: Array<Type>;
+			if (nullCheck) {
+				var t = addIfNull(nobj);
+				tblock = t.0;
+				fblock = t.1;
+				merge = t.2;
+				curBlock = fblock;
+				var tn = mach.intNorm.normType(machType);
+				sub = if(tn == null, [machType], tn.sub);
+			}
+			var loads = genNormTypedLoads(oi.source, false, machType, nobj, offset);
+			if (nullCheck) {
+				fblock.addGoto(merge.block);
+				tblock.addGoto(merge.block);
+				curBlock = merge;
+				// if (nobj == null) emit null values
+				for (i < loads.length) {
+					loads[i] = curBlock.addPhi(sub[i], [loads[i], context.graph.valConst(sub[i], null)]);
+				}
+			}
+			mapN(oi, loads);
+		} else {
+			var loads = genNormTypedLoads(oi.source, nullCheck, machType, nobj, offset);
+			mapN(oi, loads);
+		}
 	}
 	def genClassSetField(oi: SsaApplyOp, init: bool) {
 		var inputs = normRefs(oi.inputs);
@@ -970,7 +997,8 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		var fieldRef = V3Op.extractIrSpec(oi.op);
 		var fieldType = mach.machType(fieldRef.getFieldType());
 		var ptr = componentFieldPtr(fieldRef);
-		genNormTypedLoads(oi, false, false, fieldType, ptr, 0);
+		var loads = genNormTypedLoads(oi.source, false, fieldType, ptr, 0);
+		mapN(oi, loads);
 	}
 	def genComponentSetField(oi: SsaApplyOp) {
 		var fieldRef = V3Op.extractIrSpec(oi.op);
@@ -1196,49 +1224,22 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		return SsaBuilder.new(context, context.graph, SsaBlock.new());
 	}
 	// Support for normalizing loads and stores.
-	def genNormTypedLoads(oi: SsaApplyOp, nullCheck: bool, nullIsBottom: bool, machType: Type, base: SsaInstr, offset: int) {
+	def genNormTypedLoads(source: Source, nullCheck: bool, machType: Type, base: SsaInstr, offset: int) -> Array<SsaInstr> {
 		var tn = mach.intNorm.normType(machType);
 		// check for simple case first.
 		if (tn == null) {
-			var result: SsaInstr;
-			if (nullIsBottom) { // generate an explicit null check
-				result = genIfNull(oi, machType, base, null, ptrLoad(machType, _, offset));
-			} else {
-				if (nullCheck) result = ptrLoadT(oi.source, machType, base, offset);
-				else result = ptrLoad(machType, base, offset);
-			}
-			return map1(oi, result);
-		}
-		var tblock: SsaBuilder, fblock: SsaBuilder, merge: SsaBuilder;
-		if (nullCheck && nullIsBottom) {
-			var t = addIfNull(base);
-			tblock = t.0;
-			fblock = t.1;
-			merge = t.2;
-			curBlock = fblock;
+			var result = if(nullCheck, ptrLoadT(source, machType, base, offset), ptrLoad(machType, base, offset));
+			return [result];
 		}
 		// generate multiple loads for normalized fields and array elements.
 		var loads = Array<SsaInstr>.new(tn.size);
 		var check = if(nullCheck, 0, -1);
 		for (i < loads.length) {
-			var load: SsaInstr, et = tn.sub[i];
-			if (i == check) load = ptrLoadT(oi.source, et, base, offset);
-			else load = ptrLoad(et, base, offset);
-			loads[i] = load;
+			var et = tn.sub[i];
+			loads[i] = if(i == check, ptrLoadT(source, et, base, offset), ptrLoad(et, base, offset));
 			offset = offset + mach.sizeOf(et);
 		}
-		if (nullCheck && nullIsBottom) {
-			// TODO: factor this could out with genIfNull into an if-builder?
-			fblock.addGoto(merge.block);
-			tblock.addGoto(merge.block);
-			curBlock = merge;
-			// if (nobj == null) emit null values
-			for (i < loads.length) {
-				loads[i] = curBlock.addPhi(tn.sub[i], [loads[i], context.graph.valConst(tn.sub[i], null)]);
-			}
-		}
-
-		return mapN(oi, loads);
+		return loads;
 	}
 	def genNormTypedStores(oi: SsaApplyOp, nullCheck: bool, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
 		var tn = mach.intNorm.normType(machType);
