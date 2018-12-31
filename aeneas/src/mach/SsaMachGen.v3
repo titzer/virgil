@@ -1,26 +1,56 @@
 // Copyright 2011 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+enum ArithWidth(subword: bool, width: byte) {
+	Sub8(true, 8),
+	Exactly8(false, 8),
+	Sub16(true, 16),
+	Exactly16(false, 16),
+	Sub32(true, 32),
+	Exactly32(false, 32),
+	Sub64(true, 64),
+	Exactly64(false, 64)
+}
 class SsaMachGenConfig {
-	var IntDivZeroTraps = true;	     // int division traps on zero
-	var IntDivOverflowMinint = true;	// int division overflow is minint
-	var Int8Arith = false;		  // native support for int8 arithmetic
+	var IntDivZeroTraps = true;	 // int division traps on zero
+	var IntDivOverflowMinint = true; // int division overflow is minint
+	var Int8Arith = false;		 // native support for int8 arithmetic
 	var Int16Arith = false;		 // native support for int16 arithmetic
-	var Int32Arith = true;		  // native support for int32 arithmetic
+	var Int32Arith = true;		 // native support for int32 arithmetic
 	var Int64Arith = false;		 // native support for int64 arithmetic
-	var StoreNarrow = true;			// enables store narrowing optimization
-	var Int8StoreNarrow = true;	     // storing > 8 bits can narrow
-	var Int16StoreNarrow = true;	    // storing > 16 bits can narrow
-	var Int32StoreNarrow = true;	    // storing > 32 bits can narrow
-	var Int8LoadZeroExtend = true;	  // loading 8 bits can zero extend
-	var Int8LoadSignExtend = true;	  // loading 8 bits can sign extend
+	var StoreNarrow = true;		 // enables store narrowing optimization
+	var Int8StoreNarrow = true;	 // storing > 8 bits can narrow
+	var Int16StoreNarrow = true;	 // storing > 16 bits can narrow
+	var Int32StoreNarrow = true;	 // storing > 32 bits can narrow
+	var Int8LoadZeroExtend = true;	 // loading 8 bits can zero extend
+	var Int8LoadSignExtend = true;	 // loading 8 bits can sign extend
 	var Int16LoadZeroExtend = true;	 // loading 16 bits can zero extend
 	var Int16LoadSignExtend = true;	 // loading 16 bits can sign extend
 	var Int32LoadZeroExtend = true;	 // loading 32 bits can zero extend to 64
 	var Int32LoadSignExtend = true;	 // loading 32 bits can sign extend to 64
 	var Int32ShiftSaturate = false;	 // shift saturates on overflow
-	var NullcheckAreaSize = 0;	      // hardware reserved null check area size
-	var ImplicitNullChecks = true;	  // generate implicit null checks
+	var NullcheckAreaSize = 0;	 // hardware reserved null check area size
+	var ImplicitNullChecks = true;	 // nullchecks implicit with loads+stores
+	var ExplicitDivChecks = false;	 // insert explicit maxint / -1 checks
+	var ExplicitModChecks = false;	 // insert explicit maxint % -1 checks
+
+	def getArithWidth(tt: IntType) -> ArithWidth {
+		// XXX: speed up this routine with a lookup table
+		if (Int8Arith) {
+			if (tt.width < 8) return ArithWidth.Sub8;
+			if (tt.width == 8) return ArithWidth.Exactly8;
+		}
+		if (Int16Arith) {
+			if (tt.width < 16) return ArithWidth.Sub16;
+			if (tt.width == 16) return ArithWidth.Exactly16;
+		}
+		if (Int32Arith) {
+			if (tt.width < 32) return ArithWidth.Sub32;
+			if (tt.width == 32) return ArithWidth.Exactly32;
+		}
+		if (tt.width < 64) return ArithWidth.Sub64;
+		return ArithWidth.Exactly64;
+	}
 }
 
 // Helper for normalizing a graph in place.
@@ -382,9 +412,9 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 			// Output of integer operations must be normalized
 			IntAdd,			// --
 			IntSub,			// --
-			IntMul,			// --
-			IntDiv,			// --
-			IntMod =>		return genTruncatingIntOp(oi);
+			IntMul =>		return genTruncatingIntOp(oi);
+			IntDiv,
+			IntMod => 		return genIntDivOrMod(oi);
 			IntShl,			// --
 			IntSar,			// --
 			IntShr =>		return genShiftOp(oi);
@@ -528,22 +558,41 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 			doShift(oi, op, tt);
 		}
 	}
+	def getShrOp(width: int) -> Operator {
+		return Int.getType(false, width).lookupInfix0(V3Infix.Shr);
+	}
+	def doSignedShr(oi: SsaApplyOp, op: Operator, tt: IntType) -> (Operator, bool) {
+		var trunc = false;
+		var diff = mach.intNorm.width - tt.width;
+		var i0 = oi.input0();
+		if (tt.signed && diff > 0 && !i0.facts.V_NON_NEGATIVE) {
+			var arith = config.getArithWidth(tt);
+			if (arith.subword) {
+				// If this is a signed subword type, the value has is already implicitly sign-extended,
+				// so first shift the sign bit left to the word's sign bit position, and then shift right
+				var i1 = oi.input1();
+				trunc = !i1.facts.V_NON_ZERO;
+				var cdiff = context.graph.intConst(diff);  // TODO: this should probably be a byte constant
+				var shlOp = Int.getType(false, arith.width).lookupInfix0(V3Infix.Shl);
+				oi.inputs[0].update(apply(oi.source, shlOp, [i0, cdiff]));
+				var addOp = Int.getType(false, arith.width).lookupInfix0(V3Infix.Add); // XXX: try to constant-fold here
+				oi.inputs[1].update(apply(oi.source, addOp, [i1, cdiff]));
+			} else {
+				return (getShrOp(arith.width), false);
+			}
+		}
+		return (mach.intNorm.shrOp, trunc);
+	}
 	def doShift(oi: SsaApplyOp, op: Operator, tt: IntType) {
 		if (tt.width <= mach.intNorm.width) {
 			// 2 -> 1 operation.
 			normInputs(oi);
 			var diff = mach.intNorm.width - tt.width;
-			var trunc = false, i0 = oi.input0(), i1 = oi.input1();
+			var trunc = false;
 			if (op.opcode == Opcode.IntShr) {
-				// Rewrite SHR (logical shift right) operations.
-				if (tt.signed && diff > 0 && !i0.facts.V_NON_NEGATIVE) {
-					trunc = !i1.facts.V_NON_ZERO;
-					var cdiff = context.graph.intConst(diff);
-					// XXX: constant fold some shifts
-					oi.inputs[0].update(apply(oi.source, mach.intNorm.shlOp, [i0, cdiff]));
-					oi.inputs[1].update(apply(oi.source, mach.intNorm.addOp, [i1, cdiff]));
-				}
-				op = mach.intNorm.shrOp;
+				var t = doSignedShr(oi, op, tt);
+				op = t.0;
+				trunc = t.1;
 			} else if (op.opcode == Opcode.IntShl) {
 				trunc = true;
 			}
@@ -577,7 +626,7 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		var trunc = false;
 		if (op.opcode == Opcode.IntShl) trunc = true;
 		else if (op.opcode == Opcode.IntShr) {
-			op = mach.intNorm.word.lookupInfix0(V3Infix.Shr);
+			op = mach.intNorm.shrOp;
 			var bigEnd = tn.bigEndIndex();
 			if ((tt.width % mach.intNorm.width != 0) && !inputs[bigEnd].facts.V_NON_NEGATIVE) {
 				// convert input big end to unsigned
@@ -599,6 +648,42 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		if ((shift % mach.intNorm.width) != 0) return -1;
 		return shift / mach.intNorm.width;
 	}
+	def genIntDivOrMod(oi: SsaApplyOp) {
+		if (oi.checkFact(Fact.O_NO_DIV_CHECK)) return genTruncatingIntOp(oi);
+		if ((config.ExplicitDivChecks && oi.op.opcode == Opcode.IntDiv) ||
+		    (config.ExplicitModChecks && oi.op.opcode == Opcode.IntMod)) {
+			var tt = IntType.!(oi.op.sig.returnType());
+			if (tt.signed) {
+				var t = splitCurBlock(), tblock = t.0, fblock = t.1, merge = t.2;
+				var x = oi.input0(), y = oi.input1();
+				var minus1 = context.graph.valConst(tt, tt.box(-1));
+				var cmp = curBlock.add(tt.lookupInfix0(V3Infix.Equal), [y, minus1], Facts.NONE);
+				curBlock.addIf(cmp, tblock.block, fblock.block);
+				var zero = context.graph.nullConst(tt);
+				var tv: SsaInstr;
+				if (oi.op.opcode == Opcode.IntDiv) {
+					// TODO: use lowering instead of map1keep for {0 - x}
+					tv = tblock.add(tt.lookupInfix0(V3Infix.Sub), [zero, x], Facts.NONE);
+					map1keep(tv, tv);
+				} else {
+					tv = zero;  // x % -1 == #0
+				}
+				var ni = fblock.add(oi.op, [x, y], oi.facts | Fact.O_NO_DIV_CHECK);
+				// TODO: use lowering instead of map1keep for new {x op y}
+				map1keep(ni, ni);
+				tblock.addGoto(merge.block);
+				fblock.addGoto(merge.block);
+				var phi = merge.addPhi(tt, [tv, ni]);
+				oi.replace(phi);
+				oi.remove();
+				curBlock = merge;
+				curBlock.pt = null;
+				getReplacements(phi);
+				return;
+			}
+		}
+		return genTruncatingIntOp(oi);
+	}
 	def genTruncatingIntOp(oi: SsaApplyOp) {
 		var tt = IntType.!(oi.op.sig.returnType());
 		var tn = mach.intNorm.normType(tt);
@@ -613,20 +698,19 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		}
 	}
 	def genTruncateInPlace(oi: SsaApplyOp, tt: IntType) {
-		if (tt.width >= mach.intNorm.width) return id(oi);
-		var arithWidth = mach.intNorm.width;
-		if (config.Int32Arith) {
-			if (tt.width == 32) return id(oi);
+		var width = tt.width, arithWidth = mach.intNorm.width;
+		if (width >= arithWidth) return id(oi);
+		if (config.Int8Arith && width <= 8) {
+			if (width == 8) return id(oi);
+			arithWidth = 8;
+		} else if (config.Int16Arith && width <= 16) {
+			if (width == 16) return id(oi);
+			arithWidth = 16;
+		} else if (config.Int32Arith && width <= 32) {
+			if (width == 32) return id(oi);
 			arithWidth = 32;
 		}
-		if (config.Int16Arith) {
-			if (tt.width == 16) return id(oi);
-			arithWidth = 16;
-		}
-		if (config.Int8Arith) {
-			if (tt.width == 8) return id(oi);
-			arithWidth = 8;
-		}
+
 		curBlock.pt = oi.next;
 		var arithType = if(arithWidth == mach.intNorm.width, mach.intNorm.word, Int.getType(false, arithWidth));
 		var trunc = curBlock.opIntConvert0(arithType, oi.op.sig.returnType(), oi);
@@ -699,7 +783,13 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		return map1(oi, ni);
 	}
 	def opIntConvertNorm(ft: IntType, tt: IntType, x: SsaInstr) -> SsaInstr {
-		if ((ft.width == tt.width) && ft.width == mach.intNorm.width) return x;
+		if (ft.width == tt.width) {
+			if (ft.width == mach.intNorm.width) return x;
+			if (ft.width == 32 && config.Int32Arith) return x;
+			if (ft.width == 16 && config.Int16Arith) return x;
+			if (ft.width == 8 && config.Int8Arith) return x;
+		}
+		if (config.Int32Arith && ft.extendsToLong(tt)) return curBlock.opIntConvert0(ft, tt, x);
 		if (ft.extendsTo(tt)) return x;
 		return curBlock.opIntConvert0(ft, tt, x);
 	}
@@ -1073,7 +1163,7 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 
 	def explicitNullCheck(source: Source, t: Type, nobj: SsaInstr) -> SsaInstr {
 		if (context.compiler.DisableNullChecks) return nobj;
-		var check = apply(null, V3Op.newEqual(t), [nobj, context.graph.nullConst(t)]);
+		var check = apply(null, V3Op.newRefEqual(t), [nobj, context.graph.nullConst(t)]);
 		apply(source, V3Op.newConditionalThrow(V3Exception.NullCheck), [check]);
 		return nobj;
 	}
@@ -1147,7 +1237,10 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		return i;
 	}
 	def ptrLoadT(source: Source, t: Type, p: SsaInstr, offset: int) -> SsaInstr {
-		if (!config.ImplicitNullChecks) explicitNullCheck(source, p.getType(), p);
+		if (!config.ImplicitNullChecks) {
+			explicitNullCheck(source, p.getType(), p);
+			if (t == Void.TYPE) return context.graph.nop();
+		}
 		if (offset != 0) p = ptrAdd(p, context.graph.intConst(offset));
 		return apply(source, MachOp.newPtrLoad(p.getType(), t), [p]); // this load may trap
 	}
@@ -1157,7 +1250,10 @@ class SsaMachGen(mach: MachProgram, compiler: Compiler, config: SsaMachGenConfig
 		return i;
 	}
 	def ptrStoreT(source: Source, vt: Type, p: SsaInstr, offset: int, v: SsaInstr) -> SsaInstr {
-		if (!config.ImplicitNullChecks) explicitNullCheck(source, p.getType(), p);
+		if (!config.ImplicitNullChecks) {
+			explicitNullCheck(source, p.getType(), p);
+			if (vt == Void.TYPE) return context.graph.nop();
+		}
 		return ptrStoreCommon(source, vt, p, offset, v);
 	}
 	def ptrStoreCommon(source: Source, vt: Type, p: SsaInstr, offset: int, v: SsaInstr) -> SsaInstr {
