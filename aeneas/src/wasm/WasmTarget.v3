@@ -1,23 +1,28 @@
 // Copyright 2016 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// TODO(wasm): mtable handling
-// TODO(wasm): indirect function table
-// TODO(wasm): size of initialized heap
-// TODO(wasm): codegen multiple return values
 // TODO(wasm): codegen system ops
-// TODO(wasm): codegen explicit nullchecks
 // TODO(wasm): stacktrace reconstruction
-// TODO(wasm): allocation stub with fallback to GC
 // TODO(wasm): garbage collector
 // TODO(wasm): shadow stack spilling/reloading
+// XXX(wasm): improve cfg optimizer
+// XXX(wasm): isel of if x != 0
 // XXX(wasm): default init of locals
-// XXX(wasm): use wasm globals for component fields
 
+// Install targets into registry for the compiler
+component WasmComponent {
+	new() {
+		Aeneas.registerTarget(WasmTarget.new("wasm-js-test", true));
+//		Aeneas.registerTarget(WasmTarget.new("wasm-js", false));
+//		Aeneas.registerTarget(WasmTarget.new("wasm", false));
+	}
+}
 def WASM_PAGE_SIZE = 65536;
 def WASM_MAGIC = 0x6d736100;
 def WASM_VERSION = 0x1;
+def XXX: Terminal;
 
+// Constants for the binary encoding of sections
 component WasmSection {
 	def UNKNOWN: byte = 0;   // code for unknown sections
 	def TYPE: byte = 1;      // Function signature declarations
@@ -33,21 +38,70 @@ component WasmSection {
 	def DATA: byte = 11;     // Data segments
 	def NAME: byte = 12;     // Name section (encoded as a string)
 }
-
+// Constants for the binary encodings of import/export kinds
 component WasmExternal {
 	def FUNCTION: byte = 0;
 	def TABLE: byte = 1;
 	def MEMORY: byte = 2;
 	def GLOBAL: byte = 3;
 }
+// Constants for WASM value types
+component WasmType {
+	def Void: byte = 0x40;
+	def I32: byte = 0x7f;
+	def I64: byte = 0x7e;
+	def F32: byte = 0x7d;
+	def F64: byte = 0x7c;
+	def AnyFunc: byte = 0x70;
+	def AnyRef: byte = 0x6f;
+	def ExceptRef: byte = 0x68;
+	def FuncTypeForm: byte = 0x60;
 
-// Install targets into registry for the compiler
-component WasmComponent {
-	new() {
-		Aeneas.registerTarget(WasmTarget.new("wasm-js-test", true));
-//		Aeneas.registerTarget(WasmTarget.new("wasm-js", false));
-//		Aeneas.registerTarget(WasmTarget.new("wasm", false));
+	def name(b: byte) -> string {
+		match (b) {
+			Void => return "void";
+			I32 => return "i32";
+			I64 => return "i64";
+			F32 => return "f32";
+			F64 => return "f64";
+			_ => return "<unknown>";
+		}
 	}
+	def of(t: Type) -> byte {
+		match (t.typeCon.kind) {
+			V3Kind.INT => return toWasmIntType(IntType.!(t));
+			V3Kind.ENUM => return toWasmIntType(V3.getVariantTagType(t));
+			V3Kind.ENUM_SET => return toWasmIntType(V3.getEnumSetType(t));
+			_ => return WasmType.I32;
+		}
+	}
+}
+def toWasmIntType(t: IntType) -> byte {
+	return if(t.width <= 32, WasmType.I32, WasmType.I64);
+}
+// A helper to emit properly-sized sections
+class WasmSectionBuffer extends MachDataBuffer {
+	var sizepos = -1;
+	var start = -1;
+	new(initialSize: int) super(WASM_PAGE_SIZE, 0, false, initialSize) {
+	}
+	def startSection(code: byte) {
+		if (sizepos >= 0) return V3.fail("unterminated section");
+		i1(code);
+		sizepos = skip_u4leb();
+		start = pos;
+	}
+	def endSection() {
+		atEnd();
+		if (sizepos < 0) return V3.fail("unstarted section");
+		patchSize(this, sizepos, pos - start);
+		sizepos = -1;
+		start = -1;
+	}
+}
+def patchSize(buffer: MachDataBuffer, offset: int, size: int) {
+	buffer.overwrite_u4leb(offset, size);
+	buffer.atEnd();
 }
 // Common code for all WASM targets
 class WasmTarget extends Target {
@@ -60,6 +114,7 @@ class WasmTarget extends Target {
 		def intNorm = IntNormalizers.I64LE;
 		var mach = MachProgram.new(prog, space, space, intNorm);
 		compiler.Reachability = true;
+		compiler.setSignatureLimits(10000, 1);
 		MachModule.install(prog);
 		mach.runtime = MachRuntime.new(mach);
 		var cirt = CiRuntime_TypeCon.new(MachModule.PTR_32.create0(), mach.runtime);
@@ -78,175 +133,189 @@ class WasmTarget extends Target {
 		// Lower to machine level from V3 level
 		def config = SsaMachGenConfig.new();
 		config.ImplicitNullChecks = false;
+		config.ExplicitDivChecks = true;
 		config.Int32Arith = true;
 		config.Int64Arith = true;
 		rt.mach.build(context.compiler, config);
-		def buffer = MachDataBuffer.new(WASM_PAGE_SIZE, 0, false, 300);
+		def initialSize = 300;
+		def out = WasmSectionBuffer.new(initialSize);
 
 		// (1) Encode the WASM header
 		//--------------------------------------------------------------------------------
-		buffer.i4(WASM_MAGIC);
-		buffer.i4(WASM_VERSION);
+		out.i4(WASM_MAGIC);
+		out.i4(WASM_VERSION);
 
 		var sizepos: int, start: int;
 
-		// Add all the method signatures to the signatures vector
-		def wasm = WasmProgram.new(rt.mach), m = rt.mach;
+		// Add the allocation stub if the program might dynamically allocate memory.
+		def wasm = WasmProgram.new(rt.mach, context), m = rt.mach;
 		def methods = prog.ir.methods;
-		var allocateStubSigIndex = 0u, numFunctions = 0;
+		var allocateStubSigIndex = 0u;
 		if (m.allocates) {  // add allocation stub
 			var sig = FuncType.!(Function.newType(Int.TYPE, Int.TYPE)).sig();
-			allocateStubSigIndex = wasm.addSig(sig);
-			numFunctions = 1;
+			allocateStubSigIndex = wasm.addSig(Void.TYPE, sig);
+			wasm.numFunctions = 1;
 		}
-		var main = IrMethod.!(prog.getMain().member), main_index = -1;
+		// Add all the method signatures to the signatures vector
+		wasm.addIrMethods();
+		// Add all the indirect adapter methods and their signatures
+		// (also assigns addresses for indirectly-referenced functions).
+		m.layoutAllRecordsAndFuncs();
+		m.methodMap.apply(wasm.addIrMethodAddr);
+		m.mtableMap.apply(wasm.addMtable);
+
+		// Generate WASM code into the code buffer. Generating code populates
+		// the signatures and indirect table, which must happen before they can
+		// be emitted.
+		def codebuf = MachDataBuffer.new(WASM_PAGE_SIZE, 0, false, initialSize);
+		var codegen = WasmCodeGen.new(context, wasm, rt, codebuf);
+		if (m.allocates) { // add allocation stub body
+			codegen.generateTestAllocationStub();
+		}
 		for (i < methods.length) {
 			var m = methods[i];
-			wasm.addSig(m.sig);
-			m.machIndex = numFunctions++;
-			if (m == main) main_index = m.machIndex;
+			codegen.generateWasm(m);
+		}
+		for (i < wasm.indirectAdapters.length) {
+			codegen.generateIndirectAdapter(wasm.indirectAdapters[i]);
 		}
 
 		// (2) Emit signatures (types)
 		//--------------------------------------------------------------------------------
-		sizepos = emitSection(buffer, WasmSection.TYPE);
-		start = buffer.pos;
-		buffer.u4leb(u32.!(wasm.signatures.length));
-		for (i < wasm.signatures.length) {
-			var sig = wasm.signatures[i];
-			buffer.u4leb(0x60u); // function type form
-			var params = sig.0;
-			buffer.u4leb(u32.!(params.length));
-			for (p in params) buffer.i1(p);
-			var rets = sig.1;
-			buffer.u4leb(u32.!(rets.length));
-			for (p in rets) buffer.i1(p);
-		}
-		patchSectionSize(buffer, sizepos, buffer.pos - start);
+		out.startSection(WasmSection.TYPE);
+		out.i4leb(wasm.sigTable.count);
+		wasm.sigTable.emit(out);
+		out.endSection();
 
 		// (3) Emit imports
 		//--------------------------------------------------------------------------------
 
 		// (4) Emit function signature declarations
 		//--------------------------------------------------------------------------------
-		sizepos = emitSection(buffer, WasmSection.FUNCTION);
-		start = buffer.pos;
-		buffer.u4leb(u32.!(numFunctions));
+		out.startSection(WasmSection.FUNCTION);
+		out.u4leb(wasm.numFunctions);
 		if (m.allocates) {  // add allocation stub
-			buffer.u4leb(allocateStubSigIndex);
+			out.u4leb(allocateStubSigIndex);
 		}
 		for (i < methods.length) {
 			var m = methods[i];
-			buffer.u4leb(wasm.getSigIndex(m));
+			context.method = m;
+			out.u4leb(wasm.getSigIndex(m));
 		}
-		patchSectionSize(buffer, sizepos, buffer.pos - start);
+		for (i < wasm.indirectAdapters.length) {
+			var e = wasm.indirectAdapters[i];
+			out.u4leb(e.1);
+		}
+		out.endSection();
 
 		// (5) Emit indirect function table
 		//--------------------------------------------------------------------------------
-		// TODO: build the indirect function table from the mtables
+		var table_length = u32.!(wasm.functionTable.length + 1);
+		if (table_length > 1 || wasm.containsCallIndirect) {
+			out.startSection(WasmSection.TABLE);
+			out.i1(1);  // 1 table
+			out.i1(WasmType.AnyFunc);  // type of table
+			out.i1(1);	// flags = contains maximum
+			out.u4leb(table_length);  // initial table length
+			out.u4leb(table_length);  // maximum table length
+			out.endSection();
+		}
 
 		// (6) Emit memory section
 		//--------------------------------------------------------------------------------
-		sizepos = emitSection(buffer, WasmSection.MEMORY);
-		start = buffer.pos;
-		buffer.i1(1);	// 1 memory
+		out.startSection(WasmSection.MEMORY);
+		out.i1(1);	// 1 memory
 		// add the size of initialized memory and runtime to the heap size
-		m.layoutAllRecords();
 		var initSize = m.metaRegion.mark + m.dataRegion.mark;
 		var pages = 2u + u32.!((rt.heapSize + initSize + (WASM_PAGE_SIZE - 1)) / WASM_PAGE_SIZE);
-		buffer.i1(1);	// flags = contains maximum
-		buffer.u4leb(pages); // initial memory size
-		buffer.u4leb(pages); // maximum memory size
-		patchSectionSize(buffer, sizepos, buffer.pos - start);
+		out.i1(1);	// flags = contains maximum
+		out.u4leb(pages); // initial memory size
+		out.u4leb(pages); // maximum memory size
+		out.endSection();
 
 		// (7) Emit the export section
 		//--------------------------------------------------------------------------------
-		if (main_index >= 0) {
-			sizepos = emitSection(buffer, WasmSection.EXPORT);
-			start = buffer.pos;
-			buffer.i1(1);		  // 1 export: main
+		if (wasm.main_index >= 0) {
+			out.startSection(WasmSection.EXPORT);
+			out.i1(1);		  // 1 export: main
 //			var str = main.source.renderLong(StringBuffer.new()).toString();
-			buffer.i1(4);
-			buffer.iN("main");
-			buffer.i1(WasmExternal.FUNCTION);  // export function
-			buffer.u4leb(u32.!(main_index));
-			patchSectionSize(buffer, sizepos, buffer.pos - start);
+			out.i1(4);
+			out.iN("main");
+			out.i1(WasmExternal.FUNCTION);  // export function
+			out.u4leb(u32.!(wasm.main_index));
+			out.endSection();
 		}
 
-		// (8) Emit the function bodies
+		// (8) Emit the function table entries
 		//--------------------------------------------------------------------------------
-		sizepos = emitSection(buffer, WasmSection.CODE);
-		start = buffer.pos;
-		buffer.u4leb(u32.!(numFunctions));
-		var codegen = WasmCodeGen.new(context, wasm, rt, buffer);
-		if (m.allocates) { // add allocation stub body
-			def b = buffer.i1, cl = CiRuntimeModule.HEAP_CUR_LOC;
-			var sizepos = buffer.pos;
-			b(/*body_size=*/0);
-			var start = buffer.pos;
-			b(/*locals_count=*/0);
-			b(WasmOp.I32_CONST.opcode); codegen.emitAddr(cl);
-			b(WasmOp.I32_LOAD.opcode); b(/*align=*/2); b(/*offset=*/0);
-			b(WasmOp.I32_CONST.opcode); codegen.emitAddr(cl);
-			b(WasmOp.I32_CONST.opcode); codegen.emitAddr(cl);
-			b(WasmOp.I32_LOAD.opcode); b(/*align=*/2); b(/*offset=*/0);
-			b(WasmOp.GET_LOCAL.opcode); b(0);
-			b(WasmOp.I32_ADD.opcode);
-			b(WasmOp.I32_STORE.opcode); b(/*align=*/2); b(/*offset=*/0);
-			b(WasmOp.END.opcode);
-			var bodysize = buffer.pos - start;
-			buffer.at(sizepos).i1(bodysize);
-			buffer.atEnd();
+		if (table_length > 1) {
+			out.startSection(WasmSection.ELEMENT);
+			out.u4leb(1);  // 1 table init entry
+			out.i1(0);  // table index = 0
+			// start init expr for base index of elements
+			out.i1(WasmOp.I32_CONST.opcode);
+			out.i1(1);  // start index of elements; 0 is reserved for null function
+			out.i1(WasmOp.END.opcode);
+			// end init expr
+			out.u4leb(table_length-1);
+			for (i < wasm.functionTable.length) {
+				var entry = wasm.functionTable[i];
+				out.u4leb(entry.1);
+//				XXX.put2("functionTable[%1] = %2\n", i, int.!(entry.1));
+			}
+			out.endSection();
 		}
-		for (i < methods.length) {
-			codegen.generateWasm(methods[i]);
-		}
-		patchSectionSize(buffer, sizepos, buffer.pos - start);
+
+		// (9) Emit the function bodies
+		//--------------------------------------------------------------------------------
+		out.startSection(WasmSection.CODE);
+		out.u4leb(u32.!(wasm.numFunctions));
+		out.md(codebuf);
+		out.endSection();
 
 		// (9) Emit the data section
 		//--------------------------------------------------------------------------------
-		sizepos = emitSection(buffer, WasmSection.DATA);
-		start = buffer.pos;
-		buffer.i1(1); // 1 data entry
-		buffer.i1(0); // linear memory #0
-		buffer.i1(WasmOp.I32_CONST.opcode);
-		buffer.i4leb(WASM_PAGE_SIZE);  // linear memory offset
-		buffer.i1(WasmOp.END.opcode);
-		var data_sizepos = buffer.skip_u4leb(); // data size
-		var data_start = buffer.pos;
-		buffer.startAddr = WASM_PAGE_SIZE - buffer.end();
+		out.startSection(WasmSection.DATA);
+		out.i1(1); // 1 data entry
+		out.i1(0); // linear memory #0
+		out.i1(WasmOp.I32_CONST.opcode);
+		out.i4leb(WASM_PAGE_SIZE);  // linear memory offset
+		out.i1(WasmOp.END.opcode);
+		var data_sizepos = out.skip_u4leb(); // data size
+		var data_start = out.pos;
+		out.startAddr = WASM_PAGE_SIZE - out.end();
 		// Encode meta region
-		if (Aeneas.PRINT_MACH.get()) Terminal.put1("META_START=%1\n", buffer.endAddr());
-		m.metaRegion.setStartAddr(buffer.endAddr());
-		m.encodeRegion(m.metaRegion, buffer);
+		if (Aeneas.PRINT_MACH.get()) Terminal.put1("META_START=%1\n", out.endAddr());
+		m.metaRegion.setStartAddr(out.endAddr());
+		m.encodeRegion(m.metaRegion, out);
 		// Encode data region
-		if (Aeneas.PRINT_MACH.get()) Terminal.put1("DATA_START=%1\n", buffer.endAddr());
-		m.dataRegion.setStartAddr(buffer.endAddr());
-		m.encodeRegion(m.dataRegion, buffer);
-		if (Aeneas.PRINT_MACH.get()) Terminal.put1("DATA_END=%1\n", buffer.endAddr());
+		if (Aeneas.PRINT_MACH.get()) Terminal.put1("DATA_START=%1\n", out.endAddr());
+		m.dataRegion.setStartAddr(out.endAddr());
+		m.encodeRegion(m.dataRegion, out);
+		if (Aeneas.PRINT_MACH.get()) Terminal.put1("DATA_END=%1\n", out.endAddr());
 		// Add the heap pointers after the initialized data. XXX: use WASM globals.
-		if (m.allocates) rt.addHeapPointers(buffer);
+		if (m.allocates) rt.addHeapPointers(out);
 
-		patchSectionSize(buffer, data_sizepos, buffer.pos - data_start);
-		patchSectionSize(buffer, sizepos, buffer.pos - start);
+		patchSize(out, data_sizepos, out.atEnd().pos - data_start);
+		out.endSection();
 
-		buffer.patch(patchAddress(wasm.mach, _, _, _, _));
+		out.patch(patchAddress(wasm.mach, _, _, _, _));
 
 		// (10) Emit the name section
 		//--------------------------------------------------------------------------------
 		if (false) { // TODO: names
-		sizepos = emitSection(buffer, WasmSection.UNKNOWN);
-		buffer.u4leb(4);
-		buffer.iN("name");
-		start = buffer.pos;
-		buffer.u4leb(u32.!(methods.length));
+		out.startSection(WasmSection.UNKNOWN);
+		out.u4leb(4);
+		out.iN("name");
+		start = out.pos;
+		out.u4leb(u32.!(methods.length));
 		var namebuf = StringBuffer.new();
 		for (i < methods.length) {
 			var m = methods[i];
-			emitMethodName(buffer, m, namebuf);
-			buffer.i1(0);  // locals count
+			emitMethodName(out, m, namebuf);
+			out.i1(0);  // locals count
 		}
-		patchSectionSize(buffer, sizepos, buffer.pos - start);
+		out.endSection();
 		}
 
 		// Dump the bytes to the file
@@ -256,7 +325,7 @@ class WasmTarget extends Target {
 			prog.ERROR.OutputError(fileName);
 			return false;
 		}
-		System.fileWriteK(fd, buffer.array, 0, buffer.end());
+		System.fileWriteK(fd, out.array, 0, out.end());
 		System.fileClose(fd);
 		return true;
 	}
@@ -307,6 +376,7 @@ class WasmTarget extends Target {
 		if (r == null) return buf.puts("0");
 		if (Box<int>.?(r)) return buf.puti(Int.unbox(Val.!(r)));
 		if (Box<bool>.?(r)) return buf.puti(if(Bool.unbox(Val.!(r)), 1, 0));
+		if (Exception.?(r)) return buf.puts("WebAssembly.RuntimeError");
 		// TODO(fsi64 values)
 		return buf;
 	}
@@ -319,14 +389,6 @@ class WasmTarget extends Target {
 	def getRuntime(prog: Program) -> MachRuntime {
 		return CiRuntime_TypeCon.!(prog.typeEnv.lookup(CiRuntimeModule.NAME)).runtime;
 	}
-	def emitSection(buffer: MachDataBuffer, code: int) -> int {
-		buffer.i1(code);
-		return buffer.skip_u4leb();
-	}
-	def patchSectionSize(buffer: MachDataBuffer, offset: int, size: int) {
-		buffer.overwrite_u4leb(offset, size);
-		buffer.atEnd();
-	}
 	def emitMethodName(buffer: MachDataBuffer, m: IrMethod, namebuf: StringBuffer) {
 		namebuf.reset();
 		m.renderLong(namebuf);
@@ -334,57 +396,109 @@ class WasmTarget extends Target {
 		buffer.iN(namebuf.buffer);
 	}
 }
-class WasmProgram(mach: MachProgram) {
-	def map = HashMap<Signature, int>.new(Signature.hash, Signature.==);
-	def signatures = Vector<(Array<byte>, Array<byte>)>.new();
-
-	def addSig(sig: Signature) -> u32 {
-		var index = map[sig];
-		if (index <= 0) {
-			var params = Arrays.map(sig.paramTypes, WasmType.of);
-			var rets = Arrays.map(sig.returnTypes, WasmType.of);
-			signatures.add(params, rets);
-			index = signatures.length;
-			map[sig] = index;
+// Canonicalizes and encodes signatures into WASM function sigs
+class SignatureTable {
+	def typeMap = HashMap<Signature, int>.new(Signature.hash, Signature.equals);
+	def buf = DataBuffer.new(false, Array<byte>.new(100), 0, null);
+	var rawMap: HashMap<(int, int), int>;
+	var count = 0;
+	new() {
+		rawMap = HashMap.new(hash, equal);
+	}
+	def add(sig: Signature) -> u32 {
+		// fastpath: type-based lookup
+		var index = typeMap[sig];
+		if (index > 0) return u32.!(index - 1);
+		// slowpath: encode a new entry into the table and de-duplicate
+		var before = buf.pos;
+		buf.u4leb(WasmType.FuncTypeForm);
+		var params = sig.paramTypes;
+		buf.u4leb(u32.!(params.length));
+		for (p in params) buf.i1(WasmType.of(p));
+		var rets = sig.returnTypes;
+		buf.u4leb(u32.!(rets.length));
+		for (p in rets) buf.i1(WasmType.of(p));
+		var len = buf.pos - before;
+		// raw map lookup will find any previous identical entry
+		index = rawMap[(before, len)];
+		if (index <= 0) {  // not found, add the entry
+			index = ++count;
+			rawMap[(before, len)] = index;
+		} else {  // found, remove the new entry and remove the old one
+			buf.max = buf.pos = before;
 		}
+		typeMap[sig] = index;
 		return u32.!(index - 1);
+	}
+	def hash(begin: int, len: int) -> int {
+		var hashval = 0, end = begin + len;
+		var array = buf.array;
+		for (i = begin; i < end; i++) hashval = hashval * 31 + array[i];
+		return hashval;
+	}
+	def equal(a: (int, int), b: (int, int)) -> bool {
+		if (a.1 != b.1) return false;
+		var array = buf.array;
+		for (i < a.1) if (array[a.0 + i] != array[b.0 + i]) return false;
+		return true;
+	}
+	def emit(out: DataBuffer) {
+		out.iK(buf.atEnd().array, 0, buf.pos);
+	}
+}
+class WasmProgram(mach: MachProgram, context: SsaContext) {
+	def sigTable = SignatureTable.new();
+	def functionTable = Vector<(IrMethod, u32)>.new();
+	def indirectAdapters = Vector<(Signature, u32, IrMethod)>.new();
+	var numFunctions = 0u;
+	var main_index = -1;
+	var containsCallIndirect = false;
+
+	def addSig(receiver: Type, sig: Signature) -> u32 {
+		if (receiver != Void.TYPE) sig = Signature.new(null, Arrays.prepend(receiver, sig.paramTypes), sig.returnTypes);
+		return sigTable.add(sig);
 	}
 	def getSigIndex(m: IrMethod) -> u32 {
-		return getSigIndexByType(m.sig);
-	}
-	def getSigIndexByType(sig: Signature) -> u32 {
-		var index = map[sig];
-		if (index == 0) return V3.fail("method signature not found");
+		var sig = m.sig;
+		if (!V3.isComponent(m.receiver)) {
+			sig = Signature.new(null, Arrays.prepend(m.ssa.params[0].vtype, sig.paramTypes), sig.returnTypes);
+		}
+		var index = sigTable.typeMap[sig];
+		if (index == 0) context.fail1("method signature not found: %1", sig.funcType().render);
 		return u32.!(index - 1);
 	}
-}
-
-component WasmType {
-	def Void: byte = 0x40;
-	def I32: byte = 0x7f;
-	def I64: byte = 0x7e;
-	def F32: byte = 0x7d;
-	def F64: byte = 0x7c;
-
-	def name(b: byte) -> string {
-		match (b) {
-			Void => return "void";
-			I32 => return "i32";
-			I64 => return "i64";
-			F32 => return "f32";
-			F64 => return "f64";
-			_ => return "<unknown>";
+	def addIrMethodAddr(m: IrItem, addr: Address<IrMethod>) {
+		var m = addr.val;
+		// allocate indirect call wrapper for component methods (first param void)
+		if (m.machIndex < 0) context.fail1("method not assigned an index: %1", m.renderLong);
+		var tableEntry = u32.!(m.machIndex);
+		if (V3.isComponent(m.receiver)) {
+			// component method; allocate a signature with the object type prepended
+			var index = addSig(AnyObject.TYPE, m.sig);
+			indirectAdapters.add((m.sig, index, m));
+			tableEntry = numFunctions++;  // the indirect adapter goes in the table
+//			XXX.put2("indirect adapter #%1 -> %2\n", m.renderLong, tableEntry);
+		}
+		// an IrMethod's "address" is its index into the function table
+		addr.absolute = functionTable.length + 1;
+//		XXX.put3("addIrMethodAddr #%1 [%2] = %3\n", m.renderLong, addr.absolute, int.!(tableEntry));
+		functionTable.add((m, tableEntry));
+	}
+	def addIrMethods() {
+		var main = IrMethod.!(mach.prog.getMain().member);
+		var methods = mach.prog.ir.methods;
+		for (i < methods.length) {
+			var m = methods[i];
+			addSig(m.ssa.params[0].vtype, m.sig);
+			m.machIndex = int.!(numFunctions++);
+			if (m == main) main_index = m.machIndex;
 		}
 	}
-	def of(t: Type) -> byte {
-		match (t.typeCon.kind) {
-			V3Kind.INT => return toWasmIntType(IntType.!(t));
-			V3Kind.ENUM => return toWasmIntType(V3.getVariantTagType(t));
-			V3Kind.ENUM_SET => return toWasmIntType(V3.getEnumSetType(t));
-			_ => return WasmType.I32;
+	def addMtable(m: IrItem, addr: Addr) {
+		var mtable = IrMtable.!(m);
+		for (m in mtable.table) {
+			if (m != null) addIrMethodAddr(m, mach.addrOfMethod(m));
 		}
 	}
 }
-def toWasmIntType(t: IntType) -> byte {
-	return if(t.width <= 32, WasmType.I32, WasmType.I64);
-}
+

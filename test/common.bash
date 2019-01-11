@@ -182,7 +182,8 @@ function run_wasm_tests() {
 	check_red $C
 
 	print_status Running wasm
-        (cd $OUT/wasm/; $TEST_D8 $VIRGIL_LOC/test/wasm-js-tester.js -- $TESTS > $R)
+        EXP=$(ls $TESTS)
+        (cd $OUT/wasm/; $TEST_D8 $VIRGIL_LOC/test/wasm-js-tester.js -- $EXP > $R)
 	check_red $R
 }
 
