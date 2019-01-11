@@ -3,7 +3,7 @@
 . ../common.bash sensitivity
 
 target=$TEST_TARGET
-if [ "$target" == x86-darwin ]; then 
+if [ "$target" == x86-darwin ]; then
     T=3;
 elif [ "$target" == x86-linux ]; then
     T=4;

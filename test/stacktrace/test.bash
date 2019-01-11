@@ -57,7 +57,7 @@ check_red $P
 for t in $(ls *.st); do
   print_status Checking "" "$t"
   diff $t $T/$t &> $T/$t.diff
-  check $?  
+  check $?
 done
 
 target=$TEST_TARGET

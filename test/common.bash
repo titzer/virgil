@@ -61,7 +61,7 @@ function check() {
 		printf "${GREEN}ok${NORM}\n"
 	else
 		printf "${RED}failed${NORM}\n"
-		if [ "$2" != "" ]; then 
+		if [ "$2" != "" ]; then
 			cat $2
 		fi
 	fi
@@ -166,7 +166,7 @@ function run_jvm_tests() {
 
 	print_status Running jvm
 	if [ -z "$HOST_JAVA" ]; then
-		printf "${YELLOW}skipped${NORM}\n" 
+		printf "${YELLOW}skipped${NORM}\n"
 	else
 		$HOST_JAVA -cp $VIRGIL_LOC/rt/jvm/bin:$OUT/jvm V3S_Tester $TESTS > $R
 		check_red $R

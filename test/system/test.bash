@@ -17,7 +17,7 @@ function do_test() {
     else printf "$exp" > $expect
     fi
     if [ $compiled = 1 ]; then
-	run_io_test $target "${1%*.*}" "$params" "$expect" 
+	run_io_test $target "${1%*.*}" "$params" "$expect"
     else
 	print_status Running int $1
 	run_v3c "" -run $1 $params > $out

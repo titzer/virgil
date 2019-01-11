@@ -36,5 +36,5 @@ if [ "$HOST_PLATFORM" == "$target" ]; then
   print_status Running "$target" CiRuntimeApi
   $OUT/CiRuntimeApi &> $OUT/$target.run.out
   check $?
- 
+
 fi
