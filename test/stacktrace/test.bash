@@ -43,7 +43,9 @@ function do_test() {
 
   printf "${GREEN}ok${NORM}\n"
 
-  run_native $target $TESTS
+  if [ "$RUN_NATIVE" != 0 ]; then
+      run_native $target $TESTS
+  fi
 }
 
 tests=$(ls *.v3)

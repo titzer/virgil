@@ -7,6 +7,11 @@ if [ "$TEST_TARGET" != $target ]; then
 	exit 0
 fi
 
+if [ "$RUN_NATIVE" == 0 ]; then
+    echo "  Darwin tests disabled by RUN_NATIVE environment variable"
+    exit 0
+fi
+
 chmod 444 readonly.txt
 
 if [ $# == 0 ]; then

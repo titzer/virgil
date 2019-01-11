@@ -8,6 +8,11 @@ if [[ "$target" != x86-darwin && "$target" != x86-linux ]]; then
     exit 0
 fi
 
+if [ "$RUN_NATIVE" == 0 ]; then
+    echo "  Pointer tests disabled by RUN_NATIVE environment variable"
+    exit 0
+fi
+
 if [ $# == 0 ]; then
   TESTS=*.v3
 else

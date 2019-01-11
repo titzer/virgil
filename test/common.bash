@@ -1,7 +1,19 @@
 #!/bin/bash
 
+if [ -z "$RUN_INT" ]; then
+    RUN_INT=1
+fi
+
 if [ -z "$RUN_WASM" ]; then
     RUN_WASM=0
+fi
+
+if [ -z "$RUN_JVM" ]; then
+    RUN_JVM=1
+fi
+
+if [ -z "$RUN_NATIVE" ]; then
+    RUN_NATIVE=1
 fi
 
 GREEN='[0;32m'
@@ -175,15 +187,21 @@ function run_wasm_tests() {
 }
 
 function run_exec_tests() {
+    if [ "$RUN_INT" = 1 ]; then
 	run_int_tests "int" ""
 	run_int_tests "int-ra" "-ra"
+    fi
 
-        if [ "$RUN_WASM" = 1 ]; then
-            run_wasm_tests
-        fi
+    if [ "$RUN_WASM" = 1 ]; then
+        run_wasm_tests
+    fi
 
+    if [ "$RUN_JVM" = 1 ]; then
         run_jvm_tests
+    fi
 
+    if [ "$RUN_NATIVE" = 1 ]; then
 	run_native_tests x86-darwin x86-darwin-test
 	run_native_tests x86-linux x86-linux-test
+    fi
 }

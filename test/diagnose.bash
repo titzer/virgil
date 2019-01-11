@@ -61,12 +61,12 @@ test=${1%*.*}
 if [ "$jvm" = 1 ]; then
     rtpath=$VIRGIL_LOC/rt/jvm/bin
     line
-    execute $AENEAS_TEST $V3C_OPTS -target=jvm-test -jvm.rt-path=$rtpath -output=$T -print-ssa $tests | tee $T/$test.compile.jvm.out
+    execute $AENEAS_TEST $V3C_OPTS -fatal -target=jvm-test -jvm.rt-path=$rtpath -output=$T -print-ssa $tests | tee $T/$test.compile.jvm.out
     line
     execute java -classpath $rtpath:$T V3S_Tester $tests | tee $T/$test.run.jvm.out
 elif [ "$wasm" = 1 ]; then
     line
-    execute $AENEAS_TEST $V3C_OPTS -target=wasm-js-test -output=$T -print-stackify -print-mach -print-ssa $tests | tee $T/$test.compile.wasm.out
+    execute $AENEAS_TEST $V3C_OPTS -fatal -target=wasm-js-test -output=$T -print-stackify -print-mach -print-mach-data -print-ssa $tests | tee $T/$test.compile.wasm.out
     line
     execute cd $T
     execute $TEST_D8 --trace-wasm-decoder --trace-wasm-interpreter --wasm-interpret-all $VIRGIL_LOC/test/wasm-js-tester.js -- $tests | tee $T/$test.run.wasm.out

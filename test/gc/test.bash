@@ -13,6 +13,11 @@ else
     exit 0
 fi
 
+if [ "$RUN_NATIVE" == 0 ]; then
+    echo "  GC tests disabled by RUN_NATIVE environment variable"
+    exit 0
+fi
+
 if [ $# -gt 0 ]; then
   TESTS="$*"
 else
