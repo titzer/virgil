@@ -24,19 +24,19 @@ def XXX: Terminal;
 
 // Constants for the binary encoding of sections
 component WasmSection {
-	def UNKNOWN: byte = 0;   // code for unknown sections
-	def TYPE: byte = 1;      // Function signature declarations
-	def IMPORT: byte = 2;    // Import declarations
-	def FUNCTION: byte = 3;  // Function declarations
-	def TABLE: byte = 4;     // Indirect function table and other tables
-	def MEMORY: byte = 5;    // Memory attributes
-	def GLOBAL: byte = 6;    // Global declarations
-	def EXPORT: byte = 7;    // Exports
-	def START: byte = 8;     // Start function declaration
-	def ELEMENT: byte = 9;   // Elements section
-	def CODE: byte = 10;     // Function code
-	def DATA: byte = 11;     // Data segments
-	def NAME: byte = 12;     // Name section (encoded as a string)
+	def UNKNOWN: byte = 0;	 // code for unknown sections
+	def TYPE: byte = 1;	 // Function signature declarations
+	def IMPORT: byte = 2;	 // Import declarations
+	def FUNCTION: byte = 3;	 // Function declarations
+	def TABLE: byte = 4;	 // Indirect function table and other tables
+	def MEMORY: byte = 5;	 // Memory attributes
+	def GLOBAL: byte = 6;	 // Global declarations
+	def EXPORT: byte = 7;	 // Exports
+	def START: byte = 8;	 // Start function declaration
+	def ELEMENT: byte = 9;	 // Elements section
+	def CODE: byte = 10;	 // Function code
+	def DATA: byte = 11;	 // Data segments
+	def NAME: byte = 12;	 // Name section (encoded as a string)
 }
 // Constants for the binary encodings of import/export kinds
 component WasmExternal {
@@ -98,6 +98,10 @@ class WasmSectionBuffer extends MachDataBuffer {
 		sizepos = -1;
 		start = -1;
 	}
+	def str(str: string) -> this {
+		i4leb(str.length);
+		iN(str);
+	}
 }
 def patchSize(buffer: MachDataBuffer, offset: int, size: int) {
 	buffer.overwrite_u4leb(offset, size);
@@ -148,15 +152,8 @@ class WasmTarget extends Target {
 
 		// Add the allocation stub if the program might dynamically allocate memory.
 		def wasm = WasmProgram.new(rt.mach, context), m = rt.mach;
-		def methods = prog.ir.methods;
-		var allocateStubSigIndex = 0u;
-		if (m.allocates) {  // add allocation stub
-			var sig = FuncType.!(Function.newType(Int.TYPE, Int.TYPE)).sig();
-			allocateStubSigIndex = wasm.addSig(Void.TYPE, sig);
-			wasm.numFunctions = 1;
-		}
 		// Add all the method signatures to the signatures vector
-		wasm.addIrMethods();
+		def methods = wasm.addIrMethods();
 		// Add all the indirect adapter methods and their signatures
 		// (also assigns addresses for indirectly-referenced functions).
 		m.layoutAllRecordsAndFuncs();
@@ -171,7 +168,7 @@ class WasmTarget extends Target {
 		if (m.allocates) { // add allocation stub body
 			codegen.generateTestAllocationStub();
 		}
-		for (i < methods.length) {
+		for (i = int.!(wasm.numImports); i < methods.length; i++) {
 			var m = methods[i];
 			codegen.generateWasm(m);
 		}
@@ -188,15 +185,27 @@ class WasmTarget extends Target {
 
 		// (3) Emit imports
 		//--------------------------------------------------------------------------------
+                if (wasm.numImports > 0) {
+			out.startSection(WasmSection.IMPORT);
+			out.u4leb(wasm.numImports);
+			for (i = 0; i < wasm.numImports; i++) {
+				var m = methods[i];
+				out.str(m.source.receiver.name());
+				out.str(m.source.name());
+                                out.i1(/*Function import*/0);
+				out.u4leb(wasm.getSigIndex(m));
+                        }
+			out.endSection();
+                }
 
 		// (4) Emit function signature declarations
 		//--------------------------------------------------------------------------------
 		out.startSection(WasmSection.FUNCTION);
-		out.u4leb(wasm.numFunctions);
+		out.u4leb(wasm.numFunctions - wasm.numImports);
 		if (m.allocates) {  // add allocation stub
-			out.u4leb(allocateStubSigIndex);
+			out.u4leb(wasm.allocateStubSigIndex);
 		}
-		for (i < methods.length) {
+		for (i = int.!(wasm.numImports); i < methods.length; i++) {
 			var m = methods[i];
 			context.method = m;
 			out.u4leb(wasm.getSigIndex(m));
@@ -268,7 +277,7 @@ class WasmTarget extends Target {
 		// (9) Emit the function bodies
 		//--------------------------------------------------------------------------------
 		out.startSection(WasmSection.CODE);
-		out.u4leb(u32.!(wasm.numFunctions));
+		out.u4leb(u32.!(wasm.numFunctions - wasm.numImports));
 		out.md(codebuf);
 		out.endSection();
 
@@ -449,6 +458,9 @@ class WasmProgram(mach: MachProgram, context: SsaContext) {
 	def sigTable = SignatureTable.new();
 	def functionTable = Vector<(IrMethod, u32)>.new();
 	def indirectAdapters = Vector<(Signature, u32, IrMethod)>.new();
+        var allocateStubFuncIndex = 0u;
+	var allocateStubSigIndex = 0u;
+        var numImports = 0u;
 	var numFunctions = 0u;
 	var main_index = -1;
 	var containsCallIndirect = false;
@@ -483,15 +495,42 @@ class WasmProgram(mach: MachProgram, context: SsaContext) {
 //		XXX.put3("addIrMethodAddr #%1 [%2] = %3\n", m.renderLong, addr.absolute, int.!(tableEntry));
 		functionTable.add((m, tableEntry));
 	}
-	def addIrMethods() {
-		var main = IrMethod.!(mach.prog.getMain().member);
+	def addIrMethods() -> Vector<IrMethod> {
 		var methods = mach.prog.ir.methods;
+		var sorted = Array<IrMethod>.new(methods.length);
+		var j = 0;
+
+		// Add all imported functions to the array.
 		for (i < methods.length) {
 			var m = methods[i];
-			addSig(m.ssa.params[0].vtype, m.sig);
-			m.machIndex = int.!(numFunctions++);
-			if (m == main) main_index = m.machIndex;
+			if (m.source == null || !m.source.isImport) continue;
+			addMethod(m);
+			sorted[j++] = m;
 		}
+		numImports = u32.!(j);
+
+		// Add the allocation stub if necessary.
+		if (mach.allocates) {
+			var sig = FuncType.!(Function.newType(Int.TYPE, Int.TYPE)).sig();
+			allocateStubSigIndex = addSig(Void.TYPE, sig);
+			allocateStubFuncIndex = numFunctions++;
+		}
+
+		// Add all non-imported functions to the array.
+		for (i < methods.length) {
+			var m = methods[i];
+			if (m.source != null && m.source.isImport) continue;
+			addMethod(m);
+			sorted[j++] = m;
+		}
+
+		Arrays.copyInto(sorted, methods.array, 0);  // update the IrModule's method vector.
+		return methods;
+	}
+	def addMethod(m: IrMethod) {
+		addSig(m.ssa.params[0].vtype, m.sig);
+		m.machIndex = int.!(numFunctions++);
+		if (m == mach.prog.getMain().member) main_index = m.machIndex;
 	}
 	def addMtable(m: IrItem, addr: Addr) {
 		var mtable = IrMtable.!(m);
