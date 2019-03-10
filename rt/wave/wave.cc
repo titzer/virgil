@@ -75,9 +75,12 @@ struct instance_fds {
 instance_fds global_fds;
 uint8_t global_pathbuf[MAXPATH + 1];
 wasm::Memory* global_memory;
+int global_argc;
+char** global_argv;
 
 void* checkbuffer(int32_t buffer, int32_t length) {
   // XXX: remove 2GiB restrictions here
+  if (!global_memory) return nullptr;
   if (buffer < 0) return nullptr;
   if (length < 0) return nullptr;
   if (buffer + length < 0) return nullptr;
@@ -100,9 +103,43 @@ inline char* copypath(int32_t path, int32_t path_len) {
 #define ARG(index, name, type) auto name = args[index].type(); USE(name)
 #define RETURN_MINUS_1 results[0] = wasm::Val::i32(-1); return nullptr
 
+bool sig_equal(const wasm::FuncType* a, const wasm::FuncType* b) {
+  if (a->params().size() != b->params().size()) return false;
+  for (size_t i = 0; i < a->params().size(); i++) {
+    if (a->params()[i] != b->params()[i]) return false;
+  }
+  if (a->results().size() != b->results().size()) return false;
+  for (size_t i = 0; i < a->results().size(); i++) {
+    if (a->results()[i] != b->results()[i]) return false;
+  }
+  return true;
+}
+
 //============================================================================
 // Wave functions that can be imported into a module.
 //============================================================================
+WAVE_FUNC(arg_len) {
+  ARG(0, arg, i32);
+  TRACE("arg_len(%d)\n", arg);
+  if (arg >= global_argc) { RETURN_MINUS_1; }
+  int len = static_cast<int>(strlen(global_argv[arg]));
+  results[0] = wasm::Val::i32(len);
+  return nullptr;
+}
+
+WAVE_FUNC(arg_copy) {
+  ARG(0, arg, i32);
+  ARG(1, dest, i32);
+  ARG(2, dest_len, i32);
+  TRACE("arg_copy(%d, buf=0x%08x, len=%d)\n", arg, dest, dest_len);
+  if (arg >= global_argc) { RETURN_MINUS_1; }
+  char* buffer = reinterpret_cast<char*>(checkbuffer(dest, dest_len));
+  if (!buffer) { RETURN_MINUS_1; }
+  char* result = stpncpy(buffer, global_argv[arg], dest_len);
+  results[0] = wasm::Val::i32(static_cast<int>(result - buffer));
+  return nullptr;
+}
+
 WAVE_FUNC(fs_size) {
   ARG(0, path, i32);
   ARG(1, path_len, i32);
@@ -152,7 +189,7 @@ WAVE_FUNC(fs_read) {
   ARG(1, buf, i32);
   ARG(2, buf_len, i32);
 
-  TRACE("fs_read(fd=%d, buf=+0x%08x, len=%d)\n", fd, buf, buf_len);
+  TRACE("fs_read(fd=%d, buf=0x%08x, len=%d)\n", fd, buf, buf_len);
 
   int sys_fd = fds->get_sys_fd(fd);
   void* buffer = checkbuffer(buf, buf_len);
@@ -168,7 +205,7 @@ WAVE_FUNC(fs_write) {
   ARG(1, buf, i32);
   ARG(2, buf_len, i32);
 
-  TRACE("fs_write(fd=%d, buf=+0x%08x, len=%d)\n", fd, buf, buf_len);
+  TRACE("fs_write(fd=%d, buf=0x%08x, len=%d)\n", fd, buf, buf_len);
 
   int sys_fd = fds->get_sys_fd(fd);
   void* buffer = checkbuffer(buf, buf_len);
@@ -245,7 +282,14 @@ WAVE_FUNC(throw_ex) {
 }
 //============================================================================
 
+
+//============================================================================
+//=={ main function }=========================================================
+//============================================================================
 int main(int argc, char* argv[]) {
+  global_argc = argc - 1;
+  global_argv = &argv[1];
+
   if (argc < 2) {
     std::cout << "Error: no input files" << std::endl;
     return 1;
@@ -276,25 +320,99 @@ int main(int argc, char* argv[]) {
   if (!module) return ERROR("compiling", filename);
 
   // Create imported functions.
-  TRACE("Creating imports...\n");
+#define V(...) wasm::vec<wasm::ValType*>::make(__VA_ARGS__)
+#define F(a, b) wasm::FuncType::make(a, b)
+  auto ti = wasm::ValType::make(wasm::I32);
+  auto i_i = F(V(ti), V(ti));
+  auto iii_i = F(V(ti, ti, ti), V(ti));
+  auto ii_i = F(V(ti, ti), V(ti));
+  auto v_i = F(V(), V(ti));
+  auto iiii_v = F(V(ti, ti, ti, ti), V());
+
+#define IMPORT_ENTRY(name, sig) {#name, sizeof(#name), wave_##name, sig}
+
+  struct ImportEntry {
+    const char* name;
+    size_t name_len;
+    wasm::own<wasm::Trap *> (*func)(const wasm::Val *, wasm::Val *);
+    wasm::own<wasm::FuncType*>& sig;
+  } import_entries[] = {
+    IMPORT_ENTRY(arg_len, i_i),
+    IMPORT_ENTRY(arg_copy, iii_i),
+    IMPORT_ENTRY(fs_size, ii_i),
+    IMPORT_ENTRY(fs_chmod, iii_i),
+    IMPORT_ENTRY(fs_open, iii_i),
+    IMPORT_ENTRY(fs_read, iii_i),
+    IMPORT_ENTRY(fs_write, iii_i),
+    IMPORT_ENTRY(fs_avail, i_i),
+    IMPORT_ENTRY(fs_close, i_i),
+    IMPORT_ENTRY(ticks_ms, v_i),
+    IMPORT_ENTRY(ticks_us, v_i),
+    IMPORT_ENTRY(ticks_ns, v_i),
+    IMPORT_ENTRY(throw_ex, iiii_v),
+  };
+
+  constexpr size_t num_import_entries = sizeof(import_entries) / sizeof(ImportEntry);
+
+  // Process imports of the module.
+  TRACE("Processing imports...\n");
+  auto imports = module->imports();
+  wasm::Extern** import_bindings = new wasm::Extern*[imports.size()];
+  for (size_t i = 0; i < imports.size(); i++) {
+    auto imp = imports[i];
+    if (imp->type()->kind() != wasm::EXTERN_FUNC) return ERROR("wrong import type", filename);
+    if (imp->module().size() != 4 || !strncmp("wave", imp->module().get(), 4)) return ERROR("only imports from \'wave\' allowed", filename);
+    bool found = false;
+    auto func_type = imp->type()->func();
+    // XXX: linear search for each import. Replace with std::unordered_map ?
+    for (size_t j = 0; j < num_import_entries; j++) {
+      auto candidate = &import_entries[j];
+      if (candidate->name_len != imp->name().size()) continue;
+      if (!strncmp(candidate->name, imp->name().get(), candidate->name_len)) continue;
+      if (!sig_equal(candidate->sig.get(), imp->type()->func())) return ERROR("import with wrong signature", filename);
+
+      // Construct the imported function.
+      auto imp_func = wasm::Func::make(store, candidate->sig.get(), candidate->func);
+      import_bindings[i] = imp_func.get();
+      found = true;
+    }
+    if (!found) return ERROR("import not found", filename);
+  }
 
   // Instantiate.
   TRACE("Instantiating module...\n");
-  wasm::Extern* imports[] = {};
-  auto instance = wasm::Instance::make(store, module.get(), imports);
+  auto instance = wasm::Instance::make(store, module.get(), import_bindings);
   if (!instance) return ERROR("instantiating", filename);
 
-  // Extract export.
-  TRACE("Extracting export...\n");
+  // Extract export(s).
+  TRACE("Extracting exports...\n");
   auto exports = instance->exports();
-  if (exports.size() == 0 || exports[0]->kind() != wasm::EXTERN_FUNC || !exports[0]->func()) {
-    return ERROR("accessing export", filename);
+  wasm::Func* entry_func = nullptr;
+  for (size_t i = 0; i < exports.size(); i++) {
+    auto e = exports[i];
+    switch (e->kind()) {
+    case wasm::EXTERN_MEMORY:
+      global_memory = e->memory();
+      break;
+    case wasm::EXTERN_FUNC:
+      entry_func = e->func();
+      break;
+    default:
+      // ignore exports of other types.
+      break;
+    }
   }
-  auto run_func = exports[0]->func();
 
-  // Call.
-  std::cout << "Calling export..." << std::endl;
-  if (run_func->call()) return ERROR("calling main", filename);
+  if (!entry_func) return ERROR("no entry function", filename);
 
-  return 0;
+  // Call the entrypoint function.
+  wasm::Val args[] = { wasm::Val::i32(global_argc) };
+  wasm::Val results[1];
+  auto trap = entry_func->call(args, results);
+  if (trap) {
+    std::cout << "Trap: " << trap->message().get() << std::endl;
+    return 42;
+  }
+
+  return results[0].i32();
 }
