@@ -10,10 +10,10 @@
 
 #include "wasm.hh"
 
-#define ENABLE_TRACE 0
+#define ENABLE_TRACE 1
 
 #if ENABLE_TRACE
-#define TRACE(...) printf(__VA_ARGS__)
+#define TRACE(...) if(global_trace) printf(__VA_ARGS__)
 #else
 #define TRACE(...)
 #endif
@@ -78,6 +78,7 @@ struct instance_fds {
 
 #define MAXPATH 1024
 
+bool global_trace;
 char* global_filename;
 instance_fds global_fds;
 uint8_t global_pathbuf[MAXPATH + 1];
@@ -297,21 +298,34 @@ WAVE_FUNC(throw_ex) {
 }
 //============================================================================
 
-
 //============================================================================
 //=={ main function }=========================================================
 //============================================================================
 int main(int argc, char* argv[]) {
-  global_argc = argc - 2;
-  global_argv = &argv[2];
+  // Process arguments.
+#define ARG_MATCH(expr, str) (strncmp((expr)+2, str, sizeof(str)-1) == 0)
+  int i = 1;
+  while (i < argc) {
+    auto arg = argv[i];
+    if (strncmp("--", arg, 2)) break;
+    if (ARG_MATCH(arg, "trace")) {
+      global_trace = true;
+    } else {
+      ERROR("unrecognized option: %s\n", arg);
+      return -1;
+    }
+    i++;
+  }
+  global_filename = argv[i];
+  global_argc = argc - i -1;
+  global_argv = &argv[i + 1];
 
-  if (argc < 2) {
+  if (i == argc) {
     std::cout << "Error: no input files" << std::endl;
     return 1;
   }
 
   // Load binary.
-  global_filename = argv[1];
   std::ifstream file(global_filename);
   file.seekg(0, std::ios_base::end);
   auto file_size = file.tellg();
@@ -458,14 +472,18 @@ int main(int argc, char* argv[]) {
   // Call the entrypoint function.
   TRACE("Calling entrypoint...\n");
   wasm::Val args[] = { wasm::Val::i32(global_argc) };
-  wasm::Val results[1];
+  wasm::Val results[] = { wasm::Val::i32(0) };
   auto trap = entry_func->call(args, results);
   if (trap) {
     std::cout << "Trap: " << trap->message().get() << std::endl;
     return 42;
   }
-  
-  auto result = results[0].i32();
-  TRACE("Return value: %d\n", result);
-  return result;
+
+  if (results[0].kind() == wasm::I32) {
+    auto result = results[0].i32();
+    TRACE("Return value: %d\n", result);
+    return result;
+  } else {
+    return 0;
+  }
 }
