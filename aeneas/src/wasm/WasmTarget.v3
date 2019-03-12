@@ -13,8 +13,7 @@
 component WasmComponent {
 	new() {
 		Aeneas.registerTarget(WasmTarget.new("wasm-js-test", true));
-		Aeneas.registerTarget(WasmTarget.new("wasm-js", false));
-//		Aeneas.registerTarget(WasmTarget.new("wasm", false));
+		Aeneas.registerTarget(WasmTarget.new("wasm", false));
 	}
 }
 def WASM_PAGE_SIZE = 65536;
@@ -168,7 +167,10 @@ class WasmTarget extends Target {
 		if (m.allocates) { // add allocation stub body
 			codegen.generateTestAllocationStub();
 		}
-		for (i = int.!(wasm.numImports); i < methods.length; i++) {
+		if (wasm.entryStubFuncIndex >= 0) {
+			codegen.generateEntryStub();
+		}
+		for (i = wasm.numImports; i < methods.length; i++) {
 			var m = methods[i];
 			codegen.generateWasm(m);
 		}
@@ -185,27 +187,30 @@ class WasmTarget extends Target {
 
 		// (3) Emit imports
 		//--------------------------------------------------------------------------------
-                if (wasm.numImports > 0) {
+		if (wasm.numImports > 0) {
 			out.startSection(WasmSection.IMPORT);
-			out.u4leb(wasm.numImports);
+			out.i4leb(wasm.numImports);
 			for (i = 0; i < wasm.numImports; i++) {
 				var m = methods[i];
 				out.str(m.source.receiver.name());
 				out.str(m.source.name());
-                                out.i1(/*Function import*/0);
+				out.i1(/*Function import*/0);
 				out.u4leb(wasm.getSigIndex(m));
-                        }
+			}
 			out.endSection();
-                }
+		}
 
 		// (4) Emit function signature declarations
 		//--------------------------------------------------------------------------------
 		out.startSection(WasmSection.FUNCTION);
-		out.u4leb(wasm.numFunctions - wasm.numImports);
+		out.i4leb(wasm.numFunctions - wasm.numImports);
 		if (m.allocates) {  // add allocation stub
-			out.u4leb(wasm.allocateStubSigIndex);
+			out.i4leb(wasm.sigIndex_i_i);
 		}
-		for (i = int.!(wasm.numImports); i < methods.length; i++) {
+		if (wasm.entryStubFuncIndex >= 0) {
+			out.i4leb(wasm.sigIndex_entryStub);
+		}
+		for (i = wasm.numImports; i < methods.length; i++) {
 			var m = methods[i];
 			context.method = m;
 			out.u4leb(wasm.getSigIndex(m));
@@ -243,22 +248,27 @@ class WasmTarget extends Target {
 
 		// (7) Emit the export section
 		//--------------------------------------------------------------------------------
-		if (wasm.main_index >= 0) {
-			out.startSection(WasmSection.EXPORT);
-			out.i1(2);		  // 2 export: main and memory
-			out.i1(4);
-                        // export main
-			out.iN("main");
-			out.i1(WasmExternal.FUNCTION);
-			out.u4leb(u32.!(wasm.main_index));
-			// export memory
-			out.i1(3);
-			out.iN("mem");
-			out.i1(WasmExternal.MEMORY);
-			out.u4leb(0);
-                        
-			out.endSection();
+		var mainIndex = prog.ir.mainMethod.asMethod().machIndex;
+		var mainName = "main";
+
+		if (wasm.entryStubFuncIndex >= 0) {
+			mainIndex = wasm.entryStubFuncIndex;
+			mainName = "entry";
 		}
+		out.startSection(WasmSection.EXPORT);
+		out.i1(2);		  // 2 exports: main and memory
+		out.i1(mainName.length);
+		// export main
+		out.iN(mainName);
+		out.i1(WasmExternal.FUNCTION);
+		out.i4leb(mainIndex);
+		// export memory
+		out.i1(3);
+		out.iN("mem");
+		out.i1(WasmExternal.MEMORY);
+		out.u4leb(0);
+
+		out.endSection();
 
 		// (8) Emit the function table entries
 		//--------------------------------------------------------------------------------
@@ -275,7 +285,6 @@ class WasmTarget extends Target {
 			for (i < wasm.functionTable.length) {
 				var entry = wasm.functionTable[i];
 				out.u4leb(entry.1);
-//				XXX.put2("functionTable[%1] = %2\n", i, int.!(entry.1));
 			}
 			out.endSection();
 		}
@@ -283,7 +292,7 @@ class WasmTarget extends Target {
 		// (9) Emit the function bodies
 		//--------------------------------------------------------------------------------
 		out.startSection(WasmSection.CODE);
-		out.u4leb(u32.!(wasm.numFunctions - wasm.numImports));
+		out.i4leb(wasm.numFunctions - wasm.numImports);
 		out.md(codebuf);
 		out.endSection();
 
@@ -464,11 +473,15 @@ class WasmProgram(mach: MachProgram, context: SsaContext) {
 	def sigTable = SignatureTable.new();
 	def functionTable = Vector<(IrMethod, u32)>.new();
 	def indirectAdapters = Vector<(Signature, u32, IrMethod)>.new();
-        var allocateStubFuncIndex = 0u;
-	var allocateStubSigIndex = 0u;
-        var numImports = 0u;
-	var numFunctions = 0u;
-	var main_index = -1;
+	var sigIndex_i_i = -1;
+	var sigIndex_entryStub = -1;
+
+	// known function indices
+	var entryStubFuncIndex = -1;
+	var allocateStubFuncIndex = -1;
+
+	var numImports = 0;
+	var numFunctions = 0;
 	var containsCallIndirect = false;
 
 	def addSig(receiver: Type, sig: Signature) -> u32 {
@@ -493,12 +506,10 @@ class WasmProgram(mach: MachProgram, context: SsaContext) {
 			// component method; allocate a signature with the object type prepended
 			var index = addSig(AnyObject.TYPE, m.sig);
 			indirectAdapters.add((m.sig, index, m));
-			tableEntry = numFunctions++;  // the indirect adapter goes in the table
-//			XXX.put2("indirect adapter #%1 -> %2\n", m.renderLong, tableEntry);
+			tableEntry = u32.!(numFunctions++);  // the indirect adapter goes in the table
 		}
 		// an IrMethod's "address" is its index into the function table
 		addr.absolute = functionTable.length + 1;
-//		XXX.put3("addIrMethodAddr #%1 [%2] = %3\n", m.renderLong, addr.absolute, int.!(tableEntry));
 		functionTable.add((m, tableEntry));
 	}
 	def addIrMethods() -> Vector<IrMethod> {
@@ -513,13 +524,19 @@ class WasmProgram(mach: MachProgram, context: SsaContext) {
 			addMethod(m);
 			sorted[j++] = m;
 		}
-		numImports = u32.!(j);
+		numImports = j;
 
 		// Add the allocation stub if necessary.
 		if (mach.allocates) {
 			var sig = FuncType.!(Function.newType(Int.TYPE, Int.TYPE)).sig();
-			allocateStubSigIndex = addSig(Void.TYPE, sig);
+			sigIndex_i_i = int.!(addSig(Void.TYPE, sig));
 			allocateStubFuncIndex = numFunctions++;
+		}
+		// Add the entry stub if {RiRuntime.init} exists.
+		if (mach.runtime.ri_init != null) {
+			var m = mach.runtime.ri_init.spec.asMethod();
+			sigIndex_entryStub = int.!(addSig(Void.TYPE, m.sig));
+			entryStubFuncIndex = numFunctions++;
 		}
 
 		// Add all non-imported functions to the array.
@@ -535,8 +552,7 @@ class WasmProgram(mach: MachProgram, context: SsaContext) {
 	}
 	def addMethod(m: IrMethod) {
 		addSig(m.ssa.params[0].vtype, m.sig);
-		m.machIndex = int.!(numFunctions++);
-		if (m == mach.prog.getMain().member) main_index = m.machIndex;
+		m.machIndex = numFunctions++;
 	}
 	def addMtable(m: IrItem, addr: Addr) {
 		var mtable = IrMtable.!(m);
