@@ -105,6 +105,7 @@ inline char* copypath(int32_t path, int32_t path_len) {
     global_pathbuf[path_len] = 0;
     return reinterpret_cast<char*>(global_pathbuf);
   }
+  
   return nullptr;
 }
 
@@ -160,8 +161,8 @@ WAVE_FUNC(fs_size) {
   ARG(0, path, i32);
   ARG(1, path_len, i32);
   char* path_str = copypath(path, path_len);
-  TRACE("fs_size(path=\"%*s\")\n", path_len, path_str);
   if (!path_str) { RETURN_MINUS_1; }
+  TRACE("fs_size(path=\"%*s\")\n", path_len, path_str);
 
   struct stat s;
   auto result = stat(path_str, &s);
@@ -175,8 +176,8 @@ WAVE_FUNC(fs_chmod) {
   ARG(1, path_len, i32);
   ARG(2, mode, i32);
   char* path_str = copypath(path, path_len);
-  TRACE("fs_chmod(path=\"%*s\", mode=0x%08x)\n", path_len, path_str, mode);
   if (!path_str) { RETURN_MINUS_1; }
+  TRACE("fs_chmod(path=\"%*s\", mode=0x%08x)\n", path_len, path_str, mode);
   ::chmod(path_str, mode);  // TODO: audit mode bits
   results[0] = wasm::Val::i32(0);
   return nullptr;
@@ -193,7 +194,7 @@ WAVE_FUNC(fs_open) {
   if (!path_str) { RETURN_MINUS_1; }
   int flags = mode ? O_CREAT | O_WRONLY : O_RDONLY;
   int sys_fd = ::open(path_str, flags, 420);
-  if (sys_fd >= 0) { RETURN_MINUS_1; }
+  if (sys_fd < 0) { RETURN_MINUS_1; }
   int fd = fds->alloc_fd(sys_fd);
   results[0] = wasm::Val::i32(fd);
   return nullptr;
@@ -362,6 +363,7 @@ int main(int argc, char* argv[]) {
   auto iii_i = F(V(TI, TI, TI), V(TI));
   auto ii_i = F(V(TI, TI), V(TI));
   auto v_i = F(V(), V(TI));
+  auto i_v = F(V(TI), V());
   auto iiii_v = F(V(TI, TI, TI, TI), V());
 
 #define IMPORT_ENTRY(name, sig) {#name, sizeof(#name)-1, wave_##name, sig}
@@ -380,7 +382,7 @@ int main(int argc, char* argv[]) {
     IMPORT_ENTRY(fs_read, iii_i),
     IMPORT_ENTRY(fs_write, iii_i),
     IMPORT_ENTRY(fs_avail, i_i),
-    IMPORT_ENTRY(fs_close, i_i),
+    IMPORT_ENTRY(fs_close, i_v),
     IMPORT_ENTRY(ticks_ms, v_i),
     IMPORT_ENTRY(ticks_us, v_i),
     IMPORT_ENTRY(ticks_ns, v_i),
