@@ -132,6 +132,10 @@ bool sig_equal(const wasm::FuncType* fa, const wasm::FuncType* fb) {
   return true;
 }
 
+bool name_eq(const char* name, size_t name_len, const wasm::Name& val) {
+  return (val.size() == name_len) && (strncmp(name, val.get(), name_len) == 0);
+}
+
 //============================================================================
 // Wave functions that can be imported into a module.
 //============================================================================
@@ -407,7 +411,7 @@ int main(int argc, char* argv[]) {
     TRACE("import[%zu] = %.*s.%.*s\n", i,
            static_cast<int>(m.size()), m.get(),
            static_cast<int>(n.size()), n.get());
-    if (m.size() != 4 || strncmp("wave", m.get(), 4)) {
+    if (!name_eq("wave", 4, m)) {
       ERROR("import[%zu] is not from \"wave\" module\n", i);
       return -1;
     }
@@ -416,8 +420,7 @@ int main(int argc, char* argv[]) {
     // XXX: linear search for each import. Replace with std::unordered_map ?
     for (size_t j = 0; j < num_import_entries; j++) {
       auto candidate = &import_entries[j];
-      if (candidate->name_len != n.size()) continue;
-      if (strncmp(candidate->name, n.get(), candidate->name_len)) continue;
+      if (!name_eq(candidate->name, candidate->name_len, n)) continue;
       if (!sig_equal(candidate->sig.get(), func_type)) {
         ERROR("import[%zu] of \"%s\" has unexpected signature\n", i, candidate->name);
         return -1;
@@ -449,17 +452,22 @@ int main(int argc, char* argv[]) {
   
   // Extract export(s).
   TRACE("Extracting exports...\n");
-  auto exports = instance->exports();
+  auto instance_exports = instance->exports();
+  auto module_exports = module->exports();
   wasm::Func* entry_func = nullptr;
-  for (size_t i = 0; i < exports.size(); i++) {
-    auto e = exports[i];
+  for (size_t i = 0; i < instance_exports.size(); i++) {
+    auto e = instance_exports[i];
     switch (e->kind()) {
     case wasm::EXTERN_MEMORY:
       global_memory = e->memory();
       break;
-    case wasm::EXTERN_FUNC:
-      entry_func = e->func();
+    case wasm::EXTERN_FUNC: {
+      auto& n = module_exports[i]->name();
+      if (name_eq("entry", 5, n) || name_eq("main", 4, n)) {
+        entry_func = e->func();
+      }
       break;
+    }
     default:
       // ignore exports of other types.
       break;
