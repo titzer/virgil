@@ -1,83 +1,218 @@
 // Copyright 2017 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Some marker values used in detecting cycles when processing phi moves.
-def PHI_ON_STACK = -2;
-def PHI_DONE = -3;
-def PHI_CYCLE = -4;
+def XXX: Terminal;
 // A utility to introduce explicit loads and stores of local variables
 // between instructions for stack machines such as WASM and the JVM.
 class MachStackifier(gen: StackInstrGen) {
 	private def VERBOSE = Aeneas.PRINT_STACKIFY.get();
 	private def stack = Vector<Operand.Use>.new();	
 	private def defs = Vector<Operand.Def>.new();
-	private def phiMoves = Vector<(VReg, List<Operand.Def>)>.new();
+	private def parmoveDests = Vector<(VReg, List<Operand.Def>)>.new();
 
-	def stackify(start: ArchInstr, end: ArchInstr, dumpRefsOnKill: bool,
-		     printInstr: ArchInstr -> void) -> ArchInstr {
-		// Prepare.
-		stack.length = 0;
-		// Process all instructions before {end} in reverse order, including {start}.
-		var limit = start.prev, i = end.prev;
-		while (i != limit) {
-			var prev = i.prev;
-			if (VERBOSE) printStack();
-			if (VERBOSE) printInstr(i);
-			if (i.opcode() == ArchInstrs.ARCH_PARMOVE) processPhiResolve(i);
-			else processInstr(i);
-			i = prev;
+	private def defStack = Vector<Operand.Def>.new();
+	private def loads = Vector<Operand.Use>.new();
+	private def insertPoint = Vector<ArchInstr>.new();
+	private def insertLoads = Vector<(ArchInstr, int, int)>.new();
+	private def moveStack = Vector<int>.new();
+
+	var printInstr: ArchInstr -> void;
+
+	def stackify(uid: int, pre: ArchInstr, end: ArchInstr, dumpRefsOnKill: bool) {
+		if (VERBOSE) {
+			XXX.put1("#stackify #%1 {\n", uid);
+			for (i = pre.next; i != end; i = i.next) printInstr(i);
+			XXX.put("----begin\n");
 		}
-		// Reached the instruction before {start}. Load remaining values.
-		loadStackFrom(0, start);
-		// Clean up.
-		stack.length = 0;
-		defs.length = 0;
-		return start;
+
+		defStack.length = 0;
+		loads.length = 0;
+		insertPoint.length = 0;
+		insertLoads.length = 0;
+
+		insertPoint.set(0, pre.next);
+		// Process instructions forward, tracking definitions on the abstract stack
+		var start = pre.next;
+		var i = start;
+		while (true) {
+			if (i == end) return finishInstrs(start, end);
+			if (VERBOSE) printInstr(i);
+			if (i.opcode() == ArchInstrs.ARCH_PARMOVE) {
+				prepareParMove(i);
+				finishInstrs(start, i);
+				start = i.next;
+				lowerParMove(i);
+				i = start;
+			} else {
+				processUses(i);
+				processDefs(i);
+				i = i.next;
+			}
+		}
 	}
-	def processInstr(i: ArchInstr) {
+	def finishInstrs(start: ArchInstr, end: ArchInstr) {
+		if (VERBOSE) XXX.put("---insertLoads\n");
+		// Insert loads at points determined from previous pass
+		for (j = insertLoads.length - 1; j >= 0; j--) {
+			var t = insertLoads[j], next = t.0;
+			for (k = t.1; k < t.2; k++) loadVRegOntoStack(loads[k].vreg, next);
+		}
+		loads.length = 0;
+		insertLoads.length = 0;
+		// Insert pops or tees for anything not consumed from stack
+		if (VERBOSE) XXX.put("---finishDefs\n");
+		var next: ArchInstr;
+		for (i = start; i != end; i = next) {
+			next = i.next;
+			finishDefs(i);
+		}
+	}
+	def processUses(i: ArchInstr) {
 		var operands = i.operands;
-		// Find and process all definitions of this instruction.
-		defs.length = 0;
-		for (o in operands) if (Operand.Def.?(o)) defs.add(Operand.Def.!(o));
-		if (defs.length > 0) processDefs(i);
-		// Load all the uses onto the stack
-		for (o in operands) if (Operand.Use.?(o)) stack.add(Operand.Use.!(o));
-		// TODO: deal with kills
-	}
-	def processDefs(i: ArchInstr) {
-		var firstVreg = defs[0].vreg, consumed = 0, pos = stack.length;
-		// Find the lowest occurrence of the first defined vreg.
-		// XXX: this could be made faster with a field in the vreg.
-		for (s < stack.length) {
-			var u = stack[s];
-			if (u.vreg == firstVreg) {  // found first vreg.
-				// Consume as many vregs on stack as possible.
-				for (j < defs.length) {
-					if (s+j >= stack.length) break;  // end of stack
-					if (!canConsumeFromStack(defs[j], stack[s+j])) break;
-					consumed = j+1;
+		var loadStart = loads.length;
+		var s = 0, nextHeight = defStack.length;
+		// Search for operands on the definition stack
+		for (j < operands.length) {
+			if (VERBOSE) XXX.put1("  op#%1 ", j);
+			var o = operands[j];
+			if (!Operand.Use.?(o)) {
+				if (VERBOSE) XXX.put1("(skip)\n", j);
+				continue;
+			}
+			var u = Operand.Use.!(o), i = u.ssa;
+			if (SsaConst.?(i) || SsaParam.?(i) || SsaPhi.?(i)) {
+				// instruction won't be on stack, needs to be loaded
+				if (VERBOSE) XXX.put1("load +%1\n", loads.length);
+				loads.add(u);
+				continue;
+			}
+			var found = false;
+			// not a loadable, search stack for this instruction
+			while (s < defStack.length) {
+				if (VERBOSE) XXX.put1("\n    s = %1 ", s);
+				var x = defStack[s];
+				if (x.ssa == i) { // found on definition stack
+					if (loads.length > loadStart) insertLoadsAfter(s, loadStart);
+					if (nextHeight == defStack.length) nextHeight = s;
+					loadStart = loads.length;
+					x.vreg.consumedFromStack = true;
+					found = true;
+					s++;
+					break;
 				}
-				pos = s + consumed;
+				s++;
+			}
+			if (!found) {
+				// not found on the stack, load everything
+				for (k = j; k < operands.length; k++) {
+					var o = operands[k];
+					if (Operand.Use.?(o)) loads.add(Operand.Use.!(o));
+				}
 				break;
 			}
 		}
-		// Store all the non-consumed definitions to locals (in reverse-definition order).
-		if (VERBOSE) Terminal.put2("   #pos=%1 consumed=%2\n", pos, consumed);
-		var next = i.next;
-		for (j = defs.length - 1; j >= consumed; j--) {
-			var d = defs[j];
-			if (useCount(d) == 0) gen.insertPop(d.vreg, next);
-			else gen.insertStoreLocal(defs[j].vreg, true, next);
-		}
-		// Load the missing operands onto the stack, starting at {pos}.
-		loadStackFrom(pos, next);
-		// Trim the stack back to the first (consumed) definition.
-		stack.length = pos - consumed;
+		insertLoadsAfter(defStack.length, loadStart);
+		defStack.length = nextHeight;
 	}
-	def loadStackFrom(pos: int, next: ArchInstr) {
-		if (VERBOSE) Terminal.put1("   #loadStackFrom pos=%1\n", pos);
-		for (s = pos; s < stack.length; s++) {
-			loadVRegOntoStack(stack[s].vreg, next);
+	// Prepare to lower a parallel move. Load all move sources that are on the
+	// definition stack to the move stack and mark them as consumed on the stack.
+	def prepareParMove(i: ArchInstr) {
+		gatherParMoveDests(i);
+		var next = i.next;
+		moveStack.length = 0;
+		for (i < defStack.length) {
+			var vreg = defStack[i].vreg;
+			pushOntoMoveStack(vreg, null);
+		}
+		defStack.length = 0;
+	}
+	// Replace a parallel move with individual moves in the right order.
+	// The definition stack has already been used to initialize the move stack.
+	def lowerParMove(i: ArchInstr) {
+		var next = i.next;
+		processMoveStack(next);
+		// Push any remaining move sources onto the move stack and process them
+		for (i < parmoveDests.length) {
+			pushOntoMoveStack(parmoveDests[i].0, next);
+			processMoveStack(next);
+		}
+		// Lastly, remove this instruction from the block
+		i.remove();
+	}
+	def pushOntoMoveStack(vreg: VReg, next: ArchInstr) -> bool {
+		if (vreg != null && vreg.parmoveState > 0) {
+			moveStack.add(vreg.parmoveState - 1);
+			vreg.parmoveState = 0 - moveStack.length;
+			if (next != null) loadVRegOntoStack(vreg, next);
+			else vreg.consumedFromStack = true;
+			return true;
+		}
+		return false;
+	}
+	// Use the move stack to implement a non-recursive post-order traversal of the move
+	// graph. Always recurse on the first destination of the top of stack. If that
+	// is already done or on the stack, generate a move, otherwise push it.
+	def processMoveStack(next: ArchInstr) {
+		while (moveStack.length > 0) {
+			var index = moveStack[moveStack.length - 1];
+			var t = parmoveDests[index], vreg = t.0, destList = t.1;
+			var done = true;
+			while (destList != null) {
+				var dest = destList.head.vreg;
+				if (pushOntoMoveStack(dest, next)) {
+					done = false;
+					parmoveDests[index] = (vreg, destList);  // remember remaining moves
+					break;
+				} else {
+					var pop = destList.tail == null;  // pop if last in list
+					gen.insertStoreLocal(dest, pop, next);
+				}
+				destList = destList.tail;
+			}
+			if (done) {
+				moveStack.length--;     // pop off move stack
+				vreg.parmoveState = 0;  // signify it's done
+				parmoveDests[index] = (null, null); // defensive
+			}
+		}
+	}
+	def processDefs(i: ArchInstr) {
+		var next = i.next;
+		for (o in i.operands) {
+			if (!Operand.Def.?(o)) continue;
+			defStack.add(Operand.Def.!(o));
+			insertPoint.set(defStack.length, next);
+		}
+		insertPoint.set(defStack.length, next);
+	}
+	def finishDefs(i: ArchInstr) {
+		var operands = i.operands;
+		for (j < operands.length) {  // skip everything consumed on stack with useCount == 1
+			var o = operands[j];
+			if (!Operand.Def.?(o)) continue;
+			var d = Operand.Def.!(o);
+			if (!d.vreg.consumedFromStack || useCount(d) != 1) return finishRemainingDefs(operands, j, i.next);
+		}
+	}
+	def finishRemainingDefs(operands: Array<Operand>, j: int, next: ArchInstr) {
+		var mustPop = false;
+		while (j < operands.length) {  // process all that need tee, pop, or store
+			var o = operands[j++];
+			if (!Operand.Def.?(o)) continue;
+			var d = Operand.Def.!(o), c = useCount(d);
+			if (c == 0) {
+				gen.insertPop(d.vreg, next);
+			} else {
+				var pop = mustPop || !d.vreg.consumedFromStack;
+				gen.insertStoreLocal(d.vreg, pop, next);
+			}
+			mustPop = true;
+		}
+	}
+	def insertLoadsAfter(height: int, start: int) {
+		var count = loads.length - start;
+		if (count > 0) {
+			insertLoads.add(insertPoint[height], start, loads.length);
 		}
 	}
 	def loadVRegOntoStack(vreg: VReg, next: ArchInstr) {
@@ -88,76 +223,23 @@ class MachStackifier(gen: StackInstrGen) {
 			gen.insertLoadLocal(vreg, next);
 		}
 	}
-	def processPhiResolve(i: ArchInstr) {
-		var map = Ssa.newMap<SsaInstr>();
+	def gatherParMoveDests(i: ArchInstr) {
+		parmoveDests.length = 0;
 		var operands = i.operands;
-		phiMoves.length = 0;
-		// Construct a mapping from vreg -> List<Def> in {phiMoves}
 		// XXX: Construct the vreg -> List<Def> mapping at instruction selection
 		for (i = 0; i < operands.length; i += 2) {
 			var d = Operand.Def.!(operands[i]), u = Operand.Use.!(operands[i + 1]);
 			var v = u.vreg;
-			if (VERBOSE) Terminal.put2("  #resolve_phi @%1 = @%2\n", d.vreg.ssa.uid, v.ssa.uid);
-			if (v.endPos <= 0) {
-				var index = phiMoves.length;
-				v.endPos = 1 + index;
-				phiMoves.add(v, List.new(d, null));
+			if (v.parmoveState <= 0) {
+				var index = parmoveDests.length;
+				v.parmoveState = 1 + index;
+				parmoveDests.add(v, List.new(d, null));
 			} else {
-				var index = v.endPos - 1;
-				var prev = phiMoves[index].1;
-				phiMoves[index] = (v, List.new(d, prev));
+				var index = v.parmoveState - 1;
+				var prev = parmoveDests[index].1;
+				parmoveDests[index] = (v, List.new(d, prev));
 			}
 		}
-		// Topologically sort the moves and resolve cycles.
-		var next = i.next;
-		for (i < phiMoves.length) {
-			var t = phiMoves[i];
-			recursivelyEmitPhiMoves(t.0, t.1, next);
-		}
-		phiMoves.clear();
-		// Moves have been inserted. Remove the phi resolution instruction.
-		i.remove();
-	}
-	// Perform a topological sort of the moves by doing a DFS and emitting moves in postorder.
-	// If a cycle is detected, then use the operand stack as a temporary in order to break
-	// the cycle. Since each ssa phi has only one input, each def can appear in at most one
-	// destination list, which means that a cycle can only occur involving the first
-	// recursion. Handle the general case anyway.
-	def recursivelyEmitPhiMoves(vreg: VReg, dstList: List<Operand.Def>, next: ArchInstr) {
-		if (vreg.endPos == PHI_DONE) return;  // Already done.
-		if (vreg.endPos == PHI_CYCLE || vreg.endPos == PHI_ON_STACK) return V3.fail1("should not recurse through cycle @%1", vreg.ssa.uid);
-		if (VERBOSE) Terminal.put2("    #recurse @%1 (state=%2)\n", vreg.ssa.uid, vreg.endPos);
-		// Recursively emit moves before overwriting any destinations.
-		vreg.endPos = PHI_ON_STACK;
-		for (l = dstList; l != null; l = l.tail) {
-			var dest = l.head.vreg;
-			if (dest.endPos > 0) {
-				var t = phiMoves[dest.endPos - 1];
-				recursivelyEmitPhiMoves(t.0, t.1, next);
-			}
-		}
-		// Emit moves from {vreg} to its destinations.
-		loadVRegOntoStack(vreg, next);
-		var cycle = false;
-		for (l = dstList; l != null; l = l.tail) {
-			var dest = l.head.vreg;
-			if (dest.endPos == PHI_ON_STACK || dest.endPos == PHI_CYCLE) {
-				// Overwriting the destination vreg would complete a cycle.
-				// Skip and leave this vreg on the stack.
-				// The move will be emitted when the recursive call for the destination unwinds.
-				cycle = true;
-				dest.endPos = PHI_CYCLE;
-			} else {
-				// Emit a store local. Pop if the last move.
-				gen.insertStoreLocal(dest, /*pop=*/ l.tail == null && !cycle, next);
-			}
-		}
-		// If this vreg was the completion of a cycle, a recursive call hit the case above and skipped emitting a move.
-		if (vreg.endPos == PHI_CYCLE) gen.insertStoreLocal(vreg, true, next);
-		vreg.endPos = PHI_DONE;
-	}
-	def canConsumeFromStack(d: Operand.Def, u: Operand.Use) -> bool {
-		return d.vreg == u.vreg && useCount(d) == 1;
 	}
 	def useCount(d: Operand.Def) -> int {
 		// XXX: get this information from the VReg.
