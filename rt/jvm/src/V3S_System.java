@@ -22,7 +22,7 @@ public class V3S_System {
 	fileOutput[2] = System.err;
     }
 
-    public static void putc(byte ch) {
+    public static void putc(char ch) {
         System.out.print((char) ch);
     }
 
@@ -38,14 +38,22 @@ public class V3S_System {
         System.out.print('\n');
     }
 
-    public static byte fileRead(int fd) throws IOException {
+    public static char fileRead(int fd) throws IOException {
 	InputStream in = getFileInput(fd);
-	return in == null ? 0 : (byte) in.read();
+        if (in == null) return 0;
+        int b = in.read();
+        return b < 0 ? 0 : (char)b;
     }
 
     public static void fileWriteK(int fd, byte[] b, int offset, int length) throws IOException {
 	OutputStream out = getFileOutput(fd);
         if (out != null) out.write(b, offset, length);
+    }
+
+    public static int fileReadK(int fd, byte[] b, int offset, int length) throws IOException {
+	InputStream in = getFileInput(fd);
+        if (in != null) return in.read(b, offset, length);
+        return 0;
     }
 
     public static int fileOpen(byte[] name, boolean input) {
