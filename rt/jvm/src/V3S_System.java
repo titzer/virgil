@@ -38,11 +38,9 @@ public class V3S_System {
         System.out.print('\n');
     }
 
-    public static char fileRead(int fd) throws IOException {
+    public static int fileRead(int fd) throws IOException {
 	InputStream in = getFileInput(fd);
-        if (in == null) return 0;
-        int b = in.read();
-        return b < 0 ? 0 : (char)b;
+        return in == null ? -1 : in.read();
     }
 
     public static void fileWriteK(int fd, byte[] b, int offset, int length) throws IOException {
