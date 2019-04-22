@@ -135,7 +135,7 @@ class MachRegSet {
 // Machine-independent representation of the calling convention for a specific call.
 class MachCallConv {
 	def regSet: MachRegSet;		// associated register set
-	def paramTypes: Array<Type>;    // parameter types
+	def paramTypes: Array<Type>;	// parameter types
 	def paramLocs: Array<int>;	// locations of parameters
 	def returnTypes: Array<Type>;	// return types
 	def retLocs: Array<int>;	// locations of return value(s)
@@ -181,12 +181,12 @@ class MachCodeGen(mach: MachProgram, context: SsaContext) {
 	var curValMoves: List<(Val, int)>;
 	var numLivePoints: int;
 	// constants for encoding the used mach vars
-	def USE  = 0x0;
-	def DEF  = 0x1;
+	def USE	 = 0x0;
+	def DEF	 = 0x1;
 	def LIVE = 0x2;
 	def KILL = 0x3;
 	def TYPE_MASK = 0x3;
-	def UNUSED_MASK   = 0x8;
+	def UNUSED_MASK	  = 0x8;
 	def ASSIGNED_MASK = 0x4;
 	def VAR_SHIFT: u3 = 4;
 
@@ -413,7 +413,7 @@ type Operand {
 	case Immediate(val: Val);
 	case Use(ssa: SsaInstr, vreg: VReg, constraint: int);
 	case Def(ssa: SsaInstr, vreg: VReg, constraint: int);
-	case Kill(constraint: int);
+	case Kill(livepoint: int, constraint: int);
 	case Overwrite(i: SsaInstr, vreg: VReg, constraint: int);
 	case Label(block: SsaBlock, label: Label);
 	case ExSource(ex: string, source: Source);
@@ -432,30 +432,23 @@ class ArchInstr(op: int, operands: Array<Operand>) {
 	}
 }
 
-enum ArchInstrFlag {
-	NO_GAP,
-	REMATERALIZE,
-	LOAD,
-	STORE
-}
-
 // Constants for Arch instructions.
 component ArchInstrs {
 	// flags for all arch instructions reordering and register allocation
 	def FLAG_NO_GAP = 0x80000000;	// cannot insert instructions before this instruction
-	def FLAG_REMAT  = 0x40000000;	// instruction can be copied for rematerialization
-	def FLAG_LOAD   = 0x20000000;	// instruction reads mutable state
-	def FLAG_STORE  = 0x10000000;	// instruction writes mutable state
+	def FLAG_REMAT	= 0x40000000;	// instruction can be copied for rematerialization
+	def FLAG_LOAD	= 0x20000000;	// instruction reads mutable state
+	def FLAG_STORE	= 0x10000000;	// instruction writes mutable state
 
 	def NUM_FLAGS: u5 = 4;
 
 	// block and SSA resolution instructions
-	def ARCH_NOP     = -6;
-	def ARCH_BLOCK   = -5;
-	def ARCH_ENTRY   = -4;
+	def ARCH_NOP	 = -6;
+	def ARCH_BLOCK	 = -5;
+	def ARCH_ENTRY	 = -4;
 	def ARCH_PARMOVE = -3;
-	def ARCH_END     = -2;
-	def ARCH_RET     = -1;
+	def ARCH_END	 = -2;
+	def ARCH_RET	 = -1;
 
 	def NO_OPERANDS: Array<Operand> = [];
 }
@@ -475,32 +468,33 @@ def CACHED_INT_IMMEDIATES = [
 
 // Basic algorithm for code generation.
 class ArchCodeGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, buffer: MachDataBuffer) {
+	def out = if(Aeneas.PRINT_MACH.get(), ArchInstrBuffer.new(mach.prog, regSet));
 	def operands = Vector<Operand>.new();
 	def vars = Vector<VReg>.new();
 	var lowestMark: int;
 	var blocks: SsaBlockOrder;
 	var order: Vector<SsaBlockInfo>;
 	var liveness: BitMatrix;
+	var numLivepoints = 0;
+	def livepoints = Vector<(SsaBlock, Operand.Kill)>.new();
 	var anyReg: int;
 	var cursor: ArchInstr;
 	var blockEnd: ArchInstr;
 	var frame: MachFrame;
 	var curBlock: SsaBlock;
-	var out: ArchInstrBuffer;
-
-	new() {
-		if (Aeneas.PRINT_MACH.get()) out = ArchInstrBuffer.new(mach.prog, regSet);
-	}
 
 	def reset(graph: SsaGraph, blocks: SsaBlockOrder, frame: MachFrame) {
+		this.operands.length = 0;
+		this.vars.length = 0;
 		this.context.graph = graph;
 		this.context.block = null;
+		this.lowestMark = graph.markGen++;
 		this.blocks = blocks;
 		this.order = if(blocks != null, blocks.order);
-		this.lowestMark = graph.markGen++;
-		this.cursor = null;
 		this.liveness = BitMatrix.new(if(order != null, order.length, 1), 32);
-		this.operands.length = 0;
+		this.numLivepoints = 0;
+		this.livepoints.length = 0;
+		this.cursor = null;
 		this.frame = frame;
 		this.curBlock = null;
 	}
@@ -570,9 +564,20 @@ class ArchCodeGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, bu
 			context.block = block;
 			gatherLivenessForBlock(block);
 			selectInstructionsForBlock(block);
+			if (info.loop != null) finishLoopLiveness(info);
 		}
 		// emit the entry instruction.
 		visitEntry(context.graph.params);
+	}
+	def finishLoopLiveness(info: SsaBlockInfo) {
+		// Propagate liveness from the loop header to all live points
+		// contained in the loop.
+		var end = info.loop.end;
+		for (i = livepoints.length - 1; i >= 0; i--) {	// process newest first
+			var t = livepoints[i], block = t.0;
+			if (block.mark > end) break;  // rely on backwards codegen order
+			liveness.or(order.length + t.1.livepoint, block.mark);
+		}
 	}
 	def gatherLivenessForBlock(block: SsaBlock) {
 		for (e in block.succs()) {
@@ -624,14 +629,16 @@ class ArchCodeGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, bu
 		return context.fail("invalid instruction type");
 	}
 	def emitPhiResolutionMoves(block: SsaBlock, edge: SsaCfEdge) {
-		// Add dest/src pairs as parallel moves.
-		var i = edge.dest.next, index = edge.desti;
-		while (true) {
-			if (!SsaPhi.?(i)) break;
+		var index = edge.desti;
+		// Add definitions of all phis.
+		for (i = edge.dest.next; SsaPhi.?(i); i = i.next) {
 			var phi = SsaPhi.!(i);
 			dfn(phi);
+		}
+		// Add uses of all phi inputs.
+		for (i = edge.dest.next; SsaPhi.?(i); i = i.next) {
+			var phi = SsaPhi.!(i);
 			use(phi.inputs[index].dest);
-			i = i.next;
 		}
 		emitN(ArchInstrs.ARCH_PARMOVE);
 	}
@@ -674,20 +681,40 @@ class ArchCodeGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, bu
 		vars[id] = n;
 		return n;
 	}
+	def newLivepoint() -> int {
+		return numLivepoints++;
+	}
 	def numVars(i: SsaInstr) -> int {
 		return Tuple.length(i.getType());
 	}
-	def updateLivenessDef(o: Operand) {
-		match (o) {
-			Def(i, vreg, constraint) => liveness[context.block.mark, vreg.varNum] = false;
-			Overwrite(i, vreg, constraint) => liveness[context.block.mark, vreg.varNum] = false;
-			_ => ;
-		}
-	}
-	def updateLivenessUse(o: Operand) {
-		match (o) {
-			Use(i, vreg, constraint) => liveness[context.block.mark, vreg.varNum] = true;
-			Overwrite(i, vreg, constraint) => liveness[context.block.mark, vreg.varNum] = true;
+	def updateLiveness(i: ArchInstr) {
+		def DEFS = 0, KILLS = 1, OVW = 2, USES = 3;
+		var state = DEFS;
+		for (o in i.operands) match (o) {
+			Def(i, vreg, constraint) => {
+				if (state > DEFS) context.fail("out of order def");
+				liveness[context.block.mark, vreg.varNum] = false;
+				state = DEFS;
+			}
+			Overwrite(i, vreg, constraint) => {
+				if (state > OVW) context.fail("out of order ovw");
+				liveness[context.block.mark, vreg.varNum] = false;
+				state = OVW;
+			}
+			Kill(livepoint, constraint) => {
+				if (state > KILLS) context.fail("out of order kill");
+				if (livepoint >= 0) {
+					var index = order.length + livepoint;
+					liveness.grow(index + 1);
+					liveness.or(index, context.block.mark);
+					livepoints.add((context.block, Operand.Kill.!(o)));
+				}
+				state = KILLS;
+			}
+			Use(i, vreg, constraint) => {
+				liveness[context.block.mark, vreg.varNum] = true;
+				state = USES;
+			}
 			_ => ;
 		}
 	}
@@ -744,8 +771,7 @@ class ArchCodeGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, bu
 			i.prev = prev;
 		}
 		cursor.prev = i;
-		for (o in x) updateLivenessDef(o);
-		for (o in x) updateLivenessUse(o);
+		updateLiveness(i);
 	}
 	def useLabel(block: SsaBlock) {
 		operands.add(Operand.Label(block, order[block.mark].label));
@@ -779,8 +805,8 @@ class ArchCodeGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, bu
 	def dfnv(vreg: VReg) {
 		operands.add(Operand.Def(null, vreg, 0));
 	}
-	def kill(constraint: int) {
-		operands.add(Operand.Kill(constraint));
+	def kill(livepoint: int, constraint: int) {
+		operands.add(Operand.Kill(livepoint, constraint));
 	}
 	def useAll(array: Array<SsaDfEdge>, start: int) {
 		for (j = start; j < array.length; j++) use(array[j].dest);
@@ -1026,8 +1052,9 @@ class ArchInstrBuffer(prog: Program, regSet: MachRegSet) extends TerminalBuffer 
 				putVReg('d', vreg);
 				putConstraint(constraint);
 			}
-			Kill(constraint) => {
+			Kill(livepoint, constraint) => {
 				putc('k');
+				if (livepoint > 0) puti(livepoint);
 				putConstraint(constraint);
 			}
 			Overwrite(i, vreg, constraint) => {
@@ -1051,151 +1078,6 @@ class ArchInstrBuffer(prog: Program, regSet: MachRegSet) extends TerminalBuffer 
 					source.render(this).end();
 				}
 			}
-		}
-	}
-}
-
-class LivenessAnalyzer(prog: Program, method: IrMethod) {
-	def graph = method.ssa;
-	def blocks = SsaBlockOrder.new(graph).order.extract();
-	def live = Array<List<SsaInstr>>.new(blocks.length);
-	def liveness = BitMatrix.new(live.length + 1, 1);
-	def lowestMark = graph.markGen++;
-	var dead = 0;
-	def analyze() {
-		for (i = blocks.length - 1; i >= 0; i--) {
-			var block = blocks[i];
-			gatherLiveness(block);
-			analyzeLiveness(block);
-		}
-		var instrs = liveness.numcols, global = liveness.count(blocks.length);
-		Terminal.put3("\n %1: %2 blocks, %3 instructions, ", method.render, blocks.length, instrs);
-		Terminal.put2("%1 global, %2", global, (global * 100) / instrs);
-		Terminal.put(" %");
-		Terminal.put1(", dead %1\n", dead);
-	}
-	def analyzeLiveness(info: SsaBlockInfo) {
-		var block = info.block;
-//		Terminal.put2("block #%1: liveout = %2\n", block.uid, liveness.count(block.mark));
-		for (i: SsaLink = block.end(); i != block; i = i.prev) {
-//			Terminal.put2("  @%1: pressure = %2\n", i.uid, liveness.count(block.mark));
-			analyzeInstr(block, i);
-		}
-//		Terminal.put2("block #%1: livein  = %2\n", block.uid, liveness.count(block.mark));
-	}
-	def analyzeInstr(block: SsaBlock, i: SsaLink) {
-		if (SsaApplyOp.?(i)) {
-			var apply = SsaApplyOp.!(i);
-			analyzeDef(block, apply);
-			analyzeUses(block, apply.inputs);
-			return;
-		}
-		if (SsaIf.?(i)) {
-			var iff = SsaIf.!(i);
-			analyzeUses(block, iff.inputs);
-			return;
-		}
-		if (SsaReturn.?(i)) {
-			var ret = SsaReturn.!(i);
-			analyzeUses(block, ret.inputs);
-			return;
-		}
-		if (SsaSwitch.?(i))  {
-			var sw = SsaSwitch.!(i);
-			analyzeUses(block, sw.inputs);
-			return;
-		}
-	}
-	def analyzeDef(block: SsaBlock, instr: SsaInstr) {
-		if (!liveness[block.mark, getIndex(instr)]) {
-			// might be dead
-			var effect = false;
-			match (SsaApplyOp.!(instr).op.opcode) {
-				CallClassVirtual,
-				CallMethod,
-				CallAddress,
-				CallClosure,
-				ConditionalThrow,
-				NullCheck,
-				SystemOp,
-				MachSystemOp,
-				ClassSetField,
-				ArraySetElem,
-				ClassInitField,
-				PtrStore,
-				PtrCmpSwp,
-				ComponentSetField => effect = true;
-				_ => ;
-			}
-			if (!effect) dead++;
-		}
-		clearLive(instr, block);
-	}
-	def analyzeUses(block: SsaBlock, inputs: Array<SsaDfEdge>) -> int {
-		var increase = 0;
-		for (i in inputs) {
-			if (!isLive(i.dest, block)) increase++;
-			if (!SsaConst.?(i.dest)) setLive(i.dest, block);
-		}
-		return increase;
-	}
-	def gatherLiveness(info: SsaBlockInfo) {
-		var succs = info.block.succs(), block = info.block;
-		for (e in succs) {
-			var succ = e.dest;
-			propagateLiveness(succ, block);
-			gatherLivenessOfPhiInputs(block, succ);
-		}
-		liveness.or(blocks.length, block.mark);  // record globalness
-	}
-	def gatherLivenessOfPhiInputs(block: SsaBlock, succ: SsaBlock) {
-		// Find the successor input index.
-		var index = -1;
-		var edges = succ.preds;
-		for (i < edges.length) {
-			if (edges[i].src == block) { index = i; break; }
-		}
-		// Add dest/src pairs as parallel moves.
-		var i = succ.next;
-		while (true) {
-			if (!SsaPhi.?(i)) break;
-			var phi = SsaPhi.!(i);
-			var input = phi.inputs[index].dest;
-			setLive(input, block);
-		}
-	}
-
-	def isLive(instr: SsaInstr, block: SsaBlock) -> bool {
-		return liveness[block.mark, getIndex(instr)];
-	}
-	def setLive(instr: SsaInstr, block: SsaBlock) {
-		liveness[block.mark, getIndex(instr)] = true;
-	}
-	def clearLive(instr: SsaInstr, block: SsaBlock) {
-		liveness[block.mark, getIndex(instr)] = false;
-	}
-	def propagateLiveness(from: SsaBlock, to: SsaBlock) {
-		liveness.or(to.mark, from.mark);
-	}
-	def getIndex(i: SsaInstr) -> int {
-		if (i.mark <= lowestMark) {
-			i.mark = graph.markGen++;
-			liveness.widen(i.mark + 1);
-		}
-		return i.mark;
-	}
-}
-
-//def liveness = Aeneas.registerTarget(LivenessTarget.new());
-class LivenessTarget extends Target("liveness") {
-	def configure(compiler: Compiler, prog: Program) {
-		SystemModule.install(prog);
-		compiler.Reachability = true;
-	}
-	def emit(compiler: Compiler, prog: Program) {
-		for (i < prog.ir.methods.length) {
-			var m = prog.ir.methods[i];
-			LivenessAnalyzer.new(prog, m).analyze();
 		}
 	}
 }
