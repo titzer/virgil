@@ -41,8 +41,8 @@ struct instance_fds {
 
   void clear() {
     fd_map[0] = 0;
-    fd_map[1] = 0;
-    fd_map[2] = 0;
+    fd_map[1] = 1;
+    fd_map[2] = 2;
     for (int i = 2; i < FD_MAX; i++) fd_map[i] = -1;
   }
 

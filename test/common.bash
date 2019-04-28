@@ -33,6 +33,7 @@ AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
 UNAME=$(uname -sm)
 HOST_PLATFORM=$($VIRGIL_LOC/bin/dev/sense_host | cut -d' ' -f1)
 HOST_JAVA=$(which java)
+HOST_WAVE=$(which wave)
 
 if [ -z "$AENEAS_TEST" ]; then
     AENEAS_TEST=$VIRGIL_LOC/bin/v3c
@@ -111,7 +112,7 @@ function run_io_test() {
 	local args="$3"
 	local expected="$4"
 
-	if [[ "$HOST_PLATFORM" == "$target" || $target == "jar" && "$HOST_JAVA" != "" ]]; then
+	if [[ "$HOST_PLATFORM" == "$target" || $target == "jar" && "$HOST_JAVA" != "" || $target == "wave" && "$HOST_WAVE" != "" ]]; then
 		print_status Running "$target" "$test"
 		P=$OUT/$target/$test.out
 		$OUT/$target/$test $args &> $P

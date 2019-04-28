@@ -1,6 +1,6 @@
 WASM_C_API_DIR := ../../bin/dev/wasm-c-api
 WASM_HH := $(WASM_C_API_DIR)/include/wasm.hh
-WASM_V8 := $(WASM_C_API_DIR)/out/wasm-v8.o
+WASM_V8 := $(WASM_C_API_DIR)/out/wasm-c.o
 WAVE=../../bin/dev/wave
 COPTS=-fsanitize=address -fsanitize-memory-track-origins -fsanitize-memory-use-after-dtor
 
