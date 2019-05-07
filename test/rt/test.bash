@@ -21,11 +21,11 @@ run_v3c $target -output=$OUT $SOURCES &> $OUT/$target.compile.out
 check_no_red $? $OUT/$target.compile.out
 
 print_compiling "$target-rt" RiRuntimeTest
-run_v3c "" -target=$target -output=$OUT -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $RT/native/*.v3 &> $OUT/$target-rt.compile.out
+run_v3c "" -target=$target -output=$OUT -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $NATIVE_SOURCES &> $OUT/$target-rt.compile.out
 check_no_red $? $OUT/$target-rt.compile.out
 
 print_compiling "$target-gc" RiRuntimeTest
-run_v3c "" -target=$target -output=$OUT -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $RT/native/*.v3 $RT/gc/*.v3 &> $OUT/$target-gc.compile.out
+run_v3c "" -target=$target -output=$OUT -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $NATIVE_SOURCES $RT/gc/*.v3 &> $OUT/$target-gc.compile.out
 check_no_red $? $OUT/$target-gc.compile.out
 
 print_compiling "$target" CiRuntimeApi

@@ -35,6 +35,9 @@ HOST_PLATFORM=$($VIRGIL_LOC/bin/dev/sense_host | cut -d' ' -f1)
 HOST_JAVA=$(which java)
 HOST_WAVE=$(which wave)
 
+N=$VIRGIL_LOC/rt/native
+NATIVE_SOURCES="$N/RiRuntime.v3 $N/NativeStackPrinter.v3 $N/NativeFileStream.v3"
+
 if [ -z "$AENEAS_TEST" ]; then
     AENEAS_TEST=$VIRGIL_LOC/bin/v3c
 fi
@@ -112,7 +115,7 @@ function run_io_test() {
 	local args="$3"
 	local expected="$4"
 
-	if [[ "$HOST_PLATFORM" == "$target" || $target == "jar" && "$HOST_JAVA" != "" || $target == "wave" && "$HOST_WAVE" != "" ]]; then
+	if [[ "$HOST_PLATFORM" == "$target" || $target == "jar" && "$HOST_JAVA" != "" || $target == "wave" && "$HOST_WAVE" != "" || $target == "wave-nogc" && "$HOST_WAVE" != "" ]]; then
 		print_status Running "$target" "$test"
 		P=$OUT/$target/$test.out
 		$OUT/$target/$test $args &> $P
@@ -130,7 +133,11 @@ function run_v3c() {
 	if [ -z "$target" ]; then
 		$AENEAS_TEST $V3C_OPTS "$@"
 	else
-		V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS "$@"
+            local F=$VIRGIL_LOC/bin/dev/v3c-$target
+            if [ ! -x "$F" ]; then
+                F=$VIRGIL_LOC/bin/v3c-$target
+            fi
+	    V3C=$AENEAS_TEST $F $V3C_OPTS "$@"
 	fi
 }
 

@@ -11,9 +11,9 @@ rm -f $C $P
 rm -f $T/*.st
 
 if [ "$target" == x86-darwin ]; then
-    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/darwin/*.v3"
+    RT_SOURCES="$VIRGIL_LOC/rt/darwin/*.v3 $NATIVE_SOURCES"
 elif [ "$target" == x86-linux ]; then
-    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/linux/*.v3"
+    RT_SOURCES="$VIRGIL_LOC/rt/linux/*.v3 $NATIVE_SOURCES"
 fi
 
 function do_test() {
