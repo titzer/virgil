@@ -16,8 +16,9 @@ fi
 
 AENEAS_SRC="$VIRGIL_LOC/aeneas/src/*/*.v3"
 
-# TODO: use regular aeneas to run the assembler tests
-AENEAS_BIG="java -server -Xmx2g -Xms2g -jar $VIRGIL_LOC/bin/stable/jar/Aeneas.jar"
+if [ -z "$AENEAS_TEST" ]; then
+    AENEAS_TEST=$VIRGIL_LOC/bin/v3c
+fi
 
 if [ ! -e $T ] || [ "$(find . -newer $T)" != "" ]; then
 	# the output doesn't exist, or some part of the test framework changed
@@ -25,7 +26,7 @@ if [ ! -e $T ] || [ "$(find . -newer $T)" != "" ]; then
 
 	printf "  Generating $S..."
 	# TODO: only use the assembler sources and util with test gen
-	$AENEAS_BIG ./X86AssemblerTestGen.v3 $AENEAS_SRC > $S
+	$AENEAS_TEST ./X86AssemblerTestGen.v3 $AENEAS_SRC > $S
 	check $?
 
 	printf "  Assembling $S..."
@@ -41,5 +42,5 @@ if [ ! -e $T ] || [ "$(find . -newer $T)" != "" ]; then
 fi
 
 printf "  Running $T..."
-$AENEAS_BIG $T $AENEAS_SRC
+$AENEAS_TEST $T $AENEAS_SRC
 check $?
