@@ -10,9 +10,9 @@ class X86Rm {
 		if (X86Reg.?(this)) return buf.puts(X86Reg.!(this).name(size));
 		var addr = X86Addr.!(this);
 		buf.putc('[');
-		if (addr.reg != null) {
-			// reg * scale + disp
-			buf.puts(addr.reg.name(size));
+		if (addr.base != null) {
+			// base + index * scale + disp
+			buf.puts(addr.base.name(size));
 			if (addr.scale != 1) buf.putc('*').puti(addr.scale);
 			if (addr.disp < 0) buf.puti(addr.disp);
 			if (addr.disp > 0) buf.putc('+').puti(addr.disp);
@@ -35,14 +35,20 @@ class X86Reg(name8: string, name16: string, name32: string, name64: string, inde
 		return null;
 	}
 	def indirect() -> X86Addr {
-		return X86Addr.new(this, 1, 0);
+		return X86Addr.new(null, this, 1, 0);
 	}
 	def plus(disp: int) -> X86Addr {
-		return X86Addr.new(this, 1, disp);
+		return X86Addr.new(null, this, 1, disp);
 	}
 }
-// [reg * scale + imm]
-class X86Addr(reg: X86Reg, scale: byte, disp: int) extends X86Rm {
+// [base + index * scale + imm]
+class X86Addr(base: X86Reg, index: X86Reg, scale: byte, disp: int) extends X86Rm {
+	new() {
+		if (index != null && index.index == X86Regs.ESP.index && scale != 1) {
+			System.error("X86AssemblerError", "%esp cannot be scaled");
+		}
+	}
+	def absolute() -> bool { return base == null && index == null; }
 }
 // global constants representing registers
 component X86Regs {
@@ -129,9 +135,9 @@ component X86Conds {
 	}
 }
 // opcodes for the 8 basic integer operators
-//------------- add  or  adc sbb and sub xor cmp
-def X86OP_rm_r  = "\x01\x09\x11\x19\x21\x29\x31\x39";
-def X86OP_r_rm  = "\x03\x0B\x13\x1B\x23\x2B\x33\x3B";
+//------------- add  or	 adc sbb and sub xor cmp
+def X86OP_rm_r	= "\x01\x09\x11\x19\x21\x29\x31\x39";
+def X86OP_r_rm	= "\x03\x0B\x13\x1B\x23\x2B\x33\x3B";
 def X86OP_eax_i = "\x05\x0D\x15\x1D\x25\x2D\x35\x3D";
 
 // 2-operand instruction that supports the standard addressing modes
@@ -158,10 +164,15 @@ class X86Op2(asm: X86Assembler, operator: int) {
 		}
 	}
 }
+def MOD_DISP0  = 0b00000000;
+def MOD_DISP8  = 0b01000000;
+def MOD_DISP32 = 0b10000000;
+def MOD_REG  = 0b11000000;
+def MOD_BITS = 0b11000000;
 // Assembles x86 instructions into the provided buffer.
 class X86Assembler(buffer: DataBuffer) {
 	var add: X86Op2;
-	var or:  X86Op2;
+	var or:	 X86Op2;
 	var adc: X86Op2;
 	var sbb: X86Op2;
 	var and: X86Op2;
@@ -314,11 +325,11 @@ class X86Assembler(buffer: DataBuffer) {
 		emitb_rm(0x8D, b, a.index);
 	}
 	def movd_rm_r(a: X86Rm, b: X86Reg) {
-		if (b == X86Regs.EAX && X86Addr.?(a) && X86Addr.!(a).reg == null) return emitbd(0xA3, X86Addr.!(a).disp);
+		if (b == X86Regs.EAX && X86Addr.?(a) && X86Addr.!(a).absolute()) return emitbd(0xA3, X86Addr.!(a).disp);
 		emitb_rm(0x89, a, b.index);
 	}
 	def movd_r_rm(a: X86Reg, b: X86Rm) {
-		if (a == X86Regs.EAX && X86Addr.?(b) && X86Addr.!(b).reg == null) return emitbd(0xA1, X86Addr.!(b).disp);
+		if (a == X86Regs.EAX && X86Addr.?(b) && X86Addr.!(b).absolute()) return emitbd(0xA1, X86Addr.!(b).disp);
 		emitb_rm(0x8B, b, a.index);
 	}
 	def movd_rm_i(a: X86Rm, i: int) { // move immediate doubleword
@@ -485,54 +496,81 @@ class X86Assembler(buffer: DataBuffer) {
 		emit_rm(a, eop);
 	}
 	def emit_rm(a: X86Rm, eop: int) {
-		eop = (eop << 3) & 0b111000;
-		if (X86Reg.?(a)) return emitb(0b11000000 | eop | X86Reg.!(a).index); // mod = 11
-		var addr = X86Addr.!(a), disp = addr.disp;
-		if (addr.reg == null) {
-			// absolute 32-bit address.
-			return emitbd(eop | X86Regs.EBP.index, disp);
+		eop = (eop & 0b111) << 3;
+		if (X86Reg.?(a)) {
+			// register addressing mode
+			return emitb(MOD_REG | eop | X86Reg.!(a).index); // mod = 11
 		}
-		var reg = addr.reg.index, isEsp = (reg == X86Regs.ESP.index), scale = addr.scale;
-		if (scale == 1) {
-			// no scale for the register
-			if (isEsp) emit_sib_esp(eop, reg, disp);
-			else if (disp == 0) {
-				if (reg == X86Regs.EBP.index) emitbb(0b01000000 | eop | reg, 0); // +disp8=0 for EBP
-				else emitb(eop | reg);
+
+		// memory addressing mode
+		var addr = X86Addr.!(a), base = addr.base, index = addr.index, disp = addr.disp;
+
+		if (index == null) {
+			if (base == null) {
+				// absolute 32-bit address.
+				return emitbd(eop | X86Regs.EBP.index, disp);
 			}
-			else if (disp < -128 || disp > 127) emitbd(0b10000000 | eop | reg, disp);
-			else emitbb(0b01000000 | eop | reg, disp);
-			return;
+			// base register only
+			return emit_rm_1(eop, base.index, disp);
 		}
-		if (isEsp) System.error("X86AssemblerError", "ESP cannot be scaled");
+
+		var scale = addr.scale;
+		if (base == null) {
+			if (scale == 1) {
+				// index register only
+				return emit_rm_1(eop, index.index, disp);
+			}
+			if (scale == 2) {
+				// reg*2 => reg+reg
+				scale = 1;
+				base = index;
+			}
+		}
+
+		// compute low part of mod/rm byte
+		var mod_rm = eop | X86Regs.ESP.index; // ESP indicates SIB byte comes next
+
+		// compute sib byte
+		var sib = index.index << 3;
 		if (scale == 2) {
-			// encode as [reg + reg (+ disp)]
-			var sib = reg << 3 | reg;
-			if (disp == 0) {
-				if (reg == X86Regs.EBP.index) emitbbb(0b01000000 | eop | X86Regs.ESP.index, sib, 0); // +disp8=0 for EBP
-				else emitbb(eop | X86Regs.ESP.index, sib);
-			}
-			else if (disp < -128 || disp > 127) emitbbd(0b10000000 | eop | X86Regs.ESP.index, sib, disp);
-			else emitbbb(0b01000000 | eop | X86Regs.ESP.index, sib, disp);
+			sib |= 0b01000000;
 		} else if (scale == 4) {
-			// encode as [reg * 4 + disp32]
-			emitbbd(eop | X86Regs.ESP.index,
-				0b10000000 | reg << 3 | X86Regs.EBP.index,
-				disp);
+			sib |= 0b10000000;
 		} else if (scale == 8) {
-			// encode as [reg * 8 + disp32]
-			emitbbd(eop | X86Regs.ESP.index,
-				0b11000000 | reg << 3 | X86Regs.EBP.index,
-				disp);
-		} else {
-			System.error("X86AssemblerError", Strings.format1("cannot scale by %1", scale));
+			sib |= 0b11000000;
 		}
+
+		if (base != null) {
+			sib |= base.index;
+			// finish mod/rm byte
+			if (disp < -128 || disp > 127) mod_rm |= MOD_DISP32;		// disp32
+			else if (disp != 0) mod_rm |= MOD_DISP8;			// disp8
+			else if (base.index == X86Regs.EBP.index) mod_rm |= MOD_DISP8;	// force disp8 for EBP+0
+		} else {
+			// no base register => mod=00 but must emit disp32
+			sib |= X86Regs.EBP.index;
+		}
+
+		// emit code
+		if (base == null || disp < -128 || disp > 127) emitbbd(mod_rm, sib, disp);
+		else if ((mod_rm & MOD_BITS) == MOD_DISP8) emitbbb(mod_rm, sib, disp);
+		else emitbb(mod_rm, sib);
 	}
-	private def emit_sib_esp(eop: int, reg: int, disp: int) {
-		// SIB byte required for [esp + off]
-		if (disp == 0) return emitbb(eop | reg, 0x24);
-		else if (disp < -128 || disp > 127) emitbbd(0b10000000 | eop | reg, 0x24, disp);
-		else emitbbb(0b01000000 | eop | reg, 0x24, disp);
+	private def emit_rm_1(eop: int, regnum: int, disp: int) {
+		def mod_rm = eop | regnum;
+		if (regnum == X86Regs.ESP.index) {
+			def sib = 0b00100100;
+			if (disp == 0) return emitbb(MOD_DISP0 | mod_rm, sib);
+			else if (disp < -128 || disp > 127) emitbbd(MOD_DISP32 | mod_rm, sib, disp);
+			else emitbbb(MOD_DISP8 | mod_rm, sib, disp);
+		} else if (disp == 0) {
+			if (regnum == X86Regs.EBP.index) emitbb(MOD_DISP8 | mod_rm, 0); // +disp8=0 for EBP
+			else emitb(MOD_DISP0 | mod_rm);
+		} else if (disp < -128 || disp > 127) {
+			emitbd(MOD_DISP32 | mod_rm, disp);
+		} else {
+			emitbb(MOD_DISP8 | mod_rm, disp);
+		}
 	}
 	def emitb(b0: int) {
 		buffer.i1(b0);
