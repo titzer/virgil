@@ -1,6 +1,6 @@
 #!/bin/bash
 
-. ../common.bash fsi32
+. ../common.bash old
 if [ $# -gt 0 ]; then
 	TESTS="$@"
 else
