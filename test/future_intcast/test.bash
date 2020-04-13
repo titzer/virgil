@@ -1,6 +1,6 @@
 #!/bin/bash
 
-. ../common.bash fsi32
+. ../common.bash future_intcast
 if [ $# -gt 0 ]; then
 	TESTS="$@"
 else
