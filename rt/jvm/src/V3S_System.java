@@ -256,4 +256,8 @@ public class V3S_System {
     public static long natlMod(long x, long y) {
 	return x - (y * natlDiv(x, y));
     }
+
+    public static float floatPow(float a, float b) {
+	return (float)Math.pow(a, b);
+    }
 }
