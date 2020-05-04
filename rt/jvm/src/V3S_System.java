@@ -260,4 +260,16 @@ public class V3S_System {
     public static float floatPow(float a, float b) {
 	return (float)Math.pow(a, b);
     }
+    
+    public static int satIntS(int v, int min, int max) {
+	if (v < min) return min;
+	if (v > max) return max;
+	return v;			
+    }
+    
+    public static long satLong(long v, long min, long max) {
+	if (v < min) return min;
+	if (v > max) return max;
+	return v;			
+    }
 }
