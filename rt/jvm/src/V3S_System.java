@@ -261,7 +261,7 @@ public class V3S_System {
 	return (float)Math.pow(a, b);
     }
     
-    public static int satIntS(int v, int min, int max) {
+    public static int satInt(int v, int min, int max) {
 	if (v < min) return min;
 	if (v > max) return max;
 	return v;			
@@ -271,5 +271,14 @@ public class V3S_System {
 	if (v < min) return min;
 	if (v > max) return max;
 	return v;			
+    }
+
+    public static long d2u64(double f) {
+	if (f <= 0) return 0;
+	if (f > 18446744073709551615d) return 0xFFFFFFFFFFFFFFFFL;
+	if (f > 9223372036854775807d) {
+	    return ((long)(f / 2)) * 2;
+	}
+	return (long)f;
     }
 }
