@@ -257,10 +257,6 @@ public class V3S_System {
 	return x - (y * natlDiv(x, y));
     }
 
-    public static float floatPow(float a, float b) {
-	return (float)Math.pow(a, b);
-    }
-    
     public static int satInt(int v, int min, int max) {
 	if (v < min) return min;
 	if (v > max) return max;
