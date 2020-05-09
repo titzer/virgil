@@ -1,6 +1,6 @@
 #!/bin/bash
 
-. ../common.bash old
+. ../common.bash legacy_intcast
 if [ $# -gt 0 ]; then
 	TESTS="$@"
 else
