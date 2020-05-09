@@ -335,4 +335,25 @@ public class V3S_System {
     public static boolean query_d2f(double v) {
 	return v == (double)(float)v;
     }
+
+    public static long cast_d2l(double v, double min, double max) {
+	if (v < min || v >= max) throw new ClassCastException();
+	if (v >= 0x1p63d) {  // XXX: only matters in u64 case
+	    long r = (long)(v/2);
+	    if (v != 2*(double)r) throw new ClassCastException();
+	    return r << 1;
+	}
+	long r = (long)v;
+	if (v != (double)r) throw new ClassCastException();
+	return r;
+    }
+
+    public static boolean query_d2l(double v, double min, double max) {
+	if (v < min || v >= max) return false;
+	if (v >= 0x1p63d) {  // XXX: only matters in u64 case
+	    long r = (long)(v/2);
+	    return v == 2*(double)r;
+	}
+	return v == (double)(long)v;
+    }
 }
