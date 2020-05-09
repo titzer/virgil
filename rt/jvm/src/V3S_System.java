@@ -260,21 +260,53 @@ public class V3S_System {
     public static int satInt(int v, int min, int max) {
 	if (v < min) return min;
 	if (v > max) return max;
-	return v;			
+	return v;
     }
-    
+
     public static long satLong(long v, long min, long max) {
 	if (v < min) return min;
 	if (v > max) return max;
-	return v;			
+	return v;
     }
 
-    public static long d2u64(double f) {
+    public static long d2ul(double f) {
 	if (f <= 0) return 0;
 	if (f > 18446744073709551615d) return 0xFFFFFFFFFFFFFFFFL;
 	if (f > 9223372036854775807d) {
 	    return ((long)(f / 2)) * 2;
 	}
 	return (long)f;
+    }
+
+    public static float cast_i2f(int v) {
+	float f = (float)v;
+	if (v != (int)f) throw new ClassCastException();
+	return f;
+    }
+
+    public static float cast_l2f(long v) {
+	float f = (float)v;
+	if (v != (long)f) throw new ClassCastException();
+	return f;
+    }
+
+    public static double cast_l2d(long v) {
+	double d = (double)v;
+	if (v != (long)d) throw new ClassCastException();
+	return d;
+    }
+
+    public static float cast_ul2f(long v) {
+	if (v >= 0) return cast_l2f(v);
+	// Manually check if any bits would be rounded off.
+	if ((v & 0x0FFFFFFFFFFL) != 0) throw new ClassCastException();
+	return 2.0f * (float)(v >>> 1);
+    }
+
+    public static double cast_ul2d(long v) {
+	if (v >= 0) return cast_l2d(v);
+	// Manually check if any bits would be rounded off.
+	if ((v & 0x7FFL) != 0) throw new ClassCastException();
+	return 2.0d * (double)(v >>> 1);
     }
 }
