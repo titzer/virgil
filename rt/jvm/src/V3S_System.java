@@ -309,4 +309,30 @@ public class V3S_System {
 	if ((v & 0x7FFL) != 0) throw new ClassCastException();
 	return 2.0d * (double)(v >>> 1);
     }
+
+    public static boolean query_i2f(int v) {
+	return v == (int)(float)v;
+    }
+
+    public static boolean query_l2f(long v) {
+	return v == (long)(float)v;
+    }
+
+    public static boolean query_l2d(long v) {
+	return v == (long)(double)v;
+    }
+
+    public static boolean query_ul2f(long v) {
+	if (v < 0) return v == (long)(float)v;
+	return (v & 0x0FFFFFFFFFFL) == 0;
+    }
+
+    public static boolean query_ul2d(long v) {
+	if (v >= 0) return v == (long)(double)v;
+	return (v & 0x7FFL) == 0;
+    }
+
+    public static boolean query_d2f(double v) {
+	return v == (double)(float)v;
+    }
 }
