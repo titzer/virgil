@@ -13,6 +13,14 @@ function do_app() {
   cd $1
   local out=$OUT/$1.compile.out
   local deps=""
+  if [ -f TARGETS ]; then
+      grep -q $target TARGETS > /dev/null
+      if [ $? != 0 ]; then
+	  echo ${YELLOW}skip${NORM}
+	  cd ..
+	  return
+      fi
+  fi
   if [ -f DEPS ]; then
     deps=$(cat DEPS)
   fi
