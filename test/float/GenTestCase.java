@@ -3,6 +3,8 @@ import java.io.*;
 
 class GenTestCase {
     static PrintStream out = System.out;
+    static boolean ftrunc = false;
+    static String fsuffix = ftrunc ? "f" : "d";
 
     public static void main(String[] args) throws java.io.IOException {
 	String template_name = args[0];
@@ -21,7 +23,7 @@ class GenTestCase {
 		out = new PrintStream(os);
 
 		doFractions(t);
-		t.doCaseF("-0d", 0-0d);
+		// TODO minus zero t.doCase(ftrunc, "-0d", 0-0d);
 		doCasesAround(t, 0);
 		//	doCasesAround(t, BigInteger.valueOf(Long.MIN_VALUE));
 		//doCasesAround(t, BigInteger.ZERO.setBit(64).subtract(BigInteger.valueOf(1)));
@@ -29,7 +31,7 @@ class GenTestCase {
 		doCasesAround(t, t.min);
 		doCasesAround(t, t.max);
 		doInfinities(t);
-		out.print("\t(0, 0)");
+		out.print("\t(0, true)");
 
 		String inputs = os.toString("UTF8");
 		String result = template.replaceAll("TYPE", t.name).replaceAll("INPUTS", inputs);
@@ -57,14 +59,18 @@ class GenTestCase {
     }
 
     static void doInfinities(IntType t) {
-	t.doCaseF("-1e+300d", Double.NEGATIVE_INFINITY);
-	t.doCaseF("1e+300d", Double.POSITIVE_INFINITY);
-	t.doCaseF("double.nan", 0d/0d);
+	t.doCase(ftrunc, "-1e+2000" + fsuffix, Double.NEGATIVE_INFINITY);
+	t.doCase(ftrunc, "1e+2000" + fsuffix, Double.POSITIVE_INFINITY);
+	if (ftrunc) {
+	    t.doCase(ftrunc, "float.nan", 0d/0d);
+	} else {
+	    t.doCase(ftrunc, "double.nan", 0d/0d);
+	}
     }
 
     static void doFractions(IntType t) {
 	for (double val = -3.0d; val < 3.25d; val += 0.25) {
-	    t.doCaseF(val + "d", val);
+	    t.doCase(ftrunc, val + fsuffix, val);
 	}
     }
 
@@ -72,8 +78,10 @@ class GenTestCase {
 	for (int inc : new int[]{-313, 313}) {
 	    long val = num;
 	    for (int i = 0; i < 5; i++) {
-		t.doCaseF(val + "d", (double)val);
-		t.doCaseF((val + inc) + "d", (double)(val + inc));
+		t.doCase(ftrunc, val + fsuffix, (double)val);
+		long val2 = ftrunc ? (long)(float)val : (long)(double)val;
+		t.doCase(ftrunc, val2 + fsuffix, (double)val2);
+		t.doCase(ftrunc, (val + inc) + fsuffix, (double)(val + inc));
 		val = nextDouble(val, inc);
 	    }
 	}
@@ -83,19 +91,12 @@ class GenTestCase {
 	for (BigInteger inc : new BigInteger[]{BigInteger.valueOf(0 - (1 << 23)), BigInteger.valueOf(1 << 23) }) {
 	    BigInteger val = num;
 	    for (int i = 0; i < 5; i++) {
-		t.doCaseF(val + "f", val.doubleValue());
+		t.doCase(ftrunc, val + fsuffix, val.doubleValue());
 		val = nextDouble(val, inc);
 	    }
 	}
     }
 
-    static long nextFloat(long val, int inc) {
-	float v = (float)val;
-	while (v == (long)val) {
-	    val += inc;
-	}
-	return val;
-    }
     static BigInteger nextDouble(BigInteger val, BigInteger inc) {
 	double v = val.doubleValue();
 	while (v == val.doubleValue()) {
@@ -105,7 +106,7 @@ class GenTestCase {
     }
     static long nextDouble(long val, int inc) {
 	double v = (double)val;
-	while (v == (long)val) {
+	while (ftrunc ? (float)v == (long)(float)val : v == (long)val) {
 	    val += inc;
 	}
 	return val;
@@ -130,16 +131,11 @@ class IntType {
 	}
 
     }
-    void doCaseF(String rep, double val) {
-	long result = (long)val;
-	if (result < min) result = (long)min;
-	if (result > max) result = (long)max;
-	GenTestCase.out.println("\t(" + rep + ", " + result + suffix + "),");
-    }
-    void doCaseD(String rep, double val) {
-	long result = (long)val;
-	if (result < min) result = (long)min;
-	if (result > max) result = (long)max;
-	GenTestCase.out.println("\t(" + rep + ", " + result + suffix + "),");
+    void doCase(boolean ftrunc, String rep, double val) {
+	long result = ftrunc ? (long)(float)val : (long)val;
+	boolean ok = val == (ftrunc ? (float)result : (double)result);
+	if (result < min) ok = false;
+	if (result > max) ok = false;
+	GenTestCase.out.println("\t(" + rep + ", " + ok + "),");
     }
 }
