@@ -11,7 +11,8 @@ class GenTestCase {
     public static void main(String[] args) throws java.io.IOException {
 	template_name = args[0];
 	template = loadFile(template_name);
-	genUnop();
+	//	genUnop();
+	genBinop();
     }
     static void genC() throws java.io.IOException {
 	int[] widths = {
@@ -61,6 +62,24 @@ class GenTestCase {
 	abstract double exec(double d);
     }
     
+    static abstract class Binop {
+	boolean isDouble;
+	String ftype;
+	String itype;
+	String rtype;
+	String opname;
+	String op;
+	Binop(boolean isDouble, String rtype, String opname, String op) {
+	    this.isDouble = isDouble;
+	    this.ftype = isDouble ? "double" : "float";
+	    this.itype = isDouble ? "u64" : "u32";
+	    this.rtype = rtype;
+	    this.opname = opname;
+	    this.op = op;
+	}
+	abstract Object exec(double a, double b);
+    }
+    
     static void genUnop() throws java.io.IOException {
 	for (boolean isDouble : new boolean[]{false, true}) {
 	    doUnop(new Unop(isDouble, "floor") {
@@ -85,45 +104,45 @@ class GenTestCase {
 		});
 	}
     }
-    
-    static void doUnop(Unop op) throws java.io.IOException {
-	double cases[] = {
-	    Double.NEGATIVE_INFINITY,
-	    Double.NaN,
-	    -134e16,
-	    -0xFFFFFFp-3,
-	    -0xFFFFFFp-2,
-	    -0xFFFFFFp-1,
-	    -0xFFFFFFp0,
-	    -0xFFFFFFp1,
-	    -0xFFFFFFp2,
-	    -0xFFFFFFp3,
-	    -3.9,
-	    -1.5,
-	    -1.25,
-	    -1,
-	    -1e-40,
-	    -0.125,
-	    -1e-319,
-	    -0,
-	    0,
-	    0.625,
-	    1e-320,
-	    1e-41,
-	    2.25,
-	    5.75,
-	    0xFFFFFFp-3,
-	    0xFFFFFFp-2,
-	    0xFFFFFFp-1,
-	    0xFFFFFFp0,
-	    0xFFFFFFp1,
-	    0xFFFFFFp2,
-	    0xFFFFFFp3,
-	    13455.16,
-	    124e17,
-	    Double.POSITIVE_INFINITY,
-	};
+
+    static double cases[] = {
+	Double.NEGATIVE_INFINITY,
+	Double.NaN,
+	-134e16,
+	-0xFFFFFFp-3,
+	-0xFFFFFFp-2,
+	-0xFFFFFFp-1,
+	-0xFFFFFFp0,
+	-0xFFFFFFp1,
+	-0xFFFFFFp2,
+	-0xFFFFFFp3,
+	-3.9,
+	-1.5,
+	-1.25,
+	-1,
+	-1e-40,
+	-0.125,
+	-1e-319,
+	-0,
+	0,
+	0.625,
+	1e-320,
+	1e-41,
+	2.25,
+	5.75,
+	0xFFFFFFp-3,
+	0xFFFFFFp-2,
+	0xFFFFFFp-1,
+	0xFFFFFFp0,
+	0xFFFFFFp1,
+	0xFFFFFFp2,
+	0xFFFFFFp3,
+	13455.16,
+	124e17,
+	Double.POSITIVE_INFINITY,
+    };
 	
+    static void doUnop(Unop op) throws java.io.IOException {
 	ByteArrayOutputStream os = new ByteArrayOutputStream();
 	out = new PrintStream(os);
 	
@@ -146,6 +165,113 @@ class GenTestCase {
 	String outname = op.ftype +
 	    template_name
 	    .replaceAll("OP", op.op)
+	    .replaceAll(".t3", ".v3");
+	
+	out = new PrintStream(new FileOutputStream(outname));
+	out.println(result);
+	out.close();
+    }
+
+    static void genBinop() throws java.io.IOException {
+	for (boolean isDouble : new boolean[]{false, true}) {
+	    doBinop(new Binop(isDouble, isDouble ? "double" : "float", "add", "+") {
+		    Object exec(double a, double b) {
+			return a + b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, isDouble ? "double" : "float", "sub", "-") {
+		    Object exec(double a, double b) {
+			return a - b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, isDouble ? "double" : "float", "mul", "*") {
+		    Object exec(double a, double b) {
+			return a * b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, isDouble ? "double" : "float", "div", "/") {
+		    Object exec(double a, double b) {
+			return a / b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, isDouble ? "double" : "float", "mod", "%") {
+		    Object exec(double a, double b) {
+			return a % b;
+		    }
+		});
+	    
+	    doBinop(new Binop(isDouble, "bool", "eq", "==") {
+		    Object exec(double a, double b) {
+			return a == b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, "bool", "ne", "!=") {
+		    Object exec(double a, double b) {
+			return a != b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, "bool", "lt", "<") {
+		    Object exec(double a, double b) {
+			return a < b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, "bool", "lteq", "<=") {
+		    Object exec(double a, double b) {
+			return a <= b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, "bool", "gt", ">") {
+		    Object exec(double a, double b) {
+			return a > b;
+		    }
+		});
+	    doBinop(new Binop(isDouble, "bool", "gteq", ">=") {
+		    Object exec(double a, double b) {
+			return a >= b;
+		    }
+		});
+	}
+    }
+
+    static void doBinop(Binop op) throws java.io.IOException {
+	ByteArrayOutputStream os = new ByteArrayOutputStream();
+	out = new PrintStream(os);
+	
+	for (int i = 0; i < cases.length; i++) {
+	    for (int j = 0; j < cases.length; j++) {
+		double a = cases[i];
+		double b = cases[j];
+		String comma = ",";
+		if (i == cases.length - 1 && j == cases.length - 1) comma = "";
+		if (!op.isDouble) a = (float)a;
+		if (!op.isDouble) b = (float)b;
+		Object result = op.exec(a, b);
+		boolean isNaN = false;
+		if (result instanceof Double) {
+		    double r = ((Double)result).doubleValue();
+		    if (!op.isDouble) r = (float)r;
+		    result = render(op.isDouble, r);
+		    isNaN = Double.isNaN(r);
+		}
+		out.println("\t("
+			    + render(op.isDouble, a) + ", "
+			    + render(op.isDouble, b) + ", "
+			    + result + ", "
+			    + isNaN + ")" + comma);
+	    }
+	}
+	    
+	String inputs = os.toString("UTF8");
+	String result = template
+	    .replaceAll("FTYPE", op.ftype)
+	    .replaceAll("ITYPE", op.itype)
+	    .replaceAll("RTYPE", op.rtype)
+	    .replaceAll("OP", op.op)
+	    .replaceAll("INPUTS", inputs);
+	    
+	String outname = op.ftype +
+	    template_name
+	    .replaceAll("OP", op.opname)
 	    .replaceAll(".t3", ".v3");
 	
 	out = new PrintStream(new FileOutputStream(outname));
