@@ -1,4 +1,5 @@
 import java.math.BigInteger;
+import java.math.BigDecimal;
 import java.io.*;
 
 class GenTestCase {
@@ -12,8 +13,58 @@ class GenTestCase {
 	template_name = args[0];
 	template = loadFile(template_name);
 	//	genUnop();
-	genBinop();
+	// genBinop();
+	genLongs();
     }
+    static BigInteger i64_min = BigInteger.ZERO.subtract(BigInteger.ZERO.setBit(63));
+    static BigInteger i64_max = BigInteger.ZERO.setBit(63).subtract(BigInteger.ONE);
+    static BigInteger u64_min = BigInteger.ZERO;
+    static BigInteger u64_max = BigInteger.ZERO.setBit(64).subtract(BigInteger.ONE);
+    
+    static void genLongs() {
+	printCasesAround(i64_min);
+	printCasesAround(i64_max);
+	printCasesAround(u64_min);
+	printCasesAround(u64_max);
+    }
+
+    static void printCasesAround(BigInteger num) {
+	for (BigInteger inc : new BigInteger[]{BigInteger.valueOf(0 - 11133), BigInteger.valueOf(11133) }) {
+	    BigInteger val = num;
+	    for (int i = 0; i < 5; i++) {
+		double d = val.doubleValue();
+		if (ftrunc) d = (float)d;
+		printCase(d);
+		val = nextDouble(val, inc);
+	    }
+	}
+    }
+    
+    static void printCase(double val) {
+	BigDecimal d = BigDecimal.valueOf(val);
+	//	boolean isI64 = inRange(val, i64_min, i64_max);
+	//	boolean isU64 = inRange(val, u64_min, u64_max);
+	String i64 = saturate(val, i64_min, i64_max);
+	String u64 = saturate(val, u64_min, u64_max);
+	out.println("\t(" + val + fsuffix + ", " + i64 + "L, " + u64 +"uL),");
+    }
+
+    static boolean inRange(double val, BigInteger a, BigInteger b) {
+	BigDecimal d = BigDecimal.valueOf(val);
+	BigDecimal min = new BigDecimal(a);
+	BigDecimal max = new BigDecimal(b);
+	return d.compareTo(min) >= 0 && d.compareTo(max) <= 0;
+    }
+
+    static String saturate(double val, BigInteger a, BigInteger b) {
+	BigDecimal d = BigDecimal.valueOf(val);
+	double r = val;
+	if (d.compareTo(new BigDecimal(a)) < 0) return a.toString();
+	else if (d.compareTo(new BigDecimal(b)) > 0) return b.toString();
+	if (ftrunc) r = (float)r;
+	return BigDecimal.valueOf(r).toPlainString();
+    }
+    
     static void genC() throws java.io.IOException {
 	int[] widths = {
 	    15, 16, 31, 32, 41, 52, 53, 63
@@ -341,9 +392,13 @@ class GenTestCase {
     }
 
     static BigInteger nextDouble(BigInteger val, BigInteger inc) {
-	double v = val.doubleValue();
-	while (v == val.doubleValue()) {
+	double s = val.doubleValue();
+	if (ftrunc) s = (float)s;
+	double v = s;
+	while (v == s) {
 	    val = val.add(inc);
+	    v = val.doubleValue();
+	    if (ftrunc) v = (float)v;
 	}
 	return val;
     }
