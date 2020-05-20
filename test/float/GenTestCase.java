@@ -4,17 +4,19 @@ import java.io.*;
 
 class GenTestCase {
     static PrintStream out = System.out;
-    static boolean ftrunc = true;
+    static boolean ftrunc = false;
     static String fsuffix = ftrunc ? "f" : "d";
+    static String ftype = ftrunc ? "float" : "double";
     static String template_name;
     static String template;
 
     public static void main(String[] args) throws java.io.IOException {
 	template_name = args[0];
 	template = loadFile(template_name);
-	//	genUnop();
+	// genUnop();
 	// genBinop();
-	genLongs();
+	// genLongs();
+	genC();
     }
     static BigInteger i64_min = BigInteger.ZERO.subtract(BigInteger.ZERO.setBit(63));
     static BigInteger i64_max = BigInteger.ZERO.setBit(63).subtract(BigInteger.ONE);
@@ -67,7 +69,8 @@ class GenTestCase {
     
     static void genC() throws java.io.IOException {
 	int[] widths = {
-	    15, 16, 31, 32, 41, 52, 53, 63
+	    //	    15, 16, 31, 32, 41, 52, 53
+	     63
 	};
 	
 	for (int width : widths) {
@@ -77,20 +80,20 @@ class GenTestCase {
 		ByteArrayOutputStream os = new ByteArrayOutputStream();
 		out = new PrintStream(os);
 
-		doFractions(t);
-		// TODO minus zero t.doCase(ftrunc, "-0d", 0-0d);
-		doCasesAround(t, 0);
-		//	doCasesAround(t, BigInteger.valueOf(Long.MIN_VALUE));
-		//doCasesAround(t, BigInteger.ZERO.setBit(64).subtract(BigInteger.valueOf(1)));
-		//doCasesAround(t, BigInteger.ZERO.setBit(63));
-		doCasesAround(t, t.min);
-		doCasesAround(t, t.max);
-		doInfinities(t);
-		out.print("\t(0, true)");
+		//		doFractions(t);
+		//		doCasesAround(t, 0);
+		doIntCasesAround(t, t.min);
+		doIntCasesAround(t, t.max);
+		doIntCasesAround(t, t.min / 2);
+		doIntCasesAround(t, t.max / 2);
+		//		doInfinities(t);
 
 		String inputs = os.toString("UTF8");
-		String result = template.replaceAll("TYPE", t.name).replaceAll("INPUTS", inputs);
-		out = new PrintStream(new FileOutputStream(t.name + template_name));
+		String result = template
+		    .replaceAll("FTYPE", ftype)
+		    .replaceAll("ITYPE", t.name)
+		    .replaceAll("INPUTS", inputs);
+		out = new PrintStream(new FileOutputStream(t.name + template_name.replaceAll(".t3", ".v3")));
 		out.println(result);
 		out.close();
 
@@ -369,7 +372,7 @@ class GenTestCase {
     }
 
     static void doCasesAround(IntType t, long num) {
-	for (int inc : new int[]{-313, 313}) {
+	for (int inc : new int[]{-311, 311}) {
 	    long val = num;
 	    for (int i = 0; i < 5; i++) {
 		t.doCase(ftrunc, val + fsuffix, (double)val);
@@ -386,6 +389,19 @@ class GenTestCase {
 	    BigInteger val = num;
 	    for (int i = 0; i < 5; i++) {
 		t.doCase(ftrunc, val + fsuffix, val.doubleValue());
+		val = nextDouble(val, inc);
+	    }
+	}
+    }
+
+    static void doIntCasesAround(IntType t, long num) {
+	for (int inc : new int[]{-311997, 311445}) {
+	    long val = num;
+	    for (int i = 0; i < 5; i++) {
+		//		t.doCase(ftrunc, val + fsuffix, (double)val);
+		long val2 = ftrunc ? (long)(float)val : (long)(double)val;
+		t.doCase(ftrunc, val2 + fsuffix, (double)val2);
+		//		t.doCase(ftrunc, (val + inc) + fsuffix, (double)(val + inc));
 		val = nextDouble(val, inc);
 	    }
 	}
