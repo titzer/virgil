@@ -1,5 +1,7 @@
 #!/bin/bash
 
+V3C_OPTS="$V3C_OPTS -fp"
+
 jvm=0
 if [ "$1" == "-jvm" ]; then
     jvm=1
