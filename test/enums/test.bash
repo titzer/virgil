@@ -1,11 +1,5 @@
 #!/bin/bash
 
-jvm=0
-if [ "$1" == "-jvm" ]; then
-    jvm=1
-    shift
-fi
-
 function do_parser_tests() {
 	cd parser
 	printf "  Running parser tests..."
@@ -32,9 +26,5 @@ else
 	TESTS=*.v3
 fi
 
-if [ "$jvm" == 1 ]; then
-  run_jvm_tests
-else
-  run_exec_tests
-fi
+run_exec_tests
 exit $?

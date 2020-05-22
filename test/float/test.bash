@@ -1,12 +1,8 @@
 #!/bin/bash
 
 V3C_OPTS="$V3C_OPTS -fp"
-
-jvm=0
-if [ "$1" == "-jvm" ]; then
-    jvm=1
-    shift
-fi
+RUN_INT=0
+RUN_NATIVE=0
 
 function do_parser_tests() {
 	cd parser
@@ -34,9 +30,5 @@ else
 	TESTS=*.v3
 fi
 
-if [ "$jvm" == 1 ]; then
-  run_jvm_tests
-else
-  run_exec_tests
-fi
+run_exec_tests
 exit $?
