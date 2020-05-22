@@ -337,18 +337,23 @@ public class V3S_System {
     }
 
     public static long cast_d2l(double v, double min, double max) {
-	if (v < min || v >= max) throw new ClassCastException();
-	if (v >= 0x1p63d) {  // XXX: only matters in u64 case
-	    long r = (long)(v/2);
-	    if (v != 2*(double)r) throw new ClassCastException();
-	    return r << 1;
+	error: {
+	    if (Double.doubleToLongBits(v) == 0x8000000000000000L) break error;
+	    if (v < min || v >= max) break error;
+	    if (v >= 0x1p63d) {  // XXX: only matters in u64 case
+		long r = (long)(v/2);
+		if (v != 2*(double)r) break error;
+		return r << 1;
+	    }
+	    long r = (long)v;
+	    if (v != (double)r) break error;
+	    return r;
 	}
-	long r = (long)v;
-	if (v != (double)r) throw new ClassCastException();
-	return r;
+	throw new ClassCastException();
     }
 
     public static boolean query_d2l(double v, double min, double max) {
+	if (Double.doubleToLongBits(v) == 0x8000000000000000L) return false;
 	if (v < min || v >= max) return false;
 	if (v >= 0x1p63d) {  // XXX: only matters in u64 case
 	    long r = (long)(v/2);
