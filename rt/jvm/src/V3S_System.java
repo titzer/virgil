@@ -336,6 +336,12 @@ public class V3S_System {
 	return v == (double)(float)v;
     }
 
+    public static float cast_d2f(double v) {
+	float f = (float)v;
+	if (f == v) return f;
+	throw new ClassCastException();
+    }
+
     public static double round_ul2d(long v) {
 	if (v < 0) {
 	    long r = v >>> 1 | v & 1; // copy lost bit for proper rounding
