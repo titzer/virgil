@@ -336,6 +336,14 @@ public class V3S_System {
 	return v == (double)(float)v;
     }
 
+    public static double round_ul2d(long v) {
+	if (v < 0) {
+	    long r = v >>> 1 | v & 1; // copy lost bit for proper rounding
+	    return 2.0*(double)r;
+	}
+	return (double)v;
+    }
+    
     public static long cast_d2l(double v, double min, double max) {
 	error: {
 	    if (Double.doubleToLongBits(v) == 0x8000000000000000L) break error;
