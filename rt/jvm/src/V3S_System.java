@@ -236,21 +236,11 @@ public class V3S_System {
     }
 
     public static long natlDiv(long x, long y) {
-	if (x < 0) {
-	    if (y == 1) return x;
-	    if (y == 2) return x >>> 1;
-	    if (y == 4) return x >>> 2;
-	    if (y == 8) return x >>> 3;
-	    if (y < 0) return y <= x ? 1 : 0;
-	    long approx = (x >>> 1) / (y >>> 1);
-	    long rem = x - y * approx;
-	    if (rem < 0) approx--;
-	    else if (rem >= y) approx++;
-	    return approx;
-	} else {
-	    if (y < 0) return 0;
-	    return x / y;
-	}
+	if (y == 1) return x;
+	if (y < 0) return natlGteq(x, y);
+	long xs = x >>> 1, q = (xs / y) << 1;
+	while (natlGteq(x - q*y, y) != 0) q++;
+	return q;
     }
 
     public static long natlMod(long x, long y) {
