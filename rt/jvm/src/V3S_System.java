@@ -373,4 +373,14 @@ public class V3S_System {
 	}
 	return v == (double)(long)v;
     }
+
+    public static float fabs(float f) {
+	int x = Float.floatToRawIntBits(f);
+	return Float.intBitsToFloat((x << 1) >>> 1);
+    }
+
+    public static double dabs(double f) {
+	long x = Double.doubleToRawLongBits(f);
+	return Double.longBitsToDouble((x << 1) >>> 1);
+    }
 }
