@@ -334,12 +334,20 @@ public class V3S_System {
 
     public static double round_ul2d(long v) {
 	if (v < 0) {
-	    long r = v >>> 1 | v & 1; // copy lost bit for proper rounding
-	    return 2.0*(double)r;
+	    long r = (v >>> 1) | (v & 1); // copy lost bit for proper rounding
+	    return 2.0 * (double)r;
 	}
 	return (double)v;
     }
-    
+
+    public static float round_ul2f(long v) {
+	if (v < 0) {
+	    long r = (v >>> 1) | (v & 1); // copy lost bit for proper rounding
+	    return 2.0f * (float)r;
+	}
+	return (float)v;
+    }
+
     public static long cast_d2l(double v, double min, double max) {
 	error: {
 	    if (Double.doubleToLongBits(v) == 0x8000000000000000L) break error;
