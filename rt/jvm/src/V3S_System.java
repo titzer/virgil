@@ -261,7 +261,7 @@ public class V3S_System {
 
     public static long d2ul(double f) {
 	if (f <= 0) return 0;
-	if (f > 18446744073709551615d) return 0xFFFFFFFFFFFFFFFFL;
+	if (f >= 18446744073709551616d) return 0xFFFFFFFFFFFFFFFFL;
 	if (f > 9223372036854775000d) {
 	    return ((long)(f / 2)) * 2;
 	}
