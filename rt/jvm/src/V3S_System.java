@@ -323,12 +323,17 @@ public class V3S_System {
     }
 
     public static boolean query_d2f(double v) {
-	return v == (double)(float)v;
+	long before = Double.doubleToRawLongBits(v);
+	float f = (float)v;
+	long after = Double.doubleToRawLongBits((double)f);
+	return (before == after);
     }
 
     public static float cast_d2f(double v) {
+	long before = Double.doubleToRawLongBits(v);
 	float f = (float)v;
-	if (f == v) return f;
+	long after = Double.doubleToRawLongBits((double)f);
+	if (before == after) return f;
 	throw new ClassCastException();
     }
 
