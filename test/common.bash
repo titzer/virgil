@@ -5,7 +5,7 @@ if [ -z "$RUN_INT" ]; then
 fi
 
 if [ -z "$RUN_WASM" ]; then
-    RUN_WASM=0
+    RUN_WASM=1
 fi
 
 if [ -z "$RUN_JVM" ]; then
@@ -45,6 +45,10 @@ fi
 if [ ! -x "$AENEAS_TEST" ]; then
     echo $AENEAS_TEST: not found or not executable
     exit 1
+fi
+
+if [ -z "$TEST_D8" ]; then
+    TEST_D8=$VIRGIL_LOC/bin/dev/d8
 fi
 
 function print_status() {
@@ -190,9 +194,14 @@ function run_wasm_tests() {
 	check_red $C
 
 	print_status Running wasm
-        EXP=$(ls $TESTS)
-        (cd $OUT/wasm/; $TEST_D8 $VIRGIL_LOC/test/wasm-js-tester.js -- $EXP > $R)
-	check_red $R
+
+	if [ ! -x "$TEST_D8" ]; then
+		echo "${YELLOW}skip${NORM} (no wasm-js shell)"
+	else
+            EXP=$(ls $TESTS)
+            (cd $OUT/wasm/; $TEST_D8 $VIRGIL_LOC/test/wasm-js-tester.js -- $EXP > $R)
+	    check_red $R
+	fi
 }
 
 function run_exec_tests() {
