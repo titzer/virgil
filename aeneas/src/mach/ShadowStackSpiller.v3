@@ -1,43 +1,135 @@
 // Copyright 2019 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// High-level questions:
-// - should this happen before, during, or after stackification?
-//   - cannot happen after, since stack values should not survive after calls
-//   - placement of reloads might benefit from fw stackification algorithm
-//   - before would be great if it doesn't complicate the stackifier
-// - is it possible to do anything on a per-block basis?
-//   - stack frame allocation/deallocation could be inserted later, as arch instrs
-//   - per basic block spill/reload would be fairly simple "dumb" mode
-
-// If shadow spilling is *before*, what mechanisms are used to:
-// - insert shadow frame allocation/deallocation
-//   => special ArchInstrs with no use/def operands
-// - insert spill + reload
-//   => new VRegs and rewrite def/uses?
-//   => 
-// - force stack clear upon kill
-// - insert phis for merging spilled and unspilled paths?
-
-// If we do the stupidest thing, how does that work?
-// - allocate shadow frame manually in prologue
-// - deallocate shadow frame at all returns
-// - before every kill, emit get_local/store pairs (manually) for all live vars
-// - after every kill, emit load/set_local pairs (manually) for all live vars
-// - each killed ref gets a shadow slot index (no coallescing)
-
+// Responsible for transforming Arch code containing livepoints (i.e. kills
+// of VRegs across potential GC points) to use a shadow stack. To do this,
+// it computes good locations for the allocation and deallocation of the stack frame,
+// saves and restores of VRegs, and inserts code into the instruction stream
+// to accomplish this. Code after this transformation is no longer in SSA form,
+// since multiple new definitions of a VReg may be introduced. The code is, however,
+// safe to run through the MachStackifier, since all live ranges will be split so
+// that no VReg originally live across a livepoint is live across any livepoint after
+// transformation.
 class ShadowStackSpiller() {
 	var codegen: ArchCodeGen;
-	def reset(codegen: ArchCodeGen) {
+	var order: SsaBlockOrder;
+	def shadowVarMap = Vector<int>.new();
+	def reset(codegen: ArchCodeGen, order: SsaBlockOrder) {
 		this.codegen = codegen;
+		this.order = order;
 	}
-	def spill() {
-		if (codegen.livepoints.length == 0) return;  // nothing to do
-		// 1. place spill frame allocation at A = "lowest non-loop common dominator of all livepoints".
-		// 2. place spill frame deallocation at post dominating set of A
-		// 3. lift spills to "lowest non-loop common dominator"
-		// 4. rewrite spilled uses to spilled vreg
-		// 5. merge control flow with new phis / parallel moves
+	// Run the algorithm, inserting save and restore code.
+	def run() {
+		var lps = codegen.livepoints;
+		if (lps.length == 0) return;  // nothing to do
+
+		// Make a first pass over all livepoints.
+		// Find the common dominator A of all blocks that contain livepoints
+		// and compute the union of all variables used in all livepoints.
+		var matrix = codegen.liveness;
+		matrix.grow(matrix.numrows + 2);
+		var allLive = matrix.numrows - 2;
+		var tmpLive = matrix.numrows - 1;
+		var blockA_i = lps[0].0.mark, blockA = order.order[blockA_i];
+		matrix.copy(allLive, blockA_i);
+		for (i = 1; i < lps.length; i++) {
+			var t = lps[i], bm = t.0.mark, info = order.order[bm];
+			matrix.or(allLive, bm); // union all livepoint sets
+			if (info == blockA) continue;
+			blockA = order.commonDominator(blockA, info);
+		}
+
+		// Find the lowest non-loop dominator of A
+		for (p = blockA; p != null; p = p.dom_parent) {
+			if (p.loop != null) blockA = p.dom_parent;
+		}
+		if (blockA == null) blockA = order.order[0];  // first block was a loop
+
+		// Compute exits E from the region dominated by A, i.e. the dominance
+		// frontier + actual throws/returns
+		var exits = Vector<SsaBlockInfo>.new();
+		var range = (blockA.block.mark, blockA.dom_max);
+		for (i = range.0; i < range.1; i++) {
+			var bi = order.order[i], end = bi.block.end();
+			if (end.succs.length == 0) {
+				exits.add(bi);
+				continue;
+			}
+			for (s in end.succs) {
+				var target = s.dest.mark;
+				if (target >= range.0 && target < range.1) continue;  // target is dominated
+				if (end.succs.length == 1) {
+					// one outgoing edge; mark the source as the exit
+					exits.add(bi);
+					break;
+				} else {
+					// multiple outgoing edges; mark the target as the exit
+					exits.add(order.order[target]);
+				}
+			}
+		}
+		// Initialize the shadow variable map.
+		// Filter out all live variables that are either constants or do
+		// not have a reference type. Allocate shadow spill slots for
+		// all live reference variables.
+		// XXX: improve shadow spill slot allocation with graph coloring.
+		var numVars = codegen.vars.length;
+		shadowVarMap.grow(numVars);
+		shadowVarMap.length = numVars;
+		var numShadowSlots = 0;
+		for (i < numVars) {
+			if (matrix[allLive, i]) {
+				if (codegen.isRef(codegen.vars[i])) {
+					shadowVarMap[i] = numShadowSlots++;
+					continue;
+				}
+			}
+			shadowVarMap[i] = -1;
+			matrix[allLive, i] = false;
+		}
+
+		// Insert shadow frame allocation into A above first livepoint
+		// and shadow frame deallocation into exit blocks.
+		var curExit = 0;
+		var shadow_sp = codegen.newVreg(null);
+		for (i = codegen.first; i != null; i = i.next) {
+			if (i.opcode() != ArchInstrs.ARCH_BLOCK) continue;
+			var label = Operand.Label.!(i.operands[0]);
+			if (label.block == blockA.block) {
+				// shadow stack allocation block
+				var startOfBlock = i.next;
+				codegen.insertShadowStackAlloc(shadow_sp, numShadowSlots, startOfBlock);
+			} else if (label.block == exits[curExit].block) {
+				// exit block
+				var endOfBlock = i.next; // TODO: compute end of block
+				codegen.insertShadowStackFree(shadow_sp, numShadowSlots, endOfBlock);
+				curExit++;
+			}
+		}
+
+		// For every livepoint, we add a save before and a restore after
+		// for every variable.
+		for (j < lps.length) {
+			var t = lps[j], i = t.1, lp = t.2.livepoint;
+			matrix.copy(tmpLive, lp);
+			matrix.and(tmpLive, allLive);  // filter non-refs and constants
+			var start = tmpLive * matrix.width, end = start + matrix.width;
+			var before = i, after = i.next;
+			for (j = start; j < end; j++) {
+				var bits = matrix.bits[j];
+				var varNum = (j - start) * 32;
+				while (bits != 0) {
+					if ((bits & 1) != 0) {
+						// spill and restore varNum
+						var vreg = codegen.vars[varNum], slot = shadowVarMap[varNum];
+						codegen.insertShadowStackSave(shadow_sp, vreg, slot, before);
+						codegen.insertShadowStackRestore(shadow_sp, vreg, slot, after);
+					}
+					bits = bits >> 1;
+					varNum++;
+				}
+			}
+		}
 	}
 	def print() {
 		var out = codegen.out;
@@ -51,44 +143,5 @@ class ShadowStackSpiller() {
 				_ => ;
 			}
 		}
-	}
-}
-
-enum RegClass {
-	BIT_8,
-	BIT_16,
-	BIT_32,
-	BIT_64,
-	FLOAT_32,
-	FLOAT_64,
-	VEC_128,
-	VEC_256,
-	VEC_512,
-	REF_32,
-	REF_64
-}
-// Machine-independent representation of a virtual register.
-class NewVReg(id: int) {
-	var rclass: RegClass;		// register class
-	var ssa: SsaInstr;		// corresponding ssa instruction (if any)
-	var hint: byte;			// physical register hint
-	var assignment: byte;		// assigned physical register
-	var spill: int;			// spill slot (< 0 indicates a constant)
-	var shadow: int;		// shadow spill slot
-
-	// VRegs can be reused
-	def reset(rclass: RegClass, ssa: SsaInstr) {
-		this.rclass = rclass;
-		this.ssa = ssa;
-		this.hint = 0;
-		this.assignment = 0;
-		this.spill = 0;
-		this.shadow = 0;
-	}
-	def isRef() -> bool {
-		return rclass.tag >= RegClass.REF_32.tag;
-	}
-	def isConst() -> bool {
-		return spill < 0;
 	}
 }
