@@ -3,30 +3,30 @@
   (func $arg_copy (import "wave" "arg_copy") (param i32 i32 i32) (result i32))
   (func $fs_write (import "wave" "fs_write") (param i32 i32 i32) (result i32))
   
-  (memory (export "memory") 1)
+  (memory (export "mem") 1)
 
-  (func (export "entry") (param $argc i32) (result i32)
+  (func (export "main") (param $argc i32) (result i32)
     (local $x i32)
     (block
     (loop
-        get_local $x
-        get_local $argc
+        local.get $x
+        local.get $argc
         i32.ge_u
         br_if 1
 
         ;; copy in the argument and print it to stdout
         (i32.const 1)
         (i32.const 100)
-        (call $arg_copy (get_local $x) (i32.const 100) (i32.const 64000))
+        (call $arg_copy (local.get $x) (i32.const 100) (i32.const 64000))
         call $fs_write
         drop
 
         call $print_sp
 
-        get_local $x
+        local.get $x
         i32.const 1
         i32.add
-        set_local $x
+        local.set $x
         br 0
     ))
     call $print_ln
