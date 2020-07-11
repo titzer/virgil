@@ -20,12 +20,12 @@ cat $TEST
 echo   "---------------------------------------------------"
 printf "Executing (-rma -norm-delegates)..."
 run_v3c "" -test -rma -norm-delegates $TEST &> $C
-check_red $C
+check_passed $C
 
 echo   "---------------------------------------------------"
 printf "Compiling tests to x86-darwin..."
 run_v3c "" -debug-mach -debug-ssa -multiple -target=x86-darwin-test -output=$VIRGIL_TEST_OUT $TEST &> $C
-check_red $C
+check_passed $C
 
 if [ ! -e $T ] || [ "$(find $LOC -newer $T)" != "" ]; then
 	echo   "---------------------------------------------------"

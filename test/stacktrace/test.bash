@@ -44,7 +44,7 @@ function do_test() {
   printf "${GREEN}ok${NORM}\n"
 
   if [ "$RUN_NATIVE" != 0 ]; then
-      run_native $target $TESTS
+      execute_target_tests $target
   fi
 }
 
@@ -52,7 +52,7 @@ tests=$(ls *.v3)
 
 print_status Testing int "test/stacktrace/*.v3"
 run_v3c "" -test -test.st -output=$T $tests &> $P
-check_red $P
+check_passed $P
 
 for t in $(ls *.st); do
   print_status Checking "" "$t"
@@ -80,6 +80,6 @@ fi
 
 print_status Testing int "$tests"
 run_v3c "" -test -test.st -output=$T $TESTS $> $T/test
-check_red $T/test
+check_passed $T/test
 
 do_test ../execute/ $tests

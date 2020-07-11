@@ -1,10 +1,12 @@
 #!/bin/bash
 
 . ../common.bash legacy_intcast
+
 if [ $# -gt 0 ]; then
-	TESTS="$@"
+    TESTS="$@"
 else
-	TESTS=*.v3
+    TESTS=*.v3
 fi
-run_exec_tests
+
+execute_tests
 exit $?

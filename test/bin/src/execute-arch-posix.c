@@ -7,8 +7,10 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <pthread.h>
 
 #define STDOUT_BUF_SIZE 100
 #define STDERR_BUF_SIZE 1024
@@ -67,8 +69,8 @@ void *trimFirstLine(char *p, int size);
 int execute_test(v3_test *test);
 void begin_test(v3_test *test);
 void end_test(v3_test *test, int result);
-
-void timeout_thread(void *ptr);
+int run_test(v3_test *test);
+void* timeout_thread(void *ptr);
 
 int main(int argc, char **argv) {
   int i;
@@ -92,16 +94,17 @@ int main(int argc, char **argv) {
   }
   tests_running = 0;
   if (INTERACTIVE) printf(CLEAR_LINE);
-  if (tests_done == tests_total && tests_failed == 0) {
-    printf("%d of %d " GREEN "ok" NORM "\n", tests_done, tests_total);
+
+  if (tests_passed == tests_total) {
+    printf("%d of %d " GREEN "passed" NORM "\n", tests_passed, tests_total);
   } else {
-    char *red = "";
-    if (tests_failed > 0) red = RED;
-    printf("%d of %d ", tests_done, tests_total);
-    printf("[" GREEN "%d" NORM "/%s%d" NORM "]", tests_passed, red, tests_failed);
-    printf(" completed (%.2f%% passed)\n", 100 * ((float)tests_passed / (float)tests_total));
+    printf("%d of %d passed\n", tests_passed, tests_total);
   }
-  if (tests_failed > 0) return 1;
+  
+  if (tests_failed > 0) {
+    printf("%d of %d " RED "failed" NORM "\n", tests_failed, tests_total);
+    return 1;
+  }
   return 0;
 }
 
@@ -441,7 +444,7 @@ int execute_test(v3_test *test) {
   return 1;
 }
 
-void timeout_thread(void *ptr) {
+void* timeout_thread(void *ptr) {
   while (tests_running) {
     if (test_timeout-- < 0) {
       test_timeout = 0;
@@ -449,4 +452,5 @@ void timeout_thread(void *ptr) {
     }
     sleep(1);
   }
+  return NULL;
 }

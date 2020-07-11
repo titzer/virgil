@@ -6,5 +6,5 @@ if [ $# -gt 0 ]; then
 else
 	TESTS=*.v3
 fi
-run_exec_tests
+execute_tests
 exit $?

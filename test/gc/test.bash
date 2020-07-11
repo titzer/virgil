@@ -46,7 +46,7 @@ done
 
 printf "${GREEN}ok${NORM}\n"
 
-run_native $target
+execute_target_tests $target
 
 HEAP='-heap-size=24m'
 print_compiling "$target $HEAP" Aeneas
@@ -56,4 +56,4 @@ mv $T/Aeneas $T/Aeneas-gc
 
 print_status Testing "$target $HEAP" Aeneas
 $T/Aeneas-gc -test -rma $VIRGIL_LOC/test/execute/*.v3 &> $T/Aeneas-gc.test.out
-check_red $T/Aeneas-gc.test.out
+check_passed $T/Aeneas-gc.test.out
