@@ -1,10 +1,43 @@
 // Copyright 2012 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Directs the creation of an x86-linux binary.
-class X86Linux extends X86Runtime {
-	new(context: SsaContext, test: bool, mach: MachProgram) super(context, test, mach) { }
-	def emit() {
+component X86LinuxTargets {
+	new() {
+		Aeneas.registerTarget(X86LinuxTarget.new("x86-linux-test", true));
+		Aeneas.registerTarget(X86LinuxTarget.new("x86-linux", false));
+	}
+}
+
+// Linux target for x86 architecture. Generates an ELF binary directly.
+class X86LinuxTarget extends Target {
+	def test: bool;
+
+	new(name: string, test) super(name) { }
+
+	def configure(compiler: Compiler, prog: Program) {
+		def space = AddressSpaces.MEM32LE;
+		def intNorm = IntNormalizers.I32LE;
+		var mach = MachProgram.new(prog, space, space, intNorm);
+		var rt = X86LinuxRuntime.new(SsaContext.new(compiler, prog), test, mach);
+		mach.runtime = rt;
+		compiler.Reachability = true;
+		MachModule.install(prog); // installs "Pointer" typecon
+		LinuxModule.install(prog); // installs "Linux" component
+		prog.typeEnv.add(rt.typeCon); // installs "CiRuntime" component (for RiRuntime code)
+	}
+	def computeFieldOffsets(prog: Program, b: Vector<IrField>, start: int) {
+		getRuntime(prog).mach.computeFieldOffsets(prog, b, start);
+	}
+	def addRoots(compiler: Compiler, prog: Program) {
+		getRuntime(prog).addRoots();
+	}
+	private def getRuntime(prog: Program) -> X86LinuxRuntime {
+		return X86LinuxRuntime.!(CiRuntime_TypeCon.!(prog.typeEnv.lookup(CiRuntimeModule.NAME)).runtime);
+	}
+	def emit(compiler: Compiler, prog: Program) {
+		var rt = getRuntime(prog), mach = rt.mach;
+		mach.build(compiler, MachLoweringConfig.new());
+
 		// make an ELF file
 		var elf = ElfHeader.new();
 		elf.e_machine = ElfConst.EM_386;
@@ -14,56 +47,86 @@ class X86Linux extends X86Runtime {
 		code.p_type = ElfConst.PT_LOAD;
 		code.p_offset = 0;
 		code.p_vaddr = LinuxModule.VADDR_START;
-		code.p_filesz = PAGE_SIZE;
-		code.p_memsz = PAGE_SIZE;
+		code.p_filesz = rt.codePageSize;
+		code.p_memsz = rt.codePageSize;
 		code.p_flags = ElfConst.PF_RX;
 
 		// ex segment for trapping explicit checks
-		var ex = if(src != null, elf.addProgramHeader());
+		var ex = if(rt.src != null, elf.addProgramHeader());
 
 		// fill out the data section
 		var data = elf.addProgramHeader();
 		data.p_type = ElfConst.PT_LOAD;
-		data.p_filesz = PAGE_SIZE;
-		data.p_memsz = PAGE_SIZE;
+		data.p_filesz = rt.codePageSize;
+		data.p_memsz = rt.codePageSize;
 		data.p_flags = ElfConst.PF_RW;
 
-		var buffer = MachDataBuffer.new(PAGE_SIZE, LinuxModule.VADDR_START, false, 300);
+		var u = MachDataBuffer.new(rt.codePageSize, LinuxModule.VADDR_START, false, 300);
 
-		buffer.skipN(elf.size());
-		elf.e_entry = buffer.posAddr();
+		u.skipN(elf.size());
+		elf.e_entry = u.posAddr();
 
 		// emit code
-		encodeCode(buffer, code, elf);
+		var codeStartOffset = u.end();
+		rt.allocator.init(rt.getFrame);
+		elf.e_entry = u.endAddr();
+		code.p_vaddr = u.endPageAddr();
+		rt.recordCodeStart(elf.e_entry);
+		var asm = X86MacroAssembler.new(mach, u, codeStartOffset);
+		rt.genMainStub(asm);
+		rt.allocator.genAllocStub(asm);
+		mach.layoutCode(u, rt.genX86Code(_, asm));
+		rt.genSignalHandler(asm);
+		rt.recordCodeEnd(u.endAddr());
+		mach.layoutMeta(u);
+		mach.layoutRuntime(u);
+		code.p_filesz = u.end();
+		code.p_memsz = rt.pageAlign(code.p_filesz);
+		code.p_offset = 0;
+
 		// generate the unmapped "ex" region for trapping explicit checks
 		if (ex != null) {
-			buffer.skipPage();
-			var exStart = buffer.endPageAddr();
-			var exSize = pageAlign(src.layoutExRegion(exStart));
-			buffer.startAddr = buffer.startAddr + exSize;
+			u.skipPage();
+			var exStart = u.endPageAddr();
+			var exSize = rt.pageAlign(rt.src.layoutExRegion(exStart));
+			u.startAddr = u.startAddr + exSize;
 			ex.p_vaddr = exStart;
 			ex.p_memsz = exSize;
 			ex.p_filesz = 0;
 			ex.p_offset = 0;
 		}
+
 		// emit data
-		buffer.skipPage();
-		encodeData(buffer, data);
+		u.skipPage();
+		u.atEnd().align(mach.data.addressSize);
+		data.p_vaddr = u.endPageAddr();
+		data.p_offset = data.p_vaddr - u.startAddr;
+		rt.recordDataStart(u.endAddr());
+		mach.layoutData(u);
+		rt.recordDataEnd(u.endAddr());
+		rt.addHeapPointers(u);
+		data.p_filesz = u.end() - data.p_offset;
+		data.p_memsz = rt.pageAlign(data.p_filesz + rt.heapSize);
+
 		// patch all addresses in the binary
-		buffer.patch(patchCodeAddr);
+		u.patch(rt.patchCodeAddr);
 
 		// encode ELF header section
-		elf.encode(buffer.at(0));
+		elf.encode(u.at(0));
 
-		var file = context.compiler.getOutputFileName(context.prog.name(), null);
+		var file = compiler.getOutputFileName(prog.name(), null);
 		var fd = System.fileOpen(file, false);
-		if (fd < 0) return context.prog.ERROR.OutputError(file);
+		if (fd < 0) return prog.ERROR.OutputError(file);
 		// write the entire file from the buffer array
-		System.fileWriteK(fd, buffer.array, 0, buffer.end());
+		System.fileWriteK(fd, u.array, 0, u.end());
 		System.fileClose(fd);
 		// change permissions to make binary executable
-		context.compiler.makeExecutable(file);
+		compiler.makeExecutable(file);
 	}
+}
+
+class X86LinuxRuntime extends X86Runtime {
+	new(context: SsaContext, test: bool, mach: MachProgram) super(context, test, mach) { }
 	def asm_exit_code(asm: X86Assembler, code: int) {
 		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
 		asm.movd_rm_i(X86Regs.EBX, code);
@@ -73,35 +136,6 @@ class X86Linux extends X86Runtime {
 		asm.movd_r_rm(X86Regs.EBX, rm);
 		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
 		asm.intK(0x80);
-	}
-	def encodeCode(u: MachDataBuffer, cs: ElfProgramHeader, elf: ElfHeader) {
-		var codeStartOffset = u.end();
-		allocator.init(getFrame);
-		elf.e_entry = u.endAddr();
-		cs.p_vaddr = u.endPageAddr();
-		recordCodeStart(elf.e_entry);
-		var asm = X86MacroAssembler.new(mach, u, codeStartOffset);
-		genMainStub(asm);
-		allocator.genAllocStub(asm);
-		mach.layoutCode(u, genX86Code(_, asm));
-		genSignalHandler(asm);
-		recordCodeEnd(u.endAddr());
-		mach.layoutMeta(u);
-		mach.layoutRuntime(u);
-		cs.p_filesz = u.end();
-		cs.p_memsz = pageAlign(cs.p_filesz);
-		cs.p_offset = 0;
-	}
-	def encodeData(u: MachDataBuffer, ds: ElfProgramHeader) {
-		u.atEnd().align(mach.data.addressSize);
-		ds.p_vaddr = u.endPageAddr();
-		ds.p_offset = ds.p_vaddr - u.startAddr;
-		recordDataStart(u.endAddr());
-		mach.layoutData(u);
-		recordDataEnd(u.endAddr());
-		addHeapPointers(u);
-		ds.p_filesz = u.end() - ds.p_offset;
-		ds.p_memsz = pageAlign(ds.p_filesz + heapSize);
 	}
 	def genTestOutput(asm: X86MacroAssembler, frame: MachFrame) {
 		// output the return register as a 4-byte integer to stdout
