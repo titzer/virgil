@@ -51,10 +51,11 @@ Proceedings of the International Conference on Compilers, Architecture, and Synt
 Embedded Systems (CASES ’07). Salzburg, Austria. October 2007.
 
 * Ben L. Titzer. [Virgil: Objects on the Head of a Pin](https://dl.acm.org/doi/10.1145/1167473.1167489). In Proceedings of the 21 st Annual
-Conference on Object-Oriented Systems, Languages, and Applications (OOPSLA '06). October
-2006.
+Conference on Object-Oriented Systems, Languages, and Applications (OOPSLA '06). October 2006.
 
 ### Tutorial programs
+
+There are lots of example programs in [doc/tutorial](doc/tutorial).
 
 ## License
 
