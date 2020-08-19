@@ -33,7 +33,26 @@ Some syntax has changed and Virgil now supports algebraic data types, enums, flo
 
 ### Research Papers
 
-Four research papers have been published on Virgil.
+Five research papers have been published on Virgil.
+
+* Ben L. Titzer. Harmonizing Classes, Functions, Tuples and Type Parameters in Virgil III. In
+Proceedings of the ACM Conference on Programming Language Design and Implementation
+(PLDI '13). San Diego, CA. June 2013.
+
+* Stephen Kou and Jens Palsberg. From OO to FPGA: Fitting round objects into square hardware? In
+Proceedings of the ACM Conference on Object-Oriented Programming Systems, Languages and
+Applications (OOPSLA '10). Reno, Nevada, 2010.
+
+* Ben L. Titzer and Jens Palsberg. Vertical Object Layout and Compression for Fixed Heaps. In
+Semantics and Algebra Specification. Pp. 376-408. 2009.
+
+* Ben L. Titzer and Jens Palsberg. Vertical Object Layout and Compression for Fixed Heaps. In
+Proceedings of the International Conference on Compilers, Architecture, and Synthesis for
+Embedded Systems (CASES ’07). Salzburg, Austria. October 2007.
+
+* Ben L. Titzer. Virgil: Objects on the Head of a Pin. In Proceedings of the 21 st Annual
+Conference on Object-Oriented Systems, Languages, and Applications (OOPSLA '06). October
+2006.
 
 ### Tutorial programs
 
