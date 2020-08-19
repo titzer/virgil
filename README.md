@@ -35,22 +35,22 @@ Some syntax has changed and Virgil now supports algebraic data types, enums, flo
 
 Five research papers have been published on Virgil.
 
-* Ben L. Titzer. Harmonizing Classes, Functions, Tuples and Type Parameters in Virgil III. In
+* Ben L. Titzer. [Harmonizing Classes, Functions, Tuples and Type Parameters in Virgil III](https://dl.acm.org/doi/10.1145/2491956.2491962). In
 Proceedings of the ACM Conference on Programming Language Design and Implementation
 (PLDI '13). San Diego, CA. June 2013.
 
-* Stephen Kou and Jens Palsberg. From OO to FPGA: Fitting round objects into square hardware? In
+* Stephen Kou and Jens Palsberg. [From OO to FPGA: Fitting round objects into square hardware](https://dl.acm.org/doi/10.1145/1869459.1869470)? In
 Proceedings of the ACM Conference on Object-Oriented Programming Systems, Languages and
 Applications (OOPSLA '10). Reno, Nevada, 2010.
 
 * Ben L. Titzer and Jens Palsberg. Vertical Object Layout and Compression for Fixed Heaps. In
 Semantics and Algebra Specification. Pp. 376-408. 2009.
 
-* Ben L. Titzer and Jens Palsberg. Vertical Object Layout and Compression for Fixed Heaps. In
+* Ben L. Titzer and Jens Palsberg. [Vertical Object Layout and Compression for Fixed Heaps](https://dl.acm.org/doi/10.1145/1289881.1289914). In
 Proceedings of the International Conference on Compilers, Architecture, and Synthesis for
 Embedded Systems (CASES ’07). Salzburg, Austria. October 2007.
 
-* Ben L. Titzer. Virgil: Objects on the Head of a Pin. In Proceedings of the 21 st Annual
+* Ben L. Titzer. [Virgil: Objects on the Head of a Pin](https://dl.acm.org/doi/10.1145/1167473.1167489). In Proceedings of the 21 st Annual
 Conference on Object-Oriented Systems, Languages, and Applications (OOPSLA '06). October
 2006.
 
