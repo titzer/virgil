@@ -5,31 +5,54 @@ Its design blends functional and object-oriented programming paradigms for expre
 without a lot of overhead, either syntactically or at runtime.
 Its implementation is focused primarily on static compilation to produce native
 executables that are standalone.
+It is well-suited to writing small and fast programs.
 That makes it ideal for building certain kinds of programs like compilers and virtual
 machines.
-Virgil can compile to x86 binaries for Linux or Darwin, to jar files for the JVM,
-or to WebAssembly.
-
-## Implementation
-
-Virgil is fully self-hosted: its entire compiler and runtime system is implemented
-in Virgil.
-It can bootstrap (i.e. compiler compiles itself and all runtime code) on any of its
-target platforms.
 It is currently being used for virtual machine and programming language research.
 
 This repository includes the entire compiler, runtime system, tests, and supporting code
 for Virgil's various compilation targets.
 
+## Features ##
 
-## Documentation
+Virgil focuses on balancing these main features in a statically-typed language:
+
+  * Classes - for basic object-oriented programming
+  * Functions - for small-scale reuse of functionality
+  * Tuples - for efficient aggregation and uniform treatment of multi-argument functions
+  * Type parameters - for powerful and clean abstraction over types
+  * Algebraic data types - for easy building and matching of data structures
+
+## Supported Targets ##
+
+Virgil can compile to x86 binaries for Linux or Darwin, to jar files for the JVM,
+or to WebAssembly. Linux binaries can run successfully under Windows using Window's
+Linux system call layer.
+
+* x86-darwin : 32-bit Darwin kernels (MacOS)
+* x86-linux : 32-bit Linux kernels
+* jar : JAR files for the Java Virtual Machine
+* wasm : WebAssembly module for any Wasm engine
+
+## Implementation ##
+
+Virgil is fully self-hosted: its entire compiler and runtime system is implemented
+in Virgil.
+The compiler can bootstrap (i.e. compile itself and all runtime code) on any of the
+target platforms.
+Native binaries compiled from your programs can be as small as a few hundred bytes in size
+and consume just kilobytes of memory at runtime.
+
+## Documentation ##
 
 The most up-to-date documentation is, as always, the implementation in this repository!
 
-### Google Code Project
+A basic [wiki](doc/wiki) is available, though not all new features are covered.
+Virgil now supports algebraic data types, enums, and floating point.
 
-An slightly out-of-date tutorial from the defunct [Google Code Project](https://code.google.com/archive/p/virgil/).
-Some syntax has changed and Virgil now supports algebraic data types, enums, floating point, and compiles to more targets.
+### Tutorial programs
+
+There are lots of example programs in [doc/tutorial](doc/tutorial).
 
 ### Research Papers
 
@@ -52,10 +75,6 @@ Embedded Systems (CASES ’07). Salzburg, Austria. October 2007.
 
 * Ben L. Titzer. [Virgil: Objects on the Head of a Pin](https://dl.acm.org/doi/10.1145/1167473.1167489). In Proceedings of the 21 st Annual
 Conference on Object-Oriented Systems, Languages, and Applications (OOPSLA '06). October 2006.
-
-### Tutorial programs
-
-There are lots of example programs in [doc/tutorial](doc/tutorial).
 
 ## License
 
