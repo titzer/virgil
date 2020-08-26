@@ -14,6 +14,7 @@ RUN_WASM=${RUN_WASM:=1}
 RUN_JVM=${RUN_JVM:=1}
 RUN_NATIVE=${RUN_NATIVE:=1}
 
+BLUE='[0;34m'
 GREEN='[0;32m'
 YELLOW='[0;33m'
 RED='[0;31m'
@@ -46,6 +47,15 @@ fi
 if [ -z "$TEST_D8" ]; then
     TEST_D8=$VIRGIL_LOC/bin/dev/d8
 fi
+
+function line() {
+    echo ================================================================================
+}
+
+function execute() {
+	echo % $@
+	$@
+}
 
 function print_status() {
     config=$(echo -n $2)
@@ -170,7 +180,7 @@ function execute_tests() {
 
     if [ "$RUN_JVM" = 1 ]; then
         compile_target_tests jvm -jvm.script=false
-        execute_target_tests jvm 
+        execute_target_tests jvm
     fi
 
     if [ "$RUN_NATIVE" = 1 ]; then

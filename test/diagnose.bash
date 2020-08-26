@@ -29,15 +29,6 @@ if [ ! -e "$1" ]; then
         exit 1
 fi
 
-function execute() {
-	echo % $@
-	$@
-}
-
-function line() {
-    echo ================================================================================
-}
-
 line
 execute cat $TESTS
 
