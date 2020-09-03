@@ -9,13 +9,13 @@ The rules for type casts and type queries in Virgil are some of the trickiest to
 Virgil uses the `!` operator for type casts and the `?` operator for type queries. When a cast is evaluated at runtime, it either produces a result of the expected type or terminates the program with a `!TypeCheckException`. A type query, however, always returns either `true` or `false`.
 
 ```
-
 class Foo {
 // an example class to show the syntax of casts
 }
 var a = Foo.new();
 var x = Foo.!(a); // casts to Foo type
-var y = Foo.?(a); // queries if a is a Foo```
+var y = Foo.?(a); // queries if a is a Foo
+```
 
 The operators are accessible as if they were type members. To cast an expression `e` _to_ a type `T`, write `T.!(e)` and to test an whether a value  `e` is of type `T`, write `T.?(e)`. The above example uses a class for the cast type, but the same applies to primitives and array casts.
 
@@ -24,11 +24,11 @@ The operators are accessible as if they were type members. To cast an expression
 Only casts between `byte` and `int` primitive types are allowed. A cast from `byte` to `int` performs a zero-extension just like a normal implicit conversion, and a cast from `int` to `byte` performs a truncation, preserving only the 8 lower bits of the value.
 
 ```
-
 var a = 100; // example integer value
 var b = '$'; // example byte value
 var c = byte.!(a); // convert an int to a byte
-var d = int.!(b);  // convert a byte to an int```
+var d = int.!(b);  // convert a byte to an int
+```
 
 Type queries for primitives, on the other hand, are never useful. A value of type `int` is never a value of type `bool` or any other type. The compiler rejects all casts between primitive types.
 
@@ -41,28 +41,27 @@ Array types are _invariant_, meaning that array types are not related to each ot
 Type casts and type queries are most useful when dealing with class types. Recall that each object remembers the class that created it. We can perform type queries and type casts on objects at runtime.
 
 ```
-
 class Animal {
-// an example class to illustrate casts with objects
+    // an example class to illustrate casts with objects
 }
 class Mammal extends Animal {
-// an example class to illustrate casts with objects
+    // an example class to illustrate casts with objects
 }
 def main() {
-var x = Animal.new();
-var y = Mammal.new();
-for (e in [x, y]) {
-// dynamically query the type of each object
-if (Mammal.?(e)) System.puts("Mammal");
-else System.puts("Animal");
-System.puts("\n");
+    var x = Animal.new();
+    var y = Mammal.new();
+    for (e in [x, y]) {
+        // dynamically query the type of each object
+        if (Mammal.?(e)) System.puts("Mammal");
+        else System.puts("Animal");
+        System.puts("\n");
+    }
 }
-}```
+```
 
 The above example loops through an array of two different animals and checks which are mammals.
 
 ```
-
 class Pet { // any kind of pet
 }
 class Cat extends Pet { // a cat
@@ -70,20 +69,21 @@ class Cat extends Pet { // a cat
 class Dog extends Pet { // a dog
 }
 def main() {
-// decide how to play with our pets
-var pets = [Cat.new(), Dog.new()];
-for (e in pets) {
-// dynamically check the type to decide how to play
-if (Cat.?(e)) playWithLaser(Cat.!(e));
-if (Dog.?(e)) playFetch(Dog.!(e));
-}
+    // decide how to play with our pets
+    var pets = [Cat.new(), Dog.new()];
+    for (e in pets) {
+        // dynamically check the type to decide how to play
+        if (Cat.?(e)) playWithLaser(Cat.!(e));
+        if (Dog.?(e)) playFetch(Dog.!(e));
+    }
 }
 def playWithLaser(x: Cat) {
-// only we know how to use the laser, not the cat!
+    // only we know how to use the laser, not the cat!
 }
 def playFetch(x: Dog) {
-// only we know how to throw the stick, not the dog!
-}```
+    // only we know how to throw the stick, not the dog!
+}
+```
 
 The above example implements a method that plays with pets and illustrates how using type casts and type queries is sometimes the simplest approach. It would seem intrusive to add methods on each `Pet` corresponding to how we might play with it,  since only the `PetDemo` component really knows how to play with each kind of `Pet`. Instead of going overboard with a fancy _visitor pattern_, the cases are few enough that the straightforward approach with type casts and queries is probably simplest.
 
@@ -104,23 +104,23 @@ Type casts and type queries on tuples are _inductive_. The result of a typecasti
 Any type cast or type query can be used as a function as well. This allows us to pass them to other functions to implement some interesting patterns. For example, it is easy to implement an operation which searches an array for an object of a particular type:
 
 ```
-
 class Person { // a demonstration class
 }
 class Employee extends Person { // our employees
 }
 def contains<T>(array: Array<T>, is: T -> bool) -> bool {
-// search any kind of array, using the is function.
-for (e in array) if (is(e)) return true;
-return false;
+    // search any kind of array, using the is function.
+    for (e in array) if (is(e)) return true;
+    return false;
 }
 def main() {
-var people = [Person.new(), Person.new(), Employee.new()];
-// search the people array for an employee
-if (contains(people, Employee.?<Person>)) {
-System.puts("Employee found.\n");
+    var people = [Person.new(), Person.new(), Employee.new()];
+    // search the people array for an employee
+    if (contains(people, Employee.?<Person>)) {
+        System.puts("Employee found.\n");
+    }
 }
-}```
+```
 
 Here we check whether an object of type `Employee` exists in the array that contains objects of type `Person`. Notice that like the `?` operator of the `Employee` class that we pass here is given a _type argument_. This is because the `!` and `?` operators are like methods that have type parameters. You just didn't notice so far because those type arguments have been inferred!
 
@@ -129,13 +129,13 @@ Here we check whether an object of type `Employee` exists in the array that cont
 We just saw that the type cast `!` and type query `?` operators are like methods that have type parameters. That means that just like other methods that have type parameters, we can _explicitly_ specify type arguments. The type argument that we supply is the _input type_ to the cast or query.
 
 ```
-
 def main() {
-var z: bool, v: void;
-// illegal without explicit type argument
-var x = int.!<bool>(z); // cast bool -> int == runtime error
-var y = int.!<void>(v); // cast void -> int == runtime error
-}```
+    var z: bool, v: void;
+    // illegal without explicit type argument
+    var x = int.!<bool>(z); // cast bool -> int == runtime error
+    var y = int.!<void>(v); // cast void -> int == runtime error
+}
+```
 
 Explicitly specifying the type argument to a cast or query _disables_ the compiler's normal checks as to whether the cast is legal. The cast will _always_ be checked at runtime if we explicitly specify the type argument. The general rule is: if `T` and `F` are types, then `T.!<F>` is a function of type `F -> T` that performs a dynamic type cast operation, and `T.?<F>` is a function of type `F -> bool` that performs a dynamic query of the value against type `T`.
 
@@ -144,25 +144,25 @@ Explicitly specifying the type argument to a cast or query _disables_ the compil
 Recall that type parameters are essentially a placeholder for an unknown type within the scope of their declaration. A type parameter could be instantiated with any type. For this reason, the Virgil compiler assumes that most casts involving type parameters _could_ succeed for _some_ type arguments, and therefore does not issue warnings. The casts and queries will be checked at runtime.
 
 ```
-
 def print<T>(e: T) {
-// dynamically check whether the value is one of the supported types
-if (int.?(e)) return System.puti(int.!(e));
-if (byte.?(e)) return System.putc(byte.!(e));
-if (bool.?(e)) return System.puts(if(bool.!(e), "true", "false"));
-if (string.?(e)) return System.puts(string.!(e));
-System.error("PrintError", "Unknown type case");
+    // dynamically check whether the value is one of the supported types
+    if (int.?(e)) return System.puti(int.!(e));
+    if (byte.?(e)) return System.putc(byte.!(e));
+    if (bool.?(e)) return System.puts(if(bool.!(e), "true", "false"));
+    if (string.?(e)) return System.puts(string.!(e));
+    System.error("PrintError", "Unknown type case");
 }
 def main() {
-// use the print method with different parameters
-print(0);
-print(" and then ");
-print('$');
-print(" also ");
-print(true);
-print(" bye.\n");
-print(()); // will cause a runtime error
-}```
+    // use the print method with different parameters
+    print(0);
+    print(" and then ");
+    print('$');
+    print(" also ");
+    print(true);
+    print(" bye.\n");
+    print(()); // will cause a runtime error
+}
+```
 
 The above example shows how to use casts involving type parameters to our advantage. Here, we define a parameterized `print` method that inspects its argument in order to determine how to handle it. If the argument is one of the types it supports, it casts the value to the appropriate type and displays it. Notice that with dynamic casts that there is always the possibility that we missed a case. Thus we trade the potential for a dynamic error for the localized ability to dynamically check the type of a parameter.
 
