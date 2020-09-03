@@ -12,14 +12,12 @@ To get started with Virgil III you will require:
 
 ## Setup ##
 
-Set up is super easy! Just:
-
-  * download the latest `virgil-starter.zip` [here](http://code.google.com/p/virgil/downloads/detail?name=virgil-starter-20120611.zip)
-  * unzip `virgil-starter.zip`
+Set up is super easy! Just clone this repository. No build step needed!
 
 Optionally:
 
-  * Add `$UNZIPPED_VIRGIL_PATH/bin` to your `$PATH`
+  * Add `$VIRGIL_PATH/bin` to your `$PATH` to use `v3c` and `v3c-*` commands from anywhere 
+  * Add `$VIRGIL_PATH/bin/dev` to your `$PATH` if you are working on the compiler/runtime itself
 
 ## Commands ##
 
