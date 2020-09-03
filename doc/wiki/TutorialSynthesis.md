@@ -24,7 +24,7 @@ class HashMap<K, V> {
         var none: V;
         if (table == null) return none; // empty table
         // hash and do bucket search
-        for (bucket = table(dohash(key)); bucket != null; bucket = bucket.next) {
+        for (bucket = table[dohash(key)]; bucket != null; bucket = bucket.next) {
             if (bucket.key == key || equals(bucket.key, key)) {
                 return bucket.val;
             }
@@ -41,7 +41,7 @@ class HashMap<K, V> {
         }
         // hash and search the table
         var hashval = dohash(key), i = 0;
-        for (bucket = table(hashval); bucket != null; bucket = bucket.next) {
+        for (bucket = table[hashval]; bucket != null; bucket = bucket.next) {
             if (equals(bucket.key, key)) {
                 bucket.val = val;
                 return;
@@ -49,7 +49,7 @@ class HashMap<K, V> {
             i++;
         }
         // insert into table
-        table(hashval) = Bucket.new(key, val, table(hashval));
+        table[hashval] = Bucket.new(key, val, table[hashval]);
         if (i > 4 && table.length < 1001) balance(); // rebalance if chain too long
     }
     // apply the given function to every (key, value) pair in the table
@@ -63,8 +63,8 @@ class HashMap<K, V> {
     }
     private def insert(bucket: Bucket<K, V>) {
         var hashval = dohash(bucket.key);
-        bucket.next = table(hashval);
-        table(hashval) = bucket;
+        bucket.next = table[hashval];
+        table[hashval] = bucket;
     }
     private def dohash(key: K) -> int {
         return (0x7FFFFFFF & hash(key)) % table.length;
@@ -105,7 +105,7 @@ def stringEqual(a: string, b: string) -> bool {
     if (a == b) return true;
     if (a.length != b.length) return false;
     for (i = 0; i < a.length; i++) {
-        if (a(i) != b(i)) return false;
+        if (a[i] != b[i]) return false;
     }
     return true;
 }
