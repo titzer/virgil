@@ -7,40 +7,40 @@ Virgil treats tuples in a uniform way that makes it easy to write methods that t
 Virgil treats multi-argument functions as if they accepted a tuple of the individual parameters. That means that passing a single tuple or multiple values are both perfectly legal.
 
 ```
-
 def main() {
-var t = (3, 4);
-// both individual parameters and a single tuple are equivalent
-m1(3, 4);
-m1(t);
-// both individual parameters and a single tuple are equivalent
-m2(3, 4);
-m2(t);
+    var t = (3, 4);
+    // both individual parameters and a single tuple are equivalent
+    m1(3, 4);
+    m1(t);
+    // both individual parameters and a single tuple are equivalent
+    m2(3, 4);
+    m2(t);
 }
 def m1(a: int, b: int) -> int {
-return a + b;
+    return a + b;
 }
 def m2(t: (int, int)) -> int {
-return t.0 + t.1;
-}```
+    return t.0 + t.1;
+}
+```
 
 ## Chaining tuple-return invocations ##
 
 Because passing a single tuple parameter is equivalent to passing individual arguments, it is now easy to chain together invocations of methods that return tuples with invocations of methods that accept tuples as arguments:
 
 ```
-
 def f() -> (int, int) {
-return (3, 4);
+    return (3, 4);
 }
 def g(a: int, b: int) {
-System.puti(a);
-System.puti(b);
-System.puts("\n");
+    System.puti(a);
+    System.puti(b);
+    System.puts("\n");
 }
 def main() {
-g(f()); // f returns a tuple, and g accepts a tuple
-}```
+    g(f()); // f returns a tuple, and g accepts a tuple
+}
+```
 
 ## Implementation notes ##
 
