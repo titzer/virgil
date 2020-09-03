@@ -23,7 +23,7 @@ Tuples and functions work together nicely again here. Since variance rules are _
 
 ## Invariant arrays ##
 
-Virgil arrays are _invariantly_ typed, meaning an `Array<Cat>` _is not_ a subtype of `Array<Animal>`, even though `Cat` is a subtype of `Animal`. This is because arrays are mutable. If arrays were not invariantly typed, then one could add `Animal` objects to an array of `Cat` by viewing the array of `Cat` as an array of `Animal` first. `*`
+Virgil arrays are _invariantly_ typed, meaning an `Array<Cat>` _is not_ a subtype of `Array<Animal>`, even though `Cat` is a subtype of `Animal`. This is because arrays are mutable. If arrays were not invariantly typed, then one could add `Animal` objects to an array of `Cat` by viewing the array of `Cat` as an array of `Animal` first. [1]
 
 ## Invariant classes ##
 
@@ -36,34 +36,34 @@ Now we've seen the basic rules for variance. How do we use them? Let's go back t
 Given the rules for functions, it is, however, legal to write an apply method that does the job.
 
 ```
-
 class List<T> {
-def head: T;
-def tail: List<T>;
-new(head, tail) {}
+    def head: T;
+    def tail: List<T>;
+    new(head, tail) {}
 }
 class Animal {
 }
 class Cat extends Animal {
 }
 def apply<T>(list: List<T>, f: T -> void) {
-for (l = list; l != null; l = l.tail) {
-f(list.head);
-}
+    for (l = list; l != null; l = l.tail) {
+        f(list.head);
+    }
 }
 def main() {
-var animals: List<Animal>;
-var cats: List<Cat>;
-// because of variance, we can apply adopt to animals
-apply(animals, adopt);
-// and we can also apply it to cats!
-apply<Cat>(cats, adopt);
+    var animals: List<Animal>;
+    var cats: List<Cat>;
+    // because of variance, we can apply adopt to animals
+    apply(animals, adopt);
+    // and we can also apply it to cats!
+    apply<Cat>(cats, adopt);
 }
 def adopt(a: Animal) {
-}```
+}
+```
 
 ## Future compatibility ##
 
 It would be safe to have _immutable_, _covariantly_ typed arrays, since updates are not be allowed to immutable arrays. This is planned for an upcoming version of Virgil.
 
-`*` Java famously allows unsafe covariance of arrays and dynamically checks all stores to arrays, throwing an exception for an invalid array store.
+[1] Java famously allows unsafe covariance of arrays and dynamically checks all stores to arrays, throwing an exception for an invalid array store.
