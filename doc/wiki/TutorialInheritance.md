@@ -5,16 +5,15 @@ Virgil supports inheritance between classes which allows one class to _inherit_ 
 ## Inheriting fields ##
 
 ```
-
 class InheritFieldA {
-var a: int = 65;
-var b: int = 77;
+    var a: int = 65;
+    var b: int = 77;
 }
 class InheritFieldB extends InheritFieldA {
-def sum() -> int {
-// a and b are inherited from the super class
-return a + b;
-}
+    def sum() -> int {
+        // a and b are inherited from the super class
+        return a + b;
+    }
 }
 ```
 
@@ -25,42 +24,42 @@ In this example, the `InheritFieldB` class uses the `extends` keyword to specify
 Virgil uses the keyword `extends` in the same way as Java. It makes clear that the new class can declare _more_ functionality by adding new fields and methods.
 
 ```
-
 class InheritMethodA {
-var a: int;
-var b: int;
-def sum() -> int {
-return a + b;
-}
+    var a: int;
+    var b: int;
+    def sum() -> int {
+        return a + b;
+    }
 }
 class InheritMethodB extends InheritMethodA {
-// extend the parent class with a new method
-def sumSquared() -> int {
-// the sum() method is inherited from the parent class
-return sum() * sum();
+    // extend the parent class with a new method
+    def sumSquared() -> int {
+        // the sum() method is inherited from the parent class
+        return sum() * sum();
+    }
 }
-}```
+```
 
 ## Overriding methods ##
 
 Virgil classes can do more than simply add fields and methods when they extend a super class; they can also _override_ the implementation of a method with a new implementation.
 
 ```
-
 class OverrideMethodA {
-var a: int;
-var b: int;
-def sum() -> int {
-return a + b;
-}
+    var a: int;
+    var b: int;
+    def sum() -> int {
+        return a + b;
+    }
 }
 class OverrideMethodB extends OverrideMethodA {
-var c: int;
-// overrides the sum() def from the parent class
-def sum() -> int {
-return a + b + c;
+    var c: int;
+    // overrides the sum() def from the parent class
+    def sum() -> int {
+        return a + b + c;
+    }
 }
-}```
+```
 
 In the example above, the subclass `OverrideMethodB` extends the super class `OverrideMethodA` by adding a field and overrides the definition of the `sum` method with a new implementation that sums over all three fields. A method in a subclass overrides a method in a superclass if it has the same name. The compiler checks that the new method's parameter and return types match those of the superclass.
 
@@ -69,17 +68,17 @@ In the example above, the subclass `OverrideMethodB` extends the super class `Ov
 When extending a class that has a constructor, a new class must also have a constructor and specify how the super class's constructor is called from the subclass constructor. We do this by inserting a call to the superclass's constructor _between_ the constructor declaration and its body and use the keyword `super`.
 
 ```
-
 class NewSuperA {
-def a: int;
-new(a) { }
+    def a: int;
+    new(a) { }
 }
 class NewSuperB extends NewSuperA {
-def b: int;
-// use 'super' to explicitly call the super constructor
-// before the body of the constructor executes
-new(x: int, b) super(x) { }
-}```
+    def b: int;
+    // use 'super' to explicitly call the super constructor
+    // before the body of the constructor executes
+    new(x: int, b) super(x) { }
+}
+```
 
 
 ## Subtyping ##
@@ -87,13 +86,12 @@ new(x: int, b) super(x) { }
 When a Virgil class extends another class, the new class not only inherits the functionality of the super class but also becomes a _subtype_ of the super class. Objects of the new class can be used anywhere objects of the super class are expected.
 
 ```
-
 class SubtypeA {
-var a: int;
-var b: int;
+    var a: int;
+    var b: int;
 }
 class SubtypeB extends SubtypeA {
-var c: int;
+    var c: int;
 }
 // OK because B is a subtype of A
 var x: SubtypeA = SubtypeB.new();
@@ -103,25 +101,25 @@ var y: Array<SubtypeA> = [SubtypeB.new(), SubtypeA.new()];
 var z = sum(SubtypeB.new());
 
 def sum(o: SubtypeA) -> int {
-return o.a + o.b;
-}```
+    return o.a + o.b;
+}
+```
 
 ## Methods are virtual ##
 
 All method calls on Virgil objects are _virtual_, meaning that a call will always invoke the version of the method associated with the object's dynamic type at runtime. An object always "remembers" the class it was constructed from, even if the object is passed to a place in the program that accepts references of its super class. To improve efficiency, the compiler uses several analyses to determine which version of the method may be invoked at each call site, replacing method lookups with direct calls whenever possible.
 
 ```
-
 class VirtualMethodA {
-def name() -> string {
-return "A";
-}
+    def name() -> string {
+        return "A";
+    }
 }
 class VirtualMethodB extends VirtualMethodA {
-// overrides name()
-def name() -> string {
-return "B";
-}
+    // overrides name()
+    def name() -> string {
+        return "B";
+    }
 }
 var a = VirtualMethodA.new();
 var b = VirtualMethodB.new();
@@ -129,8 +127,9 @@ var x = a.name(); // calls A.name() because a is of type A
 var y = b.name(); // calls B.name() because b is of type B
 
 def name(o: VirtualMethodA) -> string {
-return o.name(); // calls A.name() or B.name() depending on the object
-}```
+    return o.name(); // calls A.name() or B.name() depending on the object
+}
+```
 
 ## Initialization order ##
 
