@@ -9,7 +9,7 @@ done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 CONFIG=$DIR/config
 
-RUN_INT=${RUN_INT=:1}
+RUN_INT=${RUN_INT:=1}
 RUN_WASM=${RUN_WASM:=1}
 RUN_JVM=${RUN_JVM:=1}
 RUN_NATIVE=${RUN_NATIVE:=1}

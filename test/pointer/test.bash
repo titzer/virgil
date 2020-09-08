@@ -10,5 +10,6 @@ fi
 
 RUN_WASM=0 # TODO: PtrCmpSwp not supported in wasm
 RUN_JVM=0
+RUN_INT=0
 execute_tests
 exit $?
