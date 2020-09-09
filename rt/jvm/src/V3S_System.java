@@ -388,4 +388,12 @@ public class V3S_System {
 	long x = Double.doubleToRawLongBits(f);
 	return Double.longBitsToDouble((x << 1) >>> 1);
     }
+
+    public static boolean feq(float a, float b) {
+	return Float.floatToRawIntBits(a) == Float.floatToRawIntBits(b);
+    }
+
+    public static boolean deq(double a, double b) {
+	return Double.doubleToRawLongBits(a) == Double.doubleToRawLongBits(b);
+    }
 }
