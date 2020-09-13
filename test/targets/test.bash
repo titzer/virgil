@@ -40,6 +40,7 @@ function run_target() {
         
         bin="$(echo $test | sed -es/.v3\$//g)"
         run_io_test $target $bin "" $expect
+	check $?
     done
 }
 

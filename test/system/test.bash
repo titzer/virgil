@@ -6,7 +6,6 @@ target=$TEST_TARGET
 T=$OUT/$target
 mkdir -p $T
 
-# TODO: reduce duplication between stacktrace and system
 function do_test() {
     params="$2"
     exp="$3"
@@ -16,18 +15,24 @@ function do_test() {
     if [ "$exp" = "" ]; then touch $expect
     else printf "$exp" > $expect
     fi
+    trace_test_start $1
     if [ $compiled = 1 ]; then
 	run_io_test $target "${1%*.*}" "$params" "$expect"
     else
-	print_status Running int $1
 	run_v3c "" -run $1 $params > $out
-	diff $expect $out > /dev/null
-	check $?
+	diff $expect $out
     fi
+    trace_test_retval $?
 }
 
 function do_tests() {
 
+    if [ $1 = "int" ]; then
+	compiled=0
+    else
+	compiled=1
+    fi
+    
 do_test System_putc1.v3 "" "System.putc\n"
 do_test System_error1.v3 "" "!SystemError: with a message
 	in System_error1.main() [System_error1.v3 @ 3:29]\n\n"
@@ -74,21 +79,30 @@ do_test System_fileWriteK_oob3.v3 "" "!BoundsCheckException
 	in main() [System_fileWriteK_oob3.v3 @ 4:26]\n\n"
 }
 
+function run_tests() {
+    print_status Running $1
+
+    do_tests $1 | tee $T/run.$1.out | $PROGRESS i
+}
+
 if [ $# -gt 0 ]; then
   TESTS=$*
 else
   TESTS=*.v3
 fi
 
-compiled=0
-do_tests
+run_tests int
 
-for b in $TESTS; do
-  out=$T/$1.compile.out
-  print_compiling "$target" $b
-  run_v3c $target -output=$T $b &> $out
-  check_no_red $? $out
-done
+function compile_sys_tests() {
+    trace_test_count $#
+    for f in $@; do
+	trace_test_start $f
+	run_v3c $target -output=$T $f
+	trace_test_retval $?
+    done
+}
 
-compiled=1
-do_tests
+print_status Compiling $target
+compile_sys_tests $TESTS | tee $T/compile.out | $PROGRESS i
+
+run_tests $target

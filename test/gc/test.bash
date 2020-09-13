@@ -31,20 +31,18 @@ C=$T/compile.out
 ALL=$T/compile.all.out
 rm -f $ALL
 
-# TODO: compile all the tests in one invocation of the compiler
-print_compiling "$target" "gc tests"
-for f in $TESTS; do
-  run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k $f $RT_SOURCES > $C
-  grep '31m' $C > $C.error
-  if [ $? == 0 ]; then
-	printf "${RED}failed${NORM}\n"
-	cat $C.error
-	exit 1
-  fi
-  cat $C >> $ALL
-done
+function compile_gc_tests() {
+    trace_test_count $#
+    for f in $@; do
+	trace_test_start $f
+	run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k $f $RT_SOURCES > $C
+	trace_test_retval $?
+    done
+}
 
-printf "${GREEN}ok${NORM}\n"
+# XXX: compile all the tests in one invocation of the compiler
+print_compiling "$target" ""
+compile_gc_tests $TESTS | tee $T/compile.all.out | $PROGRESS i
 
 execute_target_tests $target
 
@@ -55,5 +53,4 @@ check_no_red $? $T/Aeneas-gc.compile.out
 mv $T/Aeneas $T/Aeneas-gc
 
 print_status Testing "$target $HEAP" Aeneas
-$T/Aeneas-gc -test -rma $VIRGIL_LOC/test/execute/*.v3 &> $T/Aeneas-gc.test.out
-check_passed $T/Aeneas-gc.test.out
+$T/Aeneas-gc -test -rma $VIRGIL_LOC/test/execute/*.v3 | tee $T/Aeneas-gc.test.out | $PROGRESS i

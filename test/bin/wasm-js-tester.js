@@ -9,15 +9,15 @@ var globalTestRuns = undefined;
 var outputDir = "";
 
 function fail(testname, msg) {
-    print("-" + RED + "fail " + NORM + testname + ": " + msg);
+    print("##-fail: " + msg);
 }
 
 function begin(testname) {
-    if (verbose == 2) print("+Running " + testname);
+    print("##+" + testname);
 }
 
 function pass(testname) {
-    print("-" + GREEN + "ok" + NORM + " " + testname);
+    print("##-ok");
 }
 
 function runTest(testname) {
@@ -79,8 +79,8 @@ function runTest(testname) {
         arg = arg.replace(/[.]wasm$/, "");  // strip .wasm extension
         tests.push(arg);
     }
+    print("##>" + tests.length);
     for (var i = 0; i < tests.length; i++) {
         runTest(tests[i]);
     }
-    print(tests.length + " passed");
 })();

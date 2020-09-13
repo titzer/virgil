@@ -16,15 +16,7 @@
 #define STDERR_BUF_SIZE 1024
 #define SPEC_BUF_SIZE 16384
 
-#define NORM "[0;00m"
-#define GREEN "[0;32m"
-#define RED "[0;31m"
-#define CLEAR_LINE "\r[K"
-
 #define TIMEOUT 5
-
-int VERBOSE = 2;
-int INTERACTIVE = 1;
 
 typedef struct run {
   int num;
@@ -93,62 +85,25 @@ int main(int argc, char **argv) {
     end_test(&test, result);
   }
   tests_running = 0;
-  if (INTERACTIVE) printf(CLEAR_LINE);
 
-  if (tests_passed == tests_total) {
-    printf("%d of %d " GREEN "passed" NORM "\n", tests_passed, tests_total);
-  } else {
-    printf("%d of %d passed\n", tests_passed, tests_total);
-  }
-  
-  if (tests_failed > 0) {
-    printf("%d of %d " RED "failed" NORM "\n", tests_failed, tests_total);
-    return 1;
-  }
-  return 0;
+  return tests_failed > 0 ? 1 : 0;
 }
 
 void begin_test(v3_test *test) {
-    if (VERBOSE > 1) {
-      if (INTERACTIVE) {
-        char *red = "";
-        if (tests_failed > 0) red = RED;
-	printf(CLEAR_LINE);
-        int testnum = 1 + tests_passed + tests_failed;
-	printf("%d of %d ", testnum, tests_total);
-        printf("[" GREEN "%d" NORM "/%s%d" NORM "]", tests_passed, red, tests_failed);
-	printf(": %s...", test->testFile);
-      } else {
-	printf("%s...", test->testFile);
-      }
-      fflush(stdout);
-    }
+  printf("##+%s\n", test->testFile);
+  fflush(stdout);
 }
 
 void end_test(v3_test *test, int result) {
   tests_done++;
-  if (result) tests_passed++;
-  else tests_failed++;
-    if (VERBOSE == 1) {
-      if (result) printf(GREEN "o" NORM);
-      else printf(RED "X" NORM);
-      if ((tests_done % 10) == 0 || tests_done == tests_total) putc(' ', stdout);
-      if ((tests_done % 50) == 0 || tests_done == tests_total) {
-	printf("%d of %d\n", tests_done, tests_total);
-      }
-      fflush(stdout);
-    } else if (VERBOSE > 1) {
-      if (INTERACTIVE) {
-        if (!result) {
- 	  printf(CLEAR_LINE);
- 	  printf(RED "%s" NORM ": %s\n", test->testFile, test->failure);
-	}
-      } else {
-        if (result) printf(GREEN "ok" NORM);
-        else printf(RED "failed" NORM);
-      }
-      fflush(stdout);
-    }
+  if (result) {
+    tests_passed++;
+    printf("##-ok\n");
+  } else {
+    tests_failed++;
+    printf("##-fail: %s\n", test->failure);
+  }
+  fflush(stdout);
 }
 
 int run_test(v3_test *test) {
@@ -314,9 +269,6 @@ int error(v3_run *run, char *fmt, ...) {
 
   run->failure = (char *) malloc(1024);
   vsnprintf(run->failure, 1024, fmt, ap);
-  if (VERBOSE > 1) {
-    printf("(%s) ", run->failure);
-  }
   if (failList != run) {
     // collect a list of all failures
     run->next = failList;
@@ -397,9 +349,6 @@ int execute_test(v3_test *test) {
     memset(&result, 0, sizeof(result));
     run->num = num++;
 
-    if (VERBOSE > 2) {
-      printf("\n  run %d...", run->num);
-    }
     if (pipe(result.pipe_stdout) != 0) return error(run, "couldn't pipe stdout");
     if (pipe(result.pipe_stderr) != 0) return error(run, "couldn't pipe stderr");
     

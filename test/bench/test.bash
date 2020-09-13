@@ -15,20 +15,30 @@ target=$TEST_TARGET
 T=$OUT/$target
 mkdir -p $T
 
-function do_benchmark() {
-  print_compiling "$target" $1
-  local out=$T/$1.compile.out
-  run_v3c $target -output=$T Common.v3 $1/*.v3 &> $out
-  local ok=$?
-  check $ok
-  if [ $ok = 0 ]; then
-     if [[ -f $1/output-test && -x $T/$1 ]]; then
-	run_io_test $target $1 "$(cat $1/args-test)" $1/output-test
-     fi
-  fi
-
+function compile_benchmarks() {
+    trace_test_count $#
+    for t in $@; do
+	trace_test_start $t
+	run_v3c $target -output=$T Common.v3 $t/*.v3
+	trace_test_retval $?
+    done
 }
 
-for b in $BENCHMARKS; do
-  do_benchmark $b
-done
+function run_benchmarks() {
+    trace_test_count $#
+    for t in $@; do
+	trace_test_start $t
+	if [ -f $t/args-test ]; then
+	    run_io_test $target $t "$(cat $t/args-test)" $t/output-test
+	else
+	    echo skipped
+	fi
+	trace_test_retval $?
+    done
+}
+
+print_status Compiling $target
+compile_benchmarks $BENCHMARKS | tee $T/compile.out | $PROGRESS i
+
+print_status Running $target
+run_benchmarks $BENCHMARKS | tee $T/run.out | $PROGRESS i

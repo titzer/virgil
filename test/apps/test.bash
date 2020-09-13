@@ -8,27 +8,32 @@ APPS=$(ls */*.v3 | cut -d/ -f1 | uniq)
 
 target=$TEST_TARGET
 
-function do_app() {
-  printf "  Compiling ($target) %s..." $1
-  cd $1
-  local out=$OUT/$1.compile.out
-  local deps=""
-  if [ -f TARGETS ]; then
-      grep -q $target TARGETS > /dev/null
-      if [ $? != 0 ]; then
-	  echo ${YELLOW}skip${NORM}
-	  cd ..
-	  return
-      fi
-  fi
-  if [ -f DEPS ]; then
-    deps=$(cat DEPS)
-  fi
-  run_v3c "$target" -output=$OUT *.v3 $deps &> $out
-  check $?
-  cd ..
+function compile_apps() {
+    trace_test_count $#
+    for t in $@; do
+	trace_test_start $t
+	cd $VIRGIL_LOC/apps/$t
+	local deps=""
+	if [ -f TARGETS ]; then
+	    if [ "$target" = "" ]; then
+		echo ${YELLOW}skip${NORM}
+		echo "##-ok"
+		continue
+	    fi
+	    grep -q $target TARGETS > /dev/null
+	    if [ $? != 0 ]; then
+		echo ${YELLOW}skip${NORM}
+		echo "##-ok"
+		continue
+	    fi
+	fi
+	if [ -f DEPS ]; then
+	    deps=$(cat DEPS)
+	fi
+	run_v3c "$target" -output=$OUT *.v3 $deps
+	trace_test_retval $?
+    done
 }
 
-for b in $APPS; do
-  do_app $b
-done
+print_status Compiling $target
+compile_apps $APPS | tee $OUT/compile.out | $PROGRESS i

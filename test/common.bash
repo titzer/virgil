@@ -28,6 +28,7 @@ mkdir -p $OUT
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $(dirname ${BASH_SOURCE[0]}) && cd .. && pwd)}
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
+PROGRESS=${VIRGIL_LOC}/test/config/progress
 
 UNAME=$(uname -sm)
 HOST_PLATFORM=$($VIRGIL_LOC/bin/dev/sense_host | cut -d' ' -f1)
@@ -60,9 +61,9 @@ function execute() {
 function print_status() {
     config=$(echo -n $2)
     if [ -z "$3" ]; then
-	printf "  %-12s ($config)..." $1
+	printf "  %-13s %-11s | "   $1 "$config"
     else
-	printf "  %-12s ($config) $3..." $1
+	printf "  %-13s %-11s $3 | "  $1 "$config"
     fi
 }
 
@@ -78,6 +79,25 @@ function check() {
 	if [ "$2" != "" ]; then
 	    cat $2
 	fi
+    fi
+}
+
+function trace_test_count() {
+    printf "##>%d\n" $1
+}
+
+function trace_test_start() {
+    printf "##+%s\n" $1
+}
+
+function trace_test_retval() {
+    if [ "$1" = 0 ]; then
+	printf "##-ok\n"
+    else
+	if [ "$2" != "" ]; then
+	    cat $2
+	fi
+	printf "##-fail\n"
     fi
 }
 
@@ -109,14 +129,11 @@ function run_io_test() {
     local expected="$4"
 
     if [[ "$HOST_PLATFORM" == "$target" || $target == "jar" && "$HOST_JAVA" != "" || $target == "wave" && "$HOST_WAVE" != "" || $target == "wave-nogc" && "$HOST_WAVE" != "" ]]; then
-	print_status Running "$target" "$test"
 	P=$OUT/$target/$test.out
 	$OUT/$target/$test $args &> $P
 	diff $expected $P > $OUT/$target/$test.diff
-	check $?
     else
-	print_status Skipping "$target/$HOST_PLATFORM"
-	echo "${YELLOW}ok${NORM}"
+	echo "${YELLOW}skipped${NORM}"
     fi
 }
 
@@ -138,8 +155,7 @@ function execute_int_tests() {
     print_status Interpreting "$2 $V3C_OPTS"
 
     P=$OUT/$1.run.out
-    run_v3c "" -test -expect=expect.txt $2 $TESTS > $P
-    check_passed $P
+    run_v3c "" -test -expect=expect.txt $2 $TESTS | $PROGRESS i
 }
 
 function compile_target_tests() {
@@ -151,8 +167,8 @@ function compile_target_tests() {
     C=$OUT/$target/compile.out
     print_compiling $target
     echo run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS &> $C
-    run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS &> $C
-    check_passed $C
+    run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS | $PROGRESS i
+#    check_passed $C
 }
 
 function execute_target_tests() {
@@ -160,8 +176,8 @@ function execute_target_tests() {
     print_status Running $target
     R=$OUT/$target/run.out
     if [ -x $CONFIG/execute-$target-test ]; then
-	$CONFIG/execute-$target-test $OUT/$target $TESTS > $R
-	check_passed $R
+	$CONFIG/execute-$target-test $OUT/$target $TESTS | $PROGRESS i
+#	check_passed $R
     else
 	printf "${YELLOW}skipped${NORM}\n"
     fi
