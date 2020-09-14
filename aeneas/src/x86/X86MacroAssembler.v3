@@ -9,11 +9,33 @@ def edi = X86Regs.EDI;
 def esi = X86Regs.ESI;
 def ebp = X86Regs.EBP;
 def esp = X86Regs.ESP;
+def xmm0 = X86Regs.XMM0;
+def xmm1 = X86Regs.XMM1;
+def xmm2 = X86Regs.XMM2;
+def xmm3 = X86Regs.XMM3;
+def xmm4 = X86Regs.XMM4;
+def xmm5 = X86Regs.XMM5;
+def xmm6 = X86Regs.XMM6;
+def xmm7 = X86Regs.XMM7;
 
 def gen_i64_divmod_stub(mach: MachProgram, addr: Addr, u: MachDataBuffer, codeStartOffset: int, op: WideDivision) {
 	var asm = X86MacroAssembler.new(mach, u, codeStartOffset);
 	asm.wdiv_full(op, null, true);
 	asm.ret();
+}
+def gen_f2i_fixup_stub(mach: MachProgram, addr: Addr, u: MachDataBuffer, codeStartOffset: int) {
+	var asm = X86MacroAssembler.new(mach, u, codeStartOffset);
+	asm.f2i_fixup();
+	asm.ret();
+}
+def gen_ui2f_fixup_stub(mach: MachProgram, addr: Addr, u: MachDataBuffer, codeStartOffset: int) {
+	var asm = X86MacroAssembler.new(mach, u, codeStartOffset);
+	asm.ui2f_fixup();
+	asm.ret();
+}
+def gen_f2ui_fixup_stub(mach: MachProgram, addr: Addr, u: MachDataBuffer, codeStartOffset: int) {
+	var asm = X86MacroAssembler.new(mach, u, codeStartOffset);
+	asm.f2ui_fixup();
 }
 
 // An extended X86Assembler that has additional machine-level utilities, such as
@@ -51,22 +73,47 @@ class X86MacroAssembler extends X86Assembler {
 		push(s);            // push value from source memory onto the stack
 		pop(X86Addr.!(d));  // pop value off stack into destination memory
 	}
+	// a macro to move between any two SSE register/memory operands
+	def movsd_sm_sm(d: SSERm, s: SSERm, scratch: SSEReg) {
+		if (s == d) return;
+		if (SSEReg.?(d)) return movsd_s_sm(SSEReg.!(d), s);
+		if (SSEReg.?(s)) return movsd_sm_s(d, SSEReg.!(s));
+		movsd_s_sm(scratch, s);
+		movsd_sm_s(d, scratch);
+	}
 	// a macro to move a value into a location
 	def movd_l_val(frame: MachFrame, loc: int, val: Val) {
-		var d = loc_rm(frame, loc);
-		if (val == null) {
-			movd_rm_i(d, 0);
-		} else if (Addr.?(val)) {
-			var pos = buffer.pos;
-			movd_rm_i(d, X86Addrs.ABS_CONST);
-			recordPatch(pos, Addr.!(val));
+		if (loc >= X86MachRegs.XMM0 && loc <= X86MachRegs.XMM7) {
+			movd_l_fval(frame, loc, val);
 		} else {
-			movd_rm_i(d, V3.unboxIntegral(val));
+			var d = loc_rm(frame, loc);
+			match (val) {
+				x: Addr => {
+					var pos = buffer.pos;
+					movd_rm_i(d, X86Addrs.ABS_CONST);
+					recordPatch(pos, x);
+				}
+				x: Float32Val => movd_l_fval(frame, loc, x); // TODO: Float64Val case
+				_ => movd_rm_i(d, V3.unboxIntegral(val));
+			}
 		}
+	}
+	// a macro to move a value into an SSE location
+	def movd_l_fval(frame: MachFrame, loc: int, val: Val) {
+		var f = 0;
+		var d = loc_sm(frame, loc);
+		if (val != null) {
+			match (val) {
+				x: Float32Val => f = int.view(x.bits);
+				x: Float64Val => f = int.view(x.bits); // TODO: fix Float64Val case
+			}
+		}
+		movd_rm_i(X86Regs.EBP, f);
+		movd_s_rm(SSEReg.!(d), X86Regs.EBP); // cast will never fail since we know d is an SSEReg from loc
 	}
 	// convert a location into an x86 register
 	def loc_r(frame: MachFrame, loc: int) -> X86Reg {
-		match(loc) {
+		match (loc) {
 			X86MachRegs.EAX => return eax;
 			X86MachRegs.EBX => return ebx;
 			X86MachRegs.ECX => return ecx;
@@ -79,7 +126,7 @@ class X86MacroAssembler extends X86Assembler {
 	}
 	// convert a location into an x86 register/memory reference
 	def loc_rm(frame: MachFrame, loc: int) -> X86Rm {
-		match(loc) {
+		match (loc) {
 			0 => return failLocation("unassigned location", loc, frame.conv.regSet);
 			X86MachRegs.EAX => return eax;
 			X86MachRegs.EBX => return ebx;
@@ -89,16 +136,60 @@ class X86MacroAssembler extends X86Assembler {
 			X86MachRegs.EDI => return edi;
 			X86MachRegs.EBP => return ebp;
 		}
-		var regSet = frame.conv.regSet, wordSize = mach.data.addressSize, offset: int;
-		if (loc >= regSet.calleeStart) offset = wordSize * (loc - regSet.calleeStart);
-		else if (loc >= regSet.callerStart) offset = frame.size() + (wordSize * (loc - regSet.callerStart));
-		else if (loc >= regSet.spillStart) offset = wordSize * (loc - regSet.spillStart + frame.spillArgs);
-		else return failLocation("invalid spill location", loc, frame.conv.regSet);
+		var offset = calc_offset(frame, loc, false);
 		return esp.plus(offset);
 	}
 	def failLocation(msg: string, loc: int, regSet: MachRegSet) -> X86Reg {
 		mach.fail(Strings.format2("%1: %2", msg, regSet.identify(loc)));
 		return X86MachRegs.SCRATCH;
+	}
+	// convert a location into an SSE register
+	def loc_s(frame: MachFrame, loc: int) -> SSEReg {
+		match (loc) {
+			X86MachRegs.XMM0 => return xmm0;
+			X86MachRegs.XMM1 => return xmm1;
+			X86MachRegs.XMM2 => return xmm2;
+			X86MachRegs.XMM3 => return xmm3;
+			X86MachRegs.XMM4 => return xmm4;
+			X86MachRegs.XMM5 => return xmm5;
+			X86MachRegs.XMM6 => return xmm6;
+			X86MachRegs.XMM7 => return xmm7;
+		}
+		return failSSELocation("required SSE register", loc, frame.conv.regSet);
+	}
+	// convert a location into an SSE register/memory reference
+	def loc_sm(frame: MachFrame, loc: int) -> SSERm {
+		match (loc) {
+			0 => return failSSELocation("unassigned location", loc, frame.conv.regSet);
+			X86MachRegs.XMM0 => return xmm0;
+			X86MachRegs.XMM1 => return xmm1;
+			X86MachRegs.XMM2 => return xmm2;
+			X86MachRegs.XMM3 => return xmm3;
+			X86MachRegs.XMM4 => return xmm4;
+			X86MachRegs.XMM5 => return xmm5;
+			X86MachRegs.XMM6 => return xmm6;
+			X86MachRegs.XMM7 => return xmm7;
+		}
+		var offset = calc_offset(frame, loc, true);
+		return esp.plusSSE(offset);
+	}
+	def failSSELocation(msg: string, loc: int, regSet: MachRegSet) -> SSEReg {
+		mach.fail(Strings.format2("%1: %2", msg, regSet.identify(loc)));
+		return X86MachRegs.SSE_SCRATCH;
+	}
+	def calc_offset(frame: MachFrame, loc: int, isSSE: bool) -> int {
+		var regSet = frame.conv.regSet, wordSize = mach.data.addressSize;
+		if (loc >= regSet.calleeStart) {
+			return wordSize * (loc - regSet.calleeStart);
+		} else if (loc >= regSet.callerStart) {
+			return frame.size() + (wordSize * (loc - regSet.callerStart));
+		} else if (loc >= regSet.spillStart) {
+			return wordSize * (loc - regSet.spillStart + frame.spillArgs);
+		} else {
+			if (isSSE) failSSELocation("invalid spill location", loc, regSet);
+			else failLocation("invalid spill location", loc, regSet);
+			return 0;
+		}
 	}
 	// patch an absolute address, scanning backwards up to "start"
 	def recordPatch(start: int, target: Addr) {
@@ -319,6 +410,204 @@ class X86MacroAssembler extends X86Assembler {
 			movd_rm_r(edx, esi);
 		}
 		if (frame != null) mach.runtime.src.recordFrameEnd(codeOffset());
+	}
+
+	def cast_f2ui(dest: X86Reg, a: SSERm) {
+		var sse_scratch = X86MachRegs.SSE_SCRATCH;
+		var save = esp.plusSSE(0x0);
+		sub.rm_i(esp, 0x8);
+		if (SSEAddr.?(a)) {
+			fld_d(SSEAddr.!(a));
+		} else {
+			movss_sm_s(save, SSEReg.!(a));
+			fld_d(save);
+		}
+		fisttp_q(save);
+		movd_r_rm(dest, save.toX86Addr());
+		add.rm_i(esp, 0x8);
+	}
+	def cast_d2ui(dest: X86Reg, a: SSERm) {
+		// TODO: convert double to unsigned int
+	}
+	def f2ui_fixup() {
+		var scratch = X86MachRegs.SCRATCH;
+		var sse_scratch = X86MachRegs.SSE_SCRATCH;
+		var inout = esp.plus(4 * 0x4); // return address + 3 saves
+		var inout_sse = inout.toSSEAddr();
+		var xmm0_save = esp.plusSSE(2 * 0x4);
+		var save = esp.plusSSE(0x0);
+		var L1 = Label.new(), L2 = Label.new();
+		sub.rm_i(esp, 0xC);
+		movss_sm_s(xmm0_save, xmm0);
+		movss_s_sm(xmm0, inout_sse);
+		xorps(sse_scratch, sse_scratch);
+		ucomiss(sse_scratch, xmm0); // if (f <= 0) return 0
+		jmpl_near(X86Conds.NC, L1);
+		movd_rm_i(scratch, 0x4f800000); // if (f >= 4294967296) return MAX_U32_INT
+		movd_s_rm(sse_scratch, scratch);
+		ucomiss(xmm0, sse_scratch);
+		jmpl_near(X86Conds.C, L2);
+		movd_rm_i(inout, 0xffffffff);
+		movss_s_sm(xmm0, xmm0_save);
+		add.rm_i(esp, 0xC);
+		ret();
+		bind(L2); // else return (unsigned int)f
+		movss_sm_s(save, xmm0);
+		fld_d(save);
+		fisttp_q(save);
+		movd_r_rm(scratch, save.toX86Addr());
+		movd_rm_r(inout, scratch);
+		movss_s_sm(xmm0, xmm0_save);
+		add.rm_i(esp, 0xC);
+		ret();
+		bind(L1);
+		movd_rm_i(inout, 0x0);
+		movss_s_sm(xmm0, xmm0_save);
+		add.rm_i(esp, 0xC);
+		ret();
+	}
+	def uint_truncf(dest: X86Reg, a: SSERm) {
+		var sse_scratch = X86MachRegs.SSE_SCRATCH;
+		var save = esp.plusSSE(0x0);
+		sub.rm_i(esp, 0x4);
+		if (SSEReg.?(a)) {
+			movss_sm_s(save, SSEReg.!(a));
+		} else {
+			movss_s_sm(sse_scratch, a);
+			movss_sm_s(save, sse_scratch);
+		}
+		var name = "f2ui_fixup";
+		var addr = mach.stubMap[name].0;
+		if (addr == null) {
+			addr = Address.new(mach.codeRegion, name);
+			mach.stubMap[name] = (addr, gen_f2ui_fixup_stub(mach, _, _, codeStartOffset));
+		}
+		call_addr(addr);
+		pop(dest);
+	}
+	def uint_truncd(dest: X86Reg, a: SSERm) {
+		// TODO: convert double to unsigned int with truncation
+	}
+	def ui2f_fixup() {
+		var scratch = X86MachRegs.SCRATCH;
+		var sse_scratch = X86MachRegs.SSE_SCRATCH;
+		var save = esp.plus(2 * 0x4); // return address + 1 save
+		var done = Label.new();
+		push(eax);
+		movd_r_rm(scratch, save);
+		cvtsi2ss(sse_scratch, scratch);
+		test_rm_r(scratch, scratch);
+		jmpl_near(X86Conds.GE, done);
+		movd_r_rm(eax, scratch);
+		shr_i(scratch, 0x1);
+		and.rm_i(eax, 0x1);
+		or.r_rm(eax, scratch);
+		cvtsi2ss(sse_scratch, eax);
+		addss(sse_scratch, sse_scratch); // return value in sse_scratch
+		bind(done);
+		pop(eax);
+	}
+	def cast_ui2f(dest: SSEReg, a: X86Rm) {
+		var sse_scratch = X86MachRegs.SSE_SCRATCH;
+		var save = esp.plusSSE(0x0);
+		push(a);
+		var name = "ui2f_fixup";
+		var addr = mach.stubMap[name].0;
+		if (addr == null) {
+			addr = Address.new(mach.codeRegion, name);
+			mach.stubMap[name] = (addr, gen_ui2f_fixup_stub(mach, _, _, codeStartOffset));
+		}
+		call_addr(addr);
+		add.rm_i(esp, 0x4);
+		movss_s_sm(dest, sse_scratch); // return value in sse_scratch
+	}
+	def cast_ui2d(dest: SSEReg, a: X86Rm) {
+		// TODO: convert unsigned int to double
+	}
+	def f2i_fixup() {
+		var scratch = X86MachRegs.SCRATCH;
+		var inout = esp.plus(4 * 0x4); // return address + 3 saves
+		var done = Label.new();
+		push(eax);
+		push(ecx);
+		push(edx);
+		movd_rm_i(eax, 0x7f800000);
+		xor.r_rm(ecx, ecx);
+		movd_r_rm(scratch, inout);
+		movd_r_rm(edx, scratch);
+		and.rm_i(edx, 0x7fffffff);
+		cmp.r_rm(eax, edx); // if NaN -> 0
+		jmpl_near(X86Conds.S, done); // if negative
+		test_rm_r(scratch, scratch); // signed ? MIN_INT : MAX_INT
+		movd_rm_i(ecx, 0x80000000);
+		movd_rm_i(eax, 0x7fffffff);
+		cmovns(ecx, eax);
+		bind(done);
+		movd_rm_r(inout, ecx);
+		pop(edx);
+		pop(ecx);
+		pop(eax);
+	}
+	def int_truncf(a: X86Reg, b: SSERm) {
+		var sse_scratch = X86MachRegs.SSE_SCRATCH;
+		var save = esp.plus(0x0);
+		var label = Label.new();
+		cvttss2si(a, b);
+		cmp.rm_i(a, 0x80000000); // XXX: float sign flip
+		jmpl_near(X86Conds.NZ, label);
+		sub.rm_i(esp, 0x4);
+		if (SSEReg.?(b)) {
+			movd_rm_s(save, SSEReg.!(b));
+		} else {
+			movss_s_sm(sse_scratch, b);
+			movd_rm_s(save, sse_scratch);
+		}
+		var name = "f2i_fixup";
+		var addr = mach.stubMap[name].0;
+		if (addr == null) {
+			addr = Address.new(mach.codeRegion, name);
+			mach.stubMap[name] = (addr, gen_f2i_fixup_stub(mach, _, _, codeStartOffset));
+		}
+		call_addr(addr);
+		pop(a);
+		bind(label);
+	}
+	// TODO: truncate double
+	def int_truncd(a: X86Reg, b: SSERm) {
+		cvttsd2si(a, b);
+	}
+	def fp_bit_eq(dest: X86Reg, a: SSEReg, b: SSERm, isDouble: bool) {
+		var sse_scratch = X86MachRegs.SSE_SCRATCH;
+		if (isDouble) {
+			if (a != sse_scratch) movsd_s_sm(sse_scratch, a);
+			pcmpeqq(sse_scratch, b);
+		} else {
+			if (a != sse_scratch) movss_s_sm(sse_scratch, a);
+			pcmpeqd(sse_scratch, b);
+		}
+		movd_rm_s(dest, sse_scratch);
+		and.rm_i(dest, 0x1);
+	}
+	def cmp_fp(cond: X86Cond, dest: X86Reg, a: SSEReg, b: SSERm, isDouble: bool) {
+		if (cond == X86Conds.NZ) movd_rm_i(dest, 0x1); // XXX: if unordered result, then default for != is true
+		else movd_rm_i(dest, 0x0);
+		if (isDouble) ucomisd(a, b);
+		else ucomiss(a, b);
+		var label = Label.new();
+		jmpl_near(X86Conds.P, label);
+		setx(cond, dest);
+		bind(label);
+	}
+	def fabs(dest: SSEReg, a: SSERm, isDouble: bool) {
+		if (isDouble) {
+			if (dest != a) movsd_s_sm(dest, a);
+			psllq_i(dest, 0x1); // lsl followed by lsr to zero out sign bit
+			psrlq_i(dest, 0x1);
+		} else {
+			if (dest != a) movss_s_sm(dest, a);
+			pslld_i(dest, 0x1);
+			psrld_i(dest, 0x1);
+		}
 	}
 }
 // A helper for generating shift operations for a given V3 opcode.
