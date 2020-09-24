@@ -2,7 +2,7 @@
 
 V3C_OPTS="$V3C_OPTS -fp"
 RUN_INT=0
-RUN_NATIVE=1
+RUN_NATIVE=0
 
 function do_parser_tests() {
 	cd parser
