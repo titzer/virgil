@@ -1,8 +1,5 @@
 #!/bin/bash
 
-V3C_OPTS="$V3C_OPTS -fp"
-RUN_INT=0
-
 function do_parser_tests() {
 	cd parser
 	printf "  Running parser tests..."

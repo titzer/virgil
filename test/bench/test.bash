@@ -18,7 +18,7 @@ mkdir -p $T
 function do_benchmark() {
   print_compiling "$target" $1
   local out=$T/$1.compile.out
-  run_v3c $target -fp -output=$T Common.v3 $1/*.v3 &> $out
+  run_v3c $target -output=$T Common.v3 $1/*.v3 &> $out
   local ok=$?
   check $ok
   if [ $ok = 0 ]; then
