@@ -11,6 +11,10 @@ public class V3S_System {
     private static final int PRINT_SIZE = 128;
     private static final int MAX_FILES = 128;
 
+    private static final int INT_MAX = 0x7fffffff;
+    private static final long LONG_MAX = 0x7fffffffffffffffL;
+    private static final long U64_MAX = 0xffffffffffffffffL;
+
     public static final InputStream[] fileInput;
     public static final OutputStream[] fileOutput;
 
@@ -269,24 +273,28 @@ public class V3S_System {
     }
 
     public static float cast_i2f(int v) {
+	if (v == INT_MAX) throw new ClassCastException();
 	float f = (float)v;
 	if (v != (int)f) throw new ClassCastException();
 	return f;
     }
 
     public static float cast_l2f(long v) {
+	if (v == LONG_MAX) throw new ClassCastException();
 	float f = (float)v;
 	if (v != (long)f) throw new ClassCastException();
 	return f;
     }
 
     public static double cast_l2d(long v) {
+	if (v == LONG_MAX) throw new ClassCastException();
 	double d = (double)v;
 	if (v != (long)d) throw new ClassCastException();
 	return d;
     }
 
     public static float cast_ul2f(long v) {
+	if (v == U64_MAX) throw new ClassCastException();
 	if (v >= 0) return cast_l2f(v);
 	// Manually check if any bits would be rounded off.
 	if ((v & 0x0FFFFFFFFFFL) != 0) throw new ClassCastException();
@@ -294,6 +302,7 @@ public class V3S_System {
     }
 
     public static double cast_ul2d(long v) {
+	if (v == U64_MAX) throw new ClassCastException();
 	if (v >= 0) return cast_l2d(v);
 	// Manually check if any bits would be rounded off.
 	if ((v & 0x7FFL) != 0) throw new ClassCastException();
@@ -301,23 +310,25 @@ public class V3S_System {
     }
 
     public static boolean query_i2f(int v) {
-	return v == (int)(float)v;
+	return v != INT_MAX && v == (int)(float)v;
     }
 
     public static boolean query_l2f(long v) {
-	return v == (long)(float)v;
+	return v != LONG_MAX && v == (long)(float)v;
     }
 
     public static boolean query_l2d(long v) {
-	return v == (long)(double)v;
+	return v != LONG_MAX && v == (long)(double)v;
     }
 
     public static boolean query_ul2f(long v) {
+	if (v == U64_MAX) return false;
 	if (v < 0) return v == (long)(float)v;
 	return (v & 0x0FFFFFFFFFFL) == 0;
     }
 
     public static boolean query_ul2d(long v) {
+	if (v == U64_MAX) return false;
 	if (v >= 0) return v == (long)(double)v;
 	return (v & 0x7FFL) == 0;
     }
