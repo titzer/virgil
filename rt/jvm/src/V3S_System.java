@@ -322,15 +322,21 @@ public class V3S_System {
     }
 
     public static boolean query_ul2f(long v) {
-	if (v == U64_MAX) return false;
-	if (v < 0) return v == (long)(float)v;
-	return (v & 0x0FFFFFFFFFFL) == 0;
+	if (v == U64_MAX || v == LONG_MAX) return false;
+	if (v < 0) {
+	    if ((v & 1) != 0) return false;
+	    v >>>= 1;
+	}
+	return v == (long)(float)v;
     }
 
     public static boolean query_ul2d(long v) {
-	if (v == U64_MAX) return false;
-	if (v >= 0) return v == (long)(double)v;
-	return (v & 0x7FFL) == 0;
+	if (v == U64_MAX || v == LONG_MAX) return false;
+	if (v < 0) {
+	    if ((v & 1) != 0) return false;
+	    v >>>= 1;
+	}
+	return v == (long)(double)v;
     }
 
     public static boolean query_d2f(double v) {
