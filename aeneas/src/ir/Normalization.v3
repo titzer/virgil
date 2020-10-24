@@ -1,0 +1,418 @@
+// Copyright 2013 Google Inc. All rights reserved.
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Normalizes a program based on the results of reachability analysis.
+class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
+	def liveClasses = Vector<RaClass>.new();
+	def allClasses = Vector<RaClass>.new();
+	def context = SsaContext.new(ra.compiler, ra.prog);
+	def fields = Vector<IrField>.new();
+	var recordMap = V3.newRecordMap<Record>(); // XXX: canonicalize equivalent variant records
+	var complexRecordMap = V3.newRecordMap<Array<Record>>();
+	var newIr = IrModule.new();
+	var specializer: Specializer;
+	var virtuals: List<RaVirtual>;
+	var ovfAlloc: OverflowFieldAllocator;  // OVF where to allocate the fields?
+
+	def normalize() {
+		// layout fields into classes
+		if (Aeneas.PRINT_DEAD_CODE.get()) DeadCodeAnalyzer.new(ra).report();
+		ra.heapTypes.apply(visitHeapType);
+		if (ra.compiler.PartialSpecialization) {
+			// if partial specialization is enabled, do specialization analysis
+			(specializer = Specializer.new(ra, this)).specialize();
+		}
+		allClasses.apply(layoutVtable);
+		Lists.apply(virtuals, layoutMtable);
+		allClasses.apply(createIrClass);
+		// create new roots for the new IrModule
+		var old = ra.oldIr.roots;
+		newIr.roots.grow(old.length);
+		newIr.roots.length = old.length;
+		for (i < old.length) {
+			var o = old[i];
+			newIr.roots[i] = IrRoot.new(o.name, normalizeMethodRef(o.spec));
+		}
+		ra.prog.ir = newIr;
+		// do remaining work; normalize record instances
+		ra.queue.drain();
+		ra.liveMethods.apply(normCode);
+		if (ovfAlloc != null) allocOverflowFieldRecord();
+	}
+	// visit a live type, deferring normalization of records
+	def visitHeapType(raType: TypeNorm) {
+		if (RaArray.?(raType)) return visitArrayType(RaArray.!(raType));
+		if (RaClass.?(raType)) return visitClassType(RaClass.!(raType));
+	}
+	def visitClassType(rc: RaClass) {
+		layoutClass(rc);
+		if (V3.isComponent(rc.oldType)) {
+			var comp = V3.asComponent(rc.oldType).componentDecl, newRecord: Record;
+			if (rc.instances != null) {
+				// normalize component record
+				var oldRecord = rc.instances.head;
+				newRecord = ra.prog.newRecord(rc.newType, rc.normFields.length);
+				complexRecordMap[oldRecord] = NO_RECORDS;
+				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
+			}
+			ra.prog.setComponentRecord(comp, newRecord);
+		} else {
+			// create and map new records to be normalized
+			for (l = rc.instances; l != null; l = l.tail) {
+				var oldRecord = l.head, newRecord = ra.prog.newRecord(rc.newType, rc.normFields.length);
+				recordMap[l.head] = newRecord;
+				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
+			}
+		}
+	}
+	def visitArrayType(rt: RaArray) {
+		if (rt.oldType != rt.newType) {
+			// map complex arrays to arrays of records
+			var ta = Tuple.toTypeArray(rt.newType);
+			for (l = rt.instances; l != null; l = l.tail) {
+				var newRecords = createComplexArrayRecord(l.head, ta, rt);
+				ra.queue.add(normComplexArrayRecord, (rt, l.head, newRecords));
+			}
+		} else if (!rt.primitive) {
+			// normalize simple arrays that are not primitive
+			for (l = rt.instances; l != null; l = l.tail) {
+				ra.queue.add(normSimpleArrayRecord, l.head);
+			}
+		}
+	}
+	// lay out a classes' fields and number it according to liveness
+	def layoutClass(rc: RaClass) {
+		if (rc.minClassId >= 0) return; // already processed this type
+		while (rc.parent != null) rc = rc.parent; // start at root
+		numberClass(rc);
+	}
+	// number a class and lay out its fields, recursively visiting children
+	def numberClass(rc: RaClass) {
+		allClasses.put(rc);
+		rc.minClassId = liveClasses.length;
+		if (V3.isVariant(rc.oldType)) return numberVariantClass(rc);
+		if (live(rc.raFacts) && !V3.isComponent(rc.oldType)) {
+			liveClasses.put(rc);
+		}
+		layoutFields(rc);
+		for (l = rc.children; l != null; l = l.tail) numberClass(l.head);
+		rc.maxClassId = liveClasses.length;
+	}
+	def numberVariantClass(rc: RaClass) {
+		layoutFields(rc);
+		// number variant classes consistently with their tagging order.
+		var isEnum = true;
+		for (l = rc.children; l != null; l = l.tail) {
+			var c = l.head;
+			allClasses.put(c);
+			layoutFields(c);
+			var index = rc.minClassId + V3.getVariantTag(c.oldType);
+			c.minClassId = index;
+			c.maxClassId = index + 1;
+			liveClasses.grow(index + 1);
+			if (liveClasses.length < c.maxClassId) liveClasses.length = index + 1;
+			liveClasses[index] = c;
+			if (c.normFields.length > 0) isEnum = false;
+		}
+		rc.maxClassId = liveClasses.length;
+		if (isEnum) {
+			// this and all children classes will be represented as enums
+			rc.raFacts |= RaFact.RC_ENUM;
+			for (l = rc.children; l != null; l = l.tail) l.head.raFacts |= RaFact.RC_ENUM;
+		}
+	}
+	// map a complex array to an array of records
+	def createComplexArrayRecord(r: Record, types: Array<Type>, rt: RaArray) -> Array<Record> {
+		var complex = Array<Record>.new(rt.size);
+		for (i < complex.length) {
+			complex[i] = ra.prog.newRecord(types[i], r.values.length);
+		}
+		complexRecordMap[r] = complex;
+		return complex;
+	}
+	// layout fields for classes and components
+	def layoutFields(rc: RaClass) {
+		fields.length = 0;
+		fields.grow(rc.fields.length);  // gather fields into vector
+		for (rf in rc.fields) {
+			if (rf == null) continue;
+			if (rf.norm != null) {
+				// inherited this field from superclass
+				for (f in rf.norm) fields.put(IrField.!(f.member));
+				continue;
+			}
+			if (rf.isConst()) continue;
+			if (!rf.raFacts.RF_READ) continue;
+			// add normalized field(s)
+			rf.normIndex = fields.length;
+			addField(rc, rf);
+		}
+		if (ra.compiler.target != null) {
+			var start = if(rc.parent != null, rc.parent.normFields.length);
+			ra.compiler.target.computeFieldOffsets(ra.prog, fields, start);
+		}
+		rc.normFields = fields.extract();
+	}
+	def addField(rc: RaClass, rf: RaField) {
+		if (rf.fieldType == null) {
+			// add single monomorphic field to the vector
+			fields.put(rf.orig);
+			rf.norm = [IrSpec.new(rc.oldType, [rc.oldType], rf.orig)];
+		} else {
+			// add normalized field(s) to the vector
+			var norms = Array<IrSpec>.new(rf.fieldType.size);
+			var facts = if(rf.fieldType.size > 1, Fact.F_NORM, Facts.NONE);
+			if (!rf.raFacts.RF_WRITTEN) facts |= (Fact.F_VALUE | Fact.O_FOLDABLE);
+			for (i < norms.length) {
+				var ft = if(rf.fieldType.sub == null, rf.fieldType.newType, rf.fieldType.sub[i]);
+				var nf = IrField.new(rc.oldType, ft);
+				nf.setFact(facts);
+				nf.source = rf.orig.source;
+				norms[i] = IrSpec.new(rc.oldType, [rc.oldType], nf);
+				fields.put(nf);
+			}
+			rf.norm = norms;
+		}
+	}
+	// normalize a live instance of a class
+	def normClassRecord(rc: RaClass, oldRecord: Record, newRecord: Record) {
+		var rfs = rc.fields;
+		for (i < rfs.length) {
+			var rf = rfs[i];
+			if (rf != null && rf.normIndex >= 0) {
+				var v = oldRecord.values[i];
+				if (rf.fieldType == null) newRecord.values[rf.normIndex] = normSimpleVal(v);
+				else normValIntoArray(v, rf.fieldType, newRecord.values, rf.normIndex);
+			}
+		}
+	}
+	// normalize the live instances of a simple (i.e. size-1 element) array type
+	def normSimpleArrayRecord(record: Record) {
+		def v = record.values;
+		for (i < v.length) v[i] = normSimpleVal(v[i]);
+	}
+	// normalize the live instances of a complex (i.e. size-N element) array type
+	def normComplexArrayRecord(rt: RaArray, oldRecord: Record, newRecords: Array<Record>) {
+		var etn = ra.makeType(V3Array.elementType(rt.oldType));
+		var old = oldRecord.values;
+		var temp = Array<Val>.new(newRecords.length);
+		for (i < old.length) {
+			for (j < temp.length) temp[j] = null; // XXX: must clear temp array first
+			normValIntoArray(old[i], etn, temp, 0);
+			for (j < newRecords.length) {
+				newRecords[j].values[i] = temp[j];
+			}
+		}
+	}
+	// normalize a record value into 1 or more records into the given array
+	def normRecordIntoArray(r: Record, array: Array<Val>, index: int) {
+		var simple = recordMap[r];
+		if (simple != null) { // simple mapping
+			array[index] = simple;
+			return;
+		}
+		var complex = complexRecordMap[r];
+		if (complex != null) { // complex mapping
+			for (i < complex.length) {
+				array[index + i] = complex[i];
+			}
+			return;
+		}
+		array[index] = r;
+	}
+	// map a record 1-1
+	def normSimpleVal(v: Val) -> Val {
+		if (Record.?(v)) {
+			// assume that a record without an entry is mapped to itself
+			var r = recordMap[Record.!(v)];
+			return if(r == null, v, r);
+		}
+		return v; // assume all other values can be reused
+	}
+	def layoutVtable(rc: RaClass) {
+		var vtable = Vector<IrMethod>.new();
+		if (rc.parent != null) vtable.puta(rc.parent.normMethods); // add superclass methods
+		else vtable.put(null); // reserve a space for constructor
+		// process all methods
+		for (ml in rc.methods) {
+			for (l = ml; l != null; l = l.tail) addMethod(vtable, rc, l.head);
+		}
+		rc.normMethods = vtable.extract();
+	}
+	def addMethod(vtable: Vector<IrMethod>, rc: RaClass, rm: RaMethod) {
+		var m = rm.orig;
+		if (!rm.raFacts.RM_LIVE) {
+			// mark methods that are abstract
+			rm.norm.ssa = null;
+			rm.norm.facts |= Fact.M_ABSTRACT;
+			if (!rm.isVirtual()) return; // not live, not virtual
+		}
+		if (m.facts.M_NEW) {
+			// constructors always end up at slot 0
+			rm.norm.facts |= Fact.M_NEW;
+			vtable[0] = rm.norm;
+			rm.norm.index = 0;
+			return;
+		}
+		var sm = resolveMethodImpl(rc.parent, rm);
+		if (sm == null) { // add a new method to the vtable
+			rm.norm.index = rm.normIndex = vtable.length;
+			vtable.put(rm.norm);
+		} else if (sm != rm) { // overwrite existing vtable entry
+			vtable[sm.normIndex] = rm.norm;
+			rm.norm.index = rm.normIndex = sm.normIndex;
+			rm.norm.facts |= Fact.M_OVERRIDE;
+			sm.norm.facts |= Fact.M_OVERRIDDEN;
+		}
+		if (rm.virtual != null) virtuals = List.new(rm.virtual, virtuals);
+	}
+	def layoutMtable(rv: RaVirtual) {
+		if (rv.mtable != null) return;
+		var rm = rv.raMethod, rc = ra.makeClass(rm.receiver);
+		var size = rc.maxClassId - rc.minClassId;
+		if (ra.compiler.RaDevirtualize && size < 2) return; // no need for an mtable
+		var table = Array<IrMethod>.new(size);
+		rv.mtable = IrMtable.new(rm.norm, rc.minClassId, table);
+		for (l = rc.subtypes; l != null; l = l.tail) { // fill out mtable
+			var impl = resolveMethodImpl(l.head, rm);
+			if (rv.mtable.table.length > 0) {
+				rv.mtable.table[l.head.minClassId - rv.mtable.rootId] = impl.norm;
+			}
+		}
+		setMtable(rc, rv); // set mtable for all child virtual methods
+	}
+	def setMtable(rc: RaClass, rv: RaVirtual) {
+		var rm = rc.findRaMethod(rv.raMethod);
+		if (rm != null && rm.virtual != null) rm.virtual.mtable = rv.mtable;
+		for (l = rc.children; l != null; l = l.tail) {
+			setMtable(l.head, rv);
+		}
+	}
+	def resolveMethodImpl(rc: RaClass, rm: RaMethod) -> RaMethod {
+		var m = rm.orig, sm: RaMethod;
+		for (sc = rc; sc != null; sc = sc.parent) {
+			// find super method, if any
+			if (m.index >= sc.methods.length) break;
+			sm = sc.findRaMethod(rm);
+			if (sm != null) break;
+		}
+		return sm;
+	}
+	def normValIntoArray(v: Val, tn: TypeNorm, array: Array<Val>, index: int) {
+		if (v == null) return;
+		if (Record.?(v)) {
+			normRecordIntoArray(Record.!(v), array, index);
+		} else if (Closure.?(v)) {
+			// closure: normalize record and method
+			var del = Closure.!(v);
+			// normalize closure value as (funcval, object) pair
+			array[index] = FuncVal.new(normalizeMethodRef(del.memberRef));
+			if (del.val != null) {
+				var r = Record.!(del.val); // XXX: assumes closure value is a record
+				if (!V3.isComponent(r.rtype)) array[index + 1] = normSimpleVal(r);
+			}
+		} else if (TupleVal.?(v)) {
+			// tuple: recursively normalize all of the sub
+			var tv = TupleVal.!(v);
+			var tnn = RaTuple.!(tn).nested;
+			for (i < tnn.length) {
+				normValIntoArray(tv.values[i], tnn[i], array, index);
+				index = index + tnn[i].size;
+			}
+		} else {
+			if (index < array.length) array[index] = v;
+		}
+	}
+	def normalizeMethodRef(spec: IrSpec) -> IrSpec {
+		var rm = spec.asMethod().raMethod;
+		var ta = spec.typeArgs;
+		if (rm == null) {
+			var rc = ra.makeClass(spec.receiver);
+			rm = rc.findMethod(spec.member.index, ta);
+			if (rm == null) return V3.fail1("ReachabilityError: method %1 not found", spec.render);
+		}
+		return IrSpec.new(ta[0], ta, rm.norm);
+	}
+	def createIrClass(rc: RaClass) {
+		var sc = if(rc.parent != null, rc.parent.normClass);
+		var ic = IrClass.new(rc.oldType, null, sc, rc.normFields, rc.normMethods);
+		ic.minClassId = rc.minClassId;
+		ic.maxClassId = rc.maxClassId;
+		rc.normClass = ic;
+		if (rc.raFacts.RC_LIVE) ic.facts |= Fact.C_HEAP;
+		if (rc.raFacts.RC_ALLOC) ic.facts |= Fact.C_ALLOCATED;
+		if (rc.raFacts.RC_ENUM) ic.facts |= Fact.C_ENUM;
+		newIr.setIrClass(rc.oldType, ic);
+		var i = 0;
+		for (f in ic.fields) {
+			if (f != null) f.index = i;
+			i++;
+		}
+	}
+	def normCode(rm: RaMethod) {
+		context.spec = rm.spec;
+		context.enterMethod(rm.orig);
+		if (specializer != null && rm.spec != null) {
+			// use specializer to generate appropriate code for method
+			if (specializer.normCode(context, rm)) return;
+		}
+		SsaRaNormalizer.new(context, this).build(rm.norm);
+		newIr.methods.put(rm.norm);
+	}
+	def allocOverflowFields(ftype: RaFuncType) {
+		if (ftype.ovfParamFields != null) return;
+		if (ovfAlloc == null) {
+			var prog = context.prog;
+			var name = Strings.concat(prog.name(), "$ovf");
+			var decl = VstComponent.new(false, Token.new("<generated>", name, 0, 0), null);
+			var typeCon = V3Component_TypeCon.new(decl, prog.typeCache);
+			decl.memberMap = Strings.newMap();
+			var receiver = typeCon.create0();
+			decl.recordIndex = prog.vst.numComponents++;
+			ovfAlloc = OverflowFieldAllocator.new(decl, receiver, context.compiler.AnyRefOverflow);
+		}
+		ovfAlloc.group++;
+		ftype.ovfParamFields = Arrays.map(ftype.ovfParamTypes, ovfAlloc.next);
+		ftype.ovfReturnFields = Arrays.map(ftype.ovfReturnTypes, ovfAlloc.next);
+	}
+	def allocOverflowFieldRecord() {
+		var r = context.prog.newRecord(ovfAlloc.receiver, ovfAlloc.fields.length);
+		context.prog.setComponentRecord(ovfAlloc.decl, r);
+		var ic = IrClass.new(ovfAlloc.receiver, null, null, ovfAlloc.fields.extract(), []);
+		newIr.setIrClass(ovfAlloc.receiver, ic);
+	}
+}
+// An allocator for global IrFields that are used for overflow parameters and returns.
+// Overflow fields must be unique within a group (i.e. for a given signature), but can
+// be reused for different signatures.
+class OverflowTypeEntry(var group: int, var index: int) {
+	def vec = Vector<IrSpec>.new();
+	def reuse(group: int) { this.group = group; index = 0; }
+}
+class OverflowFieldAllocator(decl: VstComponent, receiver: Type, anyref: bool) {
+	def map = TypeUtil.newTypeMap<OverflowTypeEntry>();
+	def fields = Vector<IrField>.new();
+	var group = 0;
+	def next(t: Type) -> IrSpec {
+		if (anyref) {
+			if (TypeSystem.isRefType(t)) t = AnyObject.TYPE;
+			else if (V3.isFunction(t)) t = AnyFunction.TYPE;
+		}
+		var entry = map[t];
+		if (entry == null) map[t] = entry = OverflowTypeEntry.new(group, 0);
+		else if (entry.group < group) entry.reuse(group);
+		if (entry.index == entry.vec.length) {
+			var f = IrField.new(receiver, t);
+			f.index = fields.length;
+			fields.put(f);
+			entry.vec.put(IrSpec.new(receiver, TypeUtil.NO_TYPES, f));
+		}
+		return entry.vec[entry.index++];
+	}
+}
+def NONE: RaFact.set;
+def live(facts: RaFact.set) -> bool {
+       	return (facts & (RaFact.RC_LIVE | RaFact.RC_ALLOC)) != NONE;
+}
+def NO_RECORDS = Array<Record>.new(0);

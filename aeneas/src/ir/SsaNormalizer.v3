@@ -1,0 +1,703 @@
+// Copyright 2013 Google Inc. All rights reserved.
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Normalizes SSA code by performing polymorphic specialization and expanding all
+// tuples. Note that SSA form supports returns with multiple values.
+class SsaRaNormalizer extends SsaRebuilder {
+	def norm: ReachabilityNormalizer;
+	var voidArray: Array<SsaInstr>;
+	var specSet: SpecSet;
+
+	new(context: SsaContext, norm) super(context) {}
+	def build(newMethod: IrMethod) {
+		newMethod.ssa = genGraph();
+		context.method = newMethod;
+		context.printSsa("Normalized");
+	}
+	def genGraph() -> SsaGraph {
+		if (newGraph != null) return newGraph;
+		var rt = context.graph.returnType;
+		var tn = normType(rt);
+		if (tn != null) {
+			var maxR = context.compiler.MaxReturnValues;
+			if (tn.size > maxR) {
+				rt = Tuple.fromTypeArray(Arrays.range(tn.sub, 0, maxR));
+			} else {
+				rt = tn.newType;
+			}
+		}
+
+		// translate parameters and allocate new graph
+		var params = Vector<SsaParam>.new().grow(context.graph.params.length);
+		// Allocate parameters
+		for (p in context.graph.params) {
+			allocParam(p, params);
+		}
+		// Handle overflow parameters if necessary
+		var maxP = context.compiler.MaxParams, newParams: Array<SsaInstr>;
+		if (params.length > maxP) {
+			newGraph = SsaGraph.new(Arrays.range(params.array, 0, maxP), rt);
+			var ftype = normFuncType(context.method.sig.funcType());
+			newParams = Array<SsaInstr>.new(params.length);
+			for (i < maxP) newParams[i] = params[i];
+			var ovfP = params.length - maxP;
+			var b = SsaBuilder.new(context, newGraph, newGraph.startBlock);
+			var nullConst = newGraph.nullConst(ftype.ovfParamFields[0].receiver);
+			for (i = 0; i < ovfP; i++) {
+				var load = b.opGetField(ftype.ovfParamFields[i], nullConst);
+				var cast = b.opTypeSubsume(ftype.ovfParamFields[i].getFieldType(), ftype.ovfParamTypes[i], load);
+				newParams[i + maxP] = cast;
+			}
+		} else {
+			var pa = params.extract();
+			newGraph = SsaGraph.new(pa, rt);
+			newParams = Array<SsaInstr>.new(pa.length);
+			for (i < pa.length) newParams[i] = pa[i];
+		}
+		// Map parameters
+		var i = 0;
+		for (p in context.graph.params) {
+			i += mapParam(i, p, newParams);
+		}
+
+		var oldStart = context.graph.startBlock;
+		if (oldStart.succs().length == 0) {
+			// common case of a single block that ends in return or throw
+			// no need for blockmaps, queueing, or phi handling
+			genBlock(oldStart, newGraph.startBlock);
+		} else {
+			// a method with multiple blocks
+			genMultiBlock(oldStart, newGraph.startBlock);
+		}
+		instrMap.clear();
+		return newGraph;
+	}
+	def allocParam(oldParam: SsaParam, params: Vector<SsaParam>) {
+		var tn = normType(oldParam.vtype);
+		if (tn == null) {
+			// type already normalized
+			params.put(SsaParam.new(params.length, oldParam.vtype));
+		} else if (params.length == 0 || tn.size == 1) {
+			// first param or simple normalization
+			params.put(SsaParam.new(params.length, tn.newType));
+		} else {
+			// allocate multiple parameters
+			for (t in tn.sub) params.put(SsaParam.new(params.length, t));
+		}
+	}
+	def mapParam(pos: int, oldParam: SsaParam, newParams: Array<SsaInstr>) -> int {
+		var tn = normType(oldParam.vtype);
+		if (tn == null || tn.size == 1) {
+			map1(oldParam, newParams[pos]);
+			return 1;
+		}
+		var vals = Arrays.range(newParams, pos, pos + tn.size);
+		mapN(oldParam, vals);
+		return if(pos == 0, 1, tn.size);
+	}
+	def genSimpleVal(v: Val) -> Val {
+		return norm.normSimpleVal(v);
+	}
+	def genValN(e: SsaDfEdge, index: int, oi: SsaConst, tn: TypeNorm, vec: Vector<SsaInstr>) {
+		vec.puta(mapValueN(oi, oi.val, tn));
+	}
+	def mapValue(oi: SsaInstr, v: Val, tn: TypeNorm) -> SsaConst {
+		var val: SsaConst;
+		if (tn.sub == null) {
+			// simple normalization
+			if (tn.size == 0) map0(oi); // void
+			else map1(oi, val = newGraph.valConst(tn.newType, norm.normSimpleVal(v)));
+		} else {
+			// complex normalization
+			mapValueN(oi, v, tn);
+		}
+		return val;
+	}
+	def mapValueN(oi: SsaInstr, v: Val, tn: TypeNorm) -> Array<SsaInstr> {
+		// complex normalization
+		var nv = Array<Val>.new(tn.size);
+		norm.normValIntoArray(v, tn, nv, 0);
+		var vals = Array<SsaInstr>.new(nv.length);
+		for (j < vals.length) vals[j] = newGraph.valConst(tn.sub[j], nv[j]);
+		mapN(oi, vals);
+		return vals;
+	}
+	def genApplyOp(app: SsaApplyOp) {
+		if (app.useList == null && app.facts.O_PURE) return; // remove dead code
+		curBlock.at(app.source);
+		var orig = app.op, op = app.op, args = app.inputs;
+		if (context.spec != null) op = app.op.subst(context.spec.instantiateType);
+		match (op.opcode) {
+			OverloadedEq =>		normEqualOp(app, op);
+			IntQueryI => {
+				var ft = op.typeArgs[0], tt = op.typeArgs[1], x = genRef1(args[0]);
+				var ni: SsaInstr;
+				if (!IntType.?(ft)) {
+					ni = newGraph.falseConst();
+				} else {
+					ni = curBlock.opIntQueryI(IntType.!(ft), IntType.!(tt), x);
+				}
+				map1(app, ni);
+			}
+			IntCastI => {
+				var ft = op.typeArgs[0], tt = op.typeArgs[1], x = genRef1(args[0]);
+				var ni: SsaInstr;
+				if (!IntType.?(ft)) {
+					curBlock.addThrow(app.source, V3Exception.TypeCheck);
+					ni = newGraph.nullConst(tt);
+				} else {
+					ni = curBlock.opIntCastI(IntType.!(ft), IntType.!(tt), x);
+				}
+				map1(app, ni);
+			}
+			BoolEq,
+			IntEq,
+			RefEq =>		normSimpleEqualOp(app, op);
+			VariantEq =>		normVariantEqualOp(app, op);
+			IntConvert =>		normIntConvert(app, op);
+			TypeCast =>		normTypeCast(app, op);
+			TypeQuery =>		normTypeQuery(app, op);
+			TypeSubsume =>		normTypeSubsume(app, op);
+			ArrayAlloc =>		normArrayAlloc(app, op);
+			ArrayInit(length) =>	normArrayInit(app, op, length);
+			ArrayGetElem =>		normArrayGetElem(app, op);
+			ArraySetElem =>		normArraySetElem(app, op);
+			ArrayGetLength =>	normArrayGetLength(app, op);
+			ClassAlloc(method) =>	normClassAlloc(app, method, op);
+			ClassGetField(field) =>	normGetField(false, app, field, op);
+			ClassInitField(field) =>normClassSetField(app, field, op, true);
+			ClassSetField(field) =>	normClassSetField(app, field, op, false);
+			ClassGetMethod(method) => {
+				var obj = genRef1(args[0]);
+				addNullCheck(app, obj);
+				mapN(app, [funcRef(extractMethodRef(orig, method).1), obj]);
+			}
+			ClassGetVirtual(method) => {
+				var t = extractVirtualRef(orig, method), obj = genRef1(args[0]);
+				if (t.2) { // still a virtual dispatch
+					mapN(app, [curBlock.opClassGetSelector(t.1, obj), obj]);
+				} else {
+					addNullCheck(app, obj);
+					mapN(app, [funcRef(t.1), obj]);
+				}
+			}
+			VariantGetField(field) =>	normGetField(true, app, field, op);
+			Init =>			map0(app);
+			ComponentGetField(field) =>	normComponentGetField(app, field, op);
+			ComponentSetField(field) =>	normComponentSetField(app, field, op);
+			TupleCreate => {
+				mapN(app, genRefs(args));
+			}
+			TupleGetElem(index) => {
+				normTupleGetElem(app, args, op, index);
+			}
+			NullCheck =>		normNullCheck(app, op);
+			BoundsCheck =>		normBoundsCheck(app, op);
+			// XXX: use SsaBuilder.opCallXXX() methods
+			CallMethod(method) => {
+				var t = extractMethodRef(orig, method);
+				var ftype = normFuncType(t.0.getBoundType());
+				normCall(app, ftype, V3Op.newCallMethod(t.1));
+			}
+			CallClassVirtual(method) => {
+				// devirtualize methods that are not overridden
+				var t = extractVirtualRef(orig, method), m = t.1, newOp: Operator;
+				var facts = Facts.NONE;
+				if (t.2) { // still a virtual dispatch
+					newOp = V3Op.newCallClassSelector(m);
+				} else {
+					// devirtualized to call abstract method => no objects instantiated of that type
+					if (m.member.facts.M_ABSTRACT) return map1(app, newGraph.nullConst(m.getReturnType()));
+					else newOp = V3Op.newCallMethod(m);
+					// don't emit a null check for devirtualized variant calls
+					facts = if(m.receiver.typeCon.kind == V3Kind.VARIANT, Fact.O_NO_NULL_CHECK, Facts.NONE);
+				}
+				var i = normCall(app, t.0, newOp);
+				i.setFact(facts);
+			}
+			CallClosure => {
+				var ftype = normFuncType(op.typeArgs[0]);
+				// normalize CallClosure into CallFunction
+				// XXX: use SsaBuilder.opCallFunction
+				normCall(app, ftype, V3Op.newCallFunction(ftype.sub[0]));
+			}
+			CreateClosure(method) => {
+				var spec = extractMethodRef(orig, method).1;
+				var receiver = if(V3.isComponent(spec.receiver), newGraph.nullReceiver(), genRef1(args[0]));
+				return mapN(app, [funcRef(spec), receiver]);
+			}
+			_ => {
+				// normalize a general operator
+				var oldInstr = app, newOp = op;
+				var newArgs = genRefs(oldInstr.inputs);
+				var newInstr = curBlock.addApply(oldInstr.source, newOp, newArgs);
+				newInstr.facts = newInstr.facts | oldInstr.facts;
+				mapNorm(oldInstr, newInstr, normReturnType(op));
+			}
+		}
+	}
+	def genReturn(oldRet: SsaReturn) {
+		// map a return (may return multiple values)
+		var vals = genRefs(oldRet.inputs), maxR = context.compiler.MaxReturnValues;
+		if (vals.length > maxR) {
+			var ovfRets = Arrays.range(vals, maxR, vals.length);
+			vals = Arrays.range(vals, 0, maxR);
+			var ftype = normFuncType(context.method.sig.funcType());
+			var nullConst = context.graph.nullConst(ftype.ovfReturnFields[0].receiver);
+			for (i < ovfRets.length) {
+				curBlock.opComponentSetField(ftype.ovfReturnFields[i], nullConst, ovfRets[i]);
+			}
+		}
+		return curBlock.addReturn(vals);
+	}
+	def normCall(oldInstr: SsaApplyOp, ftype: RaFuncType, newOp: Operator) -> SsaInstr {
+		var newArgs = normArgs(ftype, genRefs(oldInstr.inputs));
+		// Create the new call instruction
+		var call = curBlock.addApply(oldInstr.source, newOp, newArgs);
+		call.facts = call.facts | oldInstr.facts;
+
+		if (ftype.ovfReturnTypes.length > 0) {
+			// load overflow return values from globals
+			var fsig = ftype.sig();
+			var rvals = Vector<SsaInstr>.new();
+			if (fsig.returnTypes.length == 1) {
+				rvals.put(call);
+			} else {
+				for (i < fsig.returnTypes.length) rvals.put(curBlock.opTupleGetElem(fsig.returnType(), i, call));
+			}
+			var nullConst = context.graph.nullConst(ftype.ovfReturnFields[0].receiver);
+			for (i < ftype.ovfReturnTypes.length) {
+				var load = curBlock.opGetField(ftype.ovfReturnFields[i], nullConst);
+				var cast = curBlock.opTypeSubsume(ftype.ovfReturnFields[i].getFieldType(), ftype.ovfReturnTypes[i], load);
+				rvals.put(cast);
+			}
+			mapN(oldInstr, rvals.extract());
+		} else {
+			mapNorm(oldInstr, call, normType(oldInstr.op.sig.returnType()));
+		}
+		return call;
+	}
+	def normArgs(ftype: RaFuncType, args: Array<SsaInstr>) -> Array<SsaInstr> {
+		if (ftype.ovfParamTypes.length > 0) {
+			// write overflow arguments into globals and truncate args array
+			var maxP = args.length - ftype.ovfParamTypes.length;
+			var ovfArgs = Arrays.range(args, maxP, args.length);
+			args = Arrays.range(args, 0, maxP);
+			var nullConst = context.graph.nullConst(ftype.ovfParamFields[0].receiver);
+			for (i < ovfArgs.length) {
+				curBlock.opComponentSetField(ftype.ovfParamFields[i], nullConst, ovfArgs[i]);
+			}
+		}
+		return args;
+	}
+	def normTypeSubsume(oldInstr: SsaApplyOp, op: Operator) {
+		var atn = normTypeArg(op, 0), rtn = normTypeArg(op, 1);
+		if (rtn.sub == null) {
+			// common case 1-1 mapping
+			return map1(oldInstr, curBlock.opTypeSubsume(atn.newType, rtn.newType, genRef1(oldInstr.inputs[0])));
+		}
+		var width = rtn.size;
+		if (width > 0) {
+			// complex operator
+			var newArgs = genRefs(oldInstr.inputs);
+			var vals = Array<SsaInstr>.new(width);
+			for (i < width) {
+				var ft = if(atn.sub == null, atn.newType, atn.sub[i]);
+				vals[i] = curBlock.opTypeSubsume(ft, rtn.sub[i], newArgs[i]);
+			}
+			mapN(oldInstr, vals);
+		}
+	}
+	// normalize an equality operator
+	def normEqualOp(oldApp: SsaApplyOp, op: Operator) {
+		var tn = normTypeArg(op, 0);
+		if (tn.size == 0) {
+			// comparison is a constant for zero-length values
+			return map1(oldApp, newGraph.trueConst());
+		}
+		var newArgs = genRefs(oldApp.inputs);
+		if (tn.size == 1) {
+			// a simple comparison
+			if (V3.isVariant(tn.newType)) return normVariantEqual(oldApp, tn, newArgs[0], newArgs[1]);
+			op = V3Op.newEqual(tn.newType);
+			return map1(oldApp, curBlock.opEqualOf(op, newArgs[0], newArgs[1]));
+		} else {
+			// a complex comparison
+			genEqualN(oldApp, tn);
+			return;
+		}
+	}
+	def normSimpleEqualOp(oldApp: SsaApplyOp, op: Operator) {
+		var tn = normTypeArg(op, 0);
+		var refs = genRefs(oldApp.inputs);
+		return map1(oldApp, curBlock.opEqualOf(op, refs[0], refs[1]));
+	}
+	def normVariantEqualOp(oldApp: SsaApplyOp, op: Operator) {
+		var tn = normTypeArg(op, 0);
+		var newArgs = genRefs(oldApp.inputs);
+		return normVariantEqual(oldApp, tn, newArgs[0], newArgs[1]);
+	}
+	def normVariantEqual(oldApp: SsaApplyOp, tn: TypeNorm, x: SsaInstr, y: SsaInstr) {
+		var rc = RaClass.!(tn);
+		if (!context.compiler.GenVariantEqual && rc.raFacts.RC_ENUM) {
+			// Enum compare is a simple comparison
+			return map1(oldApp, curBlock.opEqualOf(V3Op.newIntEq(tn.newType), x, y));
+		}
+		var list = rc.methods[IrUtil.EQUALS_METHOD_INDEX];
+		if (list == null) {
+			tn = normType(V3.getSuperType(tn.oldType));
+			return normVariantEqual(oldApp, tn, x, y);
+		}
+		var rm = list.head;
+		// devirtualize methods that are not overridden
+		var t = tryDevirtualize(rm, [rc.newType]), m = t.0, newOp: Operator;
+		var facts = Fact.O_PURE | Fact.O_COMMUTATIVE;
+		if (t.1) {
+			newOp = V3Op.newCallClassSelector(m);
+		} else {
+			newOp = V3Op.newCallMethod(m);
+			facts = facts | Fact.O_NO_NULL_CHECK;
+		}
+		var call = curBlock.addApply(oldApp.source, newOp, [x, y]);
+		call.setFact(facts);
+		map1(oldApp, call);
+	}
+	def normTupleGetElem(oldInstr: SsaInstr, args: Array<SsaDfEdge>, op: Operator, index: int) {
+		var tn = RaTuple.!(normTypeArg(op, 0));
+		return mapN(oldInstr, tn.getElem(genRefs(args), index));
+	}
+	def castError() {
+		curBlock.addThrow(curBlock.source, V3Exception.TypeCheck);
+	}
+	def normTupleCastRec(oi: Array<SsaInstr>, offset: int, atn: RaTuple, rtn: RaTuple, result: Vector<SsaInstr>) {
+		if (atn.nested.length != rtn.nested.length) return castError();
+		for (i < atn.nested.length) {
+			var ri = rtn.nested[i];
+			normTypeCastRec(oi, offset + atn.offsets[i], atn.nested[i], ri, result);
+		}
+	}
+	def normTypeCastRec(oi: Array<SsaInstr>, offset: int, atn: TypeNorm, rtn: TypeNorm, result: Vector<SsaInstr>) {
+		if (atn.size == 1 && rtn.size == 1) {
+			// common case 1->1 mapping
+			var ni = curBlock.opTypeCast(atn.newType, rtn.newType, oi[offset]);
+			return result.put(ni);
+		} else if (rtn.oldType == Void.TYPE) {
+			// special case of void.!()
+			return;
+		}
+		if (RaTuple.?(atn) && RaTuple.?(rtn)) {
+			// process tuple casts element by element
+			return normTupleCastRec(oi, offset, RaTuple.!(atn), RaTuple.!(rtn), result);
+		}
+		// general case of N->N mapping
+		if (atn.size != rtn.size) return castError();
+		for (i < atn.size) {
+			var ni = curBlock.opTypeCast(atn.sub[i], rtn.sub[i], oi[offset + i]);
+			result.put(ni);
+		}
+	}
+	def normTypeCast(oldApp: SsaApplyOp, op: Operator) {
+		curBlock.source = oldApp.source;
+		var atn = normTypeArg(op, 0), rtn = normTypeArg(op, 1);
+//		XXX.put2("normTypeCast(%1, %2)\n", atn.newType.render, rtn.newType.render);
+//		XXX.put2("            (%1, %2)\n", atn.size, rtn.size);
+		if (atn.size == 1 && rtn.size == 1) {
+			// common case 1->1 mapping
+			return map1(oldApp, curBlock.opTypeCast(atn.newType, rtn.newType, genRef1(oldApp.inputs[0])));
+		}
+		if (rtn.oldType == Void.TYPE) {
+			// special case of void.!()
+			return map0(oldApp);
+		}
+		// general case of M->N mapping
+		var oi = genRefs(oldApp.inputs), result = Vector<SsaInstr>.new().grow(rtn.size);
+		normTypeCastRec(oi, 0, atn, rtn, result);
+		mapN(oldApp, result.extract());
+	}
+	def normIntConvert(oldApp: SsaApplyOp, op: Operator) {
+		map1(oldApp, curBlock.opIntConvert(op, genRef1(oldApp.inputs[0])));
+	}
+	def normTypeQuery(oldApp: SsaApplyOp, op: Operator) {
+		var atn = normTypeArg(op, 0), rtn = normTypeArg(op, 1), width = rtn.size;
+		if (atn.size != width) {
+			// query will always fail
+			return map1(oldApp, newGraph.falseConst());
+		} else if (width == 1) {
+			// 1-1 mapping
+			if (RaClass.?(rtn) && RaClass.!(rtn).subtypes == null) return map1(oldApp, newGraph.falseConst());
+			return map1(oldApp, curBlock.opTypeQuery(atn.newType, rtn.newType, genRef1(oldApp.inputs[0])));
+		}
+		// a complex or zero arg type query
+		var newArgs = genRefs(oldApp.inputs);
+		var expr: SsaInstr;
+		for (i < atn.size) {
+			var cmp = curBlock.opTypeQuery(atn.sub[i], rtn.sub[i], newArgs[i]);
+			if (SsaConst.?(cmp)) {
+				// this part of the type query can be statically decided
+				if (cmp.unbox<bool>()) continue;
+				return map1(oldApp, cmp);
+			}
+			if (expr == null) expr = cmp;
+			else expr = opBoolAnd(expr, cmp);
+		}
+		if (expr == null) expr = newGraph.trueConst();
+		map1(oldApp, expr);
+	}
+	def normArrayAlloc(oldApp: SsaApplyOp, op: Operator) {
+		var rtn = nonzero(normReturnType(op));
+		var length = genRef1(oldApp.inputs[0]);
+		if (rtn.size == 1) return map1(oldApp, curBlock.opArrayAlloc(rtn.newType, length));
+		// complex array allocation
+		return mapN(oldApp, Arrays.map(rtn.sub, newArrayAlloc(_, oldApp.source, length)));
+	}
+	def newArrayAlloc(arrayType: Type, source: Source, length: SsaInstr) -> SsaInstr {
+		return curBlock.opArrayAlloc(arrayType, length);
+	}
+	def normArrayInit(oldApp: SsaApplyOp, op: Operator, len: int) {
+		var rtn = nonzero(normTypeArg(op, 0));
+		var etn = normType(V3Array.elementType(op.typeArgs[0]));
+		var width = etn.size;
+		if (width == 0) {
+			// this is a void array
+			var length: SsaInstr = newGraph.intConst(len);
+			return map1(oldApp, curBlock.opArrayAlloc(rtn.newType, length));
+		}
+		var newArgs = genRefs(oldApp.inputs);
+		if (rtn.size == 1) return map1(oldApp, curBlock.opArrayInit(rtn.newType, newArgs));
+		// complex array initialization
+		var arrays = Array<SsaInstr>.new(width);
+		for (i < width) {
+			var vals = Array<SsaInstr>.new(len);
+			for (j < len) {
+				vals[j] = newArgs[i + j * width];
+			}
+			arrays[i] = curBlock.opArrayInit(rtn.sub[i], vals);
+		}
+		mapN(oldApp, arrays);
+	}
+	def normArrayGetElem(oldApp: SsaApplyOp, op: Operator) {
+		var atn = normTypeArg(op, 0), rtn = normReturnType(op);
+		var newArgs = genRefs(oldApp.inputs), width = rtn.size;
+		if (width == 1) {
+			// common case 1-1 mapping
+			return map1(oldApp, curBlock.opArrayGetElem(atn.newType, Int.TYPE, oldApp.facts, newArgs[0], newArgs[1]));
+		} else if (width == 0) {
+			// void array access
+			curBlock.opBoundsCheck(atn.newType, newArgs[0], newArgs[1]);
+			return map0(oldApp);
+		}
+		// complex array access
+		var vals = Array<SsaInstr>.new(width);
+		var index = newArgs[width], facts = oldApp.facts;
+		for (i < width) {
+			vals[i] = curBlock.opArrayGetElem(atn.sub[i], Int.TYPE, facts, newArgs[i], index);
+			facts = facts | Facts.O_SAFE_BOUNDS;
+		}
+		mapN(oldApp, vals);
+	}
+	def normArraySetElem(oldApp: SsaApplyOp, op: Operator) {
+		var atn = normTypeArg(op, 0), rtn = normType(op.sig.paramTypes[2]);
+		var width = rtn.size;
+		var newArgs = genRefs(oldApp.inputs);
+		if (width == 1) {
+			curBlock.opArraySetElem(atn.newType, Int.TYPE, oldApp.facts, newArgs[0], newArgs[1], newArgs[2]);
+			return;
+		} else if (width == 0) {
+			curBlock.opBoundsCheck(atn.newType, newArgs[0], newArgs[1]);
+			return;
+		}
+		// complex array set
+		var index = newArgs[width], facts = oldApp.facts;
+		for (i < width) {
+			curBlock.opArraySetElem(atn.sub[i], Int.TYPE, facts, newArgs[i], index, newArgs[i + 1 + width]);
+			facts = facts | Facts.O_SAFE_BOUNDS;
+		}
+	}
+	def normArrayGetLength(oldApp: SsaApplyOp, op: Operator) {
+		var atn = nonzero(normTypeArg(op, 0));
+		var array = genRefs(oldApp.inputs);
+		// get the length from the first component array
+		var arrayType = if(atn.sub == null, atn.newType, atn.sub[0]);
+		return map1(oldApp, curBlock.opArrayGetLength(arrayType, array[0]));
+	}
+	def normComponentGetField(oldApp: SsaApplyOp, field: IrField, op: Operator) {
+		if (oldApp.useList == null) return; // remove unused reads of fields
+		var raField = extractFieldRef(oldApp, field);
+		if (raField.isConst()) {
+			// OPT: inline the field as a constant
+			mapValue(oldApp, raField.val, normReturnType(oldApp.op));
+			return;
+		} else if (raField.size == 1) {
+			// common case 1-1 mapping
+			var read = curBlock.opGetField(raField.norm[0], voidConst());
+			read.facts = read.facts | raField.facts();
+			return map1(oldApp, read);
+		}
+		var reads = Array<SsaInstr>.new(raField.size);
+		for (i < reads.length) {
+			reads[i] = curBlock.opGetField(raField.norm[i], voidConst());
+		}
+		return mapN(oldApp, reads);
+	}
+	def normComponentSetField(oldApp: SsaApplyOp, field: IrField, op: Operator) {
+		var raField = extractFieldRef(oldApp, field), fieldVals = genRefs(oldApp.inputs);
+		if (raField.norm == null) return; // field has been eliminated
+		if (raField.size == 1) {
+			// common case 1-1 mapping
+			curBlock.opComponentSetField(raField.norm[0], voidConst(), fieldVals[0]);
+			return;
+		}
+		for (i < raField.size) {
+			curBlock.opComponentSetField(raField.norm[i], voidConst(), fieldVals[i]);
+		}
+	}
+	def normClassAlloc(oldApp: SsaApplyOp, m: IrMethod, op: Operator) {
+		if (m == null) {
+			// trivial constructor
+			var spec = IrSpec.new(op.typeArgs[0], op.typeArgs, null);
+			return map1(oldApp, curBlock.opClassAlloc(spec, Ssa.NO_INSTRS));
+		}
+		var t = extractMethodRef(oldApp.op, m);
+		var ftype = normFuncType(t.0.getBoundType());
+		var newArgs = normArgs(ftype, genRefs(oldApp.inputs));
+		return map1(oldApp, curBlock.opClassAlloc(t.1, newArgs));
+	}
+	def normGetField(isVariant: bool, oldApp: SsaApplyOp, field: IrField, op: Operator) {
+		// XXX: propagate O_NO_NULL_CHECK and O_PURE
+		var receiver = genRef1(oldApp.inputs[0]);
+		if (oldApp.useList == null) {
+			// OPT: remove unused read of field
+			if (!isVariant) addNullCheck(oldApp, receiver);
+			return;
+		}
+		var raField = extractFieldRef(oldApp, field);
+		if (raField.size == 0) {
+			// OPT: remove read of useless field
+			// OPT: remove read of zero-width field
+			if (!isVariant) addNullCheck(oldApp, receiver);
+			return map0(oldApp);
+		} else if (raField.isConst()) {
+			// OPT: inline the field as a constant
+			if (!isVariant) addNullCheck(oldApp, receiver);
+			mapValue(oldApp, raField.val, normReturnType(oldApp.op));
+			return;
+		} else if (raField.size == 1) {
+			// common case 1-1 mapping
+			var read = curBlock.opGetField(raField.norm[0], receiver);
+			read.facts = read.facts | raField.facts(); // OPT: propagate field facts
+			return map1(oldApp, read);
+		}
+		// 1-many mapping
+		var vals = Array<SsaInstr>.new(raField.size);
+		for (i < vals.length) {
+			vals[i] = curBlock.opGetField(raField.norm[i], receiver);
+		}
+		return mapN(oldApp, vals);
+	}
+	def normClassSetField(oldApp: SsaApplyOp, field: IrField, op: Operator, init: bool) {
+		// XXX: propagate O_NO_NULL_CHECK
+		var raField = extractFieldRef(oldApp, field);
+		var newArgs = genRefs(oldApp.inputs), receiver = newArgs[0];
+		if (raField.norm == null || raField.size == 0 || !raField.raFacts.RF_READ) {
+			// OPT: remove write to useless field
+			// OPT: remove write of zero-width field
+			// OPT: remove write of write-only field
+			return addNullCheck(oldApp, receiver);
+		} else if (raField.size == 1) {
+			// common case; 1-1 field mapping
+			curBlock.opClassSetField(raField.norm[0], receiver, newArgs[1], init);
+			return;
+		}
+		// 1-many mapping
+		var vals = Array<SsaInstr>.new(raField.size);
+		for (i < vals.length) {
+			curBlock.opClassSetField(raField.norm[i], receiver, newArgs[i + 1], init);
+		}
+	}
+	def normNullCheck(oldApp: SsaApplyOp, op: Operator) {
+		var newArgs = genRefs(oldApp.inputs);
+		if (newArgs.length >= 1) addNullCheck(oldApp, newArgs[0]);
+	}
+	def normBoundsCheck(oldInstr: SsaApplyOp, op: Operator) {
+		var newArgs = genRefs(oldInstr.inputs);
+		var newCheck = curBlock.opBoundsCheck(op.typeArgs[0], newArgs[0], newArgs[1]);
+		if (newCheck != null) newCheck.facts = newCheck.facts | oldInstr.facts;
+	}
+	private def normType(t: Type) -> TypeNorm {
+		if (context.spec != null) t = context.spec.instantiateType(t);
+		return norm.ra.makeType(t);
+	}
+	private def normFuncType(t: Type) -> RaFuncType {
+		def ftype = RaFuncType.!(normType(t));
+		norm.allocOverflowFields(ftype);
+		return ftype;
+	}
+	private def extractFieldRef(oldApp: SsaApplyOp, field: IrField) -> RaField {
+		var spec = if (specSet != null, specSet.first(), context.spec);
+		return norm.ra.makeField(oldApp, field, spec);
+	}
+	private def extractMethodRef(op: Operator, method: IrMethod) -> (IrSpec, IrSpec) {
+		if (specSet != null) op = op.subst(specSet.first().instantiateType);
+		else if (context.spec != null) op = op.subst(context.spec.instantiateType);
+		var ta = op.typeArgs;
+		var orig = IrSpec.new(ta[0], ta, method);
+		return (orig, norm.normalizeMethodRef(orig));
+	}
+	private def extractVirtualRef(op: Operator, method: IrMethod) -> (RaFuncType, IrSpec, bool) {
+		if (specSet != null) op = op.subst(specSet.first().instantiateType);
+		else if (context.spec != null) op = op.subst(context.spec.instantiateType);
+		// look up RaMethod
+		var ta = op.typeArgs;
+		var spec = IrSpec.new(ta[0], ta, method);
+		var rm = method.raMethod;
+		if (rm == null) {
+			var rc = norm.ra.makeClass(spec.receiver);
+			rm = rc.findMethod(spec.member.index, ta);
+			if (rm == null) return V3.fail1("ReachabilityError: method %1 not found", spec.render);
+		}
+		var t = tryDevirtualize(rm, ta);
+		return (normFuncType(spec.getBoundType()), t.0, t.1);
+	}
+	def tryDevirtualize(rm: RaMethod, ta: Array<Type>) -> (IrSpec, bool) {
+		if (rm.virtual == null) {
+			return (IrSpec.new(ta[0], ta, rm.norm), false);
+		}
+		if (context.compiler.ChaDevirtualize && !rm.norm.facts.M_OVERRIDDEN) {
+			// devirtualize this call because the method is not overridden
+			return (IrSpec.new(ta[0], ta, rm.norm), false);
+		}
+		if (context.compiler.RaDevirtualize && rm.virtual.devirtual != null) {
+			// devirtualize this call because only one live version exists
+			var m = rm.virtual.devirtual.norm;
+			return (IrSpec.new(m.receiver, Arrays.replace0(m.receiver, ta), m), false);
+		}
+		// the call remains a virtual dispatch
+		var receiver = ta[0];
+		var selector = IrSelector.new(receiver, rm.norm, rm.virtual.mtable, rm.normIndex);
+		return (IrSpec.new(receiver, ta, selector), true);
+	}
+	private def normTypeArg(op: Operator, index: int) -> TypeNorm {
+		return normType(op.typeArgs[index]);
+	}
+	private def normReturnType(op: Operator) -> TypeNorm {
+		return normType(op.sig.returnType());
+	}
+	private def voidConst() -> SsaInstr {
+		return voidConsts()[0];
+	}
+	private def voidConsts() -> Array<SsaInstr> {
+		if (voidArray == null) voidArray = [newGraph.nop()];
+		return voidArray;
+	}
+	private def funcRef(m: IrSpec) -> SsaInstr {
+		return newGraph.valConst(Function.funcRefType(m.getFuncType()), FuncVal.new(m));
+	}
+	private def nonzero(tn: TypeNorm) -> TypeNorm {
+		if (tn.size == 0) context.fail("expected at least one type");
+		return tn;
+	}
+	private def addNullCheck(oldApp: SsaInstr, obj: SsaInstr) {
+		if (!oldApp.facts.O_NO_NULL_CHECK) curBlock.opNullCheck(obj.getType(), obj);
+	}
+}
