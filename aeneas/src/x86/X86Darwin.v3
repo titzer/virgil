@@ -1,39 +1,93 @@
 // Copyright 2011 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Directs the creation of an x86-darwin binary.
-class X86Darwin extends X86Runtime {
-	new(context: SsaContext, test: bool, mach: MachProgram) super(context, test, mach) {
-		header = MachO_Header.new(false); 
+component X86DarwinTargets {
+	new() {
+		Aeneas.registerTarget(X86DarwinTarget.new("x86-darwin-test", true));
+		Aeneas.registerTarget(X86DarwinTarget.new("x86-darwin", false));
+	}
+}
+
+// Darwin target for x86 architecture. Generates an Mach-O binary directly.
+class X86DarwinTarget extends Target {
+	def test: bool;
+
+	new(name: string, test) super(name) { }
+
+	def configure(compiler: Compiler, prog: Program) {
+		def space = AddressSpaces.MEM32LE;
+		def intNorm = IntNormalizers.I32LE;
+		var mach = MachProgram.new(prog, space, space, intNorm);
+		var rt = X86DarwinRuntime.new(SsaContext.new(compiler, prog), test, mach);
+		mach.runtime = rt;
+		compiler.Reachability = true;
+		MachModule.install(prog); // installs "Pointer" typecon
+		DarwinModule.install(prog); // installs "Darwin" component
+		prog.typeEnv.add(rt.typeCon); // installs "CiRuntime" component (for RiRuntime code)
+	}
+	def computeFieldOffsets(prog: Program, b: Vector<IrField>, start: int) {
+		getRuntime(prog).mach.computeFieldOffsets(prog, b, start);
+	}
+	def addRoots(compiler: Compiler, prog: Program) {
+		getRuntime(prog).addRoots();
+	}
+	private def getRuntime(prog: Program) -> X86DarwinRuntime {
+		return X86DarwinRuntime.!(CiRuntime_TypeCon.!(prog.typeEnv.lookup(CiRuntimeModule.NAME)).runtime);
+	}
+	def emit(compiler: Compiler, prog: Program) {
+		var rt = getRuntime(prog), mach = rt.mach;
+		mach.build(compiler, MachLoweringConfig.new());
+
+		var header = MachO_Header.new(false); 
 		header.cputype = MachO.CPU_TYPE_X86;
 		header.filetype = MachO.MH_EXECUTE;
-	}
-	def emit() {
+
 		// protect page zero for trapping null accesses
-		var pz = newSegmentLoad("__NULL", 0);
-		pz.vmsize = PAGE_SIZE;
+		var pz = newSegmentLoad(header, "__NULL", 0);
+		pz.vmsize = rt.codePageSize;
 		// code (text) segment starts at page 1
-		var cs = newSegmentLoad("__TEXT", MachO.VM_PROT_RX);
+		var cs = newSegmentLoad(header, "__TEXT", MachO.VM_PROT_RX);
 		// data segment immediately follows code segment
-		var ds = newSegmentLoad("__DATA", MachO.VM_PROT_RW);
+		var ds = newSegmentLoad(header, "__DATA", MachO.VM_PROT_RW);
 		// initial thread state for registers (includes starting IP)
 		var ts = MachO_X86ThreadState.new();
 		header.addCmd(ts);
 		// ex segment for trapping explicit checks
-		var ex = if(src != null, newSegmentLoad("__EX", 0));
+		var ex = if(rt.src != null, newSegmentLoad(header, "__EX", 0));
 		// create the buffer
-		var buffer = MachDataBuffer.new(PAGE_SIZE, 0, false, 300 + mach.numMethods * 50);
+		var buffer = MachDataBuffer.new(rt.codePageSize, 0, false, 300 + mach.numMethods * 50);
 		// skip mach-o headers
 		buffer.skipN(header.totalsize);
 		// skip page zero
 		buffer.skipPage();
 		// generate code and runtime tables into buffer
-		encodeCode(buffer, cs, ts);
+		// encodeCode(buffer, cs, ts);
+		var codeStartOffset = buffer.end();
+		rt.allocator.init(rt.getFrame);
+		ts.eip = buffer.endAddr();
+		cs.vmaddr = buffer.endPageAddr();
+		rt.recordCodeStart(ts.eip);
+		var asm = X86MacroAssembler.new(mach, buffer, codeStartOffset);
+		rt.genMainStub(asm);
+		rt.allocator.genAllocStub(asm);
+		mach.layoutCode(buffer, rt.genX86Code(_, asm));
+		rt.genSignalHandler(asm);
+		var size = buffer.end();
+		if (size < rt.codePageSize) {
+			// TODO: Santa or MacOS rejects binaries with text segments smaller than a page!
+			buffer.skipN(rt.codePageSize - size);
+		}
+		rt.recordCodeEnd(buffer.endAddr());
+		mach.layoutMeta(buffer);
+		mach.layoutRuntime(buffer);
+		cs.filesize = buffer.end();
+		cs.vmsize = rt.pageAlign(cs.filesize);
+		cs.fileoff = 0;
 		// generate the unmapped "ex" region for trapping explicit checks
 		if (ex != null) {
 			buffer.skipPage();
 			var exStart = buffer.endPageAddr();
-			var exSize = pageAlign(src.layoutExRegion(exStart));
+			var exSize = rt.pageAlign(rt.src.layoutExRegion(exStart));
 			buffer.startAddr = buffer.startAddr + exSize;
 			ex.vmaddr = exStart;
 			ex.vmsize = exSize;
@@ -43,29 +97,43 @@ class X86Darwin extends X86Runtime {
 		// generate data into buffer
 		buffer.skipPage();
 		// compute starting location of data
-		encodeData(buffer, ds);
+		buffer.atEnd().align(mach.data.addressSize);
+		ds.vmaddr = buffer.endPageAddr();
+		ds.fileoff = ds.vmaddr - buffer.startAddr;
+		rt.recordDataStart(buffer.endAddr());
+		mach.layoutData(buffer);
+		rt.recordDataEnd(buffer.endAddr());
+		rt.addHeapPointers(buffer);
+		ds.filesize = buffer.end() - ds.fileoff;
+		ds.vmsize = rt.pageAlign(ds.filesize + rt.heapSize);
 		// patch all addresses in the binary
-		buffer.patch(patchCodeAddr);
+		buffer.patch(rt.patchCodeAddr);
 		// encode header at position 0 now that all addresses and offsets are known
 		header.encode(buffer.at(0));
 		header.encodeCmds(buffer);
 		// open the output file
-		var file = context.compiler.getOutputFileName(context.prog.name(), null);
+		var file = compiler.getOutputFileName(prog.name(), null);
 		var fd = System.fileOpen(file, false);
-		if (fd < 0) return context.prog.ERROR.OutputError(file);
+		if (fd < 0) return prog.ERROR.OutputError(file);
 		// write the entire file from the buffer array
 		System.fileWriteK(fd, buffer.array, 0, buffer.end());
 		System.fileClose(fd);
 		// change permissions to make binary executable
-		context.compiler.makeExecutable(file);
+		compiler.makeExecutable(file);
 	}
-	def newSegmentLoad(name: string, prot: int) ->  MachO_SegmentLoad {
+	def newSegmentLoad(header: MachO_Header, name: string, prot: int) ->  MachO_SegmentLoad {
 		var s = MachO_SegmentLoad.new(name);
 		s.initprot = prot;
 		s.maxprot = prot;
 		header.addCmd(s);
 		return s;
 	}
+}
+
+
+// Directs the creation of an x86-darwin binary.
+class X86DarwinRuntime extends X86Runtime {
+	new(context: SsaContext, test: bool, mach: MachProgram) super(context, test, mach) { }
 	def asm_exit_code(asm: X86Assembler, code: int) {
 		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
 		asm.push_i(code);
@@ -77,40 +145,6 @@ class X86Darwin extends X86Runtime {
 		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
 		asm.push_i(0);
 		asm.intK(0x80);
-	}
-	def encodeCode(u: MachDataBuffer, cs: MachO_SegmentLoad, ts: MachO_X86ThreadState) {
-		var codeStartOffset = u.end();
-		allocator.init(getFrame);
-		ts.eip = u.endAddr();
-		cs.vmaddr = u.endPageAddr();
-		recordCodeStart(ts.eip);
-		var asm = X86MacroAssembler.new(mach, u, codeStartOffset);
-		genMainStub(asm);
-		allocator.genAllocStub(asm);
-		mach.layoutCode(u, genX86Code(_, asm));
-		genSignalHandler(asm);
-		var size = u.end();
-		if (size < PAGE_SIZE) {
-			// TODO: Santa or MacOS rejects binaries with text segments smaller than a page!
-			u.skipN(PAGE_SIZE - size);
-		}
-		recordCodeEnd(u.endAddr());
-		mach.layoutMeta(u);
-		mach.layoutRuntime(u);
-		cs.filesize = u.end();
-		cs.vmsize = pageAlign(cs.filesize);
-		cs.fileoff = 0;
-	}
-	def encodeData(u: MachDataBuffer, ds: MachO_SegmentLoad) {
-		u.atEnd().align(mach.data.addressSize);
-		ds.vmaddr = u.endPageAddr();
-		ds.fileoff = ds.vmaddr - u.startAddr;
-		recordDataStart(u.endAddr());
-		mach.layoutData(u);
-		recordDataEnd(u.endAddr());
-		addHeapPointers(u);
-		ds.filesize = u.end() - ds.fileoff;
-		ds.vmsize = pageAlign(ds.filesize + heapSize);
 	}
 	def genTestOutput(asm: X86MacroAssembler, frame: MachFrame) {
 		// output the return register as a 4-byte integer to stdout
