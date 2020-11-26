@@ -30,9 +30,9 @@ for t in $( ls -1 ${test_dir}/*.txt ) ; do
     ${prog_bin} s < "${t}" &>> ${out_file}
 done;
 
-diff -u "${out_file}" "${exp_file}" > "${diff_file}"
+diff -u "${exp_file}"  "${out_file}" > "${diff_file}"
 X=$?
-check $?
+check $X
 
 if [ $X != 0 ]; then
     echo -e "${BLUE}test: ${diff_file}${NORM}"
