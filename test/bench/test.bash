@@ -37,7 +37,7 @@ function run_benchmarks() {
     done
 }
 
-print_status Compiling $target
+print_compiling $target
 compile_benchmarks $BENCHMARKS | tee $T/compile.out | $PROGRESS i
 
 print_status Running $target
