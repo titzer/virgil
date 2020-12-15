@@ -1,0 +1,225 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Utility for reading and matching text, i.e. lexing and parsing. Has routines
+// for reading tokens from a stream of characters, match characters, literals,
+// etc. Keeps track of the current line, column, and a mapping from lines to
+// their ending offsets (for later extracting a line from the text). Stores the
+// first (earliest position) error, if any. Automatically skips whitespace when
+// extracting tokens with a configurable whitespace skipping routine.
+class TextReader {
+	def fileName: string;
+	def data: Array<byte>;			// array containing data
+	def var pos: int;			// current position
+	def var limit = data.length;		// limit within array
+	def var char: byte;			// current character
+	def var line: int;			// current line number
+	def var column: int;			// current column
+	def var lineEnds = Vector<int>.new();
+
+	def var ok: bool = true;		// true if no error
+	def var error_line: int = int.max;	// earliest line with error
+	def var error_column: int = int.max;	// earliest column with error
+	def var error_msg: string;		// error message
+
+	var skipWs  = TextReader.skipWhitespace;// whitespace callback
+	var onError = TextReader.setFirstError;	// error callback
+
+	new(fileName, data) {
+		line = 1;
+		column = 1;
+		if (data.length > 0) char = data[0];
+		skipWs(this);
+	}
+	// extract a token of the specified length from the current position and advance
+	def read_token(len: int) -> Token {
+		var t = tokenFor(pos, pos + len, line, column);
+		advance(len);
+		return t;
+	}
+	// extract a token between {start} and {end}
+	def read_token_at(start: int, end: int) -> Token {
+		return tokenFor(start, end, posToLine(start), posToColumn(start));
+	}
+	private def tokenFor(start: int, end: int, l: int, c: int) -> Token {
+		var b = Array<byte>.new(end - start), d = data;
+		for (p = start; p < end; p++) { // inlined array copy
+			b[p - start] = d[p];
+		}
+		return Token.new(fileName, b, l, c);
+	}
+	// advance by {len} characters and skip to next non-whitespace character
+	def advance(len: int) -> int {
+		at(pos + len, line, column + len);
+		skipWs(this);
+		return pos;
+	}
+	// advance by 1 character and skip to next non-whitespace character (specialized for speed)
+	def advance1() -> this {
+		var newPos = 1 + pos;
+		if (newPos < limit) {
+			pos = newPos;
+			column++;
+			char = data[newPos];
+			skipWs(this);
+		} else {
+			pos = limit;
+			char = '\x00';
+		}
+	}
+	// optionally consume a sequence of characters and advance()
+	def optN(s: string) -> int {
+		if (pos + s.length < limit) {
+			var p = pos, d = data, max = s.length;
+			for (i < max) {
+				if (s[i] != d[i + p]) return -1;
+			}
+			return advance(s.length);
+		}
+		return -1;
+	}
+	// optionally consume a single character and advance()
+	def opt1(ch: byte) -> int {
+		if (char == ch) { var p = pos; advance1(); return p; }
+		return -1;
+	}
+	// consume the character {ch} at the current position; error if no match
+	def req1(ch: byte) -> int {
+		if (char == ch) { var p = pos; advance1(); return p; }
+		fail(Strings.format1("\"%c\" expected", ch));
+		return -1;
+	}
+	// consume the characters {s} at the current position; error if no match
+	def reqN(s: string) -> int {
+		if (pos + s.length >= limit) return expected(s);
+		for (i < s.length) {
+			if (data[pos + i] != s[i]) return expected(s);
+		}
+		advance(s.length);
+		return pos;
+	}
+	private def expected(s: string) -> int {
+		fail(Strings.format1("\"%s\" expected", s));
+		return -1;
+	}
+	// set the current position, line, and column
+	def at(npos: int, nline: int, ncol: int) -> this {
+		var p = pos;
+		line = nline;
+		column = ncol;
+		if (npos == p) return;
+		if (npos < limit) { pos = npos; char = data[npos]; }
+		else { pos = limit; char = '\x00'; }
+	}
+	// convert the current location to a source range
+	def range() -> FileRange {
+		return FileRange.new(fileName, line, column, line, column);
+	}
+	// return the line number of the specified offset
+	def posToLine(at: int) -> int {
+		if (at == pos) return line;
+		for (i = lineEnds.length - 1; i >= 0; i--) {
+			// XXX: linear search OK for near the end, use binary search for random access
+			if (lineEnds[i] <= at) return i + 2;
+		}
+		return 1;
+	}
+	// return the column number of the specified offset
+	def posToColumn(at: int) -> int {
+		if (at == pos) return column;
+		var q = 0, c = 1, d = data;
+		var l = posToLine(at) - 1;
+		if (l > 0) q = 1 + lineEnds[l - 1];
+		while (q < at) {
+			var ch = d[q];
+			if (ch == '\t') c = 1 + ((c + 8) / 8) * 8; // tab character
+			else if (ch == '\n') {
+				System.error("TextReader", Strings.format2("missed a newline %d:%d", l + 1, c));
+				c = 1;
+			}
+			else c++;
+			q++;
+		}
+		return c;
+	}
+	// record an error with the specified message
+	def fail(msg: string) -> this {
+		fail_rel(0, msg);
+	}
+	// record an error at the given offset with the specified message
+	def fail_rel(offset: int, msg: string) -> this {
+		var eline = posToLine(pos + offset);
+		var ecol = posToColumn(pos + offset);
+		onError(this, eline, ecol, msg);
+	}
+	// peek {offset} characters ahead without advancing
+	def peek_rel(offset: int) -> byte {
+		var q = pos + offset;
+		if (q < limit) return data[q];
+		return '\x00';
+	}
+	// peek {offset} characters ahead and match 0 or more characters that
+	// match the given condition {f}, returning the position past the last
+	// match
+	def star_rel(offset: int, f: byte -> bool) -> int {
+		var d = data, max = d.length;
+		for (q = pos + offset; q < max; q++) {
+			if (!f(d[q])) return q;
+		}
+		return max;
+	}
+	// peek {offset} characters ahead and match 1 or more characters that
+	// match the given condition {f}, returning the position past the last
+	// match
+	def plus_rel(offset: int, f: byte -> bool) -> int {
+		if (f(peek_rel(offset))) {
+			var d = data, max = d.length;
+			for (q = pos + offset + 1; q < max; q++) {
+				if (!f(d[q])) return q;
+			}
+			return max;
+		}
+		return -1;
+	}
+	// verify that all new line characters have their positions set in the map
+	def verifyLineEnds() -> bool {
+		var j = 0, d = data, max = d.length;
+		for (i < pos) {
+			if (d[i] == '\n') {
+				if (j >= lineEnds.length || lineEnds[j] != i) return false;
+				j++;
+			}
+		}
+		return true;
+	}
+	// default skip callback: skip spaces, tabs, and newlines
+	def skipWhitespace() {
+		var pos = this.pos, line = this.line, column = this.column;
+		var data = this.data, max = limit;
+		while (pos < max) {
+			var ch = data[pos];
+			match (ch) {
+				' ' => { column++; }
+				'\t' => { column = 1 + (((column + 8) >>> 3) << 3); }
+				'\n' => {
+					lineEnds.put(pos);
+					column = 1;
+					line++;
+				}
+				_ => break; // not whitespace
+			}
+			pos++;
+		}
+		// reached the end or a non-whitespace character
+		at(pos, line, column);
+	}
+	// default error callback: record first error
+	def setFirstError(eline: int, ecol: int, msg: string) {
+		if (eline <= error_line && ecol < error_column) {
+			ok = false;
+			error_line = eline;
+			error_column = ecol;
+			error_msg = msg;
+		}
+	}
+}

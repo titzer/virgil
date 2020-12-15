@@ -1,0 +1,317 @@
+// Copyright 2019 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Utility for reading data items from a stream of bytes, offering routines to
+// read bytes, integers, LEBs, etc. A data reader has state for whether an
+// error occurred, keeping the first (earliest position) error. Read operations
+// only succeed if all of the data they expect is in the current buffer and
+// instead signal an end-of-file error if they would go past the end of the
+// current buffer. When the caller has more data to supply, they can use the
+// {append()} and {divest()} calls add data to this buffer while minding proper
+// aliasing.
+class DataReader {
+	def var data: Array<byte>;		// array containing data
+	def var pos: int;			// current position
+	def var limit: int;			// read limit within array
+	def var pos_offset: int;		// address of pos = 0
+
+	def var ok: bool = true;		// true if no error
+	def var error_pos: int = int.max;	// first error position
+	def var error_msg: string;		// error message
+
+	var onEOF = DataReader.setEOFError;	// EOF callback
+	var onError = DataReader.setFirstError;	// error callback
+
+	new(data) {
+		if (data == null) this.data = data = EMPTY_BYTES;
+		limit = data.length;
+	}
+
+	// {true} if the input has been completely consumed
+	def done() -> bool {
+		return pos >= limit;
+	}
+	// {true} if more input remains, i.e. {!done()}
+	def more() -> bool {
+		return pos < limit;
+	}
+	// number of available bytes
+	def available() -> int {
+		var diff = limit - pos;
+		return if(diff > 0, diff);
+	}
+	// set the current position
+	def at(npos: int) -> this {
+		pos = npos;
+	}
+	// set the current position and limit
+	def atl(npos: int, nlimit: int) -> this {
+		pos = npos;
+		limit = nlimit;
+	}
+	// calculate the absolute offset of the current position
+	def abspos() -> int {
+		return pos + pos_offset;
+	}
+	// calculate the absolute offset of a given position
+	def abs_of(pos: int) -> int {
+		return pos + pos_offset;
+	}
+	// reset the current data, position, and limit
+	def reset(ndata: Array<byte>, npos: int, nlimit: int) -> this {
+		pos_offset = 0;
+		data = ndata;
+		pos = npos;
+		limit = nlimit;
+	}
+	// record an error with the specified message
+	def fail(msg: string) -> this {
+		fail_at(pos, msg);
+	}
+	// record an error at the given position with the specified message
+	def fail_at(pos: int, msg: string) -> this {
+		onError(this, pos + pos_offset, msg);
+	}
+	// record end-of-file for a read beginning at the given position
+	def eof_at(pos: int, size: int, msg: string) -> this {
+		onEOF(this, pos + pos_offset, size, Strings.format1(msg, size));
+	}
+	// peek a single byte, if available, or {-1} if EOF
+	def peek1() -> int {
+		return if(pos >= limit, -1, data[pos]);
+	}
+	// query if {length} bytes can be read
+	def peekN(length: int) -> bool {
+		return (limit - pos) >= length;
+	}
+	// consume the next byte if it matches {b} and return {true}
+	def match1(b: byte) -> bool {
+		if (pos < limit && data[pos] == b) {
+			pos++;
+			return true;
+		}
+		return false;
+	}
+	// check that a string of {length} bytes could be read and record an EOF
+	// error if not possible
+	def checkN(length: int) -> bool {
+		if (limit - pos < length) {
+			eof_at(pos, length, "expecting %d bytes");
+			return false;
+		}
+		return true;
+	}
+	// skip {length} bytes
+	def skipN(length: int) {
+		if (limit - pos < length) {
+			eof_at(pos, length, "expecting %d bytes");
+			return;
+		}
+		pos += length;
+	}
+	// read a single byte
+	def read1() -> byte {
+		if (pos >= limit) {
+			eof_at(pos, 1, "expected byte");
+			return 0;
+		}
+		return data[pos++];
+	}
+	// read a 4-byte little-endian unsigned integer
+	def read_u32() -> u32 {
+		if (limit - pos < 4) {
+			eof_at(pos, 4, "expected %d bytes");
+			return 0;
+		}
+		var b0: u32 = data[pos];
+		var b1: u32 = data[pos + 1];
+		var b2: u32 = data[pos + 2];
+		var b3: u32 = data[pos + 3];
+		pos += 4;
+		var result = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+		return result;
+	}
+	// read a 8-byte little-endian unsigned integer
+	def read_u64() -> u64 {
+		if (limit - pos < 8) {
+			eof_at(pos, 8, "expected %d bytes");
+			return 0;
+		}
+		var w0 = read_u32();
+		var w1 = read_u32();
+		return (u64.!(w1) << 32) | w0;
+	}
+	// read an unsigned 32-bit LEB-encoded integer
+	def read_uleb32() -> u32 {
+		var b = read1();
+		if (b < 0x80) return b;
+		return read_xleb32(b, false, "LEB out of unsigned 32-bit range");
+	}
+	// read a signed 32-bit LEB-encoded integer
+	def read_sleb32() -> i32 {
+		var b = read1();
+		if (b < 0x80) return i7.view(b);
+		return int.view(read_xleb32(b, true, "LEB out of signed 32-bit range"));
+	}
+	private def check_leb_ext(b: byte, signed: bool, shift: u3, msg: string) {
+		if ((b & 0x80) != 0) {
+			fail("overlong LEB");
+			return;
+		}
+		if (signed) {
+			var upper = i7.view(b) >> u3.view(shift - 1);
+			if (upper != 0 && upper != -1) fail(msg);
+		} else {
+			var upper = i7.view(b) >> shift;
+			if (upper != 0) fail(msg);
+		}
+	}
+	private def read_xleb32(first: byte, signed: bool, msg: string) -> u32 {
+		var result = u32.view(first) & 0x7Fu, p = pos, shift = 7;
+		while (p < limit) {
+			var b = data[p++];
+			result = result | u32.view(b & 0x7F) << u5.view(shift);
+			shift += 7;
+			if (shift == 35) { // consumed (special) 5th byte
+				// check upper bits of last byte and extension
+				check_leb_ext(b, signed, 4, msg);
+				pos = p;
+				return result;
+			}
+			if (b < 0x80) { // no continuation byte
+				if (signed) { // perform sign-extension
+					var rem = u5.view(0 - shift);
+					result = u32.view(i32.view(result << rem) >> rem);
+				}
+				pos = p;
+				return result;
+			}
+		}
+		eof_at(pos, 0, "unterminated LEB");
+		return 0;
+	}
+	// read an unsigned 64-bit LEB-encoded integer
+	def read_uleb64() -> u64 {
+		var b = read1();
+		if (b < 0x80) return b;
+		return read_xleb64(b, false, "LEB out of unsigned 64-bit range");
+	}
+	// read a signed 64-bit LEB-encoded integer
+	def read_sleb64() -> i64 {
+		var b = read1();
+		if (b < 0x80) return i7.view(b);
+		return i64.view(read_xleb64(b, true, "LEB out of signed 64-bit range"));
+	}
+	private def read_xleb64(first: byte, signed: bool, msg: string) -> u64 {
+		var result: u64 = u32.view(first) & 0x7Fu, p = pos, shift = 7;
+		while (p < limit) {
+			var b = data[p++];
+			result = result | u64.view(b & 0x7F) << u6.view(shift);
+			shift += 7;
+			if (shift == 70) { // consumed (special) 10th byte
+				// check upper bits of last byte and extension
+				check_leb_ext(b, signed, 1, msg);
+				pos = p;
+				return result;
+			}
+			if (b < 0x80) { // no continuation byte
+				if (signed) { // perform sign-extension
+					var rem = u6.view(0 - shift);
+					result = u64.view(i64.view(result << rem) >> rem);
+				}
+				pos = p;
+				return result;
+			}
+		}
+		eof_at(pos, 0, "unterminated LEB");
+		return 0;
+
+	}
+	// read {length} bytes, copying them into a new array
+	def readN(length: int) -> Array<byte> {
+		if (limit - pos < length) {
+			eof_at(pos, length, "expecting %d bytes");
+			return [];
+		}
+		var result = Arrays.range(data, pos, pos + length);
+		pos += length;
+		return result;
+	}
+	// Append more data to the internal buffer. Reuse the provided
+	// buffer {x}, i.e. *alias* it, if there is no remaining data in the
+	// internal buffer. The caller may specify an {expecting} argument that
+	// it is expecting a given number of bytes, and thus this method should
+	// preallocate more space to avoid future reallocations.
+	def putK(expecting: int, x: Array<byte>, xpos: int, xlength: int) -> this {
+		if ((data.length - limit) >= xlength) {
+			// Enough space to copy into this buffer.
+			for (i < xlength) data[limit + i] = x[xpos + i];
+			limit += xlength;
+			return;
+		}
+		var avail = available(), diff = 0;
+		if (avail == 0 && x.length >= expecting) {
+			// Reuse {x} in-place by aliasing it.
+			diff = pos - xpos;
+			data = x;
+			pos = xpos;
+			limit = xpos + xlength;
+		} else {
+			// Not enough space. Copy the old data and the new data
+			// together into a new buffer.
+			var combined = avail + xlength;
+			var nlength = if(expecting > combined, expecting, combined);
+			var nbuf = Array<byte>.new(nlength);
+			for (i < avail) nbuf[i] = data[pos + i];
+			for (i < xlength) nbuf[avail + i] = x[xpos + i];
+
+			diff = pos;
+			data = nbuf;
+			pos = 0;
+			limit = combined;
+		}
+		pos_offset += diff;
+	}
+	// Divest from the given buffer {alias} so that this data reader no longer
+	// aliases it. Callers should use this method if they have previously
+	// provided {alias} to this data reader through the constructor or
+	// {append()} but now need to reuse {alias}.
+	def divest(expecting: int, alias: Array<byte>) -> this {
+		if (alias != data) return; // nothing to do
+		var avail = available();
+		var nlength = if(expecting > avail, expecting, avail);
+		var nbuf = Array<byte>.new(nlength);
+		for (i < avail) nbuf[i] = data[pos + i];
+		data = nbuf;
+		pos_offset += pos;
+		limit = avail;
+		pos = 0;
+	}
+	// populate the given sub-reader with the range of bytes from {pos}
+	// to {pos+length}
+	def sub_bytes(d: DataReader, length: int) {
+		if (limit - pos < length) {
+			eof_at(pos, length, "expecting %d bytes");
+			if (pos < limit) pos = limit;  // consume remaining
+			return;
+		}
+		d.data = data;
+		d.pos = this.pos;
+		d.limit = this.pos + length;
+		d.pos_offset = this.pos_offset;
+		this.pos += length;
+	}
+	// default behavior on EOF: record an error
+	def setEOFError(abspos: int, size: int, msg: string) {
+		setFirstError(abspos, msg);
+	}
+	// default error behavior: record first error
+	def setFirstError(abspos: int, msg: string) {
+		if (abspos < error_pos) {
+			error_pos = abspos;
+			error_msg = msg;
+			ok = false;
+		}
+	}
+}
+def EMPTY_BYTES: Array<byte> = []; // used instead of null
