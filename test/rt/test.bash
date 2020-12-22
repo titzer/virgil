@@ -39,6 +39,12 @@ print_compiling "$target" FindFunc
 run_v3c $target -output=$T FindFunc.v3 &> $T/find.compile.out
 check_no_red $? $T/find.compile.out
 
+if [ "$TEST_TARGET=x86-linux" ]; then
+    print_compiling "$target" JIT
+    run_v3c $target -output=$T jit-x86-linux.v3 &> $T/jit.compile.out
+    check_no_red $? $T/jit.compile.out
+fi
+
 if [ "$HOST_PLATFORM" == "$target" ]; then
   print_status Running "$target" CiRuntimeApi
   $T/CiRuntimeApi &> $T/run.out
@@ -47,4 +53,12 @@ if [ "$HOST_PLATFORM" == "$target" ]; then
   print_status Running "$target" FindFunc
   $T/FindFunc &> $T/find.run.out
   check $?
+
+  if [ -x $T/jit-$target ]; then
+      print_status Running "$target" JIT
+      $T/jit-$target &> $T/jit.run.out
+      check $?
+
+  fi
 fi
+
