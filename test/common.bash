@@ -155,7 +155,7 @@ function execute_int_tests() {
     print_status Interpreting "$2 $V3C_OPTS"
 
     P=$OUT/$1.run.out
-    run_v3c "" -test -expect=expect.txt $2 $TESTS | $PROGRESS i
+    run_v3c "" -test -expect=expect.txt $2 $TESTS | tee $OUT/run.out | $PROGRESS i
 }
 
 function compile_target_tests() {
@@ -166,8 +166,8 @@ function compile_target_tests() {
     mkdir -p $OUT/$target
     C=$OUT/$target/compile.out
     print_compiling $target
-    echo run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS &> $C
-    run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS | $PROGRESS i
+#    echo run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS &> $C
+    run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS | tee $C | $PROGRESS i
 #    check_passed $C
 }
 
@@ -176,7 +176,7 @@ function execute_target_tests() {
     print_status Running $target
     R=$OUT/$target/run.out
     if [ -x $CONFIG/execute-$target-test ]; then
-	$CONFIG/execute-$target-test $OUT/$target $TESTS | $PROGRESS i
+	$CONFIG/execute-$target-test $OUT/$target $TESTS | tee $OUT/$target/run.out | $PROGRESS i
 #	check_passed $R
     else
 	printf "${YELLOW}skipped${NORM}\n"
