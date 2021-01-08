@@ -11,11 +11,11 @@ if [ -z "$NASM" ]; then
 	exit 0
 fi
 
-AENEAS_UTIL="${AENEAS_LOC}/util/*.v3 ${VIRGIL_LOC}/lib/util/*.v3"
-AENEAS_ASM="${AENEAS_LOC}/x86/X86Assembler.v3"
+LIB_UTIL="${VIRGIL_LOC}/lib/util/*.v3"
+LIB_ASM="${VIRGIL_LOC}/lib/asm/x86/*.v3"
 
-printf "  Generating (aeneas)..."
-run_v3c "" -run ./X86AssemblerTestGen.v3 $AENEAS_ASM $AENEAS_UTIL $@ > $S
+printf "  Generating (int)..."
+run_v3c "" -run ./X86AssemblerTestGen.v3 $LIB_ASM $LIB_UTIL $@ > $S
 check_passed $S
 
 printf "  Assembling (nasm)..."
@@ -24,9 +24,9 @@ check $?
 
 printf "  Comparing..."
 perl -n -e'/ \d+ [0-9A-F]+ ([0-9A-F]+)\(?([0-9A-F]*)\)? (.*);;== (.*)/ && print "$1$2 $3\n"' $L > $L.nasm
-perl -n -e'/ \d+ [0-9A-F]+ ([0-9A-F]+)\(?([0-9A-F]*)\)? (.*);;== (.*)/ && print "$4 $3\n"' $L > $L.aeneas
+perl -n -e'/ \d+ [0-9A-F]+ ([0-9A-F]+)\(?([0-9A-F]*)\)? (.*);;== (.*)/ && print "$4 $3\n"' $L > $L.int
 
-diff $L.nasm $L.aeneas > $L.diff
+diff $L.nasm $L.int > $L.diff
 X=$?
 check $X
 

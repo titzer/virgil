@@ -4,7 +4,8 @@
 
 printf "  Running Aeneas unit tests..."
 P=$OUT/block_order.out
-run_v3c "" -fp -run $AENEAS_SOURCES $VIRGIL_LOC/lib/util/*.v3 $AENEAS_LOC/../test/*.v3 -version > $P
-grep "passed" $P > /dev/null
-check $? $P
+pushd $VIRGIL_LOC > /dev/null
+SRCS="aeneas/src/*/*.v3 $(cat aeneas/DEPS)"
+run_v3c "" -fp -run $SRCS $AENEAS_LOC/../test/*.v3 -version | $PROGRESS i
+popd > /dev/null
 

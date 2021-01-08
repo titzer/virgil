@@ -11,17 +11,18 @@ if [ -z "$NASM" ]; then
 	exit 0
 fi
 
-UTIL="${VIRGIL_LOC}/lib/util/*.v3"
-ASM="${VIRGIL_LOC}/lib/asm/x64/X64Assembler.v3"
+LIB_UTIL="${VIRGIL_LOC}/lib/util/*.v3"
+LIB_ASM="${VIRGIL_LOC}/lib/asm/x64/*.v3"
 
-run_v3c "" ./X64AssemblerTestGen.v3 $ASM $UTIL $@
-if [ $? != 0 ]; then
-    exit 1
-fi
-   
 printf "  Generating (int)..."
-run_v3c "" -run ./X64AssemblerTestGen.v3 $ASM $UTIL $@ > $S
+run_v3c "" -run ./X64AssemblerTestGen.v3 $LIB_ASM $LIB_UTIL $@ > $S
+if [ "$?" != 0 ]; then
+    printf "\n"
+    cat $S
+    exit $?
+fi
 check_passed $S
+
 
 printf "  Assembling (nasm)..."
 nasm -l $L $S > ${OUT}/nasm.out

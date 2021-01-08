@@ -48,7 +48,12 @@ execute_target_tests $target
 
 HEAP='-heap-size=24m'
 print_compiling "$target $HEAP" Aeneas
-run_v3c $target -output=$T $HEAP $AENEAS_SOURCES $VIRGIL_LOC/lib/util/*.v3 &> $T/Aeneas-gc.compile.out
+
+pushd $VIRGIL_LOC > /dev/null
+SRCS="aeneas/src/*/*.v3 $(cat aeneas/DEPS)"
+run_v3c $target -output=$T $HEAP $SRCS &> $T/Aeneas-gc.compile.out
+popd > /dev/null
+
 check_no_red $? $T/Aeneas-gc.compile.out
 mv $T/Aeneas $T/Aeneas-gc
 
