@@ -11,7 +11,7 @@ if [ -z "$NASM" ]; then
 	exit 0
 fi
 
-AENEAS_UTIL="${AENEAS_LOC}/util/*.v3"
+AENEAS_UTIL="${AENEAS_LOC}/util/*.v3 ${VIRGIL_LOC}/lib/util/*.v3"
 AENEAS_ASM="${AENEAS_LOC}/x86/X86Assembler.v3"
 
 printf "  Generating (aeneas)..."
