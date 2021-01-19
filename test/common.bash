@@ -61,9 +61,9 @@ function execute() {
 function print_status() {
     config=$(echo -n $2)
     if [ -z "$3" ]; then
-	printf "  %-13s %-11s | "   $1 "$config"
+	printf "  %-13s %-12s | "   $1 "$config"
     else
-	printf "  %-13s %-11s $3 | "  $1 "$config"
+	printf "  %-13s %-12s $3 | "  $1 "$config"
     fi
 }
 
