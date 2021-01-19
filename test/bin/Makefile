@@ -17,6 +17,9 @@ progress-x86-linux: src/progress.*
 progress-x86-64-darwin: src/progress.*
 	cc -m64 -o progress-x86-64-darwin -Isrc src/progress.c
 
+progress-arm64-darwin: src/progress.*
+	cc -m64 -o progress-arm64-darwin -Isrc src/progress.c
+
 progress-x86-64-linux: src/progress.*
 	cc -m64 -o progress-x86-64-linux -Isrc src/progress.c
 
