@@ -10,7 +10,7 @@ That makes it ideal for building certain kinds of programs like compilers and vi
 machines.
 It is currently being used for virtual machine and programming language research.
 
-This repository includes the entire compiler, runtime system, tests, and supporting code
+This repository includes the entire compiler, runtime system, some libraries, tests, and supporting code
 for Virgil's various compilation targets.
 
 ## Features ##
