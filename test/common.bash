@@ -61,9 +61,9 @@ function execute() {
 function print_status() {
     config=$(echo -n $2)
     if [ -z "$3" ]; then
-	printf "  %-13s %-12s | "   $1 "$config"
+	printf "  %-13s %-12s | "   "$1" "$config"
     else
-	printf "  %-13s %-12s $3 | "  $1 "$config"
+	printf "  %-13s %-12s $3 | "  "$1" "$config"
     fi
 }
 
@@ -168,18 +168,53 @@ function compile_target_tests() {
     print_compiling $target
 #    echo run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS &> $C
     run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS | tee $C | $PROGRESS i
-#    check_passed $C
+}
+
+function check_cached_target_tests() {
+    # XXX: improve the performance of cache tests
+    T=$OUT/$target/
+    C=$TEST_CACHE/$SUITE/$target
+    L=$OUT/$target/leftover
+    count=$(echo $(echo $TESTS | wc -w))
+    echo > $L
+    echo "##>$count"
+    for t in $TESTS; do
+	tf=${t/.v3/}
+	cached="$C/$tf"
+	gen="$T/$tf"
+	if [ -e $cached ]; then
+	    diff -q $cached $gen
+	    if [ "$?" = 0 ]; then
+		echo "##+$t"
+		echo "##-ok"
+		continue
+	    fi
+	fi
+	echo $cached "!=" $gen
+	echo $t >> $L
+    done
 }
 
 function execute_target_tests() {
     target=$1
-    print_status Running $target
     R=$OUT/$target/run.out
-    if [ -x $CONFIG/execute-$target-test ]; then
-	$CONFIG/execute-$target-test $OUT/$target $TESTS | tee $OUT/$target/run.out | $PROGRESS i
-#	check_passed $R
+    if [ -d "$TEST_CACHE/$SUITE/$target" ]; then
+	print_status "   cached" ""
+	check_cached_target_tests | tee $OUT/$target/cached.out | $PROGRESS i
+	TORUN=$(cat $OUT/$target/leftover)
     else
-	printf "${YELLOW}skipped${NORM}\n"
+	TORUN="$TESTS"
+    fi
+
+    if [ "$TORUN" != "" ]; then
+	print_status "  running" ""
+
+	if [ -x $CONFIG/execute-$target-test ]; then
+	    $CONFIG/execute-$target-test $OUT/$target $TORUN | tee $OUT/$target/run.out | $PROGRESS i
+	else
+	    count=$(echo $(echo $TORUN | wc -w))
+	    printf "$count ${YELLOW}skipped${NORM}\n"
+	fi
     fi
 }
 
