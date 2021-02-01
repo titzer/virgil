@@ -25,7 +25,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	var negativeHeaders = false; // object headers are at negative offsets
 
 	new() {
-		stackAlign = data.alignment;
+		stackAlign = data.addrAlign.size;
 	}
 	def build(compiler: Compiler, config: MachLoweringConfig) {
 		prog.ir.classes.apply(processIrClass);
@@ -57,12 +57,12 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		if (!Facts.isLive(ic)) return;
 		if (ic.fields.length == 0) {
 			// no fields
-			ic.machSize = data.align(sizeOf(tagType));
+			ic.machSize = data.addrAlign.alignUp(sizeOf(tagType));
 		} else {
 			// find field at maximum offset; assume no overlapping fields
 			var maxf = ic.fields[0];
 			for (f in ic.fields) if (f.machOffset > maxf.machOffset) maxf = f;
-			ic.machSize = data.align(maxf.machOffset + sizeOf(maxf.fieldType));
+			ic.machSize = data.addrAlign.alignUp(maxf.machOffset + sizeOf(maxf.fieldType));
 		}
 		// create GC maps for object if necessary
 		if (runtime != null && runtime.gc != null) runtime.gc.recordTypeRefMap(ic);
@@ -85,7 +85,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		// 1. compute the layout for the array header
 		layout.addType(tagType);
 		marray.lengthOffset = layout.addType(Int.TYPE);
-		marray.headerSize = data.align(layout.size);
+		marray.headerSize = data.addrAlign.alignUp(layout.size);
 		// 2. compute the scale for elements
 		var elemType = V3Array.elementType(utype);
 		// TODO: round up array element scale to a power of two if necessary
@@ -197,7 +197,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	}
 	def getObjectSize(t: Type, r: Record) -> int {
 		if (V3.isClass(t)) return irClass(t).machSize; // return the size of the object
-		if (V3.isArray(t)) return data.align(arrayRep(t).getObjectSize(r)); // return the size of the header only
+		if (V3.isArray(t)) return data.addrAlign.alignUp(arrayRep(t).getObjectSize(r)); // return the size of the header only
 		return unexpectedType(t, 0);
 	}
 	def alignTo(i: int, a: int) -> int {
@@ -411,7 +411,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		for (i < methods.length) {
 			// generate code for each method
 			var m = methods[i];
-			w.atEnd().align(code.alignment);
+			w.atEnd().align(code.addrAlign.size);
 			var methodStart = w.endAddr();
 			addrOfMethod(m).absolute = methodStart;
 			genCode(m);
@@ -432,7 +432,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	}
 	// generate each stub after the code
 	def genStub(w: MachDataWriter, t: (string, (Addr, (Addr, MachDataWriter) -> void))) {
-		w.atEnd().align(code.alignment);
+		w.atEnd().align(code.addrAlign.size);
 		var addr = t.1.0, gen = t.1.1;
 		addr.absolute = w.endAddr();
 		if (Aeneas.PRINT_MACH.val != VstMatcher.None) Terminal.put3("genFatalStub[%s] @ %q = %x\n", t.0, V3.renderResult(addr, null, _), addr.absolute);
@@ -517,7 +517,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		var addr = recordMap[r];
 		if (addr == null) {
 			// allocate space in the data region
-			dataRegion.align(data.alignment);
+			dataRegion.align(data.addrAlign.size);
 			addr = dataRegion.allocate(r, getObjectSize(r.rtype, r));
 			recordMap[r] = addr;
 			// queue for later processing
@@ -560,9 +560,6 @@ class MachLayout(mach: MachProgram) {
 }
 // Represents all runtime data structures exposed to the Virgil runtime code.
 class MachRuntime(mach: MachProgram) {
-	def codePageSize = 4096;
-	def codePageMask = 4095;
-	def codePageShift: u5 = 12;
 	def codeRegion = mach.codeRegion;
 	def addrs = Array<int>.new(CiRuntimeModule.max); // CiRuntime absolute addresses
 	var typeCon: CiRuntime_TypeCon;
@@ -659,7 +656,9 @@ class MachRuntime(mach: MachProgram) {
 	def codePages() -> int {
 		var end = CiRuntimeModule.CODE_END.getAbs(this);
 		if (end == 0) mach.prog.ERROR.fail("code end not set yet");
-		return (end - CiRuntimeModule.CODE_START.getAbs(this) + codePageSize - 1) / codePageSize;
+		var size = end - CiRuntimeModule.CODE_START.getAbs(this);
+		var align = codeRegion.space.pageAlign;
+		return align.alignUp(size) >> align.shift;
 	}
 	def encode(w: MachDataWriter) {
 		if (gc != null) gc.encode(w);
@@ -735,8 +734,9 @@ class MachRtPageTable(
 		table.setAbs(rt, tableAddr);
 		// encode the page table pointers
 		var lastPage = -1;
+		var shift = rt.codeRegion.space.pageAlign.shift;
 		for (i < maxEntry) {
-			var page = entries[i].0 / rt.codePageSize;
+			var page = entries[i].0 >> shift;
 			if (page != lastPage) {
 				// first entry on new page, fill intervening pages
 				var entryAddr = tableAddr + i * 4;
@@ -747,9 +747,10 @@ class MachRtPageTable(
 		// encode the last entries of the table
 		for (j = lastPage; j < maxPage; j++) w.put_b32(tableEndAddr);
 		// encode the table entries
+		var mask = rt.codeRegion.space.pageAlign.add;
 		for (i < maxEntry) {
 			var entry = entries[i];
-			w.put_b32((entry.0 & rt.codePageMask) | (entry.1 << rt.codePageShift));
+			w.put_b32((entry.0 & mask) | (entry.1 << shift));
 		}
 		if (!wide) return;
 		// encode the wide part of the table

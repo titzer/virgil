@@ -34,14 +34,13 @@ TEST_HOST=jar
 
 for target in $TEST_TARGETS; do
 
-    T=$OUT/$target
-    mkdir -p $T/before
-    do_aeneas_compile "$VIRGIL_LOC/bin/stable/$TEST_HOST/Aeneas" $T/before $target "stable"
+    mkdir -p $OUT/before
+    do_aeneas_compile "$VIRGIL_LOC/bin/stable/$TEST_HOST/Aeneas" $OUT/before $target "stable"
 
-    mkdir -p $T/after
-    do_aeneas_compile "$AENEAS_TEST" $T/after $target " test "
+    mkdir -p $OUT/after
+    do_aeneas_compile "$AENEAS_TEST" $OUT/after $target " test "
 
-    diff -rq $T/before $T/after 2&>1 > /dev/null
+    diff -rq $OUT/before $OUT/after &> /dev/null
     if [ $? ]; then
 	printf "    matching | ${GREEN}ok${NORM}\n"
     else
