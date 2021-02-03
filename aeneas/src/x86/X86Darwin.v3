@@ -20,7 +20,7 @@ class X86DarwinTarget extends Target {
 		def space = SPACE;
 		def intNorm = IntNormalizers.I32LE;
 		var mach = MachProgram.new(prog, space, space, intNorm);
-		var rt = X86DarwinRuntime.new(SsaContext.new(compiler, prog), test, mach);
+		var rt = MachRuntime.new(mach);
 		mach.runtime = rt;
 		compiler.Reachability = true;
 		MachModule.install(prog); // installs "Pointer" typecon
@@ -33,21 +33,21 @@ class X86DarwinTarget extends Target {
 	def addRoots(compiler: Compiler, prog: Program) {
 		getRuntime(prog).addRoots();
 	}
-	private def getRuntime(prog: Program) -> X86DarwinRuntime {
-		return X86DarwinRuntime.!(CiRuntime_TypeCon.!(prog.typeEnv.lookup(CiRuntimeModule.NAME)).runtime);
+	private def getRuntime(prog: Program) -> MachRuntime {
+		return CiRuntime_TypeCon.!(prog.typeEnv.lookup(CiRuntimeModule.NAME)).runtime;
 	}
 	def emit(compiler: Compiler, prog: Program) {
 		var rt = getRuntime(prog), mach = rt.mach;
 		mach.build(compiler, MachLoweringConfig.new());
 
 		var header = MachO_Header.new(false);
-		var codePageSize = rt.codeRegion.space.pageAlign.size;
+		var pageAlign = rt.codeRegion.space.pageAlign;
 		header.cputype = MachO.CPU_TYPE_X86;
 		header.filetype = MachO.MH_EXECUTE;
 
 		// protect page zero for trapping null accesses
 		var pz = newSegmentLoad(header, "__NULL", 0);
-		pz.vmsize = codePageSize;
+		pz.vmsize = pageAlign.size;
 		// code (text) segment starts at page 1
 		var cs = newSegmentLoad(header, "__TEXT", MachO.VM_PROT_RX);
 		// data segment immediately follows code segment
@@ -58,69 +58,65 @@ class X86DarwinTarget extends Target {
 		// ex segment for trapping explicit checks
 		var ex = if(rt.src != null, newSegmentLoad(header, "__EX", 0));
 		// create the buffer
-		var buffer = MachDataWriter.new(rt.codeRegion.space.pageAlign,
+		var w = MachDataWriter.new(rt.codeRegion.space.pageAlign,
 			0, 300 + mach.numMethods * 50);
+		var backend = X86DarwinBackend.new(compiler, prog, mach, w, test);
 		// skip mach-o headers
-		buffer.skipN(header.totalsize);
+		w.skipN(header.totalsize);
 		// skip page zero
-		buffer.skipPage();
+		w.skipPage();
 		// generate code and runtime tables into buffer
-		// encodeCode(buffer, cs, ts);
-		var codeStartOffset = buffer.end();
-		rt.initAllocator();
-		ts.eip = buffer.endAddr();
-		cs.vmaddr = buffer.endPageAddr();
+		// encodeCode(w, cs, ts);
+		var codeStartOffset = w.end();
+		ts.eip = w.endAddr();
+		cs.vmaddr = w.endPageAddr();
 		rt.recordCodeStart(ts.eip);
-		var asm = X86MacroAssembler.new(mach, buffer, codeStartOffset);
-		rt.genMainStub(asm);
-		rt.genAllocStub(asm);
-		mach.layoutCode(buffer, rt.genX86Code(_, asm));
-		rt.genSignalHandler(asm);
-		var size = buffer.end();
-		if (size < codePageSize) {
+		backend.genAllCode();
+		var size = w.end();
+		if (size < pageAlign.size) {
 			// TODO: Santa or MacOS rejects binaries with text segments smaller than a page!
-			buffer.skipN(codePageSize - size);
+			w.skipN(pageAlign.size - size);
 		}
-		rt.recordCodeEnd(buffer.endAddr());
-		mach.layoutMeta(buffer);
-		mach.layoutRuntime(buffer);
-		cs.filesize = buffer.end();
-		cs.vmsize = rt.pageAlign(cs.filesize);
+		rt.recordCodeEnd(w.endAddr());
+		mach.layoutMeta(w);
+		mach.layoutRuntime(w);
+		cs.filesize = w.end();
+		cs.vmsize = pageAlign.alignUp(cs.filesize);
 		cs.fileoff = 0;
 		// generate the unmapped "ex" region for trapping explicit checks
 		if (ex != null) {
-			buffer.skipPage();
-			var exStart = buffer.endPageAddr();
-			var exSize = rt.pageAlign(rt.src.layoutExRegion(exStart));
-			buffer.startAddr = buffer.startAddr + exSize;
+			w.skipPage();
+			var exStart = w.endPageAddr();
+			var exSize = pageAlign.alignUp(rt.src.layoutExRegion(exStart));
+			w.startAddr = w.startAddr + exSize;
 			ex.vmaddr = exStart;
 			ex.vmsize = exSize;
 			ex.filesize = 0;
 			ex.fileoff = 0;
 		}
 		// generate data into buffer
-		buffer.skipPage();
+		w.skipPage();
 		// compute starting location of data
-		buffer.atEnd().align(mach.data.addressSize);
-		ds.vmaddr = buffer.endPageAddr();
-		ds.fileoff = ds.vmaddr - buffer.startAddr;
-		rt.recordDataStart(buffer.endAddr());
-		mach.layoutData(buffer);
-		rt.recordDataEnd(buffer.endAddr());
-		rt.addHeapPointers(buffer);
-		ds.filesize = buffer.end() - ds.fileoff;
-		ds.vmsize = rt.pageAlign(ds.filesize + int.view(rt.heapSize));
+		w.atEnd().align(mach.data.addressSize);
+		ds.vmaddr = w.endPageAddr();
+		ds.fileoff = ds.vmaddr - w.startAddr;
+		rt.recordDataStart(w.endAddr());
+		mach.layoutData(w);
+		rt.recordDataEnd(w.endAddr());
+		rt.addHeapPointers(w);
+		ds.filesize = w.end() - ds.fileoff;
+		ds.vmsize = pageAlign.alignUp(ds.filesize + int.view(rt.heapSize));
 		// patch all addresses in the binary
-		buffer.patch(rt.patchCodeAddr);
+		w.patch(backend.patchCodeAddr);
 		// encode header at position 0 now that all addresses and offsets are known
-		header.encode(buffer.at(0));
-		header.encodeCmds(buffer);
+		header.encode(w.at(0));
+		header.encodeCmds(w);
 		// open the output file
 		var file = compiler.getOutputFileName(prog.name(), null);
 		var fd = System.fileOpen(file, false);
 		if (fd < 0) return prog.ERROR.OutputError(file);
 		// write the entire file from the buffer array
-		System.fileWriteK(fd, buffer.data, 0, buffer.end());
+		System.fileWriteK(fd, w.data, 0, w.end());
 		System.fileClose(fd);
 		// change permissions to make binary executable
 		compiler.makeExecutable(file);
@@ -134,23 +130,24 @@ class X86DarwinTarget extends Target {
 	}
 }
 
-
-// Directs the creation of an x86-darwin binary.
-class X86DarwinRuntime extends X86Runtime {
-	new(context: SsaContext, test: bool, mach: MachProgram) super(context, test, mach) { }
-	def asm_exit_code(asm: X86Assembler, code: int) {
+// Darwin-specific backend code generation.
+class X86DarwinBackend extends X86Backend {
+	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, test: bool) super(compiler, prog, mach, w, test) {
+		kernel = X86KernelCallingConv.DARWIN;
+	}
+	def asm_exit_code(code: int) {
 		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
 		asm.push_i(code);
 		asm.push_i(0);
 		asm.intK(0x80);
 	}
-	def asm_exit_rm(asm: X86Assembler, rm: X86Rm) {
+	def asm_exit_rm(rm: X86Rm) {
 		asm.push(rm);
 		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
 		asm.push_i(0);
 		asm.intK(0x80);
 	}
-	def genTestOutput(asm: X86MacroAssembler, frame: MachFrame) {
+	def genTestOutput(frame: MachFrame) {
 		// output the return register as a 4-byte integer to stdout
 		asm.push(asm.loc_rm(frame, frame.conv.callerRet(0)));
 		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
@@ -161,12 +158,12 @@ class X86DarwinRuntime extends X86Runtime {
 		asm.movd_rm_i(X86Regs.EAX, 4); // write()
 		asm.intK(0x80);
 	}
-	def genSignalHandler(asm: X86MacroAssembler) {
+	def genSignalHandlerStub() {
 		// Specialized assembly to directly handle a signal from the kernel
-		var handler_meth = getRiSignal();
+		var handler_meth = mach.runtime.getRiSignal();
 		if (handler_meth == null) return;
 		var frame = getFrame(handler_meth.ssa);
-		CiRuntimeModule.SIGNAL_STUB.setAbs(this, asm.machBuffer.posAddr());
+		CiRuntimeModule.SIGNAL_STUB.setAbs(mach.runtime, asm.machBuffer.posAddr());
 		// "this" = null
 		asm.movd_rm_i(asm.loc_rm(frame, frame.conv.calleeParam(0)), 0); // "this" = null
 		var scratch = X86MachRegs.SCRATCH;
@@ -180,7 +177,7 @@ class X86DarwinRuntime extends X86Runtime {
 		asm.call_addr(mach.addrOfMethod(handler_meth));
 		// should not return
 	}
-	def genFatalStub(ex: string, addr: Addr, w: MachDataWriter) {
+	def genFatalStub(ex: string, addr: Addr) {
 		var asm = X86Assembler.new(w);
 		addr.absolute = w.endAddr();
 		// 1. encode a call to write() on stderr
@@ -204,11 +201,11 @@ class X86DarwinRuntime extends X86Runtime {
 		w.atEnd();
 	}
 	// generate code that installs a signal handler
-	def genSigHandlerInstall(asm: X86Assembler, signo: int, handler: Addr) {
+	def genSigHandlerInstall(signo: int, handler: Addr) {
 		asm.push_i(0);			// sa_flags
 		asm.push_i(0);			// sa_mask
 		asm.push_i(X86Addrs.ABS_CONST);	// sa_handler: handler address
-		recordPatch(asm, handler);
+		recordPatch(handler);
 		asm.push_i(2);			// TODO: why a nonzero value here?
 		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
 		asm.push_i(0);			// sigaction *oact
@@ -218,34 +215,6 @@ class X86DarwinRuntime extends X86Runtime {
 		asm.movd_rm_i(X86Regs.EAX, 46); // sigaction
 		asm.intK(0x80);
 		asm.add.rm_i(X86Regs.ESP, 32);	// pop params off stack
-	}
-	def genSystemOp(g: MachCodeGen, sys: SsaApplyOp, rv: VReg) {
-		var gen = X86CodeGen.!(g);
-		var inputs = sys.inputs;
-		gen.frame.allocOverflow((1 + inputs.length) * mach.data.addressSize);
-		// polymorphic system call: define EAX, EDX, and ECX = eflags
-		gen.dfnAt(rv, X86MachRegs.EAX);
-		// define second result in EDX
-		gen.dfnAt(gen.vars[rv.varNum + 1], X86MachRegs.EDX);
-		// define third result in ECX
-		var flags = gen.vars[rv.varNum + 2];
-		gen.dfnAt(flags, X86MachRegs.ECX);
-		// accept system call number in EAX
-		gen.useFixed(inputs[0].dest, X86MachRegs.EAX);
-		// accept arguments on callee's portion of stack of current frame
-		var start = gen.frame.conv.regSet.calleeStart;
-		for (i = 1; i < inputs.length; i++) {
-			gen.useFixed(inputs[i].dest, start + i);
-		}
-		gen.gen("darwin:int80", asmSystemOp, (gen, flags));
-	}
-	private def asmSystemOp(gen: X86CodeGen, flags: VReg) {
-		// polymorphic
-		gen.asm.intK(0x80);
-		if (flags.live) {
-			gen.asm.pushfd();         // push flags
-			gen.asm.pop(X86Regs.ECX); // pop flags into ECX
-		}
 	}
 }
 // a mach-O thread state command for x86

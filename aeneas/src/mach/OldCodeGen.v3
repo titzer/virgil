@@ -1,0 +1,263 @@
+// Copyright 2011 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Base class for (old) machine code generators.
+// To be superceded with SsaMachGen-based generators in the future.
+class OldCodeGen(mach: MachProgram, context: SsaContext) {
+	def rt = mach.runtime;
+	def rtsrc = rt.src;
+	def rtgc = rt.gc;
+	def code = Vector<MachInstr>.new();
+	def vars = Vector<VReg>.new();
+	def uses  = Vector<int>.new();
+	def markQueue = Vector<VReg>.new();
+	def blocks = SsaBlockOrder.new(context.graph);
+
+	var multiBlock: bool;
+	var frame: MachFrame;
+	var phiList: List<SsaPhi>;
+	var lsra: LinearScanRegAlloc;
+	var varRefSlotIndex: Array<int>; // XXX: move to VReg directly?
+	// current position in the uses array
+	var curUse: int;
+	var curBlockStart: int;
+	var curValMoves: List<(Val, int)>;
+	var numLivePoints: int;
+	// constants for encoding the used mach vars
+	def USE	 = 0x0;
+	def DEF	 = 0x1;
+	def LIVE = 0x2;
+	def KILL = 0x3;
+	def TYPE_MASK = 0x3;
+	def UNUSED_MASK	  = 0x8;
+	def ASSIGNED_MASK = 0x4;
+	def VAR_SHIFT: u3 = 4;
+
+	new() {
+		multiBlock = context.graph.isMultiBlock();
+	}
+
+	def makeVar(i: SsaInstr) -> VReg {
+		var max = context.graph.markGen;
+		if (i.mark >= max) return vars[i.mark - max]; // already has a variable
+		var isConst = SsaConst.?(i);
+		var varNum = vars.length;
+		var t = i.getType();
+		if (V3.isTuple(t)) {
+			var size = Tuple.length(t);
+			for (l = t.nested; l != null; l = l.tail) {
+				var vreg = VReg.new(i, vars.length, size, isConst);
+				vreg.regClass = Regs.toRegClass(l.head);
+				vars.put(vreg);
+				size = 1;
+			}
+		} else {
+			var vreg = VReg.new(i, varNum, 1, isConst);
+			vreg.regClass = Regs.toRegClass(t);
+			vars.put(vreg);
+		}
+		i.mark = varNum + max; // maps instruction to var
+		return vars[varNum];
+	}
+	def val(i: SsaInstr) -> Val {
+		return SsaConst.!(i).val;
+	}
+	def id(i: SsaInstr, vreg: VReg) -> VReg {
+		i.mark = vreg.varNum + context.graph.markGen;
+		return vreg;
+	}
+	def info(b: SsaBlock) -> SsaBlockInfo {
+		return blocks.order[b.mark];
+	}
+	def markLive(v: VReg) {
+		if (!v.live) {
+			markQueue.put(v);
+			v.live = true;
+		}
+	}
+	def markAllLiveVars() {
+		for (j < markQueue.length) {
+			var v = markQueue[j];
+			if (v.start >= 0) {
+				markUsesLive(v);
+			} else {
+				var inputs = v.ssa.inputs;
+				for (k = 0; k < inputs.length; k++) markLive(makeVar(inputs[k].dest));
+			}
+		}
+	}
+	def markUsesLive(v: VReg) {
+		if (SsaPhi.?(v.ssa)) {
+			// mark all inputs to the SsaPhi as live
+			for (i in v.ssa.inputs) markLive(makeVar(i.dest));
+			return;
+		}
+		for (i = v.start; i < v.end; i++) {
+			// for each instruction corresponding to this instruction
+			var c = code[i];
+			c.live = true;
+			for (j = c.useStart; j < c.useEnd; j = j + 2) {
+				// for every input to the instruction, mark it live
+				var u = uses[j], uv = u & TYPE_MASK;
+				if (uv == USE) markLive(vars[u >>> VAR_SHIFT]);
+			}
+		}
+	}
+	def genPhis() {
+		// for each block that has phis
+		for (l = phiList; l != null; l = l.tail) {
+			var phi = l.head, firstInstr = code[info(phi.block).start];
+
+			// define the live phis
+			firstInstr.useStart = uses.length;
+			var livePhis = definePhis(phi);
+			firstInstr.useEnd = uses.length; // update defs of first instruction
+
+			// add moves at control flow predecessors
+			if (livePhis != null) addPhiMoves(livePhis, phi.block.preds);
+		}
+	}
+	def definePhis(phi: SsaPhi) -> List<(SsaPhi, int)> {
+		// for each live phi in this block, define it at this instruction
+		var livePhis: List<(SsaPhi, int)>;
+		while (true) {
+			if (phi.mark >= context.graph.markGen) {
+				var vreg = vars[phi.mark - context.graph.markGen];
+				// define the phi at the beginning of the block
+				if (vreg.live) {
+					var defpos = dfnAt(vreg, 0);
+					livePhis = List.new((phi, defpos), livePhis);
+				}
+			}
+			var next = phi.next;
+			if (!SsaPhi.?(next)) break;
+			phi = SsaPhi.!(next);
+		}
+		return livePhis;
+	}
+	def addPhiMoves(livePhis: List<(SsaPhi, int)>, edges: Array<SsaCfEdge>) {
+		// for each incoming edge to this block
+		for (j < edges.length) {
+			var e = edges[j], endInstr = code[info(e.src.block()).end - 2];
+			if (endInstr.moves != null) failCriticalEdge(e);
+			if (e.src.succs.length > 1) failCriticalEdge(e);
+			var m = MachMoves.new();
+			endInstr.moves = m;
+			endInstr.useStart = uses.length;
+			// for each live phi
+			for (lp = livePhis; lp != null; lp = lp.tail) {
+				// use phi input at end of respective predecessor
+				var input = lp.head.0.inputs[j].dest, defpos = lp.head.1;
+				var phivar = makeVar(lp.head.0);
+				if (SsaConst.?(input)) {
+					// add a value move
+					m.valMoves = List.new((val(input), defpos), m.valMoves);
+				} else {
+					// add a var-var move, and a hint
+					var inputvar = makeVar(input);
+					m.varMoves = List.new((useAt(inputvar, 0), defpos), m.varMoves);
+					hintVar(inputvar, phivar);
+				}
+			}
+			endInstr.useEnd = uses.length;
+		}
+	}
+	def failCriticalEdge(e: SsaCfEdge) {
+		context.fail(Strings.format2("critical edge #%d -> #%d", e.src.uid, e.dest.uid));
+	}
+	def kill(fixed: int) -> int {
+		return record(KILL, -1, fixed);
+	}
+	def livePoint() -> int {
+		var lp = numLivePoints++;
+		record(LIVE, lp, 0);
+		return lp;
+	}
+	def useAt(v: VReg, fixed: int) -> int {
+		var usepos = record(USE, v.varNum, fixed);
+		if (v.isConst()) curValMoves = List.new((val(v.ssa), usepos), curValMoves);
+		return usepos;
+	}
+	def dfnAt(v: VReg, fixed: int) -> int {
+		return record(DEF, v.varNum, fixed);
+	}
+	def hintVar(src: VReg, dest: VReg) {
+		// XXX: record a register hint
+	}
+	def hint(src: SsaInstr, dest: VReg) {
+		// XXX: record a register hint
+	}
+	private def record(mode: int, num: int, fixed: int) -> int {
+		var pos = uses.length;
+		uses.put(mode | (num << VAR_SHIFT));
+		uses.put(fixed);
+		return pos;
+	}
+	def addInstr(i: MachInstr) -> MachInstr {
+		if (curValMoves != null) {
+			i.moves = MachMoves.new();
+			i.moves.valMoves = curValMoves;
+			curValMoves = null;
+		}
+		i.useStart = curUse;
+		i.useEnd = uses.length;
+		curUse = uses.length;
+		code.put(i);
+		return i;
+	}
+	def renderInstr(i: MachInstr, buf: StringBuilder) -> StringBuilder {
+		var p = buf.length;
+		if (!i.live) return buf; // nothing to print
+		buf.puts(i.name).pad(' ', p + 8);
+		for (j = i.useStart; j < i.useEnd; j = j + 2) {
+			buf.puts(" ");
+			renderUse(j, buf);
+		}
+		return buf;
+	}
+	def renderUse(use: int, buf: StringBuilder) {
+		var u = uses[use], vnum = u >>> VAR_SHIFT;
+		buf.puts(useType(u));
+		buf.putc(':');
+		if (vnum >= 0 && vnum < (-1 >>> VAR_SHIFT)) {
+			var v = vars[vnum];
+			if (v != null && v.ssa != null) buf.putc('@').putd(v.ssa.uid);
+			buf.putc('#').putd(vnum);
+		}
+		buf.putc('u').putd(use);
+		// render the constraint of the use
+		var fixed = uses[use + 1];
+		if (fixed != 0) {
+			if ((u & ASSIGNED_MASK) != 0) buf.putc('=');
+			else buf.putc('@');
+			buf.puts(frame.conv.regSet.identify(fixed));
+		}
+	}
+	def varOfUse(use: int) -> VReg {
+		return vars[uses[use] >>> VAR_SHIFT];
+	}
+	def useType(u: int) -> string {
+		u = u & TYPE_MASK;
+		if (u == USE) return "use";
+		if (u == DEF) return "def";
+		if (u == KILL) return "kill";
+		if (u == LIVE) return "live";
+		return "??";
+	}
+	def matchEdge(e: SsaDfEdge, optag: u8) -> bool {
+		return soleEdge(e) && e.dest.optag() == optag;
+	}
+	def soleEdge(e: SsaDfEdge) -> bool {
+		if (e.next != null) return false; // not the only use
+		var i = e.dest;
+		if (i.useList != e) return false; // not the only use
+		return inSameBlock(i);
+	}
+	def inSameBlock(i: SsaInstr) -> bool {
+		if (multiBlock) {
+			if (i.mark < context.graph.markGen) return false;
+			return vars[i.mark - context.graph.markGen].start >= curBlockStart;
+		}
+		return true;
+	}
+}

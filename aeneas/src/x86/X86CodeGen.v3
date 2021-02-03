@@ -36,16 +36,20 @@ def SHR_shifter = X86Shifter.new(Opcode.IntShr);
 def SAR_shifter = X86Shifter.new(Opcode.IntSar);
 def SHL_shifter = X86Shifter.new(Opcode.IntShl);
 
+enum X86KernelCallingConv { LINUX, DARWIN }
+
 // Generates X86 code from SSA-M32 form.
 // XXX: emit short branch instructions where possible
 // XXX: align loop headers to cache boundaries
 // XXX: schedule loads of constants for calls, phis, etc
 // XXX: remove use of scratch register
-class X86CodeGen extends MachCodeGen {
+class X86CodeGen extends OldCodeGen {
 	def scratchReg = X86MachRegs.SCRATCH;
 	var branches: List<(int, SsaBlock)>; // XXX: pull branches up to MachCodeGen?
 	var jumpTables: List<(int, Array<SsaCfEdge>)>;
 	var asm: X86MacroAssembler;
+	var allocStub: Addr;
+	var kernel: X86KernelCallingConv;
 
 	new(mach: MachProgram, context: SsaContext) super(mach, context) {
 		frame = MachFrame.new(X86VirgilCallConv.getForGraph(context.graph));
@@ -228,17 +232,11 @@ class X86CodeGen extends MachCodeGen {
 			PtrCmpSwp =>		root = genCmpSwp(i, v);
 			PtrAdd =>		genAdd(i, v);
 			PtrSub =>		genOp2("sub", i, v, X86Assembler.sub);
-			Alloc => {
-				rt.genAlloc(this, i, v);
-				root = true;
-			}
+			Alloc => 		root = genAlloc(i, v);
 			CallAddress(funcRep) =>		root = genCall(i, v, funcRep);
 			CallerIp =>		gen("caller-ip", asm_caller_ip, dfngpr(v));
 			CallerSp =>		gen("caller-sp", asm_caller_sp, dfn(v));
-			CallKernel => {
-				rt.genSystemOp(this, i, v);
-				root = true;
-			}
+			CallKernel => 		root = genCallKernel(i, v);
 		} else {
 			context.fail1("Unexpected opcode %s", i.op.opcode.name);
 		}
@@ -591,6 +589,24 @@ class X86CodeGen extends MachCodeGen {
 		gen("br", asm_brthrow, (cmp.cond, exception, i.source));
 		return true;
 	}
+	def genAlloc(i: SsaApplyOp, v: VReg) -> bool {
+		var size = i.input0();
+		def objLoc = X86MachRegs.EAX; // TODO: hard-coded calling conv
+		def sizeLoc = X86MachRegs.EAX; // TODO: hard-coded calling conv
+		if (allocStub != null) {
+			// generate a call to the allocation stub
+			dfnAt(v, objLoc);
+			var lp = if(mach.runtime.gc != null, livePoint());
+			kill(X86MachRegs.ALL);
+			useAt(makeVar(size), sizeLoc);
+			gen("alloc", asm_alloc_rt, (lp, i.source));
+		} else {
+			// generate inlined (test) allocation
+			hint(size, v);
+			gen("alloc", asm_alloc_test, (dfngpr(v), gpr(size), i.source));
+		}
+		return true;
+	}
 	def genCall(call: SsaApplyOp, rv: VReg, funcRep: Mach_FuncRep) -> bool {
 		var func = call.input0(), mi: MachInstr;
 		var conv = frame.allocCallerSpace(X86VirgilCallConv.getForFunc(funcRep));
@@ -618,6 +634,43 @@ class X86CodeGen extends MachCodeGen {
 			}
 			// generate an indirect call, {func} as last input
 			mi = gen("icall", asm_icall, (conv, lp, gpr(func), call.source));
+		}
+		return true;
+	}
+	def genCallKernel(sys: SsaApplyOp, rv: VReg) -> bool {
+		match (kernel) {
+			LINUX => {
+				// polymorphic system call: define EAX and EDX
+				dfnAt(rv, X86MachRegs.EAX);
+				// define second result in EDX
+				dfnAt(vars[rv.varNum + 1], X86MachRegs.EDX);
+				// accept system call number in EAX
+				useFixed(sys.input0(), X86MachRegs.EAX);
+				// accept arguments in registers according to kernel calling convention
+				for (i = 1; i < sys.inputs.length; i++) {
+					useFixed(sys.inputs[i].dest, LinuxModule.paramRegs[i - 1]);
+				}
+				gen("linux:int80", asm_int80, ());
+			}
+			DARWIN => {
+				var inputs = sys.inputs;
+				frame.allocOverflow((1 + inputs.length) * mach.data.addressSize);
+				// polymorphic system call: define EAX, EDX, and ECX = eflags
+				dfnAt(rv, X86MachRegs.EAX);
+				// define second result in EDX
+				dfnAt(vars[rv.varNum + 1], X86MachRegs.EDX);
+				// define third result in ECX
+				var flags = vars[rv.varNum + 2];
+				dfnAt(flags, X86MachRegs.ECX);
+				// accept system call number in EAX
+				useFixed(inputs[0].dest, X86MachRegs.EAX);
+				// accept arguments on callee's portion of stack of current frame
+				var start = frame.conv.regSet.calleeStart;
+				for (i = 1; i < inputs.length; i++) {
+					useFixed(inputs[i].dest, start + i);
+				}
+				gen("darwin:int80", asm_int80_flags, flags);
+			}
 		}
 		return true;
 	}
@@ -1245,6 +1298,31 @@ class X86CodeGen extends MachCodeGen {
 	}
 	def asm_wdiv(op: WideDivision, source: Source) {
 		asm.wdiv(op, source);
+	}
+	def asm_alloc_test(dest: int, sz: int, source: Source) {
+		// exchange-add [CiRuntime.heapCurLoc] with size
+		var rd = r(dest), ra = r(sz);
+		if (rd != ra) asm.movd_rm_r(rd, ra);
+		var pos = asm.pos();
+		asm.xadd(X86Addrs.ABS_PATCH, rd);
+		recordPatch(pos, CiRuntimeModule.HEAP_CUR_LOC);
+	}
+	def asm_alloc_rt(lp: int, source: Source) {
+		// call a shared allocation stub routine
+		asm.call_addr(allocStub);
+		var off = asm.codeOffset();
+		if (rtgc != null) rtgc.recordStackRefMap(off, source, buildStackMap(off, null, lp));
+		if (rtsrc != null) rtsrc.recordReturnSource(off, source);
+	}
+	def asm_int80() {
+		asm.intK(0x80);
+	}
+	def asm_int80_flags(flags: VReg) {
+		asm.intK(0x80);
+		if (flags.live) {
+			asm.pushfd();         // push flags
+			asm.pop(X86Regs.ECX); // pop flags into ECX
+		}
 	}
 	def asm_caller_ip(dst: int) {
 		var d = rm(dst);
