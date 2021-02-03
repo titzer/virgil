@@ -14,8 +14,8 @@ function do_aeneas_compile() {
 	local TARGET_DIR=$2/$3
 	local target=$3
 	mkdir -p $TARGET_DIR
+	echo "${CYAN}Compiling ($HOST_AENEAS -> $TARGET_DIR/Aeneas)...${NORM}"
 	print_status "Compiling ($4)" "$target"
-#	echo "${CYAN}Compiling ($HOST_AENEAS -> $TARGET_DIR/Aeneas)...${NORM}"
 
 	pushd ${VIRGIL_LOC} > /dev/null
 	local SRCS="aeneas/src/*/*.v3 $(cat aeneas/DEPS)"
@@ -40,12 +40,11 @@ for target in $TEST_TARGETS; do
     mkdir -p $OUT/after
     do_aeneas_compile "$AENEAS_TEST" $OUT/after $target " test "
 
-    diff -rq $OUT/before $OUT/after &> /dev/null
-    if [ $? ]; then
+    diff -rq $OUT/before/$target $OUT/after/$target &> /dev/null
+    if [ $? = 0 ]; then
 	printf "    matching | ${GREEN}ok${NORM}\n"
     else
 	printf "    matching | ${RED}failed${NORM}\n"
-        ls -al $OUT/$target/*/*
+        ls -al $OUT/{before,after}/$target/
     fi
-
 done
