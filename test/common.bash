@@ -185,8 +185,8 @@ function check_cached_target_tests() {
 	if [ -e $cached ]; then
 	    diff -q $cached $gen
 	    if [ "$?" = 0 ]; then
-		echo "##+$t"
-		echo "##-ok"
+		printf "##+$t\n"
+		printf "##-ok\n"
 		continue
 	    fi
 	fi
