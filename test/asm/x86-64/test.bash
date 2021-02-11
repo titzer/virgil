@@ -1,6 +1,6 @@
 #!/bin/bash
 
-. ../../common.bash x64-asm
+. ../../common.bash x86-64-asm
 
 S=${OUT}/test.s
 L=${OUT}/test.list
@@ -12,10 +12,10 @@ if [ -z "$NASM" ]; then
 fi
 
 LIB_UTIL="${VIRGIL_LOC}/lib/util/*.v3"
-LIB_ASM="${VIRGIL_LOC}/lib/asm/x64/*.v3"
+LIB_ASM="${VIRGIL_LOC}/lib/asm/x86-64/*.v3"
 
 printf "  Generating (int)..."
-run_v3c "" -run ./X64AssemblerTestGen.v3 $LIB_ASM $LIB_UTIL $@ > $S
+run_v3c "" -run ./X86_64AssemblerTestGen.v3 $LIB_ASM $LIB_UTIL $@ > $S
 if [ "$?" != 0 ]; then
     printf "\n"
     cat $S
