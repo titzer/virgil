@@ -3,8 +3,10 @@
 
 def INITIAL_BUF_SIZE = 300;
 
+def Regs: X86_64RegSet;
+
 class X86_64Backend extends MachBackend {
-//	var asm: X86_64MacroAssembler;
+	var asm: X86_64Assembler;
 	def test: bool;
 
 	def debugMach = Aeneas.PRINT_MACH.val != VstMatcher.None;
@@ -22,7 +24,7 @@ class X86_64Backend extends MachBackend {
 	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, test)
 		super(compiler, prog, mach, w) {
 
-//		asm = X86_64MacroAssembler.new(mach, w, w.end());
+		asm = X86_64Assembler.new(w);
 		if (allocStub) {
 			// initialize locations based on calling convention to RiRuntime.gc()
 			allocStubAddr = Address.new(mach.codeRegion, "alloc_stub");
@@ -34,12 +36,24 @@ class X86_64Backend extends MachBackend {
 				sizeLoc = frame.conv.calleeParam(1); // param 0 = "this"
 			} else {
 				// there is no appropriate RiRuntime.gc() method
-				objLoc = X86_64RegSet.RAX;
-				sizeLoc = X86_64RegSet.RAX;
+				objLoc = Regs.RAX;
+				sizeLoc = Regs.RAX;
 			}
 		}
 	}
 	def genMainEntry() { // TODO(x86-64)
+		var main = prog.getMain().asMethod();
+		var frame = getFrame(main.ssa);
+		// initialize runtime if necessary
+		genMainInit(frame);
+		if (test) genTestInputs(main, frame);
+		// call main
+//TODO		asm.call_addr(mach.addrOfMethod(main));
+		// write return value to stdout if this is a test
+		if (test) genTestOutput(frame);
+		// exit with the return value of main
+		if (main.sig.returnTypes.length == 0) return asm_exit_code(0);
+		asm_exit_r(loc_gpr(frame, frame.conv.callerRet(0)));
 	}
 	def genAllocStub() { // TODO(x86-64)
 	}
@@ -52,9 +66,77 @@ class X86_64Backend extends MachBackend {
 		genSigHandlerInstall(10, mach.runtime.getFatalAddress(V3Exception.NullCheck));
 		genSigHandlerInstall(11, mach.runtime.getFatalAddress(V3Exception.NullCheck));
 	}
-	def genMainInit(frame: MachFrame) { // TODO(x86-64)
+	def genMainInit(frame: MachFrame) {
+		// call RiRuntime.init() if it exists
+		if (mach.runtime.ri_init >= 0) return genRiInit(frame);
+		// if this is a test, install custom signal handlers
+		if (test) return genSigInstalls();
+		// TODO: remove compiler-generated initialization of args
+		if (frame.conv.paramTypes.length <= 1) return; // don't bother, main doesn't use it
+		// initialize arg array from OS-supplied argv and envp
+		var argc = X86_64Regs.RBX, argp = X86_64Regs.RBX, argArray = X86_64Regs.RDX;
+		var arrayType = V3Array.newType(mach.machType(V3.stringType));
+
+		asm.movq_r_m(argc, X86_64Regs.RSP.indirect());
+		asm.subq_r_i(argc, 1); // adjust for first arg
+		asmArrayAlloc(arrayType, argArray, argc);
+		asm.pushq_r(argArray); // save array on stack
+
+		asm.leaq(argArray, argArray.plus(mach.getArrayElemOffset(arrayType)));
+		asm.leaq(argp, X86_64Regs.RSP.plus(3 * mach.data.addressSize));
+
+		// loop over individual arguments
+		var loopStart = asm.pos();
+		var str = X86_64Regs.RDI, strlen = X86_64Regs.RCX;
+
+		// load the argument and test against null
+		asm.movq_r_m(str, argp.indirect());
+		asm.cmpq_r_i(str, 0);
+		asm.j(X86_64Conds.Z, 0);
+		var cmpPatch = asm.pos() - 1;
+
+		// compute length of string by finding null byte
+		asm.movq_r_i(strlen, -1);
+		asm.repne().scasb(); // updates EDI and ECX, kills EAX
+		asm.notq_r(strlen);
+		asm.decq_r(strlen);
+
+		// allocate a byte array of length strlen
+		var argString = X86_64Regs.RDI;
+		asmArrayAlloc(V3.stringType, argString, strlen);
+		asm.movq_m_r(argArray.indirect(), argString); // write into arg array
+
+		// copy data into array
+		asm.leaq(X86_64Regs.RDI, argString.plus(mach.getArrayElemOffset(V3.stringType)));
+		asm.movq_r_m(X86_64Regs.RSI, argp.indirect());
+		asm.repne().movsb();
+
+		// increment argp and argarray position
+		asm.addq_r_i(argArray, 4);
+		asm.addq_r_i(argp, 4);
+		var offset = loopStart - (asm.pos() + 2);
+		asm.j(X86_64Conds.ALWAYS, offset); // loop back to start
+
+		var offset2 = asm.pos() - cmpPatch - 1;
+		asm.w.at(cmpPatch).putb(offset2); // patch the branch that skips the loop
+		asm.w.atEnd();
+		asm.popq_r(loc_gpr(frame, frame.conv.callerParam(1)));
 	}
 	def genRiInit(frame: MachFrame) { // TODO(x86-64)
+	}
+	def asmArrayAlloc(arrayType: Type, dest: X86_64Gpr, len: X86_64Gpr) {
+		var scale = mach.getArrayElemScale(arrayType), align = (scale % mach.data.addressSize) != 0;
+		var adjust = if(align, mach.data.addressSize - 1, 0);
+		asm.leaq(dest, X86_64Addr.new(null, len, scale, mach.getArrayElemOffset(arrayType) + adjust));
+		if (align) asm.andq_r_i(dest, -1 ^ adjust);
+		asmAlloc(dest);
+		asm.movq_m_i(dest.indirect(), Int.unbox(mach.objectTag(arrayType)));
+		asm.movq_m_r(dest.plus(mach.getArrayLengthOffset(arrayType)), len);
+	}
+	def asmAlloc(reg: X86_64Gpr) {
+		// exchange-add with heap current pointer
+//TODO		asm.xadd(X86Addrs.ABS_PATCH, reg);
+		recordPatch(CiRuntimeModule.HEAP_CUR_LOC);
 	}
 	def recordPatch(addr: Addr) { // TODO(x86-64)
 	}
@@ -78,8 +160,29 @@ class X86_64Backend extends MachBackend {
 		}
 		w.at(pos).put_b32(abs);
 	}
+	def loc_gpr(frame: MachFrame, loc: int) -> X86_64Gpr {
+		match (loc) {
+			Regs.RAX => return X86_64Regs.RAX;
+			Regs.RBX => return X86_64Regs.RBX;
+			Regs.RCX => return X86_64Regs.RCX;
+			Regs.RDX => return X86_64Regs.RDX;
+			Regs.RSI => return X86_64Regs.RSI;
+			Regs.RDI => return X86_64Regs.RDI;
+			Regs.RBP => return X86_64Regs.RBP;
+			Regs.R8 => return X86_64Regs.R8;
+			Regs.R9 => return X86_64Regs.R9;
+			Regs.R10 => return X86_64Regs.R10;
+			Regs.R11 => return X86_64Regs.R11;
+			Regs.R12 => return X86_64Regs.R12;
+			Regs.R13 => return X86_64Regs.R13;
+			Regs.R14 => return X86_64Regs.R14;
+			Regs.R15 => return X86_64Regs.R15;
+		}
+		return V3.fail(Strings.format1("expected GPR, but got %s", frame.conv.regSet.identify(loc)));
+	}
 	// Methods overridden for each OS target
 	def genSigHandlerInstall(signo: int, handler: Addr);
+	def asm_exit_r(r: X86_64Gpr);
 	def asm_exit_code(code: int);
 //	def asm_exit_rm(loc: X86_64Rm);
 	def genTestOutput(frame: MachFrame);
