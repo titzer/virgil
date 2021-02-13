@@ -13,6 +13,7 @@ RUN_INT=${RUN_INT:=1}
 RUN_WASM=${RUN_WASM:=1}
 RUN_JVM=${RUN_JVM:=1}
 RUN_NATIVE=${RUN_NATIVE:=1}
+RUN_X86_64=${RUN_X86_64:=0}
 
 BLUE='[0;34m'
 GREEN='[0;32m'
@@ -239,5 +240,10 @@ function execute_tests() {
 	execute_target_tests x86-darwin
 	compile_target_tests x86-linux
 	execute_target_tests x86-linux
+    fi
+
+    if [ "$RUN_X86_64" = 1 ]; then
+	compile_target_tests x86-64-linux
+	execute_target_tests x86-64-linux
     fi
 }
