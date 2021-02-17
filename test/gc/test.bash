@@ -43,7 +43,11 @@ function do_test() {
     mv $T/Aeneas $T/Aeneas-gc
 
     print_status Testing "$target $HEAP" Aeneas
-    $T/Aeneas-gc -test -rma $VIRGIL_LOC/test/execute/*.v3 | tee $T/Aeneas-gc.test.out | $PROGRESS i
+    if [ -x $CONFIG/run-$target ]; then
+	$T/Aeneas-gc -test -rma $VIRGIL_LOC/test/execute/*.v3 | tee $T/Aeneas-gc.test.out | $PROGRESS i
+    else
+	echo "${YELLOW}skipped${NORM}"
+    fi
 }
 
 for target in $TEST_TARGETS; do
