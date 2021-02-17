@@ -14,7 +14,7 @@ TEST_TARGETS=""
 for target in $ALL_TEST_TARGETS; do
     if [ "$target" = int ]; then
 	continue # skip
-    elif [ "$target" = jvm ]; then
+    elif [[ "$target" = jvm || "$target" = jar ]]; then
 	continue # skip
     elif [ "$target" = wasm-js ]; then
 	continue # skip
