@@ -8,8 +8,20 @@ else
     TESTS=*.v3
 fi
 
-RUN_WASM=0 # TODO: PtrCmpSwp not supported in wasm
-RUN_JVM=0
-RUN_INT=0
+ALL_TEST_TARGETS=$TEST_TARGETS
+TEST_TARGETS=""
+
+for target in $ALL_TEST_TARGETS; do
+    if [ "$target" = int ]; then
+	continue # skip
+    elif [ "$target" = jvm ]; then
+	continue # skip
+    elif [ "$target" = wasm-js ]; then
+	continue # skip
+    else
+	TEST_TARGETS="$TEST_TARGETS $target"
+    fi
+done
+
 execute_tests
 exit $?

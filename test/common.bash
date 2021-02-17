@@ -9,12 +9,6 @@ done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 CONFIG=$DIR/config
 
-RUN_INT=${RUN_INT:=1}
-RUN_WASM=${RUN_WASM:=1}
-RUN_JVM=${RUN_JVM:=1}
-RUN_NATIVE=${RUN_NATIVE:=1}
-RUN_X86_64=${RUN_X86_64:=0}
-
 BLUE='[0;34m'
 GREEN='[0;32m'
 YELLOW='[0;33m'
@@ -40,6 +34,7 @@ N=$VIRGIL_LOC/rt/native
 NATIVE_SOURCES="$N/RiRuntime.v3 $N/NativeStackPrinter.v3 $N/NativeFileStream.v3"
 
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
+TEST_TARGETS=${TEST_TARGETS:="int jvm wasm-js x86-darwin x86-linux"}
 
 if [ ! -x "$AENEAS_TEST" ]; then
     echo $AENEAS_TEST: not found or not executable
@@ -62,9 +57,9 @@ function execute() {
 function print_status() {
     config=$(echo -n $2)
     if [ -z "$3" ]; then
-	printf "  %-13s %-12s | "   "$1" "$config"
+	printf "  %-13s %-13s | "   "$1" "$config"
     else
-	printf "  %-13s %-12s $3 | "  "$1" "$config"
+	printf "  %-13s %-13s $3 | "  "$1" "$config"
     fi
 }
 
@@ -129,12 +124,14 @@ function run_io_test() {
     local args="$3"
     local expected="$4"
 
-    if [[ "$HOST_PLATFORM" == "$target" || $target == "jar" && "$HOST_JAVA" != "" || $target == "wave" && "$HOST_WAVE" != "" || $target == "wave-nogc" && "$HOST_WAVE" != "" ]]; then
+    if [ -x $CONFIG/run-$target ]; then
 	P=$OUT/$target/$test.out
+	# TODO: use run-target to actually execute the IO test
 	$OUT/$target/$test $args &> $P
 	diff $expected $P > $OUT/$target/$test.diff
     else
-	echo "${YELLOW}skipped${NORM}"
+	echo "target $target ${YELLOW}skipped${NORM}"
+	return 1
     fi
 }
 
@@ -177,17 +174,17 @@ function check_cached_target_tests() {
     C=$TEST_CACHE/$SUITE/$target
     L=$OUT/$target/leftover
     count=$(echo $(echo $TESTS | wc -w))
+    ext=$1
     echo > $L
     echo "##>$count"
     for t in $TESTS; do
 	tf=${t/.v3/}
-	cached="$C/$tf"
-	gen="$T/$tf"
+	cached="$C/${tf}${ext}"
+	gen="$T/${tf}${ext}"
 	if [ -e $cached ]; then
 	    diff -q $cached $gen
 	    if [ "$?" = 0 ]; then
-		printf "##+$t\n"
-		printf "##-ok\n"
+		printf "##+$t\n##-ok\n"
 		continue
 	    fi
 	fi
@@ -201,7 +198,11 @@ function execute_target_tests() {
     R=$OUT/$target/run.out
     if [ -d "$TEST_CACHE/$SUITE/$target" ]; then
 	print_status "   cached" ""
-	check_cached_target_tests | tee $OUT/$target/cached.out | $PROGRESS i
+	ext=""
+	if [ "$target" = "wasm-js" ]; then
+	   ext=".wasm"
+	fi
+	check_cached_target_tests $ext | tee $OUT/$target/cached.out | $PROGRESS i
 	TORUN=$(cat $OUT/$target/leftover)
     else
 	TORUN="$TESTS"
@@ -220,30 +221,17 @@ function execute_target_tests() {
 }
 
 function execute_tests() {
-    if [ "$RUN_INT" = 1 ]; then
-	execute_int_tests "int" ""
-	execute_int_tests "int-ra" "-ra"
-    fi
-
-    if [ "$RUN_WASM" = 1 ]; then
-        compile_target_tests wasm-js
-        execute_target_tests wasm-js
-    fi
-
-    if [ "$RUN_JVM" = 1 ]; then
-        compile_target_tests jvm -jvm.script=false
-        execute_target_tests jvm
-    fi
-
-    if [ "$RUN_NATIVE" = 1 ]; then
-	compile_target_tests x86-darwin
-	execute_target_tests x86-darwin
-	compile_target_tests x86-linux
-	execute_target_tests x86-linux
-    fi
-
-    if [ "$RUN_X86_64" = 1 ]; then
-	compile_target_tests x86-64-linux
-	execute_target_tests x86-64-linux
-    fi
+    for target in $TEST_TARGETS; do
+	if [ "$target" = "int" ]; then
+	    execute_int_tests "int" ""
+	    execute_int_tests "int-ra" "-ra"
+	elif [ "$target" = "jvm" ]; then
+            compile_target_tests jvm -jvm.script=false
+            execute_target_tests jvm
+	    continue
+	else
+    	    compile_target_tests $target
+	    execute_target_tests $target
+	fi
+    done
 }

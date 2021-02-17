@@ -11,10 +11,6 @@ else
   BENCHMARKS=$(ls */*.v3 | cut -d/ -f1 | sort | uniq)
 fi
 
-target=$TEST_TARGET
-T=$OUT/$target
-mkdir -p $T
-
 function compile_benchmarks() {
     trace_test_count $#
     for t in $@; do
@@ -36,9 +32,29 @@ function run_benchmarks() {
 	trace_test_retval $?
     done
 }
+    
+function do_test() {
+    T=$OUT/$target
+    mkdir -p $T
 
-print_compiling $target
-compile_benchmarks $BENCHMARKS | tee $T/compile.out | $PROGRESS i
+    print_compiling $target
+    compile_benchmarks $BENCHMARKS | tee $T/compile.out | $PROGRESS i
 
-print_status Running $target
-run_benchmarks $BENCHMARKS | tee $T/run.out | $PROGRESS i
+    print_status Running $target
+    if [ ! -x $CONFIG/run-$target ]; then
+	echo "${YELLOW}skipped${NORM}"
+    else
+	run_benchmarks $BENCHMARKS | tee $T/run.out | $PROGRESS i
+    fi
+}
+
+for target in $TEST_TARGETS; do
+    if [ "$target" = int ]; then
+	continue
+    elif [ "$target" = wasm-js ]; then
+	continue
+    elif [ "$target" = jvm ]; then
+	target=jar
+    fi
+    do_test
+done

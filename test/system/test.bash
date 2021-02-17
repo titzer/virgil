@@ -2,10 +2,6 @@
 
 . ../common.bash system
 
-target=$TEST_TARGET
-T=$OUT/$target
-mkdir -p $T
-
 function do_test() {
     params="$2"
     exp="$3"
@@ -16,7 +12,7 @@ function do_test() {
     else printf "$exp" > $expect
     fi
     trace_test_start $1
-    if [ $compiled = 1 ]; then
+    if [ $int = 0 ]; then
 	run_io_test $target "${1%*.*}" "$params" "$expect"
     else
 	run_v3c "" -run $1 $params > $out
@@ -25,14 +21,16 @@ function do_test() {
     trace_test_retval $?
 }
 
+function run_sys_tests() {
+    if [[ $int = 0 && ! -x $CONFIG/run-$target ]]; then
+	echo "${YELLOW}skipped${NORM}"
+    else
+	do_tests | tee $T/run.out | $PROGRESS i
+    fi
+}
+
 function do_tests() {
 
-    if [ $1 = "int" ]; then
-	compiled=0
-    else
-	compiled=1
-    fi
-    
 do_test System_putc1.v3 "" "System.putc\n"
 do_test System_error1.v3 "" "!SystemError: with a message
 	in System_error1.main() [System_error1.v3 @ 3:29]\n\n"
@@ -81,19 +79,11 @@ do_test Params02.v3 "a b c" ""
 #	in main() [System_fileWriteK_oob3.v3 @ 4:26]\n\n"
 }
 
-function run_tests() {
-    print_status Running $1
-
-    do_tests $1 | tee $T/run.$1.out | $PROGRESS i
-}
-
 if [ $# -gt 0 ]; then
   TESTS=$*
 else
   TESTS=*.v3
 fi
-
-run_tests int
 
 function compile_sys_tests() {
     trace_test_count $#
@@ -104,7 +94,27 @@ function compile_sys_tests() {
     done
 }
 
-print_status Compiling $target
-compile_sys_tests $TESTS | tee $T/compile.out | $PROGRESS i
+for target in $TEST_TARGETS; do
+    int=0
+    if [ "$target" = "int" ]; then
+	int=1
+	T=$OUT/$target
+	mkdir -p $T
+	print_status Running $target
+	do_tests | tee $T/run.out | $PROGRESS i
+	continue
+    elif [ "$target" = "wasm-js" ]; then
+	continue # skip
+    elif [ "$target" = "jvm" ]; then
+	target=jar
+    fi
 
-run_tests $target
+    # compile+run
+    T=$OUT/$target
+    mkdir -p $T
+
+    print_status Compiling $target
+    compile_sys_tests $TESTS | tee $T/compile.out | $PROGRESS i
+    print_status Running $target
+    run_sys_tests
+done
