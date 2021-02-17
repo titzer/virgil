@@ -29,10 +29,16 @@ function do_aeneas_compile() {
 	fi
 }
 
-TEST_TARGETS="x86-linux x86-darwin jar"
 TEST_HOST=jar
 
 for target in $TEST_TARGETS; do
+    if [ "$target" = "int" ]; then
+	continue # skip
+    elif [ "$target" = "wasm-js" ]; then
+	continue # TODO: wasm-js bootstrap
+    elif [ "$target" = "jvm" ]; then
+	target=jar
+    fi
 
     mkdir -p $OUT/before
     do_aeneas_compile "$VIRGIL_LOC/bin/stable/$TEST_HOST/Aeneas" $OUT/before $target "stable"

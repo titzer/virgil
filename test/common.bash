@@ -225,7 +225,7 @@ function execute_tests() {
 	if [ "$target" = "int" ]; then
 	    execute_int_tests "int" ""
 	    execute_int_tests "int-ra" "-ra"
-	elif [ "$target" = "jvm" ]; then
+	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             compile_target_tests jvm -jvm.script=false
             execute_target_tests jvm
 	    continue

@@ -52,7 +52,7 @@ for target in $TEST_TARGETS; do
     elif [ "$target" = "jvm" ]; then
 	continue
     elif [ "$target" = "wasm-js" ]; then
-	continue
+	continue # TODO: gc tests for wasm
     elif [ "$target" = "x86-darwin" ]; then
 	RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/darwin/*.v3 $VIRGIL_LOC/rt/gc/*.v3"
 	do_test
