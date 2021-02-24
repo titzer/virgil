@@ -35,6 +35,7 @@ def I_FLDD	= 0x2E;		def I_FLDQ	= 0x3E;
 def I_CVTSS2SI 	= 0x2F;		def I_CVTSD2SI 	= 0x3F;
 
 def I_CVTSI2SS 	= 0x40;		def I_CVTSI2SD 	= 0x50;
+def I_FSTPD	= 0x41;		def I_FSTPQ	= 0x51;
 
 def I_THROW	= 0x43;
 def I_THROWC	= 0x44;
@@ -50,7 +51,6 @@ def I_JMP	= 0x4D;
 def I_JC	= 0x4E;
 def I_SETC	= 0x4F;
 
-def I_FISTTPQ 	= 0x52;
 def I_CMPXCHG8		= 0x53;
 def I_CMPXCHG16		= 0x54;
 def I_CMPXCHG32		= 0x55;
@@ -59,6 +59,9 @@ def I_CALL		= 0x57;
 def I_CALLER_IP		= 0x58;
 def I_CALLER_SP		= 0x59;
 def I_TEST_ALLOC	= 0x5A;
+def I_FILDQ	= 0x5B;
+def I_FISTTPQ 	= 0x5C;
+def I_CMPB	= 0x5D;
 
 def I_QD_DIFF = I_ADDQ - I_ADDD; // Used to compute 64-bit opcode from 32-bit opcode
 
@@ -145,12 +148,12 @@ class SsaX86_64Gen extends SsaMachGen {
 				var rcl = if(is64, RegClass.F64, RegClass.F32);
 				match (it.rank) {
 					SUBU32, SUBI32, I32 => {
-						// use cvtsd2si
+						// signed 32 bit integers can use cvtsd2si
 						emit2(if(is64, I_CVTSD2SI, I_CVTSS2SI) | (AM_REG_XMM << AM_SHIFT), dfnReg(i), useReg(i.input0()));
 					}
 					U32, SUBI64, SUBU64, I64 => {
-						// FLD/FISTTQ to convert to signed 64-bit
-						var s1 = frame.allocSpill(rcl);
+						// signed 64 bit integers need FLD/FISTTQ
+						var s1 = frame.getTmpSpill(rcl);
 						emit1(if(is64, I_FLDQ, I_FLDD) | (AM_OP << AM_SHIFT), useFixed(i.input0(), s1));
 						emit1(I_FISTTPQ | (AM_OP << AM_SHIFT), dfnFixed(i, s1));
 					}
@@ -161,10 +164,29 @@ class SsaX86_64Gen extends SsaMachGen {
 			}
 			FloatPromoteI(is64) => {
 				var it = IntType.!(i.op.typeArgs[0]);
-				var opcode = if(is64, I_CVTSI2SD, I_CVTSI2SS);
 				match (it.rank) {
-					SUBI32, I32 => emit2(opcode | (AM_XMM_REG << AM_SHIFT), dfnReg(i), useReg(i.input0()));
-					_ => context.fail("unimplemented FloatPromoteI"); //TODO
+					SUBI32, SUBU32, I32 => {
+						var opcode = if(is64, I_CVTSI2SD, I_CVTSI2SS);
+						emit2(opcode | (AM_XMM_REG << AM_SHIFT), dfnReg(i), useReg(i.input0()));
+					}
+					U32 => {
+						var t1 = newTmp(Int.getType(false, 64));
+						// zero-extend u32 to u64
+						emit2(I_MOVD | (AM_REG_OP << AM_SHIFT), dfnv(t1, Regs.GPR_CLASS), use(i.input0()));
+						var rcl = RegClasses.fromType(i.op.typeArgs[1]);
+						var s1 = frame.getTmpSpill(rcl); // FPU must use stack slot
+						emit1(I_FILDQ | (AM_OP << AM_SHIFT), usev(t1, s1));
+						emit1(if(is64, I_FSTPQ, I_FSTPD) | (AM_OP << AM_SHIFT), dfnFixed(i, s1));
+					}
+					SUBI64, SUBU64, I64 => {
+						var rcl = RegClasses.fromType(i.op.typeArgs[1]);
+						var s1 = frame.getTmpSpill(rcl); // FPU must use stack slot
+						emit1(I_FILDQ | (AM_OP << AM_SHIFT), useFixed(i.input0(), s1));
+						emit1(if(is64, I_FSTPQ, I_FSTPD) | (AM_OP << AM_SHIFT), dfnFixed(i, s1));
+					}
+					U64 => {
+						context.fail("unimplemented FloatPromoteI<u64>"); //TODO
+					}
 				}
 			}
 			IntViewF(is64) => {
@@ -183,7 +205,6 @@ class SsaX86_64Gen extends SsaMachGen {
 			PtrLteq => {
 				var cmp = matchCmp(i, false);
 				emitCmp(cmp);
-				// TODO: zero-extend?
 				emit1(ArchInstrs.FLAG_NO_GAP | I_SETC | encodeCond(cmp.cond), dfnFixed(i, Regs.GPR_CLASS));
 			}
 			FloatAdd(is64) => doFloatBinop(i, if(is64, I_ADDSD, I_ADDSS));
@@ -387,15 +408,18 @@ class SsaX86_64Gen extends SsaMachGen {
 		return emitN(selectWidth(i, if(it.signed, I_IDIVD, I_DIVD)));
 	}
 	def selectWidth(i: SsaApplyOp, op: int) -> int {
-		return if(isInt64(i), op + I_QD_DIFF, op);
+		return if(intOpWidth(i) > 32, op + I_QD_DIFF, op);
 	}
-	def isInt64(i: SsaApplyOp) -> bool {
+	def intOpWidth(i: SsaApplyOp) -> byte {
 		// XXX: factor this out and clean it up
 		var t = i.op.typeArgs[0];
-		if (IntType.?(t)) return IntType.!(t).width > 32;
-		if (t.typeCon.kind == V3Kind.ENUM) return false;
-		if (t.typeCon.kind == V3Kind.ENUM_SET) return V3.getEnumSetType(t).width > 32;
-		return true;
+		if (IntType.?(t)) return IntType.!(t).width;
+		if (t.typeCon.kind == V3Kind.ENUM) return 32;
+		if (t.typeCon.kind == V3Kind.ENUM_SET) return V3.getEnumSetType(t).width;
+		return 64;
+	}
+	def intOpSize(i: SsaApplyOp) -> byte {
+		return byte.view((7 + intOpWidth(i)) >> 3);
 	}
 	def emitCall(call: SsaApplyOp, funcRep: Mach_FuncRep) {
 		var func = call.input0(), mi: MachInstr;
@@ -603,7 +627,9 @@ class SsaX86_64Gen extends SsaMachGen {
 		emit2(opcode | (AM_XMM_OP << AM_SHIFT), ovwv(d, u, reg), use(i.input1()));
 	}
 	def emitCmp(cmp: X86_64CmpMatch) {
-		var opcode = if(cmp.is64, I_CMPQ, I_CMPD);
+		var opcode = I_CMPB;
+		if (cmp.size > 4) opcode = I_CMPQ;
+		else if (cmp.size > 1) opcode = I_CMPD;
 		useReg(cmp.x); // XXX: don't use reg if can use immediate for y
 		if (tryUseImm32(cmp.y)) {
 			emitN(opcode | (AM_OP_IMM << AM_SHIFT));
@@ -755,6 +781,9 @@ class SsaX86_64Gen extends SsaMachGen {
 			I_FLDD => asm.fldd(a);
 			I_FLDQ => asm.fldq(a);
 			I_FISTTPQ => asm.fisttpq(a);
+			I_FILDQ => asm.fildq(a);
+			I_FSTPD => asm.fstpd(a);
+			I_FSTPQ => asm.fstpq(a);
 			_ => return invalidOpcode(opcode);
 		}
 	}
@@ -767,6 +796,7 @@ class SsaX86_64Gen extends SsaMachGen {
 			I_SUBD => asm.subd_r_r(a, b);
 			I_XORD => asm.xord_r_r(a, b);
 			I_CMPD => asm.cmpd_r_r(a, b);
+			I_CMPB => asm.cmpb_r_r(a, b);
 			I_MULD => asm.imuld_r_r(a, b);
 			I_CDQ => asm.cdq();
 
@@ -841,6 +871,7 @@ class SsaX86_64Gen extends SsaMachGen {
 			I_SUBD => asm.subd_m_r(a, b);
 			I_XORD => asm.xord_m_r(a, b);
 			I_CMPD => asm.cmpd_m_r(a, b);
+			I_CMPB => asm.cmpb_m_r(a, b);
 			I_TESTD => asm.testd_m_r(a, b);
 
 			I_ADDQ => asm.addq_m_r(a, b);
@@ -895,6 +926,7 @@ class SsaX86_64Gen extends SsaMachGen {
 			I_SUBD => asm.subd_r_m(a, b);
 			I_XORD => asm.xord_r_m(a, b);
 			I_CMPD => asm.cmpd_r_m(a, b);
+			I_CMPB => asm.cmpb_r_m(a, b);
 			I_TESTD => asm.testq_r_m(a, b);
 
 			I_ADDQ => asm.addq_r_m(a, b);
@@ -933,6 +965,7 @@ class SsaX86_64Gen extends SsaMachGen {
 			I_SUBD => asm.subd_m_i(a, b);
 			I_XORD => asm.xord_m_i(a, b);
 			I_CMPD => asm.cmpd_m_i(a, b);
+			I_CMPB => asm.cmpb_m_i(a, b);
 			I_TESTD => asm.testd_m_i(a, b);
 
 			I_ADDQ => asm.addq_m_i(a, b);
@@ -964,6 +997,7 @@ class SsaX86_64Gen extends SsaMachGen {
 			I_SUBD => asm.subd_r_i(a, b);
 			I_XORD => asm.xord_r_i(a, b);
 			I_CMPD => asm.cmpd_r_i(a, b);
+			I_CMPB => asm.cmpb_r_i(a, b);
 			I_MULD => asm.imuld_r_i(a, b);
 			I_SHLD => asm.shld_r_i(a, u5.view(b));
 			I_SARD => asm.sard_r_i(a, u5.view(b));
@@ -1109,28 +1143,28 @@ class SsaX86_64Gen extends SsaMachGen {
 	}
 
 	def matchCmp(i: SsaInstr, inblock: bool) -> X86_64CmpMatch {
-		if ((inblock && !inSameBlock(i)) || !SsaApplyOp.?(i)) return X86_64CmpMatch.new(false, Conds.NZ, i, null);
+		if ((inblock && !inSameBlock(i)) || !SsaApplyOp.?(i)) return X86_64CmpMatch.new(1, Conds.NZ, i, null);
 		var apply = SsaApplyOp.!(i);
 		match (apply.op.opcode) {
-			BoolEq => 	return newCmp(false, i, Conds.Z);
-			RefEq =>	return newCmp(mach.refSize == 64, i, Conds.Z);
-			IntEq => 	return newCmp(isInt64(apply), i, Conds.Z);
-			IntLt =>	return newCmp(isInt64(apply), i, signedCmp(i, Conds.L, Conds.C));
-			IntLteq =>	return newCmp(isInt64(apply), i, signedCmp(i, Conds.LE, Conds.NA));
-			PtrLt =>	return newCmp(true, i, Conds.C);
-			PtrLteq =>	return newCmp(true, i, Conds.NA);
+			BoolEq => 	return newCmp(1, i, Conds.Z);
+			RefEq =>	return newCmp(mach.refSize, i, Conds.Z);
+			IntEq => 	return newCmp(intOpSize(apply), i, Conds.Z);
+			IntLt =>	return newCmp(intOpSize(apply), i, signedCmp(i, Conds.L, Conds.C));
+			IntLteq =>	return newCmp(intOpSize(apply), i, signedCmp(i, Conds.LE, Conds.NA));
+			PtrLt =>	return newCmp(8, i, Conds.C);
+			PtrLteq =>	return newCmp(8, i, Conds.NA);
 			BoolNot => 	return matchCmp(i.input0(), inblock).negate();
 			_ => ;
 		}
-		return X86_64CmpMatch.new(false, Conds.NZ, i, null);
+		return X86_64CmpMatch.new(1, Conds.NZ, i, null);
 	}
 	def signedCmp(i: SsaInstr, signed: X86_64Cond, unsigned: X86_64Cond) -> X86_64Cond {
 		return if(V3.isSigned(SsaApplyOp.!(i).op.sig.paramTypes[0]), signed, unsigned);
 	}
-	def newCmp(is64: bool, i: SsaInstr, cond: X86_64Cond) -> X86_64CmpMatch {
+	def newCmp(size: byte, i: SsaInstr, cond: X86_64Cond) -> X86_64CmpMatch {
 		var x = i.input0(), y = i.input1();
-		if (SsaConst.?(x) && cond.commute != null) return X86_64CmpMatch.new(is64, cond.commute, y, x);
-		return X86_64CmpMatch.new(is64, cond, x, y);
+		if (SsaConst.?(x) && cond.commute != null) return X86_64CmpMatch.new(size, cond.commute, y, x);
+		return X86_64CmpMatch.new(size, cond, x, y);
 	}
 
 	def frameAdjust() -> int {
@@ -1202,6 +1236,7 @@ class X86InstrBuffer extends ArchInstrBuffer {
 			I_ANDD => name = "andd";
 			I_SUBD => name = "subd";
 			I_CMPD => name = "cmpd";
+			I_CMPB => name = "cmpb";
 			I_MULD => name = "imuld";
 			I_DIVD => name = "divd";
 			I_IDIVD => name = "idivd";
@@ -1238,6 +1273,9 @@ class X86InstrBuffer extends ArchInstrBuffer {
 			I_FLDD => name = "fldd";
 			I_FLDQ => name = "fldq";
 			I_FISTTPQ => name = "fisttpq";
+			I_FILDQ => name = "fildq";
+			I_FSTPD => name = "fstpd";
+			I_FSTPQ => name = "fstpq";
 			I_MOVB => name = "movb";
 			I_MOVBSX => name = "movbsx";
 			I_MOVBZX => name = "movbzx";
@@ -1365,10 +1403,10 @@ class X86InstrBuffer extends ArchInstrBuffer {
 }
 // Pattern match of a comparison between two vars or a var and a constant
 class X86_64CmpMatch {
-	def is64: bool;
+	def size: byte;
 	def cond: X86_64Cond;
 	def x: SsaInstr;
 	def y: SsaInstr;
-	new(is64, cond, x, y) { }
-	def negate() -> X86_64CmpMatch { return X86_64CmpMatch.new(is64, cond.negate, x, y); }
+	new(size, cond, x, y) { }
+	def negate() -> X86_64CmpMatch { return X86_64CmpMatch.new(size, cond.negate, x, y); }
 }
