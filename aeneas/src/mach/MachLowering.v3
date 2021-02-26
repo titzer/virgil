@@ -33,6 +33,11 @@ class MachLoweringConfig {
 	var ImplicitNullChecks = true;	 // nullchecks implicit with loads+stores
 	var ExplicitDivChecks = false;	 // insert explicit maxint / -1 checks
 	var ExplicitModChecks = false;	 // insert explicit maxint % -1 checks
+	var IntConvertFUnsigned = true;	 // native support for unsigned float conversions
+	var IntConvertFMapsNanToZero = true;
+	var IntConvertFPosSaturates = true; // proper positive saturation
+	var IntConvertFNegSaturates = true; // proper negative saturation
+	var FloatPromoteU64 = true;
 	var IntCastFTraps = false;	 // IntCastF machine instruction traps
 
 	def getArithWidth(tt: IntType) -> ArithWidth {
@@ -832,8 +837,9 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var rangeChecks = !oi.facts.O_NO_BOUNDS_CHECK;
 		if (rangeChecks) {
 			match (itt.rank) {
-				SUBI32, SUBI64, SUBU32, SUBU64 => rangeChecks = true;
-				_ => rangeChecks = !config.IntCastFTraps;
+				SUBI32, SUBI64, SUBU32, SUBU64 => rangeChecks = true; // all subword types
+				U32, U64 => rangeChecks = !config.IntConvertFUnsigned || !config.IntCastFTraps; // other unsigned
+				I32, I64 => rangeChecks = !config.IntCastFTraps; // if hardware can't trap
 			}
 		}
 		curBlock.at(oi.source);
@@ -881,6 +887,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var x = oi.input0();
 		var ni: SsaInstr;
 		var f = context.graph.falseConst();
+		// NB: queries always need boundary checks to avoid {int.max+1 -(saturate)-> int.max -(round)-> int.max+1}
 		if (itt.signed) {
 			// IntTruncF<F,iNN>(x) => if(x >= maxf, false, if(x < minf, false, IntPromote<iWW, F>(IntTruncF<F,iWW>(x)) == x))
 			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
@@ -894,17 +901,33 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			curBlock = split.finish();
 			var phi = split.addPhi(Bool.TYPE, [f, f, cmp]);
 			map1(oi, phi);
-		} else {
-			// IntTruncF<F,uNN>(x) => if(x >= maxf, maxi, IntTruncF<F,uWW>(x))
-			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
+			return;
+		}
+		if (!config.IntConvertFUnsigned) { // TODO: u64
+			// IntQueryF<F,uNN>(x) => if(x >= 0, if(x >= maxf, false, IntTruncFEqual<F,uWW>(x)), false)
 			var split = SsaBlockSplit.new(context, curBlock);
+			var fzero = context.graph.nullConst(ft);
+			curBlock = split.addIfNot(curBlock.addApply(null, ftc.cache.opGteq, [x, fzero]));
+			curBlock = split.addElse();
+			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
 			curBlock = split.addIf(curBlock.addApply(null, ftc.cache.opGteq, [x, maxf]));
 			curBlock = split.addElse();
 			var cmp = genIntTruncFEqual(oi.source, ft, ett, x);
 			curBlock = split.finish();
-			var phi = split.addPhi(Bool.TYPE, [f, cmp]);
+			var zfalse = context.graph.falseConst();
+			var phi = split.addPhi(Bool.TYPE, [zfalse, zfalse, cmp]);
 			map1(oi, phi);
+			return;
 		}
+		// IntTruncF<F,uNN>(x) => if(x >= maxf, maxi, IntTruncF<F,uWW>(x))
+		var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
+		var split = SsaBlockSplit.new(context, curBlock);
+		curBlock = split.addIf(curBlock.addApply(null, ftc.cache.opGteq, [x, maxf]));
+		curBlock = split.addElse();
+		var cmp = genIntTruncFEqual(oi.source, ft, ett, x);
+		curBlock = split.finish();
+		var phi = split.addPhi(Bool.TYPE, [f, cmp]);
+		map1(oi, phi);
 	}
 	def mostlyRoundUpIntType(it: IntType) -> IntType {
 		match (it.rank) {
@@ -927,41 +950,78 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var ett = mostlyRoundUpIntType(itt), tn = normIntType(ett);
 		var x = oi.input0();
 		var ni: SsaInstr;
+		if (!config.IntConvertFUnsigned && !itt.signed) {
+			// IntTruncF<F,uNN>(x) => if(x > 0, if(x >= maxf, maxi, IntTruncF<F,uWW>(x)), 0)
+			var split = SsaBlockSplit.new(context, curBlock);
+			var fzero = context.graph.nullConst(ft);
+			curBlock = split.addIfNot(curBlock.addApply(null, ftc.cache.opGt, [x, fzero]));
+			curBlock = split.addElse();
+			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
+			curBlock = split.addIf(curBlock.addApply(null, ftc.cache.opGteq, [x, maxf]));
+			var maxi = context.graph.valConst(ett, itt.max);
+			curBlock = split.addElse();
+			var truncs = wideOutputs(V3Op.newIntTruncF(ft, ett), tn, [x], Fact.O_NO_BOUNDS_CHECK);
+			curBlock = split.finish();
+			var izero = context.graph.nullConst(itt);
+			var phis = addPhis(curBlock, ett, tn, [wideConsts(tn, izero), wideConsts(tn, maxi), truncs]);
+			mapN(oi, phis);
+			return;
+		}
+		var rangeCheckNeg: bool, rangeCheckPos: bool, checkNan = !config.IntConvertFMapsNanToZero;
 		match (itt.rank) {
 			SUBI32, SUBI64 => {
-				// IntTruncF<F,iNN>(x) => if(x >= maxf, maxi, if(x < minf, mini, IntTruncF<F,iWW>(x)))
-				var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
-				var split = SsaBlockSplit.new(context, curBlock);
-				curBlock = split.addIf(curBlock.addApply(null, ftc.cache.opGteq, [x, maxf]));
-				var maxi = context.graph.valConst(ett, itt.max);
-				curBlock = split.addElse();
-				var minf = context.graph.valConst(ft, ftc.min(itt));
-				curBlock = split.addIf(curBlock.addApply(null, ftc.cache.opLt, [x, minf]));
-				var mini = context.graph.valConst(ett, itt.min);
-				curBlock = split.addElse();
-				var truncs = wideOutputs(V3Op.newIntTruncF(ft, ett), tn, [x], Fact.O_NO_BOUNDS_CHECK);
-				curBlock = split.finish();
-				var phis = addPhis(curBlock, ett, tn, [wideConsts(tn, maxi), wideConsts(tn, mini), truncs]);
-				mapN(oi, phis);
+				rangeCheckPos = !oi.facts.O_NO_BOUNDS_CHECK;
+				rangeCheckNeg = !oi.facts.O_NO_BOUNDS_CHECK && !oi.facts.O_NO_NEGATIVE_CHECK;
+			}
+			I32, I64 => {
+				rangeCheckPos = !config.IntConvertFPosSaturates;
+				rangeCheckNeg = !config.IntConvertFNegSaturates;
 			}
 			SUBU32, SUBU64 => {
-				// IntTruncF<F,iNN>(x) => if(x >= maxf, maxi, IntTruncF<F,iWW>(x))
-				var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
-				var split = SsaBlockSplit.new(context, curBlock);
-				curBlock = split.addIf(curBlock.addApply(null, ftc.cache.opGteq, [x, maxf]));
-				var maxi = context.graph.valConst(ett, itt.max);
-				curBlock = split.addElse();
-				var truncs = wideOutputs(V3Op.newIntTruncF(ft, ett), tn, [x], Fact.O_NO_BOUNDS_CHECK);
-				curBlock = split.finish();
-				var phis = addPhis(curBlock, ett, tn, [wideConsts(tn, maxi), truncs]);
-				mapN(oi, phis);
+				rangeCheckPos = !oi.facts.O_NO_BOUNDS_CHECK;
+				// assume that hardware does >= 0 check
 			}
-			_ => {
-				oi.facts |= Fact.O_NO_BOUNDS_CHECK;
-				var results = wideOutputs(oi.op, tn, [x], Fact.O_NO_BOUNDS_CHECK);
-				mapN(oi, results);
+			U32, U64 => {
+				rangeCheckPos = !config.IntConvertFPosSaturates;
 			}
 		}
+
+		if (!rangeCheckNeg && !rangeCheckPos && !checkNan) {
+			// target instruction does everything right
+			oi.facts |= Fact.O_NO_BOUNDS_CHECK;
+			var results = wideOutputs(oi.op, tn, [x], Fact.O_NO_BOUNDS_CHECK);
+			mapN(oi, results);
+			return;
+		}
+		// at least one check is required.
+		var results = Vector<Array<SsaInstr>>.new(); // collect cases
+		var split = SsaBlockSplit.new(context, curBlock);
+		if (checkNan) {
+			curBlock = split.addIfNot(curBlock.addApply(null, ftc.cache.opEqual, [x, x]));
+			var izero = context.graph.nullConst(itt);
+			results.put(wideConsts(tn, izero));
+			curBlock = split.addElse();
+		}
+		if (rangeCheckNeg) {
+			var minf = context.graph.valConst(ft, ftc.min(itt));
+			curBlock = split.addIf(curBlock.addApply(null, ftc.cache.opLt, [x, minf]));
+			var mini = context.graph.valConst(ett, itt.min);
+			results.put(wideConsts(tn, mini));
+			curBlock = split.addElse();
+		}
+		if (rangeCheckPos) {
+			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
+			curBlock = split.addIf(curBlock.addApply(null, ftc.cache.opGteq, [x, maxf]));
+			var maxi = context.graph.valConst(ett, itt.max);
+			results.put(wideConsts(tn, maxi));
+			curBlock = split.addElse();
+		}
+		// finally, do the actual truncation
+		var truncs = wideOutputs(V3Op.newIntTruncF(ft, ett), tn, [x], Fact.O_NO_BOUNDS_CHECK);
+		results.put(truncs);
+		curBlock = split.finish();
+		var phis = addPhis(curBlock, ett, tn, results.extract());
+		mapN(oi, phis);
 	}
 	def wideConsts(tn: TypeNorm, v: SsaConst) -> Array<SsaInstr> {
 		if (tn == null || tn.size == 1) return [v];
@@ -1536,7 +1596,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return context.graph.valConst(mach.data.ptrType, mach.componentFieldPtr(f));
 	}
 	def addIfNull(x: SsaInstr) -> (SsaBuilder, SsaBuilder, SsaBuilder) {
-		var t = splitCurBlock();
+		var t = splitCurBlock(); // XXX: switch to using SsaBlockSplit
 		curBlock.addIfNull(x, t.0.block, t.1.block);
 		return t;
 	}
