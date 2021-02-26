@@ -355,19 +355,15 @@ public class V3S_System {
     }
 
     public static double round_ul2d(long v) {
-	if (v < 0) {
-	    long r = (v >>> 1) | (v & 1); // copy lost bit for proper rounding
-	    return 2.0 * (double)r;
-	}
-	return (double)v;
+	double r = (double)v;
+	if (v < 0) return r + 0x1p64;
+	return r;
     }
 
     public static float round_ul2f(long v) {
-	if (v < 0) {
-	    long r = (v >>> 1) | (v & 1); // copy lost bit for proper rounding
-	    return 2.0f * (float)r;
-	}
-	return (float)v;
+	float r = (float)v;
+	if (v < 0) return r + 0x1p64f;
+	return r;
     }
 
     public static long cast_d2l(double v, double min, double max) {
