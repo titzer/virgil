@@ -1,6 +1,6 @@
 #!/bin/bash
 
-. ../common.bash pointer
+. ../common.bash ptr32
 
 if [ $# -gt 0 ]; then
     TESTS="$@"
