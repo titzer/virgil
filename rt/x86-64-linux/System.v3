@@ -1,0 +1,140 @@
+// Copyright 2021 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implementation of the "System" component for Linux, using the underlying
+// Linux methods.
+
+// XXX: not thread-safe
+// XXX: use on-stack storage for small IO buffers
+// XXX: what about GC moving arrays during IO operations?
+// XXX: merge common code with darwin/System.v3 into a common Posix implementation
+component System {
+	// @thread-local @static buffer for gettimeofday
+	var timeval = Array<long>.new(2);
+	// @thread-local @static buffer for fstat
+	var statbuf = Array<int>.new(LinuxConst.STAT_BUF_SIZE);
+	// @thread-local @lazy buffer for path that don't have space for a null
+	var pathbuf = Array<byte>.new(100);
+	// the standard output stream
+	def out = linuxFileStream(LinuxConst.STDOUT);
+	// the standard input stream
+	def err = linuxFileStream(LinuxConst.STDERR);
+	// the method that can print a stack trace
+	var printStack: (Pointer, Pointer) -> void;
+
+	// change the permissions of a file
+	def chmod(fileName: string, mode: int) {
+		Linux.syscall(LinuxConst.SYS_chmod, (pathName(fileName), mode));
+	}
+	// open a file
+	def fileOpen(fileName: string, read: bool) -> int {
+		var mode = if(read, LinuxConst.O_RDONLY, LinuxConst.O_WRONLY | LinuxConst.O_TRUNC | LinuxConst.O_CREAT);
+		var fd = Linux.syscall(LinuxConst.SYS_open, (pathName(fileName), mode, 420)).0;
+		return if(fd >= 0, int.view(fd), -1);
+	}
+	// close a file
+	def fileClose(fd: int) {
+		Linux.syscall(LinuxConst.SYS_close, fd);
+	}
+	// read a single byte from a file
+	def fileRead(fd: int) -> int {
+		var r = Linux.syscall(LinuxConst.SYS_read, (fd, Pointer.atContents(out.iobuf), 1)).0;
+		return if(r == 1, out.iobuf[0], -1);
+	}
+	// write some bytes to the file
+	def fileWriteK(fd: int, data: Array<byte>, offset: int, len: int) {
+		boundsCheck(data, offset, len);
+		var buf = Pointer.atContents(data) + offset;
+		Linux.syscall(LinuxConst.SYS_write, (fd, buf, len));
+	}
+	// read some bytes from the file
+	def fileReadK(fd: int, data: Array<byte>, offset: int, len: int) -> int {
+		boundsCheck(data, offset, len);
+		var buf = Pointer.atContents(data) + offset;
+		var r = Linux.syscall(LinuxConst.SYS_read, (fd, buf, len)).0;
+		return if(r > 0, int.view(r));
+	}
+	// XXX: factor out bounds check to common code?
+	private def BCE = "BoundsCheckException";
+	private def EMPTY = "";
+	private def boundsCheck<T>(array: Array<T>, start: int, len: int) {
+		if (start < 0) System.error(BCE, EMPTY);
+		if (start > array.length) System.error(BCE, EMPTY);
+		var end = long.view(start) + long.view(len);
+		if (u64.view(end) > u32.view(array.length)) System.error(BCE, EMPTY);
+	}
+	// calculate bytes remaining to be read from file
+	def fileLeft(fd: int) -> int {
+		// XXX: is there a cheaper way to tell the number of available bytes?
+		var offset = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_CUR)).0;
+		var end = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
+		Linux.syscall(LinuxConst.SYS_lseek, (fd, offset, LinuxConst.SEEK_SET));
+		return int.view(end - offset);
+	}
+	// load a file into a byte array
+	def fileLoad(fileName: string) -> Array<byte> {
+		var path = pathName(fileName);
+		if (Linux.syscall(LinuxConst.SYS_stat, (path, Pointer.atContents(statbuf))).0 < 0) return null;
+		var fd = Linux.syscall(LinuxConst.SYS_open, (path, LinuxConst.O_RDONLY, 0)).0;
+		if (fd < 0) return null;
+		var buf = Array<byte>.new(statbuf[LinuxConst.STAT64_WOFF_ST_SIZE]);
+		if (Linux.syscall(LinuxConst.SYS_read, (fd, Pointer.atContents(buf), buf.length)).0 < 0) return null;
+		Linux.syscall(LinuxConst.SYS_close, fd);
+		return buf;
+	}
+	// print a character to standard out
+	def putc(ch: byte) {
+		out.putc(ch);
+	}
+	// print an integer (in decimal) to standard out
+	def puti(i: int) {
+		out.puti(i);
+	}
+	// print a string (as bytes) to standard out
+	def puts(str: string) {
+		out.puts(str);
+	}
+	// prints a newline character to standard out
+	def ln() {
+		out.ln();
+	}
+	// output an error, stacktrace, and exit
+	def error(ex: string, msg: string) {
+		err.putc('!').puts(ex).puts(": ").puts(msg).putc('\n');
+		if (printStack != null) printStack(CiRuntime.callerIp() + -1, CiRuntime.callerSp());
+		Linux.syscall(LinuxConst.SYS_exit, 254);
+	}
+	// get ticks in milliseconds
+	def ticksMs() -> int {
+		Linux.syscall(LinuxConst.SYS_gettimeofday, (Pointer.atContents(timeval), Pointer.NULL));
+		return int.view(timeval[0] * 1000 + timeval[1] / 1000);
+	}
+	// get ticks in microseconds
+	def ticksUs() -> int {
+		Linux.syscall(LinuxConst.SYS_gettimeofday, (Pointer.atContents(timeval), Pointer.NULL));
+		return int.view(timeval[0] * 1000000 + timeval[1]);
+	}
+	// get ticks in nanoseconds
+	def ticksNs() -> int {
+		Linux.syscall(LinuxConst.SYS_gettimeofday, (Pointer.atContents(timeval), Pointer.NULL));
+		return int.view(timeval[1] * 1000);
+	}
+	// get a zero-terminated pathname, allocating if necessary
+	private def pathName(fileName: string) -> Pointer {
+		if ((fileName.length & 3) == 0) {
+			// no extra space on the end of the array for the null byte
+			if (pathbuf.length <= fileName.length) pathbuf = Array.new(fileName.length + 5);
+			for (i < fileName.length) pathbuf[i] = fileName[i];
+			pathbuf[fileName.length] = '\x00';
+			return Pointer.atContents(pathbuf);
+		}
+		return Pointer.atContents(fileName);
+	}
+}
+def linuxWrite(fd: int, buf: Pointer, len: int) -> int {
+	var t = Linux.syscall(LinuxConst.SYS_write, (fd, buf, len));
+	return int.view(t.0);
+}
+def linuxFileStream(fd: int) -> NativeFileStream {
+	return NativeFileStream.new(linuxWrite, fd);
+}
