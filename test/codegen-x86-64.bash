@@ -7,7 +7,7 @@ if [ $? != 0 ]; then
     exit 1
 fi
 
-DIRS="execute fsi32 fsi64 legacy_intcast future_intcast variants enums ptr64 large float"
+DIRS="execute fsi32 fsi64 float legacy_intcast future_intcast variants enums ptr64 large"
 
 if [ $# != 0 ]; then
     DIRS="$@"
