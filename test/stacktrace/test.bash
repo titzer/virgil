@@ -13,7 +13,9 @@ rm -f $T/*.st
 if [ "$target" == x86-darwin ]; then
     RT_SOURCES="$VIRGIL_LOC/rt/darwin/*.v3 $NATIVE_SOURCES"
 elif [ "$target" == x86-linux ]; then
-    RT_SOURCES="$VIRGIL_LOC/rt/linux/*.v3 $NATIVE_SOURCES"
+    RT_SOURCES="$VIRGIL_LOC/rt/x86-linux/*.v3 $NATIVE_SOURCES"
+elif [ "$target" == x86-64-linux ]; then
+    RT_SOURCES="$VIRGIL_LOC/rt/x86-64-linux/*.v3 $NATIVE_SOURCES"
 fi
 
 function compile_st_tests() {

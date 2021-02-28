@@ -10,7 +10,9 @@ target=$TEST_TARGET
 if [ "$target" == x86-darwin ]; then
     OS_SOURCES="$RT/darwin/*.v3"
 elif [ "$target" == x86-linux ]; then
-    OS_SOURCES="$RT/linux/*.v3"
+    OS_SOURCES="$RT/x86-linux/*.v3"
+elif [ "$target" == x86-64-linux ]; then
+    OS_SOURCES="$RT/x86-64-linux/*.v3"
 else
     echo "  Runtime tests not supported on TEST_TARGET=$target"
     exit 0

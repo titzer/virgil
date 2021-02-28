@@ -7,7 +7,9 @@ target=$TEST_TARGET
 if [ "$target" == x86-darwin ]; then
     RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/darwin/*.v3 $VIRGIL_LOC/rt/gc/*.v3"
 elif [ "$target" == x86-linux ]; then
-    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/linux/*.v3 $VIRGIL_LOC/rt/gc/*.v3"
+    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/x86-linux/*.v3 $VIRGIL_LOC/rt/gc/*.v3"
+elif [ "$target" == x86-64-linux ]; then
+    RT_SOURCES="$VIRGIL_LOC/rt/native/*.v3 $VIRGIL_LOC/rt/x86-64-linux/*.v3 $VIRGIL_LOC/rt/gc/*.v3"
 else
     echo "  GC tests not supported for TEST_TARGET=$target"
     exit 0
