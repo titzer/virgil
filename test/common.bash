@@ -28,6 +28,7 @@ AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
 NATIVE_SOURCES="$RT_LOC/native/*.v3"
 GC_SOURCES="${GC_LOC}/*.v3"
+V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
 
 PROGRESS=${VIRGIL_LOC}/test/config/progress
 
@@ -252,7 +253,7 @@ function compile_aeneas() {
 
     pushd ${VIRGIL_LOC} > /dev/null
     local SRCS="aeneas/src/*/*.v3 $(cat aeneas/DEPS)"
-    V3C=$HOST_AENEAS bin/v3c-$target $V3C_OPTS -fp $V3C_HEAP_SIZE -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
+    V3C=$HOST_AENEAS bin/v3c-$target $V3C_HEAP_SIZE $V3C_OPTS -fp -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
     EXIT_CODE=$?
     popd > /dev/null
     if [ $EXIT_CODE != 0 ]; then
