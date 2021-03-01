@@ -33,19 +33,15 @@ function do_test() {
     execute_target_tests $target
 
     HEAP='-heap-size=24m'
-    print_compiling "$target $HEAP" Aeneas
-
-    pushd $VIRGIL_LOC > /dev/null
-    SRCS="aeneas/src/*/*.v3 $(cat aeneas/DEPS)"
-    run_v3c $target -output=$T $HEAP $SRCS &> $T/Aeneas-gc.compile.out
-    popd > /dev/null
-
-    check_no_red $? $T/Aeneas-gc.compile.out
-    mv $T/Aeneas $T/Aeneas-gc
+    BEFORE=$V3C_OPTS
+    V3C_OPTS="$V3C_OPTS $HEAP"
+    QUIET_COMPILE=1
+    compile_aeneas $AENEAS_TEST $T $target
+    V3C_OPTS="$BEFORE"
 
     print_status Testing "$target $HEAP" Aeneas
     if [ -x $CONFIG/run-$target ]; then
-	$T/Aeneas-gc -test -rma $VIRGIL_LOC/test/execute/*.v3 | tee $T/Aeneas-gc.test.out | $PROGRESS i
+	$T/$target/Aeneas -test -rma $VIRGIL_LOC/test/execute/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS i
     else
 	echo "${YELLOW}skipped${NORM}"
     fi
