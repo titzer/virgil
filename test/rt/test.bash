@@ -4,7 +4,8 @@
 
 SOURCES="RiRuntimeTest.v3"
 EXE=RiRuntimeTest
-RT=$VIRGIL_LOC/rt
+N=$VIRGIL_LOC/rt/native
+RT_SOURCES="$N/RiRuntime.v3 $N/NativeStackPrinter.v3 $N/NativeFileStream.v3"
 
 function do_test() {
     set_os_sources $target
@@ -16,11 +17,11 @@ function do_test() {
     check_no_red $? $T/compile.out
 
     print_compiling "$target-rt" RiRuntimeTest
-    run_v3c "" -target=$target -output=$T -heap-size=1k -rt.sttables $SOURCES $OS_SOURCES $NATIVE_SOURCES &> $T/rt.compile.out
+    run_v3c "" -target=$target -output=$T -heap-size=1k -rt.sttables $SOURCES $OS_SOURCES $RT_SOURCES &> $T/rt.compile.out
     check_no_red $? $T/rt.compile.out
 
     print_compiling "$target-gc" RiRuntimeTest
-    run_v3c "" -target=$target -output=$T -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $NATIVE_SOURCES $RT/gc/*.v3 &> $T/gc.compile.out
+    run_v3c "" -target=$target -output=$T -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $RT_SOURCES $GC_SOURCES &> $T/gc.compile.out
     check_no_red $? $T/gc.compile.out
 
     print_compiling "$target" CiRuntimeApi

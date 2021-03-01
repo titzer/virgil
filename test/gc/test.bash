@@ -12,7 +12,7 @@ function compile_gc_tests() {
     trace_test_count $#
     for f in $@; do
 	trace_test_start $f
-	run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -set-exec=false -heap-size=10k $f $OS_SOURCES $NATIVE_SOURCES $GC_SOURCES
+	run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k $f $OS_SOURCES $NATIVE_SOURCES $GC_SOURCES
 	trace_test_retval $?
     done
 }

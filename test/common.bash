@@ -26,8 +26,7 @@ RT_LOC=$VIRGIL_LOC/rt
 GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
-N=$RT_LOC/native
-NATIVE_SOURCES="$N/RiRuntime.v3 $N/NativeStackPrinter.v3 $N/NativeFileStream.v3"
+NATIVE_SOURCES="$RT_LOC/native/*.v3"
 GC_SOURCES="${GC_LOC}/*.v3"
 
 PROGRESS=${VIRGIL_LOC}/test/config/progress
