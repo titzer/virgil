@@ -6,8 +6,6 @@
 cd ../../apps
 APPS=$(ls */*.v3 | cut -d/ -f1 | uniq)
 
-target=$TEST_TARGET
-
 function compile_apps() {
     trace_test_count $#
     for t in $@; do
@@ -30,10 +28,21 @@ function compile_apps() {
 	if [ -f DEPS ]; then
 	    deps=$(cat DEPS)
 	fi
-	run_v3c "$target" -output=$OUT *.v3 $deps
+	run_v3c "$target" -output=$T *.v3 $deps
 	trace_test_retval $?
     done
 }
 
-print_status Compiling $target
-compile_apps $APPS | tee $OUT/compile.out | $PROGRESS i
+for target in $TEST_TARGETS; do
+    if [ "$target" = int ]; then
+	continue
+    elif [ "$target" = wasm-js ]; then
+	continue
+    elif [ "$target" = jvm ]; then
+	target=jar
+    fi
+    T=$OUT/$target
+    mkdir -p $T
+    print_status Compiling $target
+    compile_apps $APPS | tee $T/compile.out | $PROGRESS i
+done

@@ -9,12 +9,7 @@ done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 CONFIG=$DIR/config
 
-RUN_INT=${RUN_INT:=1}
-RUN_WASM=${RUN_WASM:=1}
-RUN_JVM=${RUN_JVM:=1}
-RUN_NATIVE=${RUN_NATIVE:=1}
-RUN_X86_64=${RUN_X86_64:=0}
-
+CYAN='[0;36m'
 BLUE='[0;34m'
 GREEN='[0;32m'
 YELLOW='[0;33m'
@@ -27,34 +22,29 @@ OUT=$VIRGIL_TEST_OUT/$SUITE
 mkdir -p $OUT
 
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $(dirname ${BASH_SOURCE[0]}) && cd .. && pwd)}
+RT_LOC=$VIRGIL_LOC/rt
+GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
+N=$RT_LOC/native
+NATIVE_SOURCES="$N/RiRuntime.v3 $N/NativeStackPrinter.v3 $N/NativeFileStream.v3"
+GC_SOURCES="${GC_LOC}/*.v3"
+
 PROGRESS=${VIRGIL_LOC}/test/config/progress
 
-UNAME=$(uname -sm)
-HOST_PLATFORM=$($VIRGIL_LOC/bin/dev/sense_host | cut -d' ' -f1)
-HOST_JAVA=$(which java)
-HOST_WAVE=$(which wave)
-
-N=$VIRGIL_LOC/rt/native
-NATIVE_SOURCES="$N/RiRuntime.v3 $N/NativeStackPrinter.v3 $N/NativeFileStream.v3"
-
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
+TEST_TARGETS=${TEST_TARGETS:="int jvm wasm-js x86-darwin x86-linux"}
 
-if [ ! -x "$AENEAS_TEST" ]; then
+if [[ ! -x "$AENEAS_TEST" && "$AENEAS_TEST" != auto ]]; then
     echo $AENEAS_TEST: not found or not executable
     exit 1
 fi
 
-if [ -z "$TEST_D8" ]; then
-    TEST_D8=$VIRGIL_LOC/bin/dev/d8
-fi
-
-function line() {
-    echo ================================================================================
+function print_line() {
+    echo --------------------------------------------------------------------------------
 }
 
-function execute() {
+function echocute() {
 	echo % $@
 	$@
 }
@@ -62,9 +52,9 @@ function execute() {
 function print_status() {
     config=$(echo -n $2)
     if [ -z "$3" ]; then
-	printf "  %-13s %-12s | "   "$1" "$config"
+	printf "  %-13s %-13s | "   "$1" "$config"
     else
-	printf "  %-13s %-12s $3 | "  "$1" "$config"
+	printf "  %-13s %-13s $3 | "  "$1" "$config"
     fi
 }
 
@@ -98,7 +88,7 @@ function trace_test_retval() {
 	if [ "$2" != "" ]; then
 	    cat $2
 	fi
-	printf "##-fail\n"
+	printf "##-fail: exitcode=$1\n"
     fi
 }
 
@@ -129,12 +119,14 @@ function run_io_test() {
     local args="$3"
     local expected="$4"
 
-    if [[ "$HOST_PLATFORM" == "$target" || $target == "jar" && "$HOST_JAVA" != "" || $target == "wave" && "$HOST_WAVE" != "" || $target == "wave-nogc" && "$HOST_WAVE" != "" ]]; then
+    if [ -x $CONFIG/run-$target ]; then
 	P=$OUT/$target/$test.out
+	# TODO: use run-target to actually execute the IO test
 	$OUT/$target/$test $args &> $P
 	diff $expected $P > $OUT/$target/$test.diff
     else
-	echo "${YELLOW}skipped${NORM}"
+	echo "target $target ${YELLOW}skipped${NORM}"
+	return 1
     fi
 }
 
@@ -172,22 +164,22 @@ function compile_target_tests() {
 }
 
 function check_cached_target_tests() {
-    # XXX: improve the performance of cache tests
+    # XXX: improve the performance of cache comparisons
     T=$OUT/$target/
     C=$TEST_CACHE/$SUITE/$target
     L=$OUT/$target/leftover
     count=$(echo $(echo $TESTS | wc -w))
+    ext=$1
     echo > $L
     echo "##>$count"
     for t in $TESTS; do
 	tf=${t/.v3/}
-	cached="$C/$tf"
-	gen="$T/$tf"
+	cached="$C/${tf}${ext}"
+	gen="$T/${tf}${ext}"
 	if [ -e $cached ]; then
 	    diff -q $cached $gen
 	    if [ "$?" = 0 ]; then
-		printf "##+$t\n"
-		printf "##-ok\n"
+		printf "##+$t\n##-ok\n"
 		continue
 	    fi
 	fi
@@ -201,7 +193,11 @@ function execute_target_tests() {
     R=$OUT/$target/run.out
     if [ -d "$TEST_CACHE/$SUITE/$target" ]; then
 	print_status "   cached" ""
-	check_cached_target_tests | tee $OUT/$target/cached.out | $PROGRESS i
+	ext=""
+	if [ "$target" = "wasm-js" ]; then
+	   ext=".wasm"
+	fi
+	check_cached_target_tests $ext | tee $OUT/$target/cached.out | $PROGRESS i
 	TORUN=$(cat $OUT/$target/leftover)
     else
 	TORUN="$TESTS"
@@ -220,30 +216,50 @@ function execute_target_tests() {
 }
 
 function execute_tests() {
-    if [ "$RUN_INT" = 1 ]; then
-	execute_int_tests "int" ""
-	execute_int_tests "int-ra" "-ra"
+    for target in $TEST_TARGETS; do
+	if [ "$target" = "int" ]; then
+	    execute_int_tests "int" ""
+	    execute_int_tests "int-ra" "-ra"
+	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
+            compile_target_tests jvm -jvm.script=false
+            execute_target_tests jvm
+	    continue
+	else
+	    compile_target_tests $target
+	    execute_target_tests $target
+	fi
+    done
+}
+
+function set_os_sources() {
+    target=$1
+    if [ "$target" = "x86-darwin" ]; then
+	export OS_SOURCES="$RT_LOC/darwin/*.v3"
+    elif [ "$target" = "x86-linux" ]; then
+	export OS_SOURCES="$RT_LOC/x86-linux/*.v3"
+    elif [ "$target" = "x86-64-linux" ]; then
+	export OS_SOURCES="$RT_LOC/x86-64-linux/*.v3"
+    fi
+}
+
+function compile_aeneas() {
+    local HOST_AENEAS=$1
+    local TARGET_DIR=$2/$3
+    local target=$3
+    mkdir -p $TARGET_DIR
+    if [ "$QUIET_COMPILE" != 1 ]; then
+	echo "${CYAN}Compiling ($HOST_AENEAS -> $TARGET_DIR/Aeneas)...${NORM}"
     fi
 
-    if [ "$RUN_WASM" = 1 ]; then
-        compile_target_tests wasm-js
-        execute_target_tests wasm-js
+    pushd ${VIRGIL_LOC} > /dev/null
+    local SRCS="aeneas/src/*/*.v3 $(cat aeneas/DEPS)"
+    V3C=$HOST_AENEAS bin/v3c-$target $V3C_OPTS -fp $V3C_HEAP_SIZE -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
+    EXIT_CODE=$?
+    popd > /dev/null
+    if [ $EXIT_CODE != 0 ]; then
+	exit $EXIT_CODE
     fi
-
-    if [ "$RUN_JVM" = 1 ]; then
-        compile_target_tests jvm -jvm.script=false
-        execute_target_tests jvm
-    fi
-
-    if [ "$RUN_NATIVE" = 1 ]; then
-	compile_target_tests x86-darwin
-	execute_target_tests x86-darwin
-	compile_target_tests x86-linux
-	execute_target_tests x86-linux
-    fi
-
-    if [ "$RUN_X86_64" = 1 ]; then
-	compile_target_tests x86-64-linux
-	execute_target_tests x86-64-linux
+    if [ "$QUIET_COMPILE" != 1 ]; then
+	wc -c $TARGET_DIR/* | sed 's/^/  /'
     fi
 }

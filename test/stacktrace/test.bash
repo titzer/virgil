@@ -2,6 +2,8 @@
 
 . ../common.bash stacktrace
 
+# TODO: use TEST_TARGETS instead of TEST_TARGET
+
 target=$TEST_TARGET
 T=$OUT/$target
 mkdir -p $T
@@ -10,13 +12,8 @@ C=$T/$target-test.compile.out
 rm -f $C $P
 rm -f $T/*.st
 
-if [ "$target" == x86-darwin ]; then
-    RT_SOURCES="$VIRGIL_LOC/rt/darwin/*.v3 $NATIVE_SOURCES"
-elif [ "$target" == x86-linux ]; then
-    RT_SOURCES="$VIRGIL_LOC/rt/x86-linux/*.v3 $NATIVE_SOURCES"
-elif [ "$target" == x86-64-linux ]; then
-    RT_SOURCES="$VIRGIL_LOC/rt/x86-64-linux/*.v3 $NATIVE_SOURCES"
-fi
+set_os_sources $target
+RT_SOURCES="$OS_SOURCES $NATIVE_SOURCES $RT/gc/*.v3"
 
 function compile_st_tests() {
     trace_test_count $#
@@ -40,10 +37,7 @@ function do_test() {
   ALL=$T/compile.all.out
 
   compile_st_tests $TESTS | $PROGRESS i
-
-  if [ "$RUN_NATIVE" != 0 ]; then
-      execute_target_tests $target
-  fi
+  execute_target_tests $target
 }
 
 tests=$(ls *.v3)
@@ -65,7 +59,7 @@ compare_st_output *.st | $PROGRESS i
 
 target=$TEST_TARGET
 if [[ "$target" != x86-darwin && "$target" != x86-linux ]]; then
-    print_status Skipping "$target/$HOST_PLATFORM"
+    print_status Skipping "$target/$TEST_HOST"
     echo "${YELLOW}ok${NORM}"
     exit 0
 fi
