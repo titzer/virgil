@@ -1,81 +1,86 @@
 #!/bin/bash
 
 . ../common.bash stacktrace
-
-# TODO: use TEST_TARGETS instead of TEST_TARGET
-
-target=$TEST_TARGET
-T=$OUT/$target
-mkdir -p $T
-P=$T/test.out
-C=$T/$target-test.compile.out
-rm -f $C $P
-rm -f $T/*.st
-
-set_os_sources $target
-RT_SOURCES="$OS_SOURCES $NATIVE_SOURCES $RT/gc/*.v3"
-
-function compile_st_tests() {
-    trace_test_count $#
-    for f in $@; do
-	trace_test_start $f
-	fname="${basedir}$(basename $f)"
-	fname="${fname%*.*}.v3"
-	run_v3c "" -output=$T -target=$target-test -rt.sttables $fname $RT_SOURCES
-	trace_test_retval $?
-    done
-}
-
-function do_test() {
-  basedir=$1
-  tests=$2
-
-  print_compiling "$target" "$tests"
-  TESTS=$(ls $T/*.st)
-
-  C=$T/compile.out
-  ALL=$T/compile.all.out
-
-  compile_st_tests $TESTS | $PROGRESS i
-  execute_target_tests $target
-}
-
-tests=$(ls *.v3)
-
-print_status Gathering int "test/stacktrace/*.v3"
-run_v3c "" -test -test.st -output=$T $tests | tee $P | $PROGRESS i
-
-function compare_st_output() {
-    trace_test_count $#
-    for t in $@; do
-	trace_test_start $t
-	diff $t $T/$t &> $T/$t.diff
-	trace_test_retval $?
-    done
-}
-
-print_status Checking ""
-compare_st_output *.st | $PROGRESS i
-
-target=$TEST_TARGET
-if [[ "$target" != x86-darwin && "$target" != x86-linux ]]; then
-    print_status Skipping "$target/$TEST_HOST"
-    echo "${YELLOW}ok${NORM}"
-    exit 0
-fi
-
-do_test '' 'test/stacktrace/*.v3'
-
-rm -f $T/*.st
 if [ $# -gt 0 ]; then
-  TESTS="$*"
-  tests='tests'
+	TESTS="$@"
 else
-  TESTS=$(ls ../execute/*.v3)
-  tests='test/execute/*.v3'
+	TESTS=*.v3
 fi
 
-print_status Gathering int "$tests"
-run_v3c "" -test -test.st -output=$T $TESTS | tee $T/test | $PROGRESS i
+function compile_tests() {
+    target=$1
+    trace_test_count $(echo $TESTS | wc -w)
+    for t in $TESTS; do
+	trace_test_start $t
+	# XXX: use bin/dev/target-nogc?
+	V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS -output=$T $t
+	EXIT_CODE=$?
+	trace_test_retval $EXIT_CODE
+    done
+}
 
-do_test ../execute/ $tests
+function run_compiled_tests() {
+    target=$1
+    trace_test_count $(echo $TESTS | wc -w)
+    for t in $TESTS; do
+	trace_test_start $t
+	exe=${t%*.*}
+	echo $T/$exe
+	$T/$exe 2> $T/$t.err
+	diff $t.expect $T/$t.err
+	EXIT_CODE=$?
+	trace_test_retval $EXIT_CODE
+    done
+}
+
+function run_int_tests() {
+    target=$1
+    trace_test_count $(echo $TESTS | wc -w)
+    for t in $TESTS; do
+	trace_test_start $t
+	$AENEAS_TEST -run $t > $T/$t.out
+	diff $t.expect $T/$t.out
+	EXIT_CODE=$?
+	trace_test_retval $EXIT_CODE
+    done
+}
+
+function do_tests() {
+    print_compiling $target
+    compile_tests $1 | tee $T/compile.out | $PROGRESS i
+    print_status "Running" ""
+    if [ -x $CONFIG/run-$target ]; then
+	run_compiled_tests $1 | tee $T/run.out | $PROGRESS i
+    else
+	echo "${YELLOW}skipped${NORM}"
+    fi
+}
+
+function do_int_tests() {
+    opt=$1
+    print_status "Running" "int $opt"
+    run_int_tests $1 | tee $T/run.out | $PROGRESS i
+}
+
+## Main loop over all targets
+for target in $TEST_TARGETS; do
+    T=$OUT/$target
+    mkdir -p $T
+
+    if [ "$target" = int ]; then
+	do_int_tests
+	do_int_tests -ra
+	
+    elif [[ "$target" = jvm || "$target" = jar ]]; then
+	continue # TODO: stacktrace tests on jvm
+    elif [ "$target" = wasm-js ]; then
+	continue # TODO: stacktrace tests on wasm
+    elif [ "$target" = x86-darwin ]; then
+	do_tests $target
+    elif [ "$target" = x86-linux ]; then
+	do_tests $target
+    elif [ "$target" = x86-64-linux ]; then
+	do_tests $target
+    fi
+done
+
