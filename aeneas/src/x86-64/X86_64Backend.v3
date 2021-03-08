@@ -13,10 +13,11 @@ class X86_64Backend extends MachBackend {
 	var simpleAlloc: SimpleRegAlloc;
 
 	// memory allocator configuration
-	var objLoc: int;
-	var sizeLoc: int;
+	var objReg: X86_64Gpr;
+	var sizeReg: X86_64Gpr;
+	var ipReg: X86_64Gpr;
+	var spReg: X86_64Gpr;
 	var allocStubAddr: Addr;
-	var frame: MachFrame;
 
 	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, test)
 		super(compiler, prog, mach, w) {
@@ -24,13 +25,15 @@ class X86_64Backend extends MachBackend {
 		asm = X86_64MacroAssembler.new(w);
 		if (ri_gc != null) {
 			// call the RiRuntime.gc() method
-			frame = computeFrameSize(getFrame(ri_gc.ssa));
-			objLoc = frame.conv.calleeRet(0);
-			sizeLoc = frame.conv.calleeParam(1); // param 0 = "this"
+			var frame = computeFrameSize(getFrame(ri_gc.ssa)), c = frame.conv;
+			objReg = Regs.toGpr(c.calleeRet(0));
+			sizeReg = Regs.toGpr(c.calleeParam(1));
+			ipReg = Regs.toGpr(c.calleeParam(2));
+			spReg = Regs.toGpr(c.calleeParam(3));
 		} else {
 			// there is no appropriate RiRuntime.gc() method
-			objLoc = Regs.RAX;
-			sizeLoc = Regs.RAX;
+			objReg = X86_64Regs.RAX;
+			sizeReg = X86_64Regs.RAX;
 		}
 		codegen = SsaX86_64Gen.new(context, mach, asm, w);
 		simpleAlloc = SimpleRegAlloc.new(X86_64RegSet.SET, codegen);
@@ -42,15 +45,58 @@ class X86_64Backend extends MachBackend {
 		genMainInit(frame);
 		if (test) genTestInputs(main, frame);
 		// call main
-		var addr = X86_64AddrRef.new(null, null, 1, mach.addrOfMethod(main));
-		asm.callr_addr(addr);
+		asm.callr_addr(ref(mach.addrOfMethod(main)));
 		// write return value to stdout if this is a test
 		if (test) genTestOutput(main, frame);
 		// exit with the return value of main
 		if (frame.conv.retLocs.length > 0) asm_exit_r(loc_gpr(frame, frame.conv.callerRet(0)));
 		else return asm_exit_code(0);
 	}
-	def genAllocStub() { // TODO(x86-64)
+	def genAllocStub() {
+		if (alwaysGc) return jumpRiGc(); // just call the GC directly
+
+		// %sizeReg = alloc(%sizeReg = size)
+		var scratchReg = Regs.toGpr(Regs.SCRATCH_GPR);
+		asm.movq_r_r(scratchReg, sizeReg);
+		// add size = size + [heapCurLoc]
+		var heapCurLocAddr = ref(CiRuntimeModule.HEAP_CUR_LOC);
+		asm.addq_r_m(sizeReg, heapCurLocAddr);
+		// check for addition overflow
+		var callrt = X86_64Label.new();
+		asm.jc_rel_near(X86_64Conds.C, callrt);
+		// compare with [heapEndLoc]
+		var heapEndLocAddr = ref(CiRuntimeModule.HEAP_END_LOC);
+		asm.cmpq_r_m(scratchReg, heapEndLocAddr);
+
+		if (ri_gc == null) {
+			// branch to the fatal address
+			var fatal = ref(mach.runtime.getFatalAddress(V3Exception.HeapOverflow));
+			asm.jc_rel_addr(X86_64Conds.A, fatal);
+		} else {
+			// branch forward to the slow path
+			asm.jc_rel_near(X86_64Conds.A, callrt);
+		}
+
+		asm.movq_m_r(heapCurLocAddr, sizeReg);
+		asm.subq_r_r(sizeReg, scratchReg);
+		if (sizeReg != objReg) asm.movq_r_r(objReg, sizeReg);
+		asm.ret();
+
+		if (ri_gc == null) return;
+		asm.bind(callrt);
+		// slow path: call RiRuntime.gc
+		// callerParam(0) = this
+		// callerParam(1) = size
+		asm.movq_r_r(sizeReg, scratchReg); // reload saved size
+		jumpRiGc(); // load other args and tail call runtime
+	}
+	def jumpRiGc() {
+		// callerParam(2) = ip
+		asm.movq_r_m(ipReg, X86_64Regs.RSP.indirect());
+		// callerParam(3) = sp
+		asm.leaq(spReg, X86_64Addr.new(null, X86_64Regs.RSP, 1, mach.data.addressSize));
+		asm.jmp_rel_addr(ref(mach.addrOfMethod(ri_gc)));
+		// no need to return, this is a tail call
 	}
 	def genCodeFromSsa() {
 		var frame = getFrame(context.method.ssa);
@@ -85,21 +131,20 @@ class X86_64Backend extends MachBackend {
 			}
 			// load the register value from the table to follow
 			var tableAddr = Addr.new(mach.codeRegion, null, 0);
-			var ref = X86_64AddrRef.new(null, X86_64Regs.RBX, 4, tableAddr);
+			var taRef = X86_64AddrRef.new(null, X86_64Regs.RBX, 4, tableAddr);
 			if (dest == null) {
 				// destination is a stack location
 				var scratchReg = Regs.toGpr(Regs.SCRATCH_GPR);
 				Terminal.put3("overflow %d: loc=%d, name=%s\n", i, loc, frame.conv.regSet.identify(loc));
 				var offset = mach.data.addressSize * (loc - frame.conv.regSet.callerStart);
-				asm.movd_r_m(scratchReg, ref);
+				asm.movd_r_m(scratchReg, taRef);
 				asm.movq_m_r(X86_64Regs.RSP.plus(offset), scratchReg);
 			} else {
-				asm.movd_r_m(dest, ref);
+				asm.movd_r_m(dest, taRef);
 			}
 
-
 			var endAddr = Addr.new(mach.codeRegion, null, 0);
-			asm.jmp_rel_addr(X86_64AddrRef.new(null, null, 1, endAddr)); // jump over the table
+			asm.jmp_rel_addr(ref(endAddr)); // jump over the table
 			tableAddr.absolute = w.posAddr() - 4; // argc = 1 adjustment
 			// emit table of argument values
 			for (v in vals) w.put_b32(V3.unboxIntegral(v[i - 1]));
@@ -213,7 +258,7 @@ class X86_64Backend extends MachBackend {
 		asm.xaddq_m_r(addr, reg);
 	}
 	def getFrame(ssa: SsaGraph) -> MachFrame {
-		return MachFrame.new(X86_64VirgilCallConv.getForGraph(ssa), mach.data.addrAlign, mach.refSize);
+		return MachFrame.new(X86_64VirgilCallConv.getForGraph(mach, ssa), mach.data.addrAlign, mach.refSize);
 	}
 	def computeFrameSize(frame: MachFrame) -> MachFrame {
 		frame.frameSize = mach.alignTo(frame.slots() * mach.refSize + mach.code.addressSize, mach.stackAlign);
@@ -237,6 +282,9 @@ class X86_64Backend extends MachBackend {
 		var r = Regs.toGpr(loc);
 		if (r == null) return V3.fail(Strings.format1("expected GPR, but got %s", frame.conv.regSet.identify(loc)));
 		return r;
+	}
+	def ref(addr: Addr) -> X86_64AddrRef {
+		return X86_64AddrRef.new(null, null, 1, addr);
 	}
 	// Methods overridden for each OS target
 	def genSigHandlerInstall(signo: int, handler: Addr);

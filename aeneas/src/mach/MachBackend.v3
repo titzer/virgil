@@ -27,32 +27,6 @@ enum RegClass {
 	F32,
 	F64
 }
-// Conversion functions from V3 Types to RegClasses
-component RegClasses {
-	// size in bytes
-	def size(t: RegClass, refSize: int) -> int {
-		match (t) {
-			I64, F64 => return 8;
-			REF => return refSize;
-			_ => return 4;
-		}
-	}
-	def fromType(t: Type) -> RegClass {
-		match (t.typeCon.kind) {
-			V3Kind.INT => return fromIntType(IntType.!(t));
-			V3Kind.FLOAT => {
-				var ftc = Float_TypeCon.!(t.typeCon);
-				return if(ftc.is64, RegClass.F64, RegClass.F32);
-			}
-			V3Kind.ENUM => return fromIntType(V3.getVariantTagType(t));
-			V3Kind.ENUM_SET => return fromIntType(V3.getEnumSetType(t));
-			_ => return RegClass.REF;
-		}
-	}
-	def fromIntType(t: IntType) -> RegClass {
-		return if(t.width <= 32, RegClass.I32, RegClass.I64);
-	}
-}
 enum Usage { NONE, ONCE, MULTIPLE }
 // Machine-independent representation of a virtual register.
 class VReg {
@@ -94,13 +68,17 @@ class MachFrame(conv: MachCallConv, align: Alignment, refSize: int) {
 	var spillArgs: int;		// space for outgoing spilled arguments
 	var frameSize: int = -1;	// architecture-specific total frame size
 	var tmpSpill: int = -1;		// temporary spill slot
-	def IS_64: int = 0x40000000;	// if the spilled value is 64 bits
+	def IS_64: int = 0x40000000;	// flags a 64-bit spill slot (TODO: only for MoveResolver)
 
 	def allocSpill(regClass: RegClass) -> int {
-		var is64 = if(regClass == RegClass.I64 || regClass == RegClass.F64, IS_64);
-		var numSpill = align.alignUp(RegClasses.size(regClass, refSize)) >> align.shift;
+		var count: int, is64: int;
+		match (regClass) {
+			I32, F32 => count = 1;
+			I64, F64 => { count = align.alignUp(8) >> align.shift; is64 = IS_64; }
+			REF => { count = align.alignUp(refSize) >> align.shift; is64 = if(refSize > 4, IS_64); }
+		}
 		var spill = conv.regSet.spillStart + spillVars;
-		spillVars += numSpill;
+		spillVars += count;
 		return spill | is64;
 	}
 	def getTmpSpill(regClass: RegClass) -> int {
@@ -129,6 +107,13 @@ class MachFrame(conv: MachCallConv, align: Alignment, refSize: int) {
 	}
 	def un64(loc: int) -> int {
 		return loc & ~IS_64;
+	}
+	def toSlot(loc: int) -> int {
+		loc &= ~IS_64;						// mask out is64
+		if (loc >= conv.regSet.callerStart) return -1;		// on caller stack
+		// TODO: relies on stack growing downward and spillArgs being first.
+		if (loc < conv.regSet.spillStart) return -1;
+		return loc - conv.regSet.spillStart + spillArgs;
 	}
 }
 // Defines physical locations (registers, register sets, and stack locations).
@@ -231,7 +216,8 @@ type Operand {
 	case Immediate(val: Val);
 	case Use(vreg: VReg, constraint: int);
 	case Def(vreg: VReg, constraint: int);
-	case Kill(livepoint: int, constraint: int);
+	case Kill(constraint: int);
+	case RefMap(livepoint: int, outgoing: MachCallConv);
 	case Overwrite(dst: VReg, src: VReg, constraint: int);
 	case Label(block: SsaBlock, label: Label);
 	case ExSource(ex: string, source: Source);
@@ -293,7 +279,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 	var order: Vector<SsaBlockInfo>;
 	var liveness: BitMatrix;
 	var numLivepoints = 0;
-	def livepoints = Vector<(SsaBlock, ArchInstr, Operand.Kill)>.new();
+	def livepoints = Vector<(SsaBlock, ArchInstr, Operand.RefMap)>.new();
 	var first: ArchInstr;
 	var cursor: ArchInstr;
 	var blockEnd: ArchInstr;
@@ -365,7 +351,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 		for (i = livepoints.length - 1; i >= 0; i--) {	// process newest first
 			var t = livepoints[i], block = t.0;
 			if (block.mark > end) break;  // rely on backwards codegen order
-			liveness.or(order.length + t.2.livepoint, block.mark);
+			liveness.or(order.length + t.2.livepoint, info.block.mark);
 		}
 	}
 	def gatherLivenessForBlock(block: SsaBlock) {
@@ -462,7 +448,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 		if (i != null) {
 			width = numVars(i);
 			i.mark = next;
-			rcl = RegClasses.fromType(i.getType());
+			rcl = mach.toRegClass(i.getType());
 		}
 		var id = next - lowestMark;
 		var length = id + width + 1;
@@ -481,7 +467,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 		return Tuple.length(i.getType());
 	}
 	def updateLiveness(i: ArchInstr) {
-		def DEFS = 0, KILLS = 1, OVW = 2, USES = 3;
+		def DEFS = 0, KILLS = 1, REFMAP = 2, OVW = 3, USES = 4;
 		var state = DEFS;
 		var row = if(context.block != null, context.block.mark);
 		for (o in i.operands) match (o) {
@@ -496,15 +482,24 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 				liveness[row, use.varNum] = true;
 				state = OVW;
 			}
-			Kill(livepoint, constraint) => {
+			Kill(constraint) => {
 				if (state > KILLS) context.fail("out of order kill");
+				state = KILLS;
+			}
+			RefMap(livepoint, outgoing) => {
+				if (state > REFMAP) context.fail("out of order refmap");
 				if (livepoint >= 0) {
 					var index = order.length + livepoint;
 					liveness.grow(index + 1);
 					liveness.or(index, row);
-					livepoints.put((context.block, i, Operand.Kill.!(o)));
+					if (Aeneas.PRINT_STACKMAP.val) {
+						var buf = TerminalBuffer.new().put1("livepoint %d = \n", livepoint);
+						liveness.renderRow(index, buf);
+						buf.outt();
+					}
+					livepoints.put((context.block, i, Operand.RefMap.!(o)));
 				}
-				state = KILLS;
+				state = REFMAP;
 			}
 			Use(vreg, constraint) => {
 				liveness[row, vreg.varNum] = true;
@@ -546,6 +541,47 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 				dests[index] = (v, List.new(d, prev));
 			}
 		}
+	}
+	def buildStackMap(codeOffset: int, outgoing: MachCallConv, lp: int) -> int {
+		var slots = frame.slots();
+		if (slots == 0) return -1;
+		var builder = mach.runtime.gc.beginRefMap(slots, 20);
+		if (outgoing != null && outgoing.overflow > 0) {
+			// record any outgoing overflow parameters that are references
+			var pt = outgoing.paramTypes;
+			for (i < pt.length) {
+				var ploc = outgoing.calleeParam(i);
+				if (regSet.isStack(ploc) && mach.isRefType(pt[i])) {
+					builder.setRefMap(ploc - regSet.calleeStart);
+				}
+			}
+		}
+		// lazily compute the reference slot index for each live VReg
+		var index = order.length + lp;
+		var width = liveness.width, start = width * index;
+		var bits = liveness.bits;
+		// for each live variable, set the appropriate bit (if any) in the stackmap
+		for (i < width) {
+			var vnum = i * 32;
+			for (b = bits[i + start]; b != 0; b = b >>> 1) {
+				if ((b & 1) != 0) { // variable is live
+					var vreg = vars[vnum];
+					if (Aeneas.PRINT_STACKMAP.val) {
+						Terminal.put3("lp=%d, vreg=%d live, class=%s, ", lp, vnum, vreg.regClass.name);
+						Terminal.put1("spill=%d\n", vreg.spill);
+					}
+					if (vreg.regClass == RegClass.REF) {
+						var slot = frame.toSlot(vreg.spill);
+						if (slot >= 0) {
+							if (Aeneas.PRINT_STACKMAP.val) Terminal.put1(" ref in slot %d\n", slot);
+							builder.setRefMap(slot);
+						}
+					}
+				}
+				vnum++;
+			}
+		}
+		return builder.finishRefMap();
 	}
 	//======================================================================
 	// MachStackifier uses these codegen methods to insert loads, stores,
@@ -712,8 +748,11 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 	def dfnv0(vreg: VReg) {
 		operands.put(Operand.Def(vreg, 0));
 	}
-	def kill(livepoint: int, constraint: int) {
-		operands.put(Operand.Kill(livepoint, constraint));
+	def kill(constraint: int) {
+		operands.put(Operand.Kill(constraint));
+	}
+	def refmap(conv: MachCallConv) {
+		operands.put(Operand.RefMap(newLivepoint(), conv));
 	}
 	def useAll(array: Array<SsaDfEdge>, start: int) {
 		for (j = start; j < array.length; j++) use(array[j].dest);
@@ -785,7 +824,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 	}
 	def newTmp(t: Type) -> VReg {
 		var vreg = newVReg(null);
-		vreg.regClass = RegClasses.fromType(t);
+		vreg.regClass = mach.toRegClass(t);
 		return vreg;
 	}
 	def id(i: SsaInstr, vreg: VReg) -> VReg {
@@ -1035,10 +1074,13 @@ class ArchInstrBuffer(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) ex
 				putVReg("def", vreg);
 				putConstraint(constraint);
 			}
-			Kill(livepoint, constraint) => {
-				putc('k');
-				if (livepoint >= 0) putd(livepoint);
+			Kill(constraint) => {
+				blue().puts("kill").end();
 				putConstraint(constraint);
+			}
+			RefMap(livepoint, outgoing) => {
+				blue().puts("refmap").end();
+				if (livepoint >= 0) putd(livepoint);
 			}
 			Overwrite(dst, src, constraint) => {
 				putVReg("ovr", dst);

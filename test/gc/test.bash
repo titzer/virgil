@@ -32,7 +32,11 @@ function do_test() {
 
     execute_target_tests $target
 
-    HEAP='-heap-size=24m'
+    if [[ "$target" =~ "x86-64" ]]; then
+        HEAP='-heap-size=48m' # 64-bit needs more heap
+    else
+        HEAP='-heap-size=24m'
+    fi
     BEFORE=$V3C_OPTS
     V3C_OPTS="$V3C_OPTS $HEAP"
     QUIET_COMPILE=1
