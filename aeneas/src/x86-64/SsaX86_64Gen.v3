@@ -195,9 +195,8 @@ class SsaX86_64Gen extends SsaMachGen {
 			FloatLteq,
 			PtrLt,
 			PtrLteq => {
-				var cmp = matchCmp(i, false);
-				emitCmp(cmp);
-				emitSetC(getVReg(i), cmp);
+				var conds = emitCmp(i, false);
+				emitSetC(getVReg(i), conds);
 			}
 			FloatAdd(is64) => emitFloatBinop(i, if(is64, I_ADDSD, I_ADDSS));
 			FloatSub(is64) => emitFloatBinop(i, if(is64, I_SUBSD, I_SUBSS));
@@ -215,10 +214,9 @@ class SsaX86_64Gen extends SsaMachGen {
 				emit2(if(is64, I_SQRTSD, I_SQRTSS) | (AM_XMM_OP << AM_SHIFT), dfnReg(i), use(i.input0()));
 			}
 			ConditionalThrow(exception) => {
-				var cmp = matchCmp(i.input0(), true);
-				emitCmp(cmp);
+				var conds = emitCmp(i.input0(), true);
 				// TODO: handle multiple conditions for conditional throw
-				emit1(ArchInstrs.FLAG_NO_GAP | I_THROWC | encodeCond(cmp.cond1), useExSource(exception, i.source));
+				emit1(ArchInstrs.FLAG_NO_GAP | I_THROWC | encodeCond(conds.cond1), useExSource(exception, i.source));
 			}
 			PtrLoad => {
 				var lt = i.op.typeArgs[1], size = mach.sizeOf(lt);
@@ -444,6 +442,58 @@ class SsaX86_64Gen extends SsaMachGen {
 		if (!i.facts.O_NO_ZERO_CHECK) useExSource(V3Exception.DivideByZero, i.source);
 		return emitN(selectWidth(i, if(it.signed, I_IDIVD, I_DIVD)));
 	}
+	def emitCmp(i: SsaInstr, inblock: bool) -> X86_64CondPair {
+		if ((inblock && !inSameBlock(i)) || !SsaApplyOp.?(i)) return emitDefaultCmp(i);
+		var apply = SsaApplyOp.!(i);
+		match (apply.op.opcode) {
+			BoolEq =>	return emitCmpBinop(I_CMPB, apply, Conds.Z);
+			RefEq =>	return emitCmpBinop(if(mach.refSize > 4, I_CMPQ, I_CMPD), apply, Conds.Z);
+			IntEq =>	return emitCmpBinop(intCmpOpcode(apply), apply, Conds.Z);
+			IntLt =>	return emitCmpBinop(intCmpOpcode(apply), apply, signedCmp(apply, Conds.L, Conds.C));
+			IntLteq =>	return emitCmpBinop(intCmpOpcode(apply), apply, signedCmp(apply, Conds.LE, Conds.NA));
+			PtrLt =>	return emitCmpBinop(I_CMPQ, apply, Conds.C);
+			PtrLteq =>	return emitCmpBinop(I_CMPQ, apply, Conds.NA);
+			BoolNot =>	return emitCmp(i.input0(), inblock).negate();
+			FloatEq(is64) =>	return emitFloatCmp(is64, apply, Conds.Z); // XXX: match x == x to Conds.NP
+			FloatNe(is64) =>	return emitFloatCmp(is64, apply, Conds.Z).negate();
+			FloatLt(is64) =>	return emitFloatCmp(is64, apply, Conds.C);
+			FloatLteq(is64) =>	return emitFloatCmp(is64, apply, Conds.NA);
+			// XXX: emitCmp of PtrCmpSwp
+			_ => ;
+		}
+		return emitDefaultCmp(i);
+	}
+	def emitDefaultCmp(i: SsaInstr) -> X86_64CondPair {
+		use(i);
+		useInt(0);
+		emitN(I_CMPB | (AM_OP_IMM << AM_SHIFT));
+		return X86_64CondPair.new(Conds.NZ, false, null);
+	}
+	def emitFloatCmp(is64: bool, i: SsaApplyOp, cond: X86_64Cond) -> X86_64CondPair {
+		var x = i.input0(), y = i.input1();
+		var opcode = if(is64, I_UCOMISD, I_UCOMISS);
+		emit2(opcode | (AM_XMM_OP << AM_SHIFT), useReg(x), use(y));
+		if (i.facts.O_NO_NULL_CHECK) return X86_64CondPair.new(cond, false, null); // no NaN check required
+		return X86_64CondPair.new(cond, true, Conds.NP);
+	}
+	def signedCmp(i: SsaApplyOp, signed: X86_64Cond, unsigned: X86_64Cond) -> X86_64Cond {
+		return if(V3.isSigned(i.op.sig.paramTypes[0]), signed, unsigned);
+	}
+	def emitCmpBinop(opcode: int, i: SsaApplyOp, cond: X86_64Cond) -> X86_64CondPair {
+		var x = i.input0(), y = i.input1();
+		if (SsaConst.?(x) && cond.commute != null) {
+			var t = x; x = y; y = t; // swap x and y
+			cond = cond.commute;
+		}
+		useReg(x); // XXX: don't use reg if can use immediate for y
+		if (tryUseImm32(y)) {
+			emitN(opcode | (AM_OP_IMM << AM_SHIFT));
+		} else {
+			use(y);
+			emitN(opcode | (AM_REG_OP << AM_SHIFT));
+		}
+		return X86_64CondPair.new(cond, false, null);
+	}
 	def selectWidth(i: SsaApplyOp, op: int) -> int {
 		return if(intOpWidth(i) > 32, op + I_QD_DIFF, op);
 	}
@@ -595,30 +645,29 @@ class SsaX86_64Gen extends SsaMachGen {
 		emit1(I_THROW, useExSource(i.exception, i.source));
 	}
 	def visitIf(block: SsaBlock, i: SsaIf) {
-		var key = i.input0(), cmp = matchCmp(key, true), succ = i.block().succ;
+		var key = i.input0(), conds = emitCmp(key, true), succ = i.block().succ;
 		var s0 = succ(0).dest, s1 = succ(1).dest, target: SsaBlock, jmp: SsaBlock;
 		var fallthru: SsaBlock;
 		if (blocks.isImmediatelyAfter(context.block, s1)) { // fall through to s1
 			target = s0;
 			fallthru = s1;
 		} else if (blocks.isImmediatelyAfter(context.block, s0)) {  // fall through to s0
-			cmp = cmp.negate();
+			conds = conds.negate();
 			target = s1;
 			fallthru = s0;
 		} else {  // cannot fall through
 			target = s0;
 			jmp = s1;
 		}
-		emitCmp(cmp);
-		if (cmp.cond2 == null) { // emit single condition
-			emitCondJump(cmp.cond1, target);
-		} else if (cmp.and) { // emit && of two conditions
+		if (conds.cond2 == null) { // emit single condition
+			emitCondJump(conds.cond1, target);
+		} else if (conds.and) { // emit && of two conditions
 			var other = if(jmp != null, jmp, fallthru);
-			emitCondJump(cmp.cond1.negate, other);
-			emitCondJump(cmp.cond2, target);
+			emitCondJump(conds.cond1.negate, other);
+			emitCondJump(conds.cond2, target);
 		} else { // emit || of two conditions
-			emitCondJump(cmp.cond1, target);
-			emitCondJump(cmp.cond2, target);
+			emitCondJump(conds.cond1, target);
+			emitCondJump(conds.cond2, target);
 		}
 		if (jmp != null) emit1(ArchInstrs.FLAG_NO_GAP | I_JMP, useLabel(jmp));
 	}
@@ -706,31 +755,14 @@ class SsaX86_64Gen extends SsaMachGen {
 		var d = getVReg(i), u = getVReg(i.input0()), reg = anyReg(d);
 		emit2(opcode | (AM_XMM_OP << AM_SHIFT), ovwv(d, u, reg), use(i.input1()));
 	}
-	def emitSetC(dreg: VReg, cmp: X86_64CmpMatch) {
+	def emitSetC(dreg: VReg, conds: X86_64CondPair) {
 		var opcode = ArchInstrs.FLAG_NO_GAP | I_SETC, gloc = Regs.GPR_CLASS;
-		if (cmp.cond2 == null) return emit1(opcode | encodeCond(cmp.cond1), dfnv(dreg, gloc));
+		if (conds.cond2 == null) return emit1(opcode | encodeCond(conds.cond1), dfnv(dreg, gloc));
 		// emit multiple conditions, and/or them together
 		var t1 = newTmp(Bool.TYPE), t2 = newTmp(Bool.TYPE);
-		emit1(opcode | encodeCond(cmp.cond1), dfnv(t1, gloc));
-		emit1(opcode | encodeCond(cmp.cond2), dfnv(t2, gloc));
-		emit2(if(cmp.and, I_ANDD, I_ORD) | (AM_REG_OP << AM_SHIFT), ovwv(dreg, t1, gloc), usev(t2, 0));
-	}
-	def emitCmp(cmp: X86_64CmpMatch) {
-		match (cmp.opcode) {
-			I_UCOMISS, I_UCOMISD => {
-				// floating point compares need XMM regs
-				emit2(cmp.opcode | (AM_XMM_OP << AM_SHIFT), useReg(cmp.x), use(cmp.y));
-			}
-			_ => {
-				useReg(cmp.x); // XXX: don't use reg if can use immediate for y
-				if (tryUseImm32(cmp.y)) {
-					emitN(cmp.opcode | (AM_OP_IMM << AM_SHIFT));
-				} else {
-					use(cmp.y);
-					emitN(cmp.opcode | (AM_REG_OP << AM_SHIFT));
-				}
-			}
-		}
+		emit1(opcode | encodeCond(conds.cond1), dfnv(t1, gloc));
+		emit1(opcode | encodeCond(conds.cond2), dfnv(t2, gloc));
+		emit2(if(conds.and, I_ANDD, I_ORD) | (AM_REG_OP << AM_SHIFT), ovwv(dreg, t1, gloc), usev(t2, 0));
 	}
 
 	def assemble(opcode: int, a: Array<Operand>) {
@@ -1334,42 +1366,6 @@ class SsaX86_64Gen extends SsaMachGen {
 		else return X86_64Addr.new(base, index, scale, toB32(val));
 	}
 
-	def matchCmp(i: SsaInstr, inblock: bool) -> X86_64CmpMatch {
-		if ((inblock && !inSameBlock(i)) || !SsaApplyOp.?(i)) return X86_64CmpMatch.new(I_CMPB, Conds.NZ, false, null, i, null);
-		var apply = SsaApplyOp.!(i);
-		match (apply.op.opcode) {
-			BoolEq => 	return newCmp(I_CMPB, i, Conds.Z);
-			RefEq =>	return newCmp(if(mach.refSize > 4, I_CMPQ, I_CMPD), i, Conds.Z);
-			IntEq => 	return newCmp(intCmpOpcode(apply), i, Conds.Z);
-			IntLt =>	return newCmp(intCmpOpcode(apply), i, signedCmp(i, Conds.L, Conds.C));
-			IntLteq =>	return newCmp(intCmpOpcode(apply), i, signedCmp(i, Conds.LE, Conds.NA));
-			PtrLt =>	return newCmp(I_CMPQ, i, Conds.C);
-			PtrLteq =>	return newCmp(I_CMPQ, i, Conds.NA);
-			BoolNot => 	return matchCmp(i.input0(), inblock).negate();
-			FloatEq(is64) =>	return matchFloatCmp(is64, i, Conds.Z); // XXX: match x == x to Conds.NP
-			FloatNe(is64) =>	return matchFloatCmp(is64, i, Conds.Z).negate();
-			FloatLt(is64) =>	return matchFloatCmp(is64, i, Conds.C);
-			FloatLteq(is64) =>	return matchFloatCmp(is64, i, Conds.NA);
-			// XXX: matchCmp of PtrCmpSwp
-			_ => ;
-		}
-		return X86_64CmpMatch.new(I_CMPB, Conds.NZ, false, null, i, null);
-	}
-	def matchFloatCmp(is64: bool, i: SsaInstr, cond: X86_64Cond) -> X86_64CmpMatch {
-		var x = i.input0(), y = i.input1();
-		var opcode = if(is64, I_UCOMISD, I_UCOMISS);
-		if (i.facts.O_NO_NULL_CHECK) return X86_64CmpMatch.new(opcode, cond, false, null, x, y); // no NaN check required
-		return X86_64CmpMatch.new(opcode, cond, true, Conds.NP, x, y);
-	}
-	def signedCmp(i: SsaInstr, signed: X86_64Cond, unsigned: X86_64Cond) -> X86_64Cond {
-		return if(V3.isSigned(SsaApplyOp.!(i).op.sig.paramTypes[0]), signed, unsigned);
-	}
-	def newCmp(opcode: int, i: SsaInstr, cond: X86_64Cond) -> X86_64CmpMatch {
-		var x = i.input0(), y = i.input1();
-		if (SsaConst.?(x) && cond.commute != null) return X86_64CmpMatch.new(opcode, cond.commute, false, null, y, x);
-		return X86_64CmpMatch.new(opcode, cond, false, null, x, y);
-	}
-
 	def frameAdjust() -> int {
 		// assumes return address already pushed
 		return frame.size() - mach.code.addressSize;
@@ -1639,10 +1635,10 @@ class X86InstrBuffer extends ArchInstrBuffer {
 		return start + 4;
 	}
 }
-// Pattern match for comparisons that can represent one or two conditions.
-class X86_64CmpMatch(opcode: int, cond1: X86_64Cond, and: bool, cond2: X86_64Cond, x: SsaInstr, y: SsaInstr) {
-	def negate() -> X86_64CmpMatch {
-		if (cond2 != null) return X86_64CmpMatch.new(opcode, cond1.negate, !and, cond2.negate, x, y);
-		return X86_64CmpMatch.new(opcode, cond1.negate, false, null, x, y);
+// Result of matching and emitting a compare: one or two conditions.
+class X86_64CondPair(cond1: X86_64Cond, and: bool, cond2: X86_64Cond) {
+	def negate() -> X86_64CondPair {
+		if (cond2 != null) return X86_64CondPair.new(cond1.negate, !and, cond2.negate);
+		return X86_64CondPair.new(cond1.negate, false, null);
 	}
 }
