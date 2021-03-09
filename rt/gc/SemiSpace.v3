@@ -5,9 +5,10 @@
 component Semispace {
 	var toSpace_start: Pointer;	// start of to-space region
 	var toSpace_end: Pointer;	// end of to-space region
-	var alloc_ptr: Pointer;	// allocation point in to-space region
+	var alloc_ptr: Pointer;		// allocation point in to-space region
 	var fromSpace_start: Pointer;	// start of from-space region
 	var fromSpace_end: Pointer;	// end of frame-space region
+	var collecting = false;		// to prevent reentry
         def D = RiGc.D;
 
 	new() {
@@ -49,16 +50,6 @@ component Semispace {
                          .putp(CiRuntime.heapEndLoc.load<Pointer>())
                          .ln();
                 }
-	}
-	// swap "from" and "to" spaces
-	def swapSpaces() {
-		var tmp = (toSpace_start, toSpace_end);
-
-		toSpace_start = fromSpace_start;
-		toSpace_end = fromSpace_end;
-
-		fromSpace_start = tmp.0;
-		fromSpace_end = tmp.1;
 	}
 	// relocate a reference
 	def relocObject(ref_loc: Pointer) {
@@ -116,59 +107,78 @@ component Semispace {
 		if (RiGc.debug || RiGc.verbose) {
 			D.puts("End   GC, ").puti(fromSpaceUsed() / 1024)
 			 .puts("K (").puti(diff).puts(" us)\n");
-	}
+		}
 		GcStats.collection_us = GcStats.collection_us + diff;
 	}
 	// perform a collection
 	def collect(size: int, ip: Pointer, sp: Pointer) -> Pointer {
-		// scan global and stack roots
+		if (collecting) RiRuntime.fatalException("GcError", "reentrant call to SemiSpace.collect", ip, sp);
+		collecting = true;
+
 		if (RiGc.debug) {
 			D.puts(RiGc.CTRL_YELLOW);
 			D.puts("\n===== begin Semispace.collect() =============================================================\n");
 			D.puts(RiGc.CTRL_DEFAULT);
 		}
+
 		var before = if(RiGc.stats, statsBefore());
+		var old_alloc_ptr = CiRuntime.heapCurLoc.load<Pointer>();
 		alloc_ptr = toSpace_start;
+		// scan global and stack roots
 		RiGc.scanGlobals();
 		RiGc.scanStack(ip, sp);
-		// scan the objects copied from roots
+		// main loop: scan the objects copied from roots
 		var scan = toSpace_start;
-		while (scan < alloc_ptr) {
-			scan = scan + RiGc.scanObject(scan);
-		}
-		GcStats.gc_count++;
-		if (GcStats.gc_count > 1) {
-			// zero the remaining portion of the to-space, since it was used previously
-			// XXX: incrementally zero to-space to avoid blowing the cache
-			RiGc.memClear(alloc_ptr, toSpace_end);
-		}
+		while (scan < alloc_ptr) scan = scan + RiGc.scanObject(scan);
+		// everything copied, check to see if enough space remains
+		if ((toSpace_end - scan) < size) return fatalOutOfMemory(size, ip, sp);
+		// zero the remaining portion of the to-space if used previously
+		if (GcStats.gc_count++ > 0) RiGc.memClear(alloc_ptr, toSpace_end);
+		// switch allocation bounds during callbacks
+		CiRuntime.heapCurLoc.store(scan);
+		CiRuntime.heapEndLoc.store(toSpace_end);
+		// Report stats immediately after collection
 		if (RiGc.stats) statsAfter();
-		swapSpaces();
+		//================================================================
+		// USER CODE: Run finalizers before overwriting from_space
+		RiGc.runFinalizers(relocCallback);
+		//================================================================
+		// weak callbacks finished, try to fulfill the request
+		scan = alloc_ptr = CiRuntime.heapCurLoc.load();
+		if ((toSpace_end - scan) < size) return fatalOutOfMemory(size, ip, sp);
+		CiRuntime.heapCurLoc.store(scan + size);
+
 		if (RiGc.paranoid) {
 			// overwrite the old from-space with garbage to catch errors
-			var end = CiRuntime.heapCurLoc.load<Pointer>();
-			for (p = toSpace_start; p < end; p = p + 4) {
-				p.store(0x80000000 | (p - Pointer.NULL));
-//XXX: which is better?		p.store(0x1BADBABE);
-			}
+			for (p = fromSpace_start; p < old_alloc_ptr; p += 4) p.store(0xFACED1ED);
 		}
-		// check to see if enough space remains
-		var available = fromSpace_end - scan;
-		if (available < size) {
-			if (RiGc.stats) {
-				D.puts("!HeapOverflow: ")
-				 .puti(scan - fromSpace_start).puts(" bytes used, ")
-				 .puti(size).puts(" requested, ")
-				 .puti(available).puts(" available\n");
-			}
-			RiRuntime.fatalException("HeapOverflow", "insufficient space after GC", ip, sp);
-			return Pointer.NULL;
-		}
-		CiRuntime.heapCurLoc.store(scan + size);
-		CiRuntime.heapEndLoc.store(fromSpace_end);
+
+		// swap spaces for next collection
+		var tmp = (toSpace_start, toSpace_end);
+		toSpace_start = fromSpace_start;
+		toSpace_end = fromSpace_end;
+		fromSpace_start = tmp.0;
+		fromSpace_end = tmp.1;
+
 		if (RiGc.stats) statsTime(before);
-		// return address of free space
+		collecting = false;
 		return scan;
+	}
+	def fatalOutOfMemory(size: int, ip: Pointer, sp: Pointer) -> Pointer {
+		if (RiGc.stats) {
+			D.puts("!HeapOverflow: ")
+			 .puti(alloc_ptr - toSpace_start).puts(" bytes used, ")
+			 .puti(size).puts(" requested, ")
+			 .puti(toSpace_end - alloc_ptr).puts(" available\n");
+		}
+		RiRuntime.fatalException("HeapOverflow", "insufficient space after GC", ip, sp);
+		return Pointer.NULL;
+	}
+	// Used by weak callbacks to check if a reference was live.
+	def relocCallback(ref: Pointer) -> Pointer {
+		if (ref >= fromSpace_end || ref < fromSpace_start) return ref;
+		var newref = ref.load<Pointer>(); // read forwarding pointer
+		return if(newref >= toSpace_start && newref < alloc_ptr, newref, Pointer.NULL);
 	}
 	// Total space used in the from space.
 	def fromSpaceUsed() -> long {
@@ -179,4 +189,3 @@ component Semispace {
 		return CiRuntime.heapCurLoc.load<Pointer>() - alloc_ptr;
 	}
 }
-

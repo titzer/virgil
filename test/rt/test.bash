@@ -7,6 +7,24 @@ EXE=RiRuntimeTest
 N=$VIRGIL_LOC/rt/native
 RT_SOURCES="$N/RiRuntime.v3 $N/NativeStackPrinter.v3 $N/NativeFileStream.v3"
 
+function compile_run() {
+    TEST=$1
+    EXE=${TEST%*.*}
+
+    print_compiling "$target" $EXE
+    run_v3c $target -output=$T $TEST &> $T/compile.out
+    check_no_red $? $T/compile.out
+
+    print_status Running "$target" $EXE
+
+    if [ -x $CONFIG/run-$target ]; then
+        $T/$EXE &> $T/$EXE.run.out
+        check $?
+    else
+	echo "${YELLOW}skipped${NORM}"
+    fi
+}
+
 function do_test() {
     set_os_sources $target
     T=$OUT/$target
@@ -24,36 +42,23 @@ function do_test() {
     run_v3c "" -target=$target -output=$T -heap-size=1k -rt.gc -rt.gctables -rt.sttables $SOURCES $OS_SOURCES $RT_SOURCES $GC_SOURCES &> $T/gc.compile.out
     check_no_red $? $T/gc.compile.out
 
-    print_compiling "$target" CiRuntimeApi
-    run_v3c $target -output=$T CiRuntimeApi.v3 &> $T/compile.out
-    check_no_red $? $T/compile.out
-
-    print_compiling "$target" FindFunc
-    run_v3c $target -output=$T FindFunc.v3 &> $T/find.compile.out
-    check_no_red $? $T/find.compile.out
+    compile_run CiRuntimeApi.v3
+    compile_run FindFunc.v3
 
     if [ -f "jit-${target}.v3" ]; then
-	print_compiling "$target" JIT
-	run_v3c $target -output=$T jit-$target.v3 &> $T/jit.compile.out
-	check_no_red $? $T/jit.compile.out
+        compile_run jit-${target}.v3
     fi
 
+    print_compiling "$target-gc" FinalizerTest
+    V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS -heap-size=1k -output=$T FinalizerTest.v3 &> $T/FinalizerTest.compile.out
+    check_no_red $? $T/FinalizerTest.compile.out
+
+    print_status Running "$target" FinalizerTest
+
     if [ -x $CONFIG/run-$target ]; then
-	print_status Running "$target" CiRuntimeApi
-	$T/CiRuntimeApi &> $T/run.out
-	check $?
-
-	print_status Running "$target" FindFunc
-	$T/FindFunc &> $T/find.run.out
-	check $?
-
-	if [ -x $T/jit-$target ]; then
-	    print_status Running "$target" JIT
-	    $T/jit-$target &> $T/jit.run.out
-	    check $?
-	fi
+        $T/FinalizerTest &> $T/FinalizerTest.run.out
+        check $?
     else
-	print_status Running "$target"
 	echo "${YELLOW}skipped${NORM}"
     fi
 }
