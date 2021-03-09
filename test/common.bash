@@ -33,7 +33,7 @@ V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
 PROGRESS=${VIRGIL_LOC}/test/config/progress
 
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
-TEST_TARGETS=${TEST_TARGETS:="int jvm wasm-js x86-darwin x86-linux x86-64-linux"}
+TEST_TARGETS=${TEST_TARGETS:="int jvm wasm-js x86-darwin x86-linux"}
 
 if [[ ! -x "$AENEAS_TEST" && "$AENEAS_TEST" != auto ]]; then
     echo $AENEAS_TEST: not found or not executable
