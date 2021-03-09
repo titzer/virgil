@@ -39,6 +39,7 @@
 
   ;; code for syntax highlighting
   (setq font-lock-defaults '((virgil-font-lock-keywords)))
+  (setq indent-tabs-mode t)
 
   (define-key virgil-mode-map [remap comment-dwim] 'virgil-comment-dwim)
 
