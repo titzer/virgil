@@ -2,62 +2,78 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Distinguishes an absolute address from an address that refers to a V3 entity.
+def MARKER = 0x11223344;
 class X86_64AddrRef extends X86_64Addr {
 	def ref: Addr;
 	new(base: X86_64Gpr, index: X86_64Gpr, scale: byte, ref)
-		super(base, index, scale, 0x44332211) { }
+		super(base, index, scale, MARKER) { }
+}
+class X86_64LabelRef extends X86_64Addr {
+	def label: Label;
+	new(label) super(null, null, 1, MARKER) { }
 }
 
 def ABS32 = '\x99';
 def REL32 = '\x88';
+def ABS64 = '\x77';
 
-// Adds additional functionality to the base X86-64 assembler, particularly the
-// functionality to record references to addresses in the code.
-class X86_64MacroAssembler extends X86_64Assembler {
+// Implementation of address patcher for assembler.
+class X86_64AddrPatcherImpl extends X86_64AddrPatcher {
 	def mw: MachDataWriter;
-	var labelUses: List<(int, Label)>; // XXX: unify label uses with MachDataWriter?
+	private var labelUses: List<(int, Label)>;
 
-	new(mw) super(mw) { }
+	new(mw) super(MARKER) { }
 
 	def recordAbs32(pos: int, addr: X86_64Addr) {
-		if (!X86_64AddrRef.?(addr)) return;
-		var ref = X86_64AddrRef.!(addr).ref;
-		w.data[pos] = ABS32;
-		mw.recordPatch(ref, pos);
+		match (addr) {
+			x: X86_64AddrRef => {
+				mw.data[pos] = ABS32;
+				mw.recordPatch(x.ref, pos);
+			}
+			x: X86_64LabelRef => {
+				mw.data[pos] = ABS32;
+				labelUses = List.new((pos, x.label), labelUses);
+			}
+		}
 	}
 	def recordRel32(pos: int, delta: int, addr: X86_64Addr) {
-		if (!X86_64AddrRef.?(addr)) return;
 		if (delta != i8.view(delta)) return V3.fail("unexpectedly large relative delta");
-		var ref = X86_64AddrRef.!(addr).ref;
-		w.data[pos] = REL32;
-		w.data[pos+1] = u8.view(delta);
-		mw.recordPatch(ref, pos);
+		match (addr) {
+			x: X86_64AddrRef => {
+				mw.data[pos] = REL32;
+				mw.data[pos+1] = u8.view(delta);
+				mw.recordPatch(x.ref, pos);
+			}
+			x: X86_64LabelRef => {
+				mw.data[pos] = REL32;
+				mw.data[pos+1] = u8.view(delta);
+				labelUses = List.new((pos, x.label), labelUses);
+			}
+		}
 	}
 	def recordAbs64(pos: int, addr: X86_64Addr) {
-		if (!X86_64AddrRef.?(addr)) return;
-		var ref = X86_64AddrRef.!(addr).ref;
-		w.data[pos] = '\x77';
-		mw.recordPatch(ref, pos);
-	}
-	def recordRelLabel32(pos: int, label: Label) {
-		w.data[pos] = REL32;
-		labelUses = List.new((pos, label), labelUses);
-	}
-	def recordAbsLabel32(pos: int, label: Label) {
-		w.data[pos] = ABS32;
-		labelUses = List.new((pos, label), labelUses);
+		match (addr) {
+			x: X86_64AddrRef => {
+				mw.data[pos] = ABS64;
+				mw.recordPatch(x.ref, pos);
+			}
+			x: X86_64LabelRef => {
+				mw.data[pos] = ABS64;
+				labelUses = List.new((pos, x.label), labelUses);
+			}
+		}
 	}
 	def patch(addr: Addr, posAddr: int, absAddr: int) {
-		match (w.data[w.pos]) {
+		match (mw.data[mw.pos]) {
 			ABS32 => {
-				w.put_b32(absAddr);
+				mw.put_b32(absAddr);
 			}
 			REL32 => {
-				var delta = i8.view(w.data[w.pos + 1]);
-				w.put_b32(absAddr - (posAddr + delta));
+				var delta = i8.view(mw.data[mw.pos + 1]);
+				mw.put_b32(absAddr - (posAddr + delta));
 			}
 			_ => {
-				w.put_b64(absAddr);
+				mw.put_b64(absAddr);
 			}
 		}
 	}
@@ -65,17 +81,28 @@ class X86_64MacroAssembler extends X86_64Assembler {
 		for (l = labelUses; l != null; l = l.tail) {
 			var u = l.head, pos = u.0, label = u.1;
 			if (label.pos < 0) return V3.fail("unbound label"); // XXX: better error message
-			if (w.data[pos] == REL32) {
-				var delta = label.pos - (pos + 4);
-				if (Aeneas.PRINT_PATCH.val) Terminal.put2("patch relative label ref @+%d -> +%d\n", pos, delta);
-				w.at(pos).put_b32(delta);
+			if (mw.data[pos] == REL32) {
+				var delta = i8.view(mw.data[pos + 1]);
+				var offset = label.pos - (pos + delta);
+				if (Aeneas.PRINT_PATCH.val) Terminal.put2("patch relative label ref @+%d -> +%d\n", pos, offset);
+				mw.at(pos).put_b32(offset);
 			} else {
 				var addr = mw.startAddr + label.pos;
 				if (Aeneas.PRINT_PATCH.val) Terminal.put2("patch absolute label ref @+%d -> 0x%x\n", pos, addr);
-				w.at(pos).put_b32(addr);
+				mw.at(pos).put_b32(addr);
 			}
 		}
 		labelUses = null;
 	}
 }
 
+// Adds additional functionality to the base X86-64 assembler, particularly the
+// functionality to record references to addresses in the code.
+class X86_64MacroAssembler extends X86_64Assembler {
+	def mw: MachDataWriter;
+	def patcherImpl = X86_64AddrPatcherImpl.new(mw);
+
+	new(mw) super(mw) {
+		this.patcher = patcherImpl;
+	}
+}
