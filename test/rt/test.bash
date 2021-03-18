@@ -12,8 +12,8 @@ function compile_run() {
     EXE=${TEST%*.*}
 
     print_compiling "$target" $EXE
-    run_v3c $target -output=$T $TEST &> $T/compile.out
-    check_no_red $? $T/compile.out
+    run_v3c $target -output=$T $TEST &> $T/$TEST.compile.out
+    check_no_red $? $T/$TEST.compile.out
 
     print_status Running "$target" $EXE
 
