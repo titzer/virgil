@@ -705,6 +705,10 @@ class VstCompoundVerifier {
 	def TypeExprError(range: FileRange, t1: Type) {
 		error(range, "TypeError", Strings.format1("type \"%q\" cannot be used as an expression", t1.render));
 	}
+	def PtrAtFieldError(range: FileRange) {
+		error(range, "TypeError",
+				"operator \"Pointer.atField\" must be applied to a class or component field reference");
+	}
 	def MemberNotInitialized(range: FileRange, msg: string) {
 		error(range, "MemberNotInitialized", msg);
 	}
@@ -1091,6 +1095,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var binding = lookupBinding(expr, outer);
 		match (binding) {
 			None => return if(outer == null, getErrorType(), outer);
+			PtrAtField(t) => methodEnv.verifier.PtrAtFieldError(expr.range());
 			Type(t) => methodEnv.verifier.TypeExprError(expr.range(), t);
 			_ => ;
 		}
@@ -1147,10 +1152,119 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return V3.stringType;
 	}
 	def visitApp(expr: AppExpr, outer: Type) -> Type {
-		// infer an open type for the function or array
-		var funcType = inferType(expr.func, null);
-		if (V3.isFunction(funcType)) return typeCheckMethodApp(expr, funcType, outer);
-		TypeError(expr.func.range(), getErrorFunctionType(), funcType, "call");
+		var funcType: Type;
+		match (expr.func) { // pattern-match on function, because Pointer.atField is a syntactic operator
+			x: VarExpr => match (lookupBinding(x, null)) {
+				None => funcType = getErrorType();
+				PtrAtField(t) => return visitPtrAtField(expr, t, outer);
+				Type(t) => methodEnv.verifier.TypeExprError(expr.range(), t);
+				_ => funcType = x.exactType;
+			}
+			_ => {
+				funcType = inferType(expr.func, null);
+			}
+		}
+
+		if (!V3.isFunction(funcType)) {
+			TypeError(expr.func.range(), getErrorFunctionType(), funcType, "call");
+			return getErrorType();
+		}
+		var partialParamTypes = typeCheckArgs("call", expr.args.exprs, funcType, outer);
+		var resultType = Function.getReturnType(funcType);
+		if (partialParamTypes != null) {
+			// this is a partial application, result is a function
+			var boundMap = Vector<int>.new(), i = 1;
+			boundMap.put(0);
+			var paramTypes: List<Type>;
+			for (el = expr.args.exprs.list; el != null; (el = el.tail, i++)) {
+				if (ParamExpr.?(el.head)) continue;
+				boundMap.put(i);
+			}
+			resultType = Function.newType(Tuple.newType(Lists.reverse(partialParamTypes)), resultType);
+			if (outer != null) TypeSystem.unifyWiden(resultType, outer);
+			expr.boundMap = boundMap.extract();
+			expr.appbind = AppBinding.Partial(expr.boundMap);
+		} else {
+			// this is a complete application, its result is the return type
+			var varbind: VarBinding, obj: Expr;
+			if (VarExpr.?(expr.func)) {
+				var v = VarExpr.!(expr.func);
+				varbind = v.varbind;
+				obj = v.receiver;
+			}
+			match (varbind) {
+				ObjectMethod(receiver, method, typeArgs) => {
+					expr.target = obj;
+					expr.appbind = AppBinding.CallObjectMethod(receiver, method, typeArgs);
+				}
+				ComponentMethod(method, typeArgs) => {
+					expr.target = obj;
+					expr.appbind = AppBinding.CallComponentMethod(method.receiver.getDeclaredType(), method, typeArgs);
+				}
+				ClassMethod(receiver, method, typeArgs) => {
+					expr.target = null;
+					expr.appbind = AppBinding.CallClassMethod(receiver, method, typeArgs);
+				}
+				ClassNew(receiver, member, funcType) => {
+					expr.target = null;
+					expr.appbind = AppBinding.ClassNew(receiver, member);
+				}
+				Inst(comp, facts) => {
+					expr.target = null;
+					expr.appbind = AppBinding.Apply(comp, facts);
+				}
+				Partial(comp, facts) => {
+					expr.target = obj;
+					expr.appbind = AppBinding.Apply(comp, facts);
+				}
+				VariantCase(receiver, member) => {
+					if (member.decl.params != null) {
+						var variant = V3.getSyntheticVariantType(receiver, member);
+						expr.target = null;
+						expr.appbind = AppBinding.ClassNew(variant, member.decl.constructor);
+					} else {
+						expr.appbind = AppBinding.CallClosure(elim(funcType));
+					}
+				}
+				_ => {
+					expr.appbind = AppBinding.CallClosure(elim(funcType));
+				}
+			}
+		}
+
+		expr.func.exactType = elim(funcType);
+		return elim(resultType);
+	}
+	def visitPtrAtField(expr: AppExpr, ptrType: Type, outer: Type) -> Type {
+		if (expr.args.exprs.length() != 1) {
+			methodEnv.verifier.PtrAtFieldError(expr.args.range());
+			return getErrorType();
+		}
+		var arg = expr.args.exprs.first();
+		inferClosedType(arg);
+		match (arg) {
+			x: VarExpr => match (x.varbind) {
+				ComponentField(member) => {
+					var receiver = member.receiver.getDeclaredType();
+					expr.appbind = AppBinding.PtrAtComponentField(receiver, member, ptrType);
+					expr.args = TupleExpr.new(VstList.new(expr.args.range(), null));
+					expr.target = null;
+					return expr.exactType = ptrType;
+				}
+				ObjectField(receiver, member) => {
+					expr.appbind = AppBinding.PtrAtObjectField(receiver, member, ptrType);
+					expr.args = TupleExpr.new(VstList.new(expr.args.range(), null));
+					expr.target = x.receiver;
+					return expr.exactType = ptrType;
+				}
+				_ => {
+					methodEnv.verifier.PtrAtFieldError(arg.range());
+				}
+			}
+			_ => {
+				methodEnv.verifier.PtrAtFieldError(arg.range());
+			}
+		}
 		return getErrorType();
 	}
 	def visitIndex(expr: IndexExpr, outer: Type) -> Type {
@@ -1262,73 +1376,6 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			typeCheckExpr(cl.head.0, elim(cl.head.1), op);
 		}
 		return partialParamTypes;
-	}
-	def typeCheckMethodApp(expr: AppExpr, funcType: Type, outer: Type) -> Type {
-		var partialParamTypes = typeCheckArgs("call", expr.args.exprs, funcType, outer);
-		var resultType = Function.getReturnType(funcType);
-		if (partialParamTypes != null) {
-			// this is a partial application, result is a function
-			var boundMap = Vector<int>.new(), i = 1;
-			boundMap.put(0);
-			var paramTypes: List<Type>;
-			for (el = expr.args.exprs.list; el != null; (el = el.tail, i++)) {
-				if (ParamExpr.?(el.head)) continue;
-				boundMap.put(i);
-			}
-			resultType = Function.newType(Tuple.newType(Lists.reverse(partialParamTypes)), resultType);
-			if (outer != null) TypeSystem.unifyWiden(resultType, outer);
-			expr.boundMap = boundMap.extract();
-			expr.appbind = AppBinding.Partial(expr.boundMap);
-		} else {
-			// this is a complete application, its result is the return type
-			var varbind: VarBinding, obj: Expr;
-			if (VarExpr.?(expr.func)) {
-				var v = VarExpr.!(expr.func);
-				varbind = v.varbind;
-				obj = v.receiver;
-			}
-			match (varbind) {
-				ObjectMethod(receiver, method, typeArgs) => {
-					expr.target = obj;
-					expr.appbind = AppBinding.CallObjectMethod(receiver, method, typeArgs);
-				}
-				ComponentMethod(method, typeArgs) => {
-					expr.target = obj;
-					expr.appbind = AppBinding.CallComponentMethod(method.receiver.getDeclaredType(), method, typeArgs);
-				}
-				ClassMethod(receiver, method, typeArgs) => {
-					expr.target = null;
-					expr.appbind = AppBinding.CallClassMethod(receiver, method, typeArgs);
-				}
-				ClassNew(receiver, member, funcType) => {
-					expr.target = null;
-					expr.appbind = AppBinding.ClassNew(receiver, member);
-				}
-				Inst(comp, facts) => {
-					expr.target = null;
-					expr.appbind = AppBinding.Apply(comp, facts);
-				}
-				Partial(comp, facts) => {
-					expr.target = obj;
-					expr.appbind = AppBinding.Apply(comp, facts);
-				}
-				VariantCase(receiver, member) => {
-					if (member.decl.params != null) {
-						var variant = V3.getSyntheticVariantType(receiver, member);
-						expr.target = null;
-						expr.appbind = AppBinding.ClassNew(variant, member.decl.constructor);
-					} else {
-						expr.appbind = AppBinding.CallClosure(elim(funcType));
-					}
-				}
-				_ => {
-					expr.appbind = AppBinding.CallClosure(elim(funcType));
-				}
-			}
-		}
-
-		expr.func.exactType = elim(funcType);
-		return elim(resultType);
 	}
 	def visitNot(expr: NotExpr, outer: Type) -> Type {
 		typeCheckExpr(expr.expr, Bool.TYPE, "boolean not operator");
@@ -1688,7 +1735,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		ERROR.addError(range, file.extractLine(range.beginLine), error, msg);
 	}
 	def TYPE(tref: Type) -> string {
-		if (tref == null) return "<unknown>";
+		if (tref == null) return "<null>";
 		return tref.render(StringBuilder.new()).toString();
 	}
 }
