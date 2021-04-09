@@ -49,6 +49,10 @@ function do_test() {
         compile_run jit-${target}.v3
     fi
 
+    if [ -f "signal-${target}.v3" ]; then
+        compile_run signal-${target}.v3
+    fi
+
     print_compiling "$target-gc" FinalizerTest
     V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS -heap-size=1k -output=$T FinalizerTest.v3 &> $T/FinalizerTest.compile.out
     check_no_red $? $T/FinalizerTest.compile.out
