@@ -85,20 +85,49 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		}
 	}
 	def makeMachArray(utype: Type) -> Mach_V3Array {
-		var marray = Mach_V3Array.new(utype, utype);
+		var arrayRep = Mach_V3Array.new(utype, utype);
 		var mlayout = MachLayout.new(this);
 		// 1. compute the layout for the array header
 		mlayout.addType(tagType);
-		marray.lengthOffset = mlayout.addType(Int.TYPE);
-		marray.headerSize = data.addrAlign.alignUp(mlayout.size);
+		arrayRep.lengthOffset = mlayout.addType(Int.TYPE);
+		arrayRep.headerSize = data.addrAlign.alignUp(mlayout.size);
 		// 2. compute the scale for elements
 		var elemType = V3Array.elementType(utype);
-		// TODO: round up array element scale to a power of two if necessary
-		marray.elemScale = byte.!(sizeOf(elemType));
-		// 3. compute the type tag for the array
-		var tag = if(isRefType(elemType), 3, 1);
-		marray.typeTag = Int.box((marray.elemScale << 2) | tag);
-		return marray;
+		if (V3.isTuple(elemType)) {
+			// 3. compute the type tag, offsets, and refmap for a mixed array
+			makeMixedArrayRep(arrayRep, elemType);
+		} else {
+			arrayRep.elemScale = sizeOf(elemType);
+			// 3. compute the type tag for the array
+			var tag = if(isRefType(elemType), MachObjectTags.REF_ARRAY_TAG, MachObjectTags.PRIM_ARRAY_TAG);
+			arrayRep.typeTag = Int.box((arrayRep.elemScale << 2) | tag);
+		}
+		return arrayRep;
+	}
+	def makeMixedArrayRep(arrayRep: Mach_V3Array, elemType: Type) {
+		var mlayout = MachLayout.new(this);
+		var offsets = Vector<int>.new();
+		var isMixed = false;
+		var ets = arrayRep.elemTypes = Tuple.toTypeArray(elemType);
+		
+		arrayRep.offsets = Arrays.map(ets, mlayout.addType);
+		arrayRep.elemScale = mlayout.size;
+		
+		for (et in ets) if (isRefType(et)) {
+			// compute a bitmap that encodes the reference map and element size
+			mlayout.size = alignTo(mlayout.size, refSize);
+			var refmap = 1 << byte.!(mlayout.size / refSize);
+			for (i < ets.length) {
+				if (isRefType(ets[i])) refmap |= 1 << byte.!(arrayRep.offsets[i] / refSize);
+			}
+			var tag = MachObjectTags.MIXED_ARRAY_TAG;
+			arrayRep.typeTag = Int.box((refmap << 2) | tag);
+			arrayRep.refmap = refmap;
+			return;
+		}
+		// no references; encode as a primitive array tag
+		var tag = MachObjectTags.PRIM_ARRAY_TAG;
+		arrayRep.typeTag = Int.box((arrayRep.elemScale << 2) | tag);
 	}
 	def machType(t: Type) -> Type {
 		var r: MachRep;
@@ -188,11 +217,13 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	def getArrayLengthOffset(arrayType: Type) -> int {
 		return arrayRep(arrayType).lengthOffset;
 	}
-	def getArrayElemScale(arrayType: Type) -> byte {
+	def getArrayElemScale(arrayType: Type) -> int {
 		return arrayRep(arrayType).elemScale;
 	}
-	def getArrayElemOffset(arrayType: Type) -> int {
-		return arrayRep(arrayType).headerSize;
+	def getArrayElemOffset(arrayType: Type, elem: int) -> int {
+		var ar = arrayRep(arrayType);
+		if (elem > 0) return ar.headerSize + ar.offsets[elem];
+		return ar.headerSize;
 	}
 	def getObjectSize(t: Type, r: Record) -> int {
 		if (V3.isClass(t)) return irClass(t).machSize; // return the size of the object
@@ -207,7 +238,7 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 	def irClass(t: Type) -> IrClass {
 		return prog.ir.getIrClass(t);
 	}
-	private def arrayRep(t: Type) -> Mach_V3Array {
+	def arrayRep(t: Type) -> Mach_V3Array {
 		var ar = Mach_V3Array.!(typeReps[t]);
 		if (ar == null) typeReps[t] = ar = makeMachArray(t); // create array representation
 		return ar;
@@ -306,7 +337,17 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 			var rep = arrayRep(r.rtype);
 			w.put_b32(Int.unbox(rep.typeTag));
 			w.at(start + rep.lengthOffset).put_b32(v.length);
-			if (rep.elemScale > 0) {
+			if (rep.offsets != null) {
+				// mixed array
+				var et = V3Array.elementType(r.rtype), ets = Tuple.toTypeArray(et);
+				for (i < v.length) {
+					var tv = TupleVal.!(v[i]), elemBegin = start + i * rep.elemScale + rep.headerSize;
+					for (j < ets.length) {
+						// XXX: special case Array<byte>, Array<Record>, Array<int> for performance
+						encodeVal(w.at(elemBegin + rep.offsets[j]), if(tv == null, null, tv.values[j]), ets[j]);
+					}
+				}
+			} else if (rep.elemScale > 0) {
 				var et = V3Array.elementType(r.rtype);
 				for (i < v.length) {
 					// XXX: special case Array<byte>, Array<Record>, Array<int> for performance
@@ -491,26 +532,18 @@ class MachProgram(prog: Program, code: AddressSpace, data: AddressSpace, intNorm
 		}
 	}
 	def layoutAllRecordsAndFuncs() {
-		Vectors.drain(recordQueue, 0, layoutRecordAndFunc);
+		Vectors.drain(recordQueue, 0, layoutRecord);
 	}
 	private def layoutRecord(r: Record) {
-		for (i < r.values.length) layoutVal(r.values[i]);
-	}
-	private def layoutRecordAndFunc(r: Record) {
-		for (i < r.values.length) {
-			var val = r.values[i];
-			layoutVal(val);
-			if (FuncVal.?(val)) {
-				addrOfMethod(FuncVal.!(val).memberRef.asMethod());
-			} else if (Closure.?(val)) {
-				addrOfMethod(Closure.!(val).memberRef.asMethod());
-			}
-		}
+		for (v in r.values) layoutVal(v);
 	}
 	private def layoutVal(val: Val) {
-		if (Record.?(val)) mapRecord(Record.!(val));
-		else if (Closure.?(val)) layoutVal(Closure.!(val).val);
-		else if (TupleVal.?(val)) for(e in TupleVal.!(val).values) layoutVal(e);
+		match (val) {
+			x: Record => mapRecord(x);
+			x: FuncVal => addrOfMethod(x.memberRef.asMethod());
+			x: Closure => { layoutVal(x.val); addrOfMethod(x.memberRef.asMethod()); }
+			x: TupleVal => for (e in x.values) layoutVal(e);
+		}
 	}
 	def encodeRegion(region: Region, w: MachDataWriter) {
 		// encode region contents at the end of this buffer
@@ -563,12 +596,26 @@ class Mach_FuncRep extends MachRep {
 class Mach_V3Array extends MachRep {
 	var lengthOffset: int;
 	var headerSize: int;
-	var elemScale: byte;
+	var elemScale: int;
 	var typeTag: Box<int>;
+	// for compound arrays
+	var elemTypes: Array<Type>; 
+	var offsets: Array<int>;
+	var refmap: int;
+
 	new(arrayType: Type, machType: Type) super(arrayType, machType) { }
+
 	def getObjectSize(r: Record) -> int {
 		if (r == null) return headerSize;
 		return headerSize + r.values.length * elemScale;
+	}
+	def getElemElemOffset(elem: int) -> int {
+		if (offsets != null) return headerSize + offsets[elem];
+		return headerSize;
+	}
+	def getElemElemType(arrayType: Type, elem: int) -> Type {
+		if (elemTypes != null) return elemTypes[elem];
+		return V3Array.elementType(arrayType);
 	}
 }
 // A layout is used for adding fields sequentially to a memory area, aligning fields
@@ -637,4 +684,11 @@ class MachRtPageTable(
 	def grow(len: int) -> this {
 		entries.grow(len);
 	}
+}
+// Constants for object tags.
+component MachObjectTags {
+	def OBJECT_TAG = 0;
+	def MIXED_ARRAY_TAG = 2;
+	def PRIM_ARRAY_TAG = 1;
+	def REF_ARRAY_TAG = 3;
 }

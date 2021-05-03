@@ -196,6 +196,13 @@ class SsaGraphNormalizer(context: SsaContext) {
 		if (i.mark != singleMark) context.fail1("instruction @%d should map 1-1", i.uid);
 		return if (i.instrVal != null, i.instrVal, i);
 	}
+	def normRefN(e: SsaDfEdge) -> Array<SsaInstr> {
+		var x = e.dest;
+		var r = getReplacements(x);
+		if (r != null) return r;
+		while (x.instrVal != null) x = x.instrVal;
+		return [x];
+	}
 	def normRefs(a: Array<SsaDfEdge>) -> Array<SsaInstr> {
 		buffer.length = 0;
 		buffer.grow(a.length);
@@ -485,8 +492,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			TypeSubsume => 			return genTypeSubsume(oi);
 			ArrayAlloc => 			ni = genArrayAlloc(oi);
 			ArrayInit => 			ni = genArrayInit(oi);
-			ArrayGetElem => 		return genArrayGetElem(oi);
-			ArraySetElem => 		return genArraySetElem(oi);
+			ArrayTupleInit(elems, length) => ni = genArrayTupleInit(oi, elems, length);
+			ArrayGetElem => 		return genArrayGetElem(oi, 0);
+			ArraySetElem => 		return genArraySetElem(oi, 0);
+			ArrayGetElemElem(index) => 	return genArrayGetElem(oi, index);
+			ArraySetElemElem(index) => 	return genArraySetElem(oi, index);
 			ArrayGetLength => 		ni = genArrayGetLength(oi);
 			ClassAlloc(method) => 		return genClassAlloc(oi, method);
 			ClassGetField(field) => 	return genObjectGetField(false, oi, field);
@@ -515,7 +525,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			}
 			PtrAtContents => {
 				var add = newPtrAdd(oi.op.sig.returnType());
-				var offset = context.graph.intConst(mach.getArrayElemOffset(oi.op.sig.paramTypes[0]));
+				var offset = context.graph.intConst(mach.getArrayElemOffset(oi.op.sig.paramTypes[0], 0));
 				var array = normRef1(oi.inputs[0]);
 				ni = apply(oi.source, add, [array, offset]);
 			}
@@ -531,7 +541,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			PtrAtElement => {
 				genBoundsCheck(oi, false);
 				var narr = normRef1(oi.inputs[0]), arrayType = oi.op.typeArgs[0];
-				var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
+				var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
 				var index = normRef1(oi.inputs[1]);
 				var offset = genArrayElemOffset(hsize, scale, index);
 				ni = ptrAdd(narr, offset);
@@ -1299,7 +1309,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def genArrayAlloc(oi: SsaApplyOp) -> SsaInstr {
 		var olen = oi.inputs[0], arrayType = oi.op.typeArgs[0];
-		var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
+		var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
 		if (SsaConst.?(olen.dest)) {
 			// length is known statically
 			var len = olen.dest.unbox<int>();
@@ -1343,7 +1353,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def genArrayInit(oi: SsaApplyOp) -> SsaInstr {
 		var arrayType = oi.op.typeArgs[0];
-		var offset = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
+		var offset = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
 		var narr = genArrayAllocWithSize(oi.source, arrayType, offset, oi.inputs.length, scale);
 		var machType = mach.machType(V3Array.elementType(arrayType));
 		var tn = normIntType(machType), stride = if(tn == null, 1, tn.size);
@@ -1355,24 +1365,40 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return narr;
 	}
-	def genArrayGetElem(oi: SsaApplyOp) {
+	def genArrayTupleInit(oi: SsaApplyOp, elems: int, length: int) -> SsaInstr {
+		var arrayType = oi.op.typeArgs[0];
+		var arrayRep = mach.arrayRep(arrayType);
+		var narr = genArrayAllocWithSize(oi.source, arrayType, arrayRep.headerSize, length, arrayRep.elemScale);
+		for (i < length) {
+			for (j < elems) {
+				var val = oi.inputs[i * elems + j];
+				var inputs = normRefN(val);
+				var offset = arrayRep.headerSize + arrayRep.offsets[j] + i * arrayRep.elemScale;
+				// XXX: cache type normalization across calls to this method
+				genNormTypedStores(oi, false, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
+			}
+		}
+		return narr;
+	}
+	def genArrayGetElem(oi: SsaApplyOp, elem: int) {
 		genBoundsCheck(oi, false);
 		var narr = normRef1(oi.inputs[0]), arrayType = oi.op.typeArgs[0];
-		var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
+		var arrayRep = mach.arrayRep(arrayType);
 		var index = normRef1(oi.inputs[1]);
-		var offset = genArrayElemOffset(hsize, scale, index);
+		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, index);
 		// XXX: fold null check into pointer access if no bounds check
-		var loads = genNormTypedLoads(oi.source, false, mach.machType(oi.getType()), ptrAdd(narr, offset), 0);
+		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
+		var loads = genNormTypedLoads(oi.source, false, machType, ptrAdd(narr, offset), 0);
 		mapN(oi, loads);
 	}
-	def genArraySetElem(oi: SsaApplyOp) {
+	def genArraySetElem(oi: SsaApplyOp, elem: int) {
 		genBoundsCheck(oi, false);
 		var inputs = normRefs(oi.inputs);
 		var narr = inputs[0], arrayType = oi.op.typeArgs[0];
-		var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
-		var offset = genArrayElemOffset(hsize, scale, inputs[1]);
+		var arrayRep = mach.arrayRep(arrayType);
+		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, inputs[1]);
 		// XXX: fold null check into pointer access if no bounds check
-		var machType = mach.machType(V3Array.elementType(arrayType));
+		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
 		genNormTypedStores(oi, false, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
 		oi.kill();
 		oi.remove();
