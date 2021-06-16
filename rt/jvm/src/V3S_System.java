@@ -361,13 +361,13 @@ public class V3S_System {
 
     public static double round_ul2d(long v) {
 	double r = (double)v;
-	if (v < 0) return r + 0x1p64;
+	if (v < 0) return 2.0d * (double)((v >>> 1) | (v & 1));
 	return r;
     }
 
     public static float round_ul2f(long v) {
 	float r = (float)v;
-	if (v < 0) return r + 0x1p64f;
+	if (v < 0) return 2.0f * (float)((v >>> 1) | (v & 1));
 	return r;
     }
 
