@@ -11,7 +11,7 @@ if [ "$?" -ne 0 ]; then
 fi
 
 if [ "$PROGRESS_PIPE" = 1 ]; then
-    v3c -run *.v3 $(cat DEPS) $@ | progress i
+    v3c $V3C_OPTS -run *.v3 $(cat DEPS) $@ | progress i
 else
-    v3c -run *.v3 $(cat DEPS) $@
+    v3c $V3C_OPTS -run *.v3 $(cat DEPS) $@
 fi
