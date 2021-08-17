@@ -10,6 +10,7 @@ fi
 function compile_tests() {
     target=$1
     trace_test_count $(echo $TESTS | wc -w)
+    # TODO: use -rt.files when that v3c option is in stable
     for t in $TESTS; do
 	trace_test_start $t
 	# XXX: use bin/dev/target-nogc?
@@ -36,6 +37,7 @@ function run_compiled_tests() {
 function run_int_tests() {
     target=$1
     trace_test_count $(echo $TESTS | wc -w)
+    # TODO: run multiple stacktrace tests in one Aeneas?
     for t in $TESTS; do
 	trace_test_start $t
 	$AENEAS_TEST -run $t > $T/$t.out

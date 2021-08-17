@@ -39,7 +39,9 @@ def MONO_TYPEARGS = [AnyObject.TYPE];
 def EQUALS_VST_METHOD = VstMethod.new(false, Token.new(null, "==", 0, 0), null, null, null, null);
 
 // Performs polymorphic reachability analysis over a program.
-class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
+class ReachabilityAnalyzer(compilation: Compilation) {
+	def compiler = compilation.compiler;
+	def prog = compilation.prog;
 	def oldIr = prog.ir;
 	def typeMap = TypeUtil.newTypeMap<TypeNorm>();
 	def records = V3.newRecordMap<Record>();
@@ -132,7 +134,8 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		} else if (Closure.?(val)) {
 			// analyze a record + method closure pair
 			var closure = Closure.!(val), spec = closure.memberRef;
-			getMethod(null, makeMethod(spec.typeArgs, IrMethod.!(spec.member), null));
+			var rm = makeMethod(spec.typeArgs, IrMethod.!(spec.member), null);
+			getMethod(null, rm);
 			if (closure.val != null) analyzeRecord(Record.!(closure.val));
 		} else if (TupleVal.?(val)) {
 			// recursively analyze tuple values
@@ -192,7 +195,7 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		if (decl.cases == null) return vec;
 		for (c in decl.cases) {
 			vec.put(oldIr.getIrClass(c.decl.getDeclaredType()));
-			gatherCaseClasses(vec, c.decl);
+			if (c.decl != decl) gatherCaseClasses(vec, c.decl);
 		}
 		return vec;
 	}
@@ -214,7 +217,9 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		// build overridden methods for each case that has fields
 		for (i < cases.length) {
 			var ic = cases[i];
-			var pc = oldIr.getIrClass(V3.getSuperType(ic.ctype));
+			var superType = V3.getSuperType(ic.ctype);
+			if (superType == null) superType = ic.ctype;
+			var pc = oldIr.getIrClass(superType);
 			var pm = pc.methods[IrUtil.EQUALS_METHOD_INDEX];
 			if (ic.fields.length > 0) {
 				pm.facts |= Fact.M_OVERRIDDEN;
@@ -237,7 +242,7 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 				var context = SsaContext.new(compiler, prog);
 				graph = VariantComparatorGen.new(context, root, receiver, rm.orig).generate();
 			} else {
-				graph = compiler.genSsa(prog, rm.getSpec(), 0);
+				graph = compilation.genSsa(rm.getSpec(), 0);
 			}
 		}
 		if (rm.spec != null) {
@@ -310,6 +315,8 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 			ClassInitField(field) => initField(op, makeField(op, field, context));
 			ClassSetField(field) => setField(op, makeField(op, field, context));
 			ComponentSetField(field) => setField(op, makeField(op, field, context));
+			PtrAtObjectField(field) => if (op.useList != null) getAndSetField(makeField(op, field, context));
+			PtrAtComponentField(field) => if (op.useList != null) getAndSetField(makeField(op, field, context));
 			_ => ;
 		}
 	}
@@ -361,10 +368,23 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 		if (rm.setFact(RaFact.RM_LIVE)) return;
 		liveMethods.put(rm);
 		queue.add(analyzeMethod, rm);
+		if (V3.isVariant(rm.receiver)) { // XXX: this is because of variant null replacement
+			var rc = makeClass(rm.receiver);
+			var newlyLive = !live(rc.raFacts);
+			rc.raFacts |= RaFact.RC_LIVE;
+			if (newlyLive) analyzeLiveClass(rc);
+		}
 	}
 	def getField(rf: RaField) {
 		if (rf.setFact(RaFact.RF_READ)) return;
 		queue.add(analyzeGetField, (makeClass(rf.receiver), rf));
+	}
+	def getAndSetField(rf: RaField) {
+		getField(rf);
+		rf.raFacts |= RaFact.RF_WRITTEN;
+		var none: Fact.set;
+		rf.writeFacts = none;
+		rf.setFact(RaFact.RF_VAL_MANY);
 	}
 	def setField(op: SsaApplyOp, rf: RaField) {
 		rf.raFacts |= RaFact.RF_WRITTEN;
@@ -495,6 +515,10 @@ class ReachabilityAnalyzer(compiler: Compiler, prog: Program) {
 					raType = RaArray.new(t, V3.voidArrayType, null);
 				} else if (enorm.sub == null) {
 					raType = RaArray.new(t, V3Array.newType(enorm.newType), null);
+				} else if (compiler.MixedArrays) {
+					var ra = RaArray.new(t, V3Array.newType(enorm.newType), null);
+					ra.enorm = enorm;
+					raType = ra;
 				} else {
 					var et = Arrays.map(enorm.sub, V3Array.newType);
 					raType = RaArray.new(t, Tuple.newType(Lists.fromArray(et)), et);
@@ -710,11 +734,16 @@ class RaClass extends TypeNorm {
 class RaArray extends TypeNorm {
 	var primitive: bool;
 	var instances: List<Record>;
+	var enorm: TypeNorm; // for mixed arrays
+
 	new(oldType: Type, newType: Type, sub: Array<Type>) super(oldType, newType, sub) {
 		var elem = oldType.nested.head;
 		match (elem.typeCon.kind) {
 			V3Kind.INT, V3Kind.FLOAT, V3Kind.BOOL, V3Kind.VOID => primitive = true;
 		}
+	}
+	def isMixed() -> bool {
+		return enorm != null && enorm.size > 1;
 	}
 }
 // Information about a function type, which might have a truncated signature
@@ -810,9 +839,11 @@ class RaVirtual(raMethod: RaMethod) {
 // A target which prints out the results of reachability analysis
 def raTarget = Aeneas.registerTarget(RaTarget.new());
 class RaTarget extends Target("ra") {
-	def configure(compiler: Compiler, prog: Program) {
-		SystemCalls.install(prog);
+	def configureCompiler(compiler: Compiler) {
 		compiler.Reachability = true;
+	}
+	def configureProgram(prog: Program) {
+		SystemCalls.install(prog);
 	}
 	def emit(compiler: Compiler, prog: Program) {
 		IrPrinter.new(prog).print();

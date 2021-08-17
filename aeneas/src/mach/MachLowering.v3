@@ -196,6 +196,13 @@ class SsaGraphNormalizer(context: SsaContext) {
 		if (i.mark != singleMark) context.fail1("instruction @%d should map 1-1", i.uid);
 		return if (i.instrVal != null, i.instrVal, i);
 	}
+	def normRefN(e: SsaDfEdge) -> Array<SsaInstr> {
+		var x = e.dest;
+		var r = getReplacements(x);
+		if (r != null) return r;
+		while (x.instrVal != null) x = x.instrVal;
+		return [x];
+	}
 	def normRefs(a: Array<SsaDfEdge>) -> Array<SsaInstr> {
 		buffer.length = 0;
 		buffer.grow(a.length);
@@ -434,8 +441,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		match(oi.op.opcode) {
 			// Simple operators require no conversion other than normalization
 			IntEq =>			ni = genEqualOp(oi);
-			IntLt =>			ni = genIntCmp(oi, V3Infix.Lt, V3Infix.Lt);
-			IntLteq =>			ni = genIntCmp(oi, V3Infix.Lt, V3Infix.LtEq);
+			IntLt =>			ni = genIntCmp(oi, IntType.opLt, IntType.opLt);
+			IntLteq =>			ni = genIntCmp(oi, IntType.opLt, IntType.opLtEq);
 			// Output of integer operations must be normalized
 			IntAdd,				// --
 			IntSub,				// --
@@ -446,9 +453,9 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			IntSar,				// --
 			IntShr =>			return genShiftOp(oi);
 			// Output of integer operations must be normalized
-			IntAnd =>			return genParallelIntOp(oi, V3Infix.And);
-			IntOr =>			return genParallelIntOp(oi, V3Infix.Or);
-			IntXor =>			return genParallelIntOp(oi, V3Infix.Xor);
+			IntAnd =>			return genParallelIntOp(oi, IntType.opAnd);
+			IntOr =>			return genParallelIntOp(oi, IntType.opOr);
+			IntXor =>			return genParallelIntOp(oi, IntType.opXor);
 			// Floating point truncations, casts, and queries may have range checks
 			IntCastF =>			return genIntCastF(oi);
 			IntQueryF =>			return genIntQueryF(oi);
@@ -485,8 +492,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			TypeSubsume => 			return genTypeSubsume(oi);
 			ArrayAlloc => 			ni = genArrayAlloc(oi);
 			ArrayInit => 			ni = genArrayInit(oi);
-			ArrayGetElem => 		return genArrayGetElem(oi);
-			ArraySetElem => 		return genArraySetElem(oi);
+			ArrayTupleInit(elems, length) => ni = genArrayTupleInit(oi, elems, length);
+			ArrayGetElem => 		return genArrayGetElem(oi, 0);
+			ArraySetElem => 		return genArraySetElem(oi, 0);
+			ArrayGetElemElem(index) => 	return genArrayGetElem(oi, index);
+			ArraySetElemElem(index) => 	return genArraySetElem(oi, index);
 			ArrayGetLength => 		ni = genArrayGetLength(oi);
 			ClassAlloc(method) => 		return genClassAlloc(oi, method);
 			ClassGetField(field) => 	return genObjectGetField(false, oi, field);
@@ -495,6 +505,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			ClassGetMethod(method) => 	ni = genClassGetMethod(oi, method);
 			ClassGetSelector(selector) => 	ni = genClassGetSelector(oi, selector);
 			VariantGetField(field) => 	return genObjectGetField(true, oi, field);
+			VariantReplaceNull =>		ni = genVariantReplaceNull(oi);
 			ComponentGetField(field) => 	return genComponentGetField(oi, field);
 			ComponentSetField(field) => 	return genComponentSetField(oi, field);
 			TupleGetElem(index) => 		return genTupleGetElem(oi, index);
@@ -514,9 +525,36 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			}
 			PtrAtContents => {
 				var add = newPtrAdd(oi.op.sig.returnType());
-				var offset = context.graph.intConst(mach.getArrayElemOffset(oi.op.sig.paramTypes[0]));
+				var offset = context.graph.intConst(mach.getArrayElemOffset(oi.op.sig.paramTypes[0], 0));
 				var array = normRef1(oi.inputs[0]);
 				ni = apply(oi.source, add, [array, offset]);
+			}
+			PtrAtLength => {
+				var add = newPtrAdd(oi.op.sig.returnType());
+				var offset = context.graph.intConst(mach.getArrayLengthOffset(oi.op.sig.paramTypes[0]));
+				var array = normRef1(oi.inputs[0]);
+				ni = apply(oi.source, add, [array, offset]);
+			}
+			PtrAtObject => {
+				ni = normRef1(oi.inputs[0]);
+			}
+			PtrAtElement => {
+				genBoundsCheck(oi, false);
+				var narr = normRef1(oi.inputs[0]), arrayType = oi.op.typeArgs[0];
+				var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
+				var index = normRef1(oi.inputs[1]);
+				var offset = genArrayElemOffset(hsize, scale, index);
+				ni = ptrAdd(narr, offset);
+			}
+			PtrAtComponentField(field) => {
+				var fieldRef = V3Op.extractIrSpec(oi.op, field);
+				ni = componentFieldPtr(fieldRef);
+			}
+			PtrAtObjectField(field) => {
+				var fieldRef = V3Op.extractIrSpec(oi.op, field);
+				var oobj = oi.inputs[0], nobj = normRef1(oobj);
+				var offset = context.graph.intConst(mach.classFieldOffset(fieldRef));
+				ni = ptrAdd(nobj, offset);
 			}
 			TupleCreate,		// --
 			ClassGetVirtual,	// --
@@ -542,22 +580,22 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	def unexpected(oi: SsaApplyOp) {
 		context.fail1("unexpected operator %q", oi.op.render);
 	}
-	def genIntCmp(oi: SsaApplyOp, infixH: V3Infix, infixL: V3Infix) -> SsaInstr {
+	def genIntCmp(oi: SsaApplyOp, infixH: IntType -> Operator, infixL: IntType -> Operator) -> SsaInstr {
 		var tn = normIntType(oi.op.typeArgs[0]);
 		if (tn == null || tn.size == 1) return normInputs(oi);
 		var newArgs = normRefs(oi.inputs);
 		return genIntCmpRec(oi, tn, newArgs, tn.bigEndIndex(), infixH, infixL);
 	}
-	def genIntCmpRec(oi: SsaApplyOp, tn: RaIntType, newArgs: Array<SsaInstr>, i: int, infixH: V3Infix, infixL: V3Infix) -> SsaInstr {
+	def genIntCmpRec(oi: SsaApplyOp, tn: RaIntType, newArgs: Array<SsaInstr>, i: int, infixH: IntType -> Operator, infixL: IntType -> Operator) -> SsaInstr {
 		var a = newArgs[i], b = newArgs[i + tn.size];
 		var tt = IntType.!(tn.sub[i]);
 		if (i == tn.littleEndIndex()) {
-			var op = tt.lookupInfix0(infixL);
+			var op = infixL(tt);
 			return apply(oi.source, op, [a, b]);
 		}
-		var op = tt.lookupInfix0(if(i == tn.littleEndIndex(), infixL, infixH));
+		var op = if(i == tn.littleEndIndex(), infixL, infixH)(tt);
 		var cmp = apply(oi.source, op, [a, b]);
-		var eq = apply(oi.source, tt.lookupInfix0(V3Infix.EqEq), [a, b]);
+		var eq = apply(oi.source, tt.opEq(), [a, b]);
 		var next = i + if(mach.intNorm.bigEndian, 1, -1);
 		var sub = genIntCmpRec(oi, tn, newArgs, next, infixH, infixL);
 		var and = apply(oi.source, V3Op.opBoolAnd, [eq, sub]);
@@ -574,7 +612,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		if (!oi.facts.O_NO_SHIFT_CHECK) {
 			// XXX: check the config for saturating shifts (e.g. arm32).
 			var split = SsaBlockSplit.new(context, curBlock);
-			var lt = Byte.TYPE.lookupInfix0(V3Infix.LtEq);
+			var lt = Byte.TYPE.opLtEq();
 			var max = context.graph.intConst(tt.width - 1);
 			var ok = curBlock.add(lt, [normRef1(oi.inputs[1]), max], Fact.O_PURE);
 			// Split the block
@@ -616,7 +654,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 	}
 	def getShrOp(width: int) -> Operator {
-		return Int.getType(false, width).lookupInfix0(V3Infix.Shr);
+		return Int.getType(false, width).opShr();
 	}
 	def doSignedShr(oi: SsaApplyOp, op: Operator, tt: IntType) -> (Operator, bool) {
 		var trunc = false;
@@ -629,11 +667,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				// so first shift the sign bit left to the word's sign bit position, and then shift right
 				var i1 = oi.input1();
 				trunc = !i1.facts.V_NON_ZERO;
-				var cdiff = context.graph.intConst(diff);  // TODO: this should probably be a byte constant
-				var shlOp = Int.getType(false, arith.width).lookupInfix0(V3Infix.Shl);
+				var cdiff = context.graph.intConst(diff);
+				var shlOp = Int.getType(false, arith.width).opShl();
 				oi.inputs[0].update(apply(oi.source, shlOp, [i0, cdiff]));
-				var addOp = Byte.TYPE.lookupInfix0(V3Infix.Add); // XXX: try to constant-fold here
-				oi.inputs[1].update(apply(oi.source, addOp, [i1, cdiff]));
+				// XXX: try to constant-fold here
+				oi.inputs[1].update(apply(oi.source, Byte.TYPE.opAdd(), [i1, cdiff]));
 			} else {
 				return (getShrOp(arith.width), false);
 			}
@@ -713,12 +751,12 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var split = SsaBlockSplit.new(context, curBlock);
 				var x = oi.input0(), y = oi.input1();
 				var minus1 = context.graph.valConst(tt, tt.box(-1));
-				var cmp = curBlock.add(tt.lookupInfix0(V3Infix.EqEq), [y, minus1], Facts.NONE);
+				var cmp = curBlock.add(tt.opEq(), [y, minus1], Facts.NONE);
 				curBlock = split.addIf(cmp);
 
 				var tv: SsaInstr, zero = context.graph.nullConst(tt);
 				if (Opcode.IntDiv.?(oi.op.opcode)) {
-					var apply = curBlock.add(tt.lookupInfix0(V3Infix.Sub), [zero, x], Facts.NONE);
+					var apply = curBlock.add(tt.opSub(), [zero, x], Facts.NONE);
 					tv = genTruncateInPlace(apply, tt);  // XXX: weird to apply this to new instructions.
 				} else {
 					tv = zero;  // x % -1 == #0
@@ -769,7 +807,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		trunc.inputs[0].update(oi);
 		return trunc;
 	}
-	def genParallelIntOp(oi: SsaApplyOp, infix: V3Infix) {
+	def genParallelIntOp(oi: SsaApplyOp, infix: IntType -> Operator) {
 		var tt = IntType.!(oi.op.sig.returnType());
 		if (tt.width <= mach.intNorm.width) {
 			// 2 -> 1 operation.
@@ -781,7 +819,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var tn = mach.intNorm.makeType(tt);
 		var vals = Array<SsaInstr>.new(tn.size);
 		for (i < vals.length) {
-			var op = IntType.!(tn.sub[i]).lookupInfix0(infix);
+			var op = infix(IntType.!(tn.sub[i]));
 			vals[i] = apply(oi.source, op, [inputs[i], inputs[i + tn.size]]);
 		}
 		return mapN(oi, vals);
@@ -789,7 +827,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	def extendBigEnd(bigEnd: SsaInstr, ft: IntType, signed: bool) -> SsaInstr {
 		if (signed) {
 			var shift = context.graph.intConst(mach.intNorm.width - 1);
-			var i = apply(null, ft.lookupInfix0(V3Infix.Sar), [bigEnd, shift]);
+			var i = apply(null, ft.opSar(), [bigEnd, shift]);
 			i.facts |= Fact.O_NO_SHIFT_CHECK;
 			return i;
 		}
@@ -835,8 +873,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return map1(oi, ni);
 	}
 	def genIntCastF(oi: SsaApplyOp) {
-		var ft = oi.op.typeArgs[0];
-		var ftc = Float_TypeCon.!(ft.typeCon);
+		var ft = FloatType.!(oi.op.typeArgs[0]);
 		var itt = IntType.!(oi.op.typeArgs[1]), tn = normIntType(itt);
 		var ett = mostlyRoundUpIntType(itt);
 		var x = oi.input0();
@@ -853,19 +890,19 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		curBlock.at(oi.source);
 		if (rangeChecks) {
 			// ConditionalThrow(#maxf < x); ConditionalThrow(x < #minf)
-			var maxf = context.graph.valConst(ft, ftc.max(itt));
-			var check = apply(oi.source, ftc.cache.opLt, [maxf, x]);
+			var maxf = context.graph.valConst(ft, ft.max(itt));
+			var check = apply(oi.source, ft.opcache().opLt, [maxf, x]);
 			check.facts |= origNanCheck;
 			curBlock.opConditionalThrow(V3Exception.TypeCheck, check);
-			var minf = context.graph.valConst(ft, ftc.min(itt));
-			check = apply(oi.source, ftc.cache.opLt, [x, minf]);
+			var minf = context.graph.valConst(ft, ft.min(itt));
+			check = apply(oi.source, ft.opcache().opLt, [x, minf]);
 			check.facts |= origNanCheck;
 			curBlock.opConditionalThrow(V3Exception.TypeCheck, check);
 		}
 		// ConditionalThrow(x != FloatPromoteI(IntCastF(x))
 		var cvts = wideOutputs(oi.op, tn, [x], Fact.O_NO_BOUNDS_CHECK | oi.facts);
 		var back = genFloatConvertI(V3Op.newFloatPromoteI(itt, ft), cvts);
-		var cmp = curBlock.opFloatBitEq(ftc.is64, x, back);
+		var cmp = curBlock.opFloatBitEq(ft.is64, x, back);
 		curBlock.opConditionalThrow(V3Exception.TypeCheck, curBlock.opBoolNot(cmp));
 		mapN(oi, cvts);
 	}
@@ -890,8 +927,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def genIntQueryF(oi: SsaApplyOp) {
 		if (oi.facts.O_NO_BOUNDS_CHECK) return id(oi);
-		var ft = oi.op.typeArgs[0];
-		var ftc = Float_TypeCon.!(ft.typeCon);
+		var ft = FloatType.!(oi.op.typeArgs[0]);
 		var itt = IntType.!(oi.op.typeArgs[1]);
 		var ett = mostlyRoundUpIntType(itt);
 		var x = oi.input0();
@@ -901,14 +937,14 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		// NB: queries always need boundary checks to avoid {int.max+1 -(saturate)-> int.max -(round)-> int.max+1}
 		if (itt.signed) {
 			// IntTruncF<F,iNN>(x) => if(x >= maxf, false, if(x < minf, false, IntPromote<iWW, F>(IntTruncF<F,iWW>(x)) == x))
-			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
+			var maxf = context.graph.valConst(ft, ft.maxplus1(itt));
 			var split = SsaBlockSplit.new(context, curBlock);
-			var cmp1 = apply(oi.source, ftc.cache.opLt, [x, maxf]);
+			var cmp1 = apply(oi.source, ft.opcache().opLt, [x, maxf]);
 			cmp1.facts |= origNanCheck;
 			curBlock = split.addIfNot(cmp1);
-			var minf = context.graph.valConst(ft, ftc.min(itt));
+			var minf = context.graph.valConst(ft, ft.min(itt));
 			curBlock = split.addElse();
-			var cmp2 = apply(oi.source, ftc.cache.opLt, [x, minf]);
+			var cmp2 = apply(oi.source, ft.opcache().opLt, [x, minf]);
 			cmp2.facts |= Facts.O_NO_NAN_CHECK; // NaN handled by first check
 			curBlock = split.addIf(cmp2);
 			curBlock = split.addElse();
@@ -919,16 +955,16 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			map1(oi, phi);
 			return;
 		}
-		if (!config.IntConvertFUnsigned) { // TODO: u64
+		if (!config.IntConvertFUnsigned) {
 			// IntQueryF<F,uNN>(x) => if(x >= 0, if(x >= maxf, false, IntTruncFEqual<F,uWW>(x)), false)
 			var split = SsaBlockSplit.new(context, curBlock);
 			var fzero = context.graph.nullConst(ft);
-			var cmp1 = apply(oi.source, ftc.cache.opGteq, [x, fzero]);
+			var cmp1 = apply(oi.source, ft.opcache().opGteq, [x, fzero]);
 			cmp1.facts |= origNanCheck;
 			curBlock = split.addIfNot(cmp1);
 			curBlock = split.addElse();
-			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
-			var cmp2 = apply(oi.source, ftc.cache.opGteq, [x, maxf]);
+			var maxf = context.graph.valConst(ft, ft.maxplus1(itt));
+			var cmp2 = apply(oi.source, ft.opcache().opGteq, [x, maxf]);
 			cmp2.facts |= Facts.O_NO_NAN_CHECK; // NaN handled by first check
 			curBlock = split.addIf(cmp2);
 			curBlock = split.addElse();
@@ -941,9 +977,9 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			return;
 		}
 		// IntTruncF<F,uNN>(x) => if(x >= maxf, maxi, IntTruncF<F,uWW>(x))
-		var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
+		var maxf = context.graph.valConst(ft, ft.maxplus1(itt));
 		var split = SsaBlockSplit.new(context, curBlock);
-		curBlock = split.addIf(apply(oi.source, ftc.cache.opGteq, [x, maxf]));
+		curBlock = split.addIf(apply(oi.source, ft.opcache().opGteq, [x, maxf]));
 		curBlock = split.addElse();
 		var cmp = genIntTruncFEqual(oi.source, ft, ett, x);
 		split.curBlock = curBlock;
@@ -966,8 +1002,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def genIntTruncF(oi: SsaApplyOp) {
 		if (oi.facts.O_NO_BOUNDS_CHECK) return id(oi);
-		var ft = oi.op.typeArgs[0];
-		var ftc = Float_TypeCon.!(ft.typeCon);
+		var ft = FloatType.!(oi.op.typeArgs[0]);
 		var itt = IntType.!(oi.op.typeArgs[1]);
 		var ett = mostlyRoundUpIntType(itt), tn = normIntType(ett);
 		var x = oi.input0();
@@ -978,12 +1013,12 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			// IntTruncF<F,uNN>(x) => if(x > 0, if(x >= maxf, maxi, IntTruncF<F,uWW>(x)), 0)
 			var split = SsaBlockSplit.new(context, curBlock);
 			var fzero = context.graph.nullConst(ft);
-			var cmp1 = apply(oi.source, ftc.cache.opGt, [x, fzero]);
+			var cmp1 = apply(oi.source, ft.opcache().opGt, [x, fzero]);
 			cmp1.facts |= origNanCheck;
 			curBlock = split.addIfNot(cmp1);
 			curBlock = split.addElse();
-			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
-			var cmp2 = apply(oi.source, ftc.cache.opGteq, [x, maxf]);
+			var maxf = context.graph.valConst(ft, ft.maxplus1(itt));
+			var cmp2 = apply(oi.source, ft.opcache().opGteq, [x, maxf]);
 			cmp2.facts |= Facts.O_NO_NAN_CHECK; // Nan covered by first check
 			curBlock = split.addIf(cmp2);
 			var maxi = context.graph.valConst(ett, itt.max);
@@ -1027,15 +1062,15 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var split = SsaBlockSplit.new(context, curBlock);
 		var propNanCheck = origNanCheck;
 		if (checkNan) {
-			curBlock = split.addIfNot(apply(oi.source, ftc.cache.opEqual, [x, x]));
+			curBlock = split.addIfNot(apply(oi.source, ft.opcache().opEqual, [x, x]));
 			var izero = context.graph.nullConst(itt);
 			results.put(wideConsts(tn, izero));
 			curBlock = split.addElse();
 			propNanCheck |= Facts.O_NO_NAN_CHECK;
 		}
 		if (rangeCheckNeg) {
-			var minf = context.graph.valConst(ft, ftc.min(itt));
-			var cmp = apply(oi.source, ftc.cache.opLt, [x, minf]);
+			var minf = context.graph.valConst(ft, ft.min(itt));
+			var cmp = apply(oi.source, ft.opcache().opLt, [x, minf]);
 			cmp.facts |= propNanCheck; // propagate previous NaN checks
 			curBlock = split.addIf(cmp);
 			var mini = context.graph.valConst(ett, itt.min);
@@ -1043,8 +1078,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			curBlock = split.addElse();
 		}
 		if (rangeCheckPos) {
-			var maxf = context.graph.valConst(ft, ftc.maxplus1(itt));
-			var cmp = apply(oi.source, ftc.cache.opGteq, [x, maxf]);
+			var maxf = context.graph.valConst(ft, ft.maxplus1(itt));
+			var cmp = apply(oi.source, ft.opcache().opGteq, [x, maxf]);
 			cmp.facts |= propNanCheck; // propagate previous NaN checks
 			curBlock = split.addIf(cmp);
 			var maxi = context.graph.valConst(ett, itt.max);
@@ -1073,12 +1108,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return phis;
 	}
 	def genFloatCastI(oi: SsaApplyOp) {
-		var ft = oi.op.typeArgs[1];
-		var ftc = Float_TypeCon.!(ft.typeCon);
+		var ft = FloatType.!(oi.op.typeArgs[1]);
 		var itt = IntType.!(oi.op.typeArgs[0]), tn = normIntType(itt);
 		var inputs = normRefs(oi.inputs);
 		curBlock.at(oi.source);
-		if (TypeSystem.isPromotableToFloat(itt, ftc)) {
+		if (TypeSystem.isPromotableToFloat(itt, ft)) {
 			var ni = wideInputs(V3Op.newFloatPromoteI(itt, ft), tn, inputs, Facts.NONE);
 			return map1(oi, ni);
 		}
@@ -1101,11 +1135,10 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return map1(oi, cvt);
 	}
 	def genFloatQueryI(oi: SsaApplyOp) {
-		var ft = oi.op.typeArgs[1];
-		var ftc = Float_TypeCon.!(ft.typeCon);
+		var ft = FloatType.!(oi.op.typeArgs[1]);
 		var itt = IntType.!(oi.op.typeArgs[0]), tn = normIntType(itt);
 		curBlock.at(oi.source);
-		if (TypeSystem.isPromotableToFloat(itt, ftc)) {
+		if (TypeSystem.isPromotableToFloat(itt, ft)) {
 			return map1(oi, context.graph.trueConst());
 		}
 		var inputs = normRefs(oi.inputs);
@@ -1122,36 +1155,69 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var tn = normIntType(itt);
 		var ni: SsaInstr;
 
-		if (!config.FloatConvertIUnsigned && (itt.rank == IntRank.U64 || itt.rank == IntRank.U32)) {
-			// if (x < 0) 0x1p64 + FloatConvertI(x)
-			var sit = Int.getType(true, itt.width), ft = op.typeArgs[1], ftc = Float_TypeCon.!(ft.typeCon);
+		if (!config.FloatConvertIUnsigned && itt.rank == IntRank.U32) {
+			// zero-extend to i64 and convert
+			var sit = Long.TYPE, ft = op.typeArgs[1];
+			tn = normIntType(sit);
+			match (op.opcode) {
+				FloatPromoteI(is64) => op = V3Op.newFloatPromoteI(sit, op.typeArgs[1]);
+				FloatRoundI(is64) => op = V3Op.newFloatRoundI(sit, op.typeArgs[1]);
+				_ => context.fail("unexpected float conversion");
+			}
+			if (tn != null) {
+				var p = inputs[0]; // TODO: assumes u32 not already normalized
+				inputs = Array<SsaInstr>.new(tn.size);
+				for (i < inputs.length) inputs[i] = context.graph.nullConst(tn.sub[0]);
+				inputs[tn.littleEndIndex()] = p;
+			}
+			ni = wideInputs(op, tn, inputs, Facts.NONE);
+		} else if (!config.FloatConvertIUnsigned && itt.rank == IntRank.U64) {
+			// if (x < 0) 2.0f * cvt((x & 1) | (x >> 1))
+			var sit = Int.getType(true, itt.width), ft = FloatType.!(op.typeArgs[1]);
 			tn = normIntType(itt);
 			match (op.opcode) {
 				FloatPromoteI(is64) => op = V3Op.newFloatPromoteI(sit, op.typeArgs[1]);
 				FloatRoundI(is64) => op = V3Op.newFloatRoundI(sit, op.typeArgs[1]);
 				_ => context.fail("unexpected float conversion");
 			}
-			var cvt = wideInputs(op, tn, inputs, Facts.NONE);
 			var split = SsaBlockSplit.new(context, curBlock);
 			var i: SsaInstr;
+			var littleEndIndex: int, littleEndType: IntType;
 			if (tn != null && tn.size > 0) { // normalized; compare upper end
 				i = inputs[tn.bigEndIndex()];
 				sit = IntType.!(tn.sub[tn.bigEndIndex()]);
+				littleEndIndex = tn.littleEndIndex();
+				littleEndType = IntType.!(tn.sub[littleEndIndex]);
 			} else {
 				i = inputs[0];
+				littleEndType = sit;
 			}
 			var zero = context.graph.nullConst(sit);
-			curBlock = split.addIf(apply(null, sit.lookupInfix0(V3Infix.Lt), [i, zero]));
-			var max = context.graph.valConst(ft, ftc.maxplus1(itt));
-			var add = apply(null, ftc.cache.opAdd, [cvt, max]);
+			curBlock = split.addIf(apply(null, sit.opLtEq(), [zero, i]));
+			var cvt = wideInputs(op, tn, inputs, Facts.NONE);
 			curBlock = split.addElse();
+			var littleEnd = inputs[littleEndIndex];
+			var one = context.graph.valConst(littleEndType, Int.ONE);
+			littleEnd =
+				apply(null,
+					littleEndType.opOr(),
+					[apply(null,
+						littleEndType.opShr(),
+						[littleEnd, one]),
+					apply(null,
+						littleEndType.opAnd(),
+						[littleEnd, one])]);
+			var inputs2 = Arrays.dup(inputs);
+			inputs2[littleEndIndex] = littleEnd;
+			var cvt2 = wideInputs(op, tn, inputs2, Facts.NONE);
+			var two = context.graph.valConst(ft, if(ft.is64, Float.f64(0, 1, 0), Float.f32(0, 1, 0)));
+			var mul = apply(null, ft.opcache().opMul, [cvt2, two]);
 			curBlock = split.finish();
-			var ni = split.addPhi(ft, [add, cvt]);
-			return idv(ni);
+			ni = split.addPhi(ft, [cvt, mul]);
 		} else {
-			var ni = wideInputs(op, tn, inputs, Facts.NONE);
-			return idv(ni);
+			ni = wideInputs(op, tn, inputs, Facts.NONE);
 		}
+		return idv(ni);
 	}
 	def genFloatQueryD(oi: SsaApplyOp) {
 		var x = oi.input0();
@@ -1271,7 +1337,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def genArrayAlloc(oi: SsaApplyOp) -> SsaInstr {
 		var olen = oi.inputs[0], arrayType = oi.op.typeArgs[0];
-		var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
+		var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
 		if (SsaConst.?(olen.dest)) {
 			// length is known statically
 			var len = olen.dest.unbox<int>();
@@ -1315,7 +1381,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def genArrayInit(oi: SsaApplyOp) -> SsaInstr {
 		var arrayType = oi.op.typeArgs[0];
-		var offset = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
+		var offset = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
 		var narr = genArrayAllocWithSize(oi.source, arrayType, offset, oi.inputs.length, scale);
 		var machType = mach.machType(V3Array.elementType(arrayType));
 		var tn = normIntType(machType), stride = if(tn == null, 1, tn.size);
@@ -1327,24 +1393,40 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return narr;
 	}
-	def genArrayGetElem(oi: SsaApplyOp) {
+	def genArrayTupleInit(oi: SsaApplyOp, elems: int, length: int) -> SsaInstr {
+		var arrayType = oi.op.typeArgs[0];
+		var arrayRep = mach.arrayRep(arrayType);
+		var narr = genArrayAllocWithSize(oi.source, arrayType, arrayRep.headerSize, length, arrayRep.elemScale);
+		for (i < length) {
+			for (j < elems) {
+				var val = oi.inputs[i * elems + j];
+				var inputs = normRefN(val);
+				var offset = arrayRep.headerSize + arrayRep.offsets[j] + i * arrayRep.elemScale;
+				// XXX: cache type normalization across calls to this method
+				genNormTypedStores(oi, false, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
+			}
+		}
+		return narr;
+	}
+	def genArrayGetElem(oi: SsaApplyOp, elem: int) {
 		genBoundsCheck(oi, false);
 		var narr = normRef1(oi.inputs[0]), arrayType = oi.op.typeArgs[0];
-		var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
+		var arrayRep = mach.arrayRep(arrayType);
 		var index = normRef1(oi.inputs[1]);
-		var offset = genArrayElemOffset(hsize, scale, index);
+		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, index);
 		// XXX: fold null check into pointer access if no bounds check
-		var loads = genNormTypedLoads(oi.source, false, mach.machType(oi.getType()), ptrAdd(narr, offset), 0);
+		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
+		var loads = genNormTypedLoads(oi.source, false, machType, ptrAdd(narr, offset), 0);
 		mapN(oi, loads);
 	}
-	def genArraySetElem(oi: SsaApplyOp) {
+	def genArraySetElem(oi: SsaApplyOp, elem: int) {
 		genBoundsCheck(oi, false);
 		var inputs = normRefs(oi.inputs);
 		var narr = inputs[0], arrayType = oi.op.typeArgs[0];
-		var hsize = mach.getArrayElemOffset(arrayType), scale = mach.getArrayElemScale(arrayType);
-		var offset = genArrayElemOffset(hsize, scale, inputs[1]);
+		var arrayRep = mach.arrayRep(arrayType);
+		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, inputs[1]);
 		// XXX: fold null check into pointer access if no bounds check
-		var machType = mach.machType(V3Array.elementType(arrayType));
+		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
 		genNormTypedStores(oi, false, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
 		oi.kill();
 		oi.remove();
@@ -1458,6 +1540,20 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var mtbl = context.graph.valConst(mach.data.ptrType, mach.methodTable(methodRef));
 		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
 	}
+	def genVariantReplaceNull(oi: SsaApplyOp) -> SsaInstr {
+		var vt = oi.op.typeArgs[0];
+		var val = oi.input0();
+		if (V3.getVariantTag(vt) == 0) return val; // tag == 0 should be prepared for null
+		var t = addIfNull(val);
+		var tblock = t.0, fblock = t.1, merge = t.2;
+		curBlock = fblock;
+		fblock.addGoto(merge.block);
+		tblock.addGoto(merge.block);
+		curBlock = merge;
+		var record = V3.makeDefaultVariantRecord(context.prog, vt);
+		var addr = mach.machVal(record);
+		return curBlock.addPhi(vt, [val, context.graph.valConst(mach.machType(vt), addr)]);
+	}
 	def genComponentGetField(oi: SsaApplyOp, field: IrField) {
 		var fieldRef = V3Op.extractIrSpec(oi.op, field);
 		var fieldType = mach.machType(fieldRef.getFieldType());
@@ -1504,7 +1600,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var index = normRef1(oi.inputs[1]);
 		var throwOp = V3Op.newConditionalThrow(V3Exception.BoundsCheck);
 		// throw BoundsCheckException if ugteq(index, length)
-		var op = Int.getType(false, 32).lookupInfix0(V3Infix.LtEq);
+		var op = Int.getType(false, 32).opLtEq();
 		apply(oi.source, throwOp, [apply(oi.source, op, [len, index])]);
 		return index;
 	}
@@ -1527,13 +1623,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var root = V3.getRootType(oi.op.typeArgs[0]);
 		var min = mach.classIdRange(root).0;
 		if (min != 0) {
-			var sub = IntType.!(mach.tagType).lookupInfix0(V3Infix.Sub);
-			val = apply(oi.source, sub, [val, context.graph.intConst(min)]);
+			val = apply(oi.source, mach.tagType.opSub(), [val, context.graph.intConst(min)]);
 		}
 		var shift = mach.code.addressSizeLog2;
 		if (shift > 0) {
-			var shr = IntType.!(mach.tagType).lookupInfix0(V3Infix.Shr);
-			val = apply(oi.source, shr, [val, context.graph.intConst(shift)]);
+			val = apply(oi.source, mach.tagType.opShr(), [val, context.graph.intConst(shift)]);
 		}
 		var conv = V3Op.newIntViewI(mach.tagType, oi.op.sig.returnType());
 		return apply(oi.source, conv, [val]);

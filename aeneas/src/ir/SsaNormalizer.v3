@@ -6,7 +6,6 @@
 // tuples. Note that SSA form supports returns with multiple values.
 class SsaRaNormalizer extends SsaRebuilder {
 	def norm: ReachabilityNormalizer;
-	var voidArray: Array<SsaInstr>;
 	var specSet: SpecSet;
 
 	new(context: SsaContext, norm) super(context) {}
@@ -196,25 +195,20 @@ class SsaRaNormalizer extends SsaRebuilder {
 			BoundsCheck =>		normBoundsCheck(app, op);
 			// XXX: use SsaBuilder.opCallXXX() methods
 			CallMethod(method) => {
-				var t = extractMethodRef(orig, method);
+				var t = extractMethodRef(orig, method), m = t.1;
 				var ftype = normFuncType(t.0.getBoundType());
-				normCall(app, ftype, V3Op.newCallMethod(t.1));
+				normCallMethod(app, ftype, m);
 			}
 			CallClassVirtual(method) => {
 				// devirtualize methods that are not overridden
-				var t = extractVirtualRef(orig, method), m = t.1, newOp: Operator;
-				var facts = Facts.NONE;
+				var t = extractVirtualRef(orig, method), m = t.1;
 				if (t.2) { // still a virtual dispatch
-					newOp = V3Op.newCallClassSelector(m);
+					normCall(app, t.0, V3Op.newCallClassSelector(m));
 				} else {
 					// devirtualized to call abstract method => no objects instantiated of that type
 					if (m.member.facts.M_ABSTRACT) return map1(app, newGraph.nullConst(m.getReturnType()));
-					else newOp = V3Op.newCallMethod(m);
-					// don't emit a null check for devirtualized variant calls
-					facts = if(V3.isVariant(m.receiver), Fact.O_NO_NULL_CHECK, Facts.NONE);
+					else normCallMethod(app, t.0, m);
 				}
-				var i = normCall(app, t.0, newOp);
-				i.setFact(facts);
 			}
 			CallClosure => {
 				var ftype = normFuncType(op.typeArgs[0]);
@@ -238,6 +232,19 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var nobj = if(nargs.length == 1, newGraph.nullConst(ptrType), nargs[1]);
 				return mapN(app, [nfunc, nobj]);
 			}
+			PtrAtObjectField(field) => {
+				var receiver = genRef1(app.inputs[0]);
+				var raField = extractFieldRef(app, field);
+				var newInstr = curBlock.addApply(curBlock.source,
+					V3Op.newPtrAtObjectField(raField.norm[0], app.op.sig.returnType()), [receiver]);
+				map1(app, newInstr);
+			}
+			PtrAtComponentField(field) => {
+				var raField = extractFieldRef(app, field);
+				var newInstr = curBlock.addApply(curBlock.source,
+					V3Op.newPtrAtComponentField(raField.norm[0], app.op.sig.returnType()), Ssa.NO_INSTRS);
+				map1(app, newInstr);
+			}
 			_ => {
 				// normalize a general operator
 				var oldInstr = app, newOp = op;
@@ -246,6 +253,22 @@ class SsaRaNormalizer extends SsaRebuilder {
 				newInstr.facts = newInstr.facts | oldInstr.facts;
 				mapNorm(oldInstr, newInstr, normReturnType(op));
 			}
+		}
+	}
+	def normCallMethod(oldInstr: SsaApplyOp, ftype: RaFuncType, m: IrSpec) {
+		var newOp = V3Op.newCallMethod(m);
+		// for variant calls, replace null receiver with record
+		if (V3.isVariant(m.receiver)) {
+			var newArgs = normArgs(ftype, genRefs(oldInstr.inputs));
+			var obj = newArgs[0];
+			if (!obj.facts.V_NON_ZERO) {
+				newArgs[0] = curBlock.add(V3Op.newVariantReplaceNull(m.receiver), [obj], Facts.NONE);
+				norm.newIr.makeIrClass(m.receiver).facts |= Fact.C_HEAP;
+			}
+			var i = normCallWithArgs(oldInstr, ftype, newOp, newArgs);
+			i.setFact(Fact.O_NO_NULL_CHECK);
+		} else {
+			normCall(oldInstr, ftype, newOp);
 		}
 	}
 	def genReturn(oldRet: SsaReturn) {
@@ -264,6 +287,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def normCall(oldInstr: SsaApplyOp, ftype: RaFuncType, newOp: Operator) -> SsaInstr {
 		var newArgs = normArgs(ftype, genRefs(oldInstr.inputs));
+		return normCallWithArgs(oldInstr, ftype, newOp, newArgs);
+	}
+	def normCallWithArgs(oldInstr: SsaApplyOp, ftype: RaFuncType, newOp: Operator, newArgs: Array<SsaInstr>) -> SsaInstr {
 		// Create the new call instruction
 		var call = curBlock.addApply(oldInstr.source, newOp, newArgs);
 		call.facts = call.facts | oldInstr.facts;
@@ -476,17 +502,24 @@ class SsaRaNormalizer extends SsaRebuilder {
 			return map1(oldApp, curBlock.opArrayAlloc(rtn.newType, length));
 		}
 		var newArgs = genRefs(oldApp.inputs);
-		if (rtn.size == 1) return map1(oldApp, curBlock.opArrayInit(rtn.newType, newArgs));
-		// complex array initialization
-		var arrays = Array<SsaInstr>.new(width);
-		for (i < width) {
-			var vals = Array<SsaInstr>.new(len);
-			for (j < len) {
-				vals[j] = newArgs[i + j * width];
+		var arrayRep = RaArray.!(rtn);
+		if (arrayRep.isMixed()) {
+			// mixed array initialization
+			var array = curBlock.add(V3Op.newArrayTupleInit(arrayRep.newType, arrayRep.enorm.size, len), newArgs, oldApp.facts);
+			map1(oldApp, array);
+		} else {
+			if (rtn.size == 1) return map1(oldApp, curBlock.opArrayInit(rtn.newType, newArgs));
+			// complex array initialization
+			var arrays = Array<SsaInstr>.new(width);
+			for (i < width) {
+				var vals = Array<SsaInstr>.new(len);
+				for (j < len) {
+					vals[j] = newArgs[i + j * width];
+				}
+				arrays[i] = curBlock.opArrayInit(rtn.sub[i], vals);
 			}
-			arrays[i] = curBlock.opArrayInit(rtn.sub[i], vals);
+			mapN(oldApp, arrays);
 		}
-		mapN(oldApp, arrays);
 	}
 	def normArrayGetElem(oldApp: SsaApplyOp, op: Operator) {
 		var atn = normTypeArg(op, 0), rtn = normReturnType(op);
@@ -499,12 +532,22 @@ class SsaRaNormalizer extends SsaRebuilder {
 			curBlock.opBoundsCheck(atn.newType, newArgs[0], newArgs[1]);
 			return map0(oldApp);
 		}
-		// complex array access
 		var vals = Array<SsaInstr>.new(width);
-		var index = newArgs[width], facts = oldApp.facts;
-		for (i < width) {
-			vals[i] = curBlock.opArrayGetElem(atn.sub[i], Int.TYPE, facts, newArgs[i], index);
-			facts = facts | Facts.O_SAFE_BOUNDS;
+		var arrayRep = RaArray.!(atn);
+		if (arrayRep.isMixed()) {
+			// mixed array access
+			var array = newArgs[0], index = newArgs[1], facts = oldApp.facts;
+			for (i < width) {
+				vals[i] = curBlock.add(V3Op.newArrayGetElemElem(atn.newType, i), [array, index], facts);
+				facts = facts | Facts.O_SAFE_BOUNDS;
+			}
+		} else {
+			// complex array access
+			var index = newArgs[width], facts = oldApp.facts;
+			for (i < width) {
+				vals[i] = curBlock.opArrayGetElem(atn.sub[i], Int.TYPE, facts, newArgs[i], index);
+				facts = facts | Facts.O_SAFE_BOUNDS;
+			}
 		}
 		mapN(oldApp, vals);
 	}
@@ -519,11 +562,21 @@ class SsaRaNormalizer extends SsaRebuilder {
 			curBlock.opBoundsCheck(atn.newType, newArgs[0], newArgs[1]);
 			return;
 		}
-		// complex array set
-		var index = newArgs[width], facts = oldApp.facts;
-		for (i < width) {
-			curBlock.opArraySetElem(atn.sub[i], Int.TYPE, facts, newArgs[i], index, newArgs[i + 1 + width]);
-			facts = facts | Facts.O_SAFE_BOUNDS;
+		var arrayRep = RaArray.!(atn);
+		if (arrayRep.isMixed()) {
+			// mixed array set
+			var array = newArgs[0], index = newArgs[1], facts = oldApp.facts;
+			for (i < width) {
+				curBlock.add(V3Op.newArraySetElemElem(atn.newType, i), [array, index, newArgs[i + 2]], facts);
+				facts = facts | Facts.O_SAFE_BOUNDS;
+			}
+		} else {
+			// complex array set
+			var index = newArgs[width], facts = oldApp.facts;
+			for (i < width) {
+				curBlock.opArraySetElem(atn.sub[i], Int.TYPE, facts, newArgs[i], index, newArgs[i + 1 + width]);
+				facts = facts | Facts.O_SAFE_BOUNDS;
+			}
 		}
 	}
 	def normArrayGetLength(oldApp: SsaApplyOp, op: Operator) {
@@ -542,13 +595,13 @@ class SsaRaNormalizer extends SsaRebuilder {
 			return;
 		} else if (raField.size == 1) {
 			// common case 1-1 mapping
-			var read = curBlock.opGetField(raField.norm[0], voidConst());
+			var read = curBlock.opGetField(raField.norm[0], newGraph.nop());
 			read.facts = read.facts | raField.facts();
 			return map1(oldApp, read);
 		}
 		var reads = Array<SsaInstr>.new(raField.size);
 		for (i < reads.length) {
-			reads[i] = curBlock.opGetField(raField.norm[i], voidConst());
+			reads[i] = curBlock.opGetField(raField.norm[i], newGraph.nop());
 		}
 		return mapN(oldApp, reads);
 	}
@@ -557,11 +610,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 		if (raField.norm == null) return; // field has been eliminated
 		if (raField.size == 1) {
 			// common case 1-1 mapping
-			curBlock.opComponentSetField(raField.norm[0], voidConst(), fieldVals[0]);
+			curBlock.opComponentSetField(raField.norm[0], newGraph.nop(), fieldVals[0]);
 			return;
 		}
 		for (i < raField.size) {
-			curBlock.opComponentSetField(raField.norm[i], voidConst(), fieldVals[i]);
+			curBlock.opComponentSetField(raField.norm[i], newGraph.nop(), fieldVals[i]);
 		}
 	}
 	def normClassAlloc(oldApp: SsaApplyOp, m: IrMethod, op: Operator) {
@@ -694,13 +747,6 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	private def normReturnType(op: Operator) -> TypeNorm {
 		return normType(op.sig.returnType());
-	}
-	private def voidConst() -> SsaInstr {
-		return voidConsts()[0];
-	}
-	private def voidConsts() -> Array<SsaInstr> {
-		if (voidArray == null) voidArray = [newGraph.nop()];
-		return voidArray;
 	}
 	private def funcRef(m: IrSpec) -> SsaInstr {
 		return newGraph.valConst(Function.funcRefType(m.getFuncType()), FuncVal.new(m));

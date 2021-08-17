@@ -26,7 +26,7 @@ function do_test() {
     ALL=$T/compile.all.out
     rm -f $ALL
 
-    # XXX: compile all the tests in one invocation of the compiler
+    # TODO: use -rt.files when that v3c option is in stable
     print_compiling "$target" ""
     compile_gc_tests $TESTS | tee $T/compile.all.out | $PROGRESS i
 

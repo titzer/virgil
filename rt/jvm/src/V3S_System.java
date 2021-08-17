@@ -273,40 +273,45 @@ public class V3S_System {
     }
 
     public static float cast_i2f(int v) {
-	if (v == INT_MAX) throw new ClassCastException();
-	float f = (float)v;
-	if (v != (int)f) throw new ClassCastException();
-	return f;
+	if (v != INT_MAX) {
+            float f = (float)v;
+            if (v == (int)f) return f;
+        }
+        throw new ClassCastException();
     }
 
     public static float cast_l2f(long v) {
-	if (v == LONG_MAX) throw new ClassCastException();
-	float f = (float)v;
-	if (v != (long)f) throw new ClassCastException();
-	return f;
+	if (v != LONG_MAX) {
+            float f = (float)v;
+            if (v == (long)f) return f;
+        }
+        throw new ClassCastException();
     }
 
     public static double cast_l2d(long v) {
-	if (v == LONG_MAX) throw new ClassCastException();
-	double d = (double)v;
-	if (v != (long)d) throw new ClassCastException();
-	return d;
+	if (v != LONG_MAX) {
+            double d = (double)v;
+            if (v == (long)d) return d;
+        }
+        throw new ClassCastException();
     }
 
     public static float cast_ul2f(long v) {
-	if (v == U64_MAX) throw new ClassCastException();
-	if (v >= 0) return cast_l2f(v);
-	// Manually check if any bits would be rounded off.
-	if ((v & 0x0FFFFFFFFFFL) != 0) throw new ClassCastException();
-	return 2.0f * (float)(v >>> 1);
+	if (v != U64_MAX) {
+            if (v >= 0) return cast_l2f(v);
+            // Manually check if any bits would be rounded off.
+            if ((v & 0x0FFFFFFFFFFL) == 0) return 2.0f * (float)(v >>> 1);
+        }
+        throw new ClassCastException();
     }
 
     public static double cast_ul2d(long v) {
-	if (v == U64_MAX) throw new ClassCastException();
-	if (v >= 0) return cast_l2d(v);
-	// Manually check if any bits would be rounded off.
-	if ((v & 0x7FFL) != 0) throw new ClassCastException();
-	return 2.0d * (double)(v >>> 1);
+	if (v != U64_MAX) {
+            if (v >= 0) return cast_l2d(v);
+            // Manually check if any bits would be rounded off.
+            if ((v & 0x7FFL) == 0) return 2.0d * (double)(v >>> 1);
+        }
+        throw new ClassCastException();
     }
 
     public static boolean query_i2f(int v) {
@@ -356,13 +361,13 @@ public class V3S_System {
 
     public static double round_ul2d(long v) {
 	double r = (double)v;
-	if (v < 0) return r + 0x1p64;
+	if (v < 0) return 2.0d * (double)((v >>> 1) | (v & 1));
 	return r;
     }
 
     public static float round_ul2f(long v) {
 	float r = (float)v;
-	if (v < 0) return r + 0x1p64f;
+	if (v < 0) return 2.0f * (float)((v >>> 1) | (v & 1));
 	return r;
     }
 

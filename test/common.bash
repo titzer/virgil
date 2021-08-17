@@ -33,7 +33,7 @@ V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
 PROGRESS=${VIRGIL_LOC}/test/config/progress
 
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
-TEST_TARGETS=${TEST_TARGETS:="int jvm wasm-js x86-darwin x86-linux"}
+TEST_TARGETS=${TEST_TARGETS:="int jvm wasm-js x86-darwin x86-linux x86-64-linux"}
 
 if [[ ! -x "$AENEAS_TEST" && "$AENEAS_TEST" != auto ]]; then
     echo $AENEAS_TEST: not found or not executable
@@ -220,6 +220,7 @@ function execute_tests() {
 	if [ "$target" = "int" ]; then
 	    execute_int_tests "int" ""
 	    execute_int_tests "int-ra" "-ra"
+	    execute_int_tests "int-ra-ma" "-ra -ma"
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             compile_target_tests jvm -jvm.script=false
             execute_target_tests jvm
