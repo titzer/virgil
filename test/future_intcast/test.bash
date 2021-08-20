@@ -1,5 +1,6 @@
 #!/bin/bash
 
+V3C_OPTS="$V3C_OPTS -legacy-cast=false"
 . ../common.bash future_intcast
 if [ $# -gt 0 ]; then
 	TESTS="$@"

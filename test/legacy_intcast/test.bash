@@ -1,5 +1,6 @@
 #!/bin/bash
 
+V3C_OPTS="$V3C_OPTS -legacy-cast=true"
 . ../common.bash legacy_intcast
 
 if [ $# -gt 0 ]; then
