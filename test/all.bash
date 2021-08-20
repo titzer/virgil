@@ -90,7 +90,7 @@ fi
 if [ $# != 0 ]; then
     TEST_DIRS="$@"
 else
-    TEST_DIRS="unit parser seman asm/x86 asm/x86-64 legacy_intcast future_intcast execute variants enums fsi32 fsi64 float large ptr32 ptr64 darwin linux rt stacktrace gc system lib wizeng apps bench"
+    TEST_DIRS="unit parser seman asm/x86 asm/x86-64 legacy_cast future_cast execute variants enums fsi32 fsi64 float large ptr32 ptr64 darwin linux rt stacktrace gc system lib wizeng apps bench"
 fi
 
 #######################################################################
