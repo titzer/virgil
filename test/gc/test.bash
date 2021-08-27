@@ -45,7 +45,7 @@ function do_test() {
 
     print_status Testing "$target $HEAP" Aeneas
     if [ -x $CONFIG/run-$target ]; then
-	$T/$target/Aeneas -test -rma $VIRGIL_LOC/test/execute/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS i
+	$T/$target/Aeneas -test -rma $VIRGIL_LOC/test/core/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS i
     else
 	echo "${YELLOW}skipped${NORM}"
     fi
