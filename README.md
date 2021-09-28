@@ -31,6 +31,7 @@ Linux system call layer.
 
 * x86-darwin : 32-bit Darwin kernels (MacOS)
 * x86-linux : 32-bit Linux kernels
+* x86-64-linux : 64-bit Linux kernels
 * jar : JAR files for the Java Virtual Machine
 * wasm : WebAssembly module for any Wasm engine
 
