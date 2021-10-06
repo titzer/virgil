@@ -118,11 +118,11 @@ function run_io_test() {
     local test=$2
     local args="$3"
     local expected="$4"
-
-    if [ -x $CONFIG/run-$target ]; then
+    R=$CONFIG/run-$target
+    
+    if [ -x $R ]; then
 	P=$OUT/$target/$test.out
-	# TODO: use run-target to actually execute the IO test
-	$OUT/$target/$test $args &> $P
+        $R $OUT/$target $test $args &> $P
 	diff $expected $P > $OUT/$target/$test.diff
     else
 	echo "target $target ${YELLOW}skipped${NORM}"
