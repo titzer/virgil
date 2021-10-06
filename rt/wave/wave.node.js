@@ -18,8 +18,12 @@ const wave = {
   },
   fs_size: (path_ptr, path_len) => {
     var path = extract_path(path_ptr, path_len);
-    var r = fs.lstatSync(path);
-    return r.size;
+    try {
+      var r = fs.lstatSync(path);
+      return r.size;
+    } catch (e) {
+      return -1;
+    }
   },
   fs_chmod: (path_ptr, path_len, perm) => {
     var path = extract_path(path_ptr, path_len);
@@ -27,17 +31,31 @@ const wave = {
   },
   fs_open: (path_ptr, path_len, read) => {
     var path = extract_path(path_ptr, path_len);
-    if (read != 0) {
-      return fs.openSync(path, fs.constants.O_RDONLY);
-    } else {
-      return fs.openSync(path, fs.constants.O_WRONLY);
+    var fd = -1;
+    try {
+      if (read == 0) {
+        fd = fs.openSync(path, fs.constants.O_R_OK);
+      } else {
+        fd = fs.openSync(path, fs.constants.O_WRONLY | fs.constants.O_W_OK | fs.constants.O_CREAT);
+      }
+    } catch (e) {
+      return -1;
     }
+    return fd;
   },
   fs_read: (fd, buf_ptr, buf_len) => {
-    return fs.writeSync(fd, memory, buf_ptr, buf_len); // TODO: handle errors
+    try {
+      return fs.readSync(fd, memory, buf_ptr, buf_len, null);
+    } catch (e) {
+      return -1;
+    }
   },
   fs_write: (fd, buf_ptr, buf_len) => {
-    return fs.writeSync(fd, memory, buf_ptr, buf_len); // TODO: handle errors
+    try {
+      return fs.writeSync(fd, memory, buf_ptr, buf_len);
+    } catch (e) {
+      return -1;
+    }
   },
   fs_avail: (fd) => {
     // TODO
