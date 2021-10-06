@@ -85,15 +85,6 @@ else
   TESTS=*.v3
 fi
 
-function compile_sys_tests() {
-    trace_test_count $#
-    for f in $@; do
-	trace_test_start $f
-	run_v3c $target -output=$T $f
-	trace_test_retval $?
-    done
-}
-
 for target in $TEST_TARGETS; do
     int=0
     if [ "$target" = "int" ]; then
@@ -114,7 +105,7 @@ for target in $TEST_TARGETS; do
     mkdir -p $T
 
     print_status Compiling $target
-    compile_sys_tests $TESTS | tee $T/compile.out | $PROGRESS i
+    run_v3c $target -output=$T -multiple $TESTS | tee $T/compile.out | $PROGRESS i
     print_status Running $target
     run_sys_tests
 done
