@@ -14,7 +14,9 @@ class ShadowStackSpiller() {
 	var codegen: SsaMachGen;
 	var order: SsaBlockOrder;
 	def shadowVarMap = Vector<int>.new();
-	def exits = Vector<SsaBlockInfo>.new();
+	def lastLivepoint = Vector<ArchInstr>.new();
+	def deallocate = Vector<bool>.new();
+
 	def reset(codegen: SsaMachGen, order: SsaBlockOrder) {
 		this.codegen = codegen;
 		this.order = order;
@@ -25,8 +27,16 @@ class ShadowStackSpiller() {
 		if (lps.length == 0) return;  // nothing to do
 
 		// Make a first pass over all livepoints.
-		// Find the common dominator A of all blocks that contain livepoints
-		// and compute the union of all variables used in all livepoints.
+		lastLivepoint.resize(codegen.order.length);
+		deallocate.resize(codegen.order.length);
+		for (i < lastLivepoint.length) {
+			lastLivepoint[i] = null;
+			deallocate[i] = false;
+		}
+
+		// Compute the allocation block A, where the shadow stack pointer will be adjusted.
+		// Find the common dominator A of all blocks that contain livepoints. Along the way,
+		// compute the union of all variables used in all livepoints.
 		var matrix = codegen.liveness;
 		matrix.grow(matrix.numrows + 2);
 		var allLive = matrix.numrows - 2;
@@ -36,47 +46,44 @@ class ShadowStackSpiller() {
 		for (i = 1; i < lps.length; i++) {
 			var t = lps[i], bm = t.0.mark, info = order.order[bm];
 			matrix.or(allLive, bm); // union all livepoint sets
+			if (lastLivepoint[bm] == null) lastLivepoint[bm] = t.1;
 			if (info == blockA) continue;
 			blockA = order.commonDominator(blockA, info);
 		}
 
-		// Find the lowest non-loop dominator of A
+		// Pull the allocation out of any loops; the lowest non-loop dominator of A.
 		for (p = blockA; p != null; p = p.dom_parent) {
 			if (p.loop != null) blockA = p.dom_parent;
 		}
-		if (blockA == null) blockA = order.order[0];  // first block was a loop
+		if (blockA == null) blockA = order.order[0];  // TODO: first block was a loop
 
-		// Compute exits E from the region dominated by A, i.e. the dominance
-		// frontier + actual throws/returns
+		// Compute deallocation points D, which are either blocks with throws/returns or
+		// on the dominance frontier of A (i.e. not dominated by A, but the destination of
+		// an edge from A).
 		var range = (blockA.block.mark, blockA.dom_max);
-		exits.resize(0);
 		for (i = range.0; i < range.1; i++) {
 			var bi = order.order[i], end = bi.block.end();
-			if (end.succs.length == 0) {
-				exits.put(bi);
-				continue;
-			}
-			for (s in end.succs) {
-				var target = s.dest.mark;
-				if (target >= range.0 && target < range.1) continue;  // target is dominated
-				if (end.succs.length == 1) {
-					// one outgoing edge; mark the source as the exit
-					exits.put(bi);
-					break;
-				} else {
-					// multiple outgoing edges; mark the target as the exit
-					exits.put(order.order[target]);
+			match (end.succs.length) {
+				0 => deallocate[i] = true;
+				1 => {
+					var ti = end.succs[0].dest.mark;
+					if (ti < range.0 || ti >= range.1) deallocate[i] = true; // target not dominated
+				}
+				_ => {
+					if (Debug.PARANOID) for (s in end.succs) { // check for non-dominated blocks
+						var ti = s.dest.mark;
+						if (ti < range.0 || ti >= range.1) {
+							codegen.context.fail(Strings.format2("unsplit critical edge at #%d -> #%d", bi.block.uid, s.dest.uid));
+						}
+					}
 				}
 			}
 		}
-		// Allocate a shadow stack pointer.
+		// Allocate a temporary for a shadow stack pointer.
 		var shadow_sp = codegen.newShadowSpTmp();
 
-		// Initialize the shadow variable map.
-		// Filter out all live variables that are either constants or do
-		// not have a reference type. Allocate shadow spill slots for
-		// all live reference variables.
-		// XXX: improve shadow spill slot allocation with graph coloring.
+		// Initialize the shadow variable map, which maps (reference) variables to shadow
+		// spill slots. XXX: improve shadow spill slot allocation with graph coloring.
 		var numVars = codegen.vars.length;
 		shadowVarMap.grow(numVars);
 		shadowVarMap.length = numVars;
@@ -93,25 +100,23 @@ class ShadowStackSpiller() {
 		}
 		if (numShadowSlots == 0) return;  // no live references at any livepoint
 
-		// Insert shadow frame allocation into A above first livepoint
-		// and shadow frame deallocation into exit blocks.
-		var curExit = 0;
+		// Insert shadow stack allocation and deallocations. Iterate instructions from top
+		// to bottom because blocks don't know their first instruction.
 		for (i = codegen.first; i != null; i = i.next) {
-			if (i.opcode() != ArchInstrs.ARCH_BLOCK) continue;
+			if (i.opcode() != ArchInstrs.ARCH_BLOCK) continue; // only need block starts
 			var label = Operand.Label.!(i.operands[0]);
-			if (label.block == blockA.block) {
-				// shadow stack allocation block
+			if (label.block == blockA.block) { // allocation block
 				var startOfBlock = i.next;
 				codegen.insertShadowStackAlloc(shadow_sp, numShadowSlots, startOfBlock);
-			} else if (curExit < exits.length && label.block == exits[curExit].block) {
-				// exit block
-				var endOfBlock = i.next; // TODO: compute end of block
-				codegen.insertShadowStackFree(shadow_sp, numShadowSlots, endOfBlock);
-				curExit++;
+			} else if (deallocate[label.block.mark]) { // deallocation block
+				var point = lastLivepoint[label.block.mark]; // insert after last livepoint
+				if (point == null) point = i.next;  // no livepoint, using block start is ok
+				codegen.insertShadowStackFree(shadow_sp, numShadowSlots, point);
 			}
 		}
 
-		// For every livepoint, we add a save before and a restore after for every variable.
+		// For every livepoint, for every live variable, add a save before and a restore after.
+		// XXX: improve spilling to the shadow stack with better splitting heuristics.
 		var start = tmpLive * matrix.width, end = start + matrix.width;
 		for (j < lps.length) {
 			var t = lps[j], i = t.1, lp = t.2.livepoint;
