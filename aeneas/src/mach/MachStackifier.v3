@@ -4,11 +4,10 @@
 // A utility to introduce explicit loads and stores of local variables
 // between instructions for stack machines such as WASM and the JVM.
 class MachStackifier(gen: SsaMachGen) {
-	private def stack = Vector<Operand.Use>.new();
-	private def defs = Vector<Operand.Def>.new();
 	private def parmoveDests = Vector<(VReg, List<Operand.Def>)>.new();
 
-	private def defStack = Vector<Operand.Def>.new();
+	private def defs = Vector<(ArchInstr, Operand.Def, bool)>.new();
+	private def defStack = Vector<int>.new();
 	private def loads = Vector<Operand.Use>.new();
 	private def insertPoint = Vector<ArchInstr>.new();
 	private def insertLoads = Vector<(ArchInstr, int, int)>.new();
@@ -67,11 +66,8 @@ class MachStackifier(gen: SsaMachGen) {
 		insertLoads.length = 0;
 		// Insert pops or tees for anything not consumed from stack
 		if (out != null) out.puts("---finishDefs:\n");
-		var next: ArchInstr;
-		for (i = start; i != end; i = next) {
-			next = i.next;
-			finishDefs(i);
-		}
+		for (i < defs.length) finishDefs(defs[i]);
+		defs.length = 0;
 	}
 	def processInstr(i: ArchInstr) {
 		var operands = i.operands;
@@ -114,11 +110,11 @@ class MachStackifier(gen: SsaMachGen) {
 				break;
 			}
 			if (out != null) out.put1(" onstack @%d\n", s);
-			if (defStack[s].vreg != vreg) return V3.fail("def not on stackifier stack");
+			if (defs[defStack[s]].1.vreg != vreg) return V3.fail("def not on stackifier stack");
 			insertLoadsAfter(s, loadStart);
 			if (nextHeight == defStack.length) nextHeight = s;
 			loadStart = loads.length;
-			vreg.consumedFromStack = true;
+			markLastDefAsConsumedFromStack(vreg);
 			maxStackIndex = s;
 		}
 		insertLoadsAfter(defStack.length, loadStart);
@@ -137,16 +133,24 @@ class MachStackifier(gen: SsaMachGen) {
 			var d = Operand.Def.!(o);
 			if (out != null) out.put2("\t\tdef v%d=%d\n", d.vreg.varNum, defStack.length);
 			d.vreg.stackIndex = defStack.length;
-			defStack.put(d);
+			defs.put(i, d, false);
+			defStack.put(defs.length - 1);
 			insertPoint.set(defStack.length, next);
 		}
 		insertPoint.set(defStack.length, next);
 	}
 	def setDefStackLength(v: int) {
 		for (i = v; i < defStack.length; i++) {
-			defStack[i].vreg.stackIndex = -1;
+			defs[defStack[i]].1.vreg.stackIndex = -1;
 		}
 		defStack.length = v;
+	}
+	def markLastDefAsConsumedFromStack(vreg: VReg) {
+		var i = vreg.stackIndex;
+		if (i >= 0 && i < defStack.length) {
+			var di = defStack[i], d = defs[di];
+			defs[di] = (d.0, d.1, true); // mark as consumed from stack
+		}
 	}
 	// Prepare to lower a parallel move. Load all move sources that are on the
 	// definition stack to the move stack and mark them as consumed from the stack.
@@ -154,7 +158,7 @@ class MachStackifier(gen: SsaMachGen) {
 		gen.gatherParallelMoveDests(i, parmoveDests);
 		moveStack.length = 0;
 		for (i < defStack.length) {
-			var vreg = defStack[i].vreg;
+			var vreg = defs[defStack[i]].1.vreg;
 			pushOntoMoveStack(vreg, null);
 		}
 		setDefStackLength(0);
@@ -177,7 +181,7 @@ class MachStackifier(gen: SsaMachGen) {
 			moveStack.put(vreg.parmoveState - 1);
 			vreg.parmoveState = 0 - moveStack.length;
 			if (next != null) loadVRegOntoStack(vreg, next);
-			else vreg.consumedFromStack = true;
+			else markLastDefAsConsumedFromStack(vreg);
 			return true;
 		}
 		return false;
@@ -209,30 +213,10 @@ class MachStackifier(gen: SsaMachGen) {
 			}
 		}
 	}
-	def finishDefs(i: ArchInstr) {
-		var operands = i.operands;
-		for (j < operands.length) {  // skip everything consumed on stack with useCount == 1
-			var o = operands[j];
-			if (!Operand.Def.?(o)) continue;
-			var d = Operand.Def.!(o);
-			if (!d.vreg.consumedFromStack || useCount(d) != 1) return finishRemainingDefs(operands, j, i.next);
-		}
-	}
-	def finishRemainingDefs(operands: Array<Operand>, j: int, next: ArchInstr) {
-		var mustPop = false;
-		while (j < operands.length) {  // process all that need tee, pop, or store
-			var o = operands[j++];
-			if (!Operand.Def.?(o)) continue;
-			var d = Operand.Def.!(o), c = useCount(d);
-			if (c == 0) {
-				gen.insertPop(d.vreg, next);
-			} else {
-				var pop = mustPop || !d.vreg.consumedFromStack;
-				gen.insertStoreLocal(d.vreg, pop, next);
-				d.vreg.consumedFromStack = false;
-			}
-			mustPop = true;
-		}
+	def finishDefs(i: ArchInstr, d: Operand.Def, consumedFromStack: bool) {
+		if (consumedFromStack && useCount(d) == 1) return;
+		if (useCount(d) == 0) gen.insertPop(d.vreg, i.next);
+		else gen.insertStoreLocal(d.vreg, !consumedFromStack, i.next);
 	}
 	def insertLoadsAfter(height: int, start: int) {
 		var count = loads.length - start;
@@ -251,14 +235,5 @@ class MachStackifier(gen: SsaMachGen) {
 	}
 	def useCount(d: Operand.Def) -> int {
 		return d.vreg.usage.tag;
-	}
-	private def printStack() {
-		out.put1("  #stack |%d| ", stack.length);
-		for (i < stack.length) {
-			var u = stack[i];
-			if (u.vreg.ssa != null) out.put1("@%d ", u.vreg.ssa.uid);
-			else out.put1("#%d ", u.vreg.varNum);
-		}
-		out.ln();
 	}
 }
