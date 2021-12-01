@@ -15,7 +15,8 @@ enum RaFact {
 	RC_DUMPED,
 	RC_EQUALITY,
 	RC_VARIANT,
-	RC_ENUM
+	RC_ENUM,
+	RC_CLOSURE
 }
 
 def DUMP: Terminal;
@@ -47,7 +48,8 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def records = V3.newRecordMap<Record>();
 	def polyMap = IrUtil.newIrItemMap<List<SsaApplyOp>>();
 	def queue = WorkQueue.new();
-	def heapTypes = Vector<TypeNorm>.new();
+	def classes = Vector<RaClass>.new();
+	def arrays = Vector<RaArray>.new();
 	var liveMethods = Vector<RaMethod>.new();
 
 	// perform the analysis, starting from the roots
@@ -58,29 +60,69 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			makeType(meth.receiver);
 		}
 		queue.drain(); // do all work
+		classes.apply(recursiveCheck0);
+	}
+	def recursiveCheck0(rc: RaClass) {
+		recursiveCheck(rc, -1);
+	}
+	// check if a variant (or one of its children) is mutually recursive
+	def recursiveCheck(rc: RaClass, w: int) -> int {
+		var cur = rc.recursive, max = int.min;
+		if (cur > 0) return max;
+		if (cur < 0) return cur;
+		rc.recursive = w;
+		for (l = rc.children; l != null; l = l.tail) { // recurse on children first
+			var d = recursiveCheck(l.head, w);
+			if (d > max) max = d;
+		}
+		for (f in rc.fields) {
+			if (f == null) continue;
+			if (f.fieldType == null) continue;
+			var d = recursiveCheckField(f.fieldType, w - 1);
+			if (d > max) max = d;
+		}
+		if (max >= w) rc.recursive = 2;
+		else rc.recursive = 1;
+		return max;
+	}
+	// check if a field type recursively refers to something on the stack
+	def recursiveCheckField(t: TypeNorm, w: int) -> int {
+		match (t) {
+			x: RaTuple => { // tuples will be flattened
+				var max = int.min;
+				for (t in x.nested) {
+					var d = recursiveCheckField(t, w);
+					if (d > max) max = d;
+				}
+				return max;
+			}
+			x: RaClass => return recursiveCheck(x, w);
+		}
+		return int.min;
 	}
 	def transform() {
 		ReachabilityNormalizer.new(this).normalize();
 	}
 	def dump() {
 		liveMethods.apply(dumpMethod);
-		heapTypes.apply(dumpType);
+		arrays.apply(dumpType);
+		classes.apply(dumpType);
 		records.apply(dumpRecord);
 	}
 	def dumpMethod(rm: RaMethod) {
 		if (rm == null || rm.setFact(RaFact.RC_DUMPED)) return;
 		DUMP.put1("%q", if (rm.spec != null, rm.spec.render, rm.orig.renderLong));
-		dumpFacts(rm.raFacts, rm.virtual, null);
+		dumpFacts(rm.raFacts, rm.virtual, null, false);
 	}
 	def dumpField(receiver: Type, rf: RaField) {
 		if (rf == null) return;
 		DUMP.put2("%q.%q", receiver.render, rf.orig.render);
-		dumpFacts(rf.raFacts, null, rf.val);
+		dumpFacts(rf.raFacts, null, rf.val, false);
 	}
 	def dumpType(rt: TypeNorm) {
 		if (live(rt.raFacts)) {
 			DUMP.put1("%q", rt.oldType.render);
-			dumpFacts(rt.raFacts, null, null);
+			dumpFacts(rt.raFacts, null, null, RaClass.?(rt) && RaClass.!(rt).recursive == 2);
 		}
 		if (RaClass.?(rt)) {
 			var rc = RaClass.!(rt);
@@ -97,20 +139,21 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def dumpRecord(r: Record, x: Record) {
 		if (!V3.isComponent(r.rtype)) DUMP.put2("%q #%d\n", r.rtype.render, r.id);
 	}
-	def dumpFacts(facts: RaFact.set, virtual: RaVirtual, val: Val) {
-		if (facts.RF_READ) DUMP.put(" r");
-		if (facts.RF_WRITTEN) DUMP.put(" w");
-		if (facts.RF_INIT) DUMP.put(" i");
-		if (facts.RM_LIVE) DUMP.put(" l");
-		if (virtual != null) DUMP.put(" v");
-		if (facts.RC_LIVE) DUMP.put(" l");
-		if (facts.RC_ALLOC) DUMP.put(" a");
-		if (facts.RC_VARIANT) DUMP.put(" t");
-		if (facts.RC_EQUALITY) DUMP.put(" =");
+	def dumpFacts(facts: RaFact.set, virtual: RaVirtual, val: Val, recursive: bool) {
+		if (facts.RF_READ) DUMP.put(" read");
+		if (facts.RF_WRITTEN) DUMP.put(" written");
+		if (facts.RF_INIT) DUMP.put(" init");
+		if (facts.RM_LIVE) DUMP.put(" live");
+		if (virtual != null) DUMP.put(" virtual");
+		if (facts.RC_LIVE) DUMP.put(" live");
+		if (facts.RC_ALLOC) DUMP.put(" alloc");
+		if (facts.RC_VARIANT) DUMP.put(" variant");
+		if (facts.RC_EQUALITY) DUMP.put(" equal");
+		if (facts.RC_CLOSURE) DUMP.put(" closure");
 		if (countVals(facts) == 1) {
-			DUMP.put(" k");
-			DUMP.put1(" = %s", V3.renderVal(val));
+			DUMP.put1(" const[%s]", V3.renderVal(val));
 		}
+		if (recursive) DUMP.put(" recursive");
 		DUMP.ln();
 	}
 	// a quick check to see if a type is the same as its normalization
@@ -123,23 +166,31 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	}
 	// defer analysis of a value
 	def deferValue(val: Val) {
-		if (val == null) return;
-		if (Record.?(val) || Closure.?(val) || TupleVal.?(val)) queue.add(analyzeValue, val);
+		match (val) {
+			null => ;
+			x: Record => queue.add(analyzeRecord, x);
+			x: Closure => queue.add(analyzeValue, x);
+			x: TupleVal => queue.add(analyzeValue, x);
+		}
+	}
+	// defer analysis of a record
+	def deferRecord(r: Record) {
+		if (r != null) queue.add(analyzeRecord, r);
 	}
 	// analyze a value such as a record, closure, or tuple
 	def analyzeValue(val: Val) {
-		if (Record.?(val)) {
-			// analyze a simple record
-			analyzeRecord(Record.!(val));
-		} else if (Closure.?(val)) {
-			// analyze a record + method closure pair
-			var closure = Closure.!(val), spec = closure.memberRef;
-			var rm = makeMethod(spec.typeArgs, IrMethod.!(spec.member), null);
-			getMethod(null, rm);
-			if (closure.val != null) analyzeRecord(Record.!(closure.val));
-		} else if (TupleVal.?(val)) {
-			// recursively analyze tuple values
-			for(e in (TupleVal.!(val)).values) analyzeValue(e);
+		match (val) {
+			x: Record => analyzeRecord(x);
+			x: Closure => {
+				// analyze a record + method closure pair
+				var spec = x.memberRef;
+				var rm = makeMethod(spec.typeArgs, IrMethod.!(spec.member), null);
+				var receiver = makeType(rm.receiver);
+				receiver.raFacts |= RaFact.RC_CLOSURE;
+				getMethod(null, rm);
+				if (x.val != null) analyzeValue(x.val);
+			}
+			x: TupleVal => for(e in x.values) analyzeValue(e);
 		}
 	}
 	// analyze a record
@@ -304,10 +355,10 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 				if (rm != null) getMethod(op, rm);
 				allocation(makeType(mono(op.op.typeArgs[0], context)));
 			}
-			ClassGetVirtual(method) => getVirtual(opMethod(op, method, context));
+			ClassGetVirtual(method) => getVirtual(closureMethod(opMethod(op, method, context)));
 			CallClassVirtual(method) => getVirtual(opMethod(op, method, context));
-			ClassGetMethod(method) => getMethod(op, opMethod(op, method, context));
-			CreateClosure(method) => getMethod(op, opMethod(op, method, context));
+			ClassGetMethod(method) => getMethod(op, closureMethod(opMethod(op, method, context)));
+			CreateClosure(method) => getMethod(op, closureMethod(opMethod(op, method, context)));
 			CallMethod(method) => getMethod(op, opMethod(op, method, context));
 			ClassGetField(field) => if (op.useList != null) getField(makeField(op, field, context));
 			VariantGetField(field) => if (op.useList != null) getField(makeField(op, field, context));
@@ -319,6 +370,11 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			PtrAtComponentField(field) => if (op.useList != null) getAndSetField(makeField(op, field, context));
 			_ => ;
 		}
+	}
+	def closureMethod(m: RaMethod) -> RaMethod {
+		var receiver = makeType(m.receiver);
+		receiver.raFacts |= RaFact.RC_CLOSURE;
+		return m;
 	}
 	// analyze an equality comparison
 	def analyzeEqualOnType(t: Type, context: IrSpec) {
@@ -505,25 +561,25 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		match (t.typeCon.kind) {
 			V3Kind.COMPONENT => {
 				var compDecl = V3.componentDecl(t);
-				deferValue(prog.getComponentRecord(compDecl));
+				deferRecord(prog.getComponentRecord(compDecl));
 				raType = newRaClass(t, Void.TYPE, oldIr.makeIrClass(t), null);
 			}
 			V3Kind.ARRAY => {
 				// normalize element type
 				var enorm = makeType(V3Array.elementType(t));
+				var at: RaArray;
 				if (enorm.size == 0) {
-					raType = RaArray.new(t, V3.voidArrayType, null);
+					raType = at = RaArray.new(t, V3.voidArrayType, null);
 				} else if (enorm.sub == null) {
-					raType = RaArray.new(t, V3Array.newType(enorm.newType), null);
+					raType = at = RaArray.new(t, V3Array.newType(enorm.newType), null);
 				} else if (compiler.MixedArrays) {
-					var ra = RaArray.new(t, V3Array.newType(enorm.newType), null);
-					ra.enorm = enorm;
-					raType = ra;
+					raType = at = RaArray.new(t, V3Array.newType(enorm.newType), null);
+					at.enorm = enorm;
 				} else {
 					var et = Arrays.map(enorm.sub, V3Array.newType);
-					raType = RaArray.new(t, Tuple.newType(Lists.fromArray(et)), et);
+					raType = at = RaArray.new(t, Tuple.newType(Lists.fromArray(et)), et);
 				}
-				heapTypes.put(raType);
+				arrays.put(at);
 			}
 			V3Kind.VARIANT => {
 				var ic = oldIr.makeIrClass(t);
@@ -532,7 +588,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 					parent = makeClass(superType);
 				} else {
 					// make the default variant record for field analysis
-					deferValue(V3.makeDefaultVariantRecord(prog, t));
+					deferRecord(V3.makeDefaultVariantRecord(prog, t));
 				}
 				var rc = newRaClass(t, t, ic, parent);
 				rc.raFacts |= RaFact.RC_VARIANT;
@@ -577,7 +633,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def newRaClass(oldType: Type, newType: Type, ic: IrClass, parent: RaClass) -> RaClass {
 		var sub = if(newType == Void.TYPE, TypeUtil.NO_TYPES);
 		var rc = RaClass.new(oldType, newType, sub, ic, parent);
-		heapTypes.put(rc);
+		classes.put(rc);
 		return rc;
 	}
 	def norm(t: Type) -> Type {
@@ -685,6 +741,7 @@ class RaClass extends TypeNorm {
 	var normClass: IrClass;			// normalized class
 	var normFields: Array<IrField>;		// normalized fields
 	var normMethods: Array<IrMethod>;	// normalized methods
+	var recursive: int;			// 0 if unknown, < 0 if on stack, 1 if not recursive, > 1 if recursive
 	var minClassId = -1;			// minimum class ID
 	var maxClassId = -1;			// maximum class ID
 
@@ -693,6 +750,7 @@ class RaClass extends TypeNorm {
 			parent.children = List.new(this, parent.children);
 			Arrays.copyInto(parent.fields, fields, 0);
 		}
+		if (oldType.typeCon.kind != V3Kind.VARIANT) recursive = 1; // not a variant, can't be recursive
 	}
 	def makeField(f: IrField, fieldType: TypeNorm, size: int) -> RaField {
 		return addField(RaField.new(oldType, f, fieldType, size));
