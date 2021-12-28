@@ -16,23 +16,19 @@ enum RaFact {
 	RC_EQUALITY,
 	RC_VARIANT,
 	RC_ENUM,
-	RC_CLOSURE
+	RC_CLOSURE,
+	RC_FLAT
 }
 
 def DUMP: Terminal;
 def XXX: Terminal;
 def NONE: RaFact.set;
-def TRANSFERRABLE_FACTS = (Fact.M_ABSTRACT | Fact.M_INLINE | Fact.M_OPERATOR | Fact.M_NEW | Fact.M_EMPTY | Fact.M_EQUALS);
 def countVals(facts: RaFact.set) -> int {
 	return if(facts.RF_VAL_MANY, 2, if(facts.RF_VAL_ONE, 1));
 }
 def live(facts: RaFact.set) -> bool {
        	return (facts & (RaFact.RC_LIVE | RaFact.RC_ALLOC)) != NONE;
 }
-
-// global reachability information for primitive types, accessed frequently
-def RA_VOID = TypeNorm.new(Void.TYPE, Void.TYPE, TypeUtil.NO_TYPES);
-def RA_BOOL = TypeNorm.new(Bool.TYPE, Bool.TYPE, null);
 
 def NO_RECORDS = Array<Record>.new(0);
 def MONO_TYPEARGS = [AnyObject.TYPE];
@@ -44,7 +40,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def compiler = compilation.compiler;
 	def prog = compilation.prog;
 	def oldIr = prog.ir;
-	def typeMap = TypeUtil.newTypeMap<TypeNorm>();
+	def typeMap = TypeUtil.newTypeMap<RaType>();
 	def records = V3.newRecordMap<Record>();
 	def polyMap = IrUtil.newIrItemMap<List<SsaApplyOp>>();
 	def queue = WorkQueue.new();
@@ -61,40 +57,46 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		}
 		queue.drain(); // do all work
 		classes.apply(recursiveCheck0);
+		arrays.apply(recursiveCheck0);
 	}
-	def recursiveCheck0(rc: RaClass) {
+	def recursiveCheck0(rc: RaType) {
 		recursiveCheck(rc, -1);
 	}
 	// check if a variant (or one of its children) is mutually recursive
-	def recursiveCheck(rc: RaClass, w: int) -> int {
-		var cur = rc.recursive, max = int.min;
+	def recursiveCheck(raType: RaType, w: int) -> int {
+		var cur = raType.recursive, max = int.min;
 		if (cur > 0) return max;
 		if (cur < 0) return cur;
-		rc.recursive = w;
-		for (l = rc.children; l != null; l = l.tail) { // recurse on children first
-			var d = recursiveCheck(l.head, w);
-			if (d > max) max = d;
+		raType.recursive = w;
+		if (RaClass.?(raType)) {
+			var rc = RaClass.!(raType);
+			for (l = rc.children; l != null; l = l.tail) { // recurse on children first
+				var d = recursiveCheck(l.head, w);
+				if (d > max) max = d;
+			}
+			for (f in rc.fields) {
+				if (f == null) continue;
+				if (f.fieldType == null) continue;
+				var d = recursiveCheckField(makeType(f.fieldType), w - 1);
+				if (d > max) max = d;
+			}
 		}
-		for (f in rc.fields) {
-			if (f == null) continue;
-			if (f.fieldType == null) continue;
-			var d = recursiveCheckField(f.fieldType, w - 1);
-			if (d > max) max = d;
-		}
-		if (max >= w) rc.recursive = 2;
-		else rc.recursive = 1;
+		if (max >= w) raType.recursive = 2;
+		else raType.recursive = 1;
 		return max;
 	}
 	// check if a field type recursively refers to something on the stack
-	def recursiveCheckField(t: TypeNorm, w: int) -> int {
+	def recursiveCheckField(t: RaType, w: int) -> int {
 		match (t) {
-			x: RaTuple => { // tuples will be flattened
-				var max = int.min;
-				for (t in x.nested) {
-					var d = recursiveCheckField(t, w);
-					if (d > max) max = d;
+			x: RaType => { // tuples will be flattened
+				if (V3.isTuple(x.oldType)) {
+					var max = int.min;
+					for (l = x.oldType.nested; l != null; l = l.tail) {
+						var d = recursiveCheckField(makeType(l.head), w);
+						if (d > max) max = d;
+					}
+					return max;
 				}
-				return max;
 			}
 			x: RaClass => return recursiveCheck(x, w);
 		}
@@ -119,7 +121,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		DUMP.put2("%q.%q", receiver.render, rf.orig.render);
 		dumpFacts(rf.raFacts, null, rf.val, false);
 	}
-	def dumpType(rt: TypeNorm) {
+	def dumpType(rt: RaType) {
 		if (live(rt.raFacts)) {
 			DUMP.put1("%q", rt.oldType.render);
 			dumpFacts(rt.raFacts, null, null, RaClass.?(rt) && RaClass.!(rt).recursive == 2);
@@ -150,6 +152,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		if (facts.RC_VARIANT) DUMP.put(" variant");
 		if (facts.RC_EQUALITY) DUMP.put(" equal");
 		if (facts.RC_CLOSURE) DUMP.put(" closure");
+		if (facts.RC_FLAT) DUMP.put(" flat");
 		if (countVals(facts) == 1) {
 			DUMP.put1(" const[%s]", V3.renderVal(val));
 		}
@@ -200,19 +203,20 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		var raType = makeType(record.rtype);
 		var newlyLive = !live(raType.raFacts);
 		raType.raFacts |= RaFact.RC_LIVE;
-		if (RaClass.?(raType)) {
-			// analyze a class object's fields and methods
-			var rc = RaClass.!(raType);
-			rc.instances = List.new(record, rc.instances);
-			if (newlyLive) analyzeLiveClass(rc);
-			// analyze class fields
-			for (rf in rc.fields) analyzeField(record, rf);
-		} else if (RaArray.?(raType)) {
-			// analyze an array's elements
-			var ra = RaArray.!(raType);
-			ra.instances = List.new(record, ra.instances);
-			if (ra.primitive) return;
-			for (v in record.values) deferValue(v);
+		match (raType) {
+			x: RaClass => {
+				// analyze a class object's fields and methods
+				x.instances = List.new(record, x.instances);
+				if (newlyLive) analyzeLiveClass(x);
+				// analyze class fields
+				for (rf in x.fields) analyzeField(record, rf);
+			}
+			x: RaArray => {
+				// analyze an array's elements
+				x.instances = List.new(record, x.instances);
+				if (x.primitive) return;
+				for (v in record.values) deferValue(v);
+			}
 		}
 	}
 	// analyze a field of a record if the field is live
@@ -406,7 +410,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			}
 		}
 	}
-	def allocation(raType: TypeNorm) {
+	def allocation(raType: RaType) {
 		var oldFacts = raType.raFacts;
 		raType.raFacts |= RaFact.RC_ALLOC;
 		if (RaClass.?(raType) && !live(oldFacts)) {
@@ -427,7 +431,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		liveMethods.put(rm);
 		queue.add(analyzeMethod, rm);
 		if (V3.isVariant(rm.receiver)) { // XXX: this is because of variant null replacement
-			var rc = makeClass(rm.receiver);
+			var rc = makeClass(V3.getDefaultVariantCaseType(prog, rm.receiver));
 			var newlyLive = !live(rc.raFacts);
 			rc.raFacts |= RaFact.RC_LIVE;
 			if (newlyLive) analyzeLiveClass(rc);
@@ -442,7 +446,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		for (f in rc.orig.fields) {
 			var rf = makeField2(rc, f);
 			getField(rf);
-			getEquality(if(rf.fieldType == null, f.fieldType, rf.fieldType.oldType), null);
+			getEquality(if(rf.fieldType == null, f.fieldType, rf.fieldType), null);
 		}
 	}
 	def getAndSetField(rf: RaField) {
@@ -486,7 +490,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		// monomorphic receiver type
 		if (isNormalType(f.fieldType)) {
 			// the field is a simple, monomorphic, normalized field
-			return f.raField = raType.makeField(f, null, 1);
+			return f.raField = raType.makeField(f, null);
 		}
 		return makePolyField(raType, f);
 	}
@@ -505,8 +509,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			// create the RaField from the normalized type
 			var ft = f.fieldType;
 			if (ft.open()) ft = f.fieldType.substitute(V3.getTypeArgs(raType.oldType));
-			var fieldType = makeType(ft);
-			rf = raType.makeField(f, fieldType, fieldType.size);
+			rf = raType.makeField(f, ft);
 		}
 		return rf;
 	}
@@ -518,13 +521,11 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		var rm = m.raMethod;
 		if (rm != null) return rm; // RaMethod already cached
 
-		var mono = isMonoMethod(typeArgs, m);
-		if (mono && isNormMethod(m)) {
-			// monomorphic and all params and returns are normalized
+		if (typeArgs.length == 1 && !m.receiver.open()) {
+			// a monomorphic method
 			var rc = makeClass(m.receiver);
 			var rm = rc.makeMethod(m, null);
-			rm.norm = IrMethod.new(m.receiver, null, m.sig);
-			return transferFacts(mono, rm);
+			return rm.orig.raMethod = rm;
 		}
 		// search for existing specialization
 		if (context != null) typeArgs = context.instantiateTypes(typeArgs);
@@ -533,49 +534,18 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		if (rm != null) return rm;  // specialization found
 
 		// not found; fully specialize and normalize the method
-		var spec = if(!mono, IrSpec.new(rc.oldType, typeArgs, m));
+		var spec = IrSpec.new(rc.oldType, typeArgs, m);
 		rm = rc.makeMethod(m, spec);
-		var typeParams = if(rm.spec != null, rm.spec.getTypes().methodTypeArgs);
-		// normalize the signature of the method by way of the function type
-		var ftype = RaFuncType.!(makeType(if(rm.spec == null, m.sig.funcType(), rm.spec.getMethodType())));
-		var ft = Function.CLOSURE.create(ftype.sub[0].nested); // correct the typecon; norm() returns FUNCREF type
-		rm.norm = IrMethod.new(rc.oldType, typeParams, FuncType.!(ft).sig());
-		return transferFacts(mono, rm);
-	}
-	def isMonoMethod(typeArgs: Array<Type>, m: IrMethod) -> bool {
-		return typeArgs.length == 1 && !m.receiver.open();
-	}
-	def isNormMethod(m: IrMethod) -> bool {
-		def sig = m.sig;
-		for (t in sig.paramTypes) {
-			if (!isNormalType(t)) return false;
-		}
-		if (sig.paramTypes.length > compiler.MaxParams) return false;
-		if (sig.returnTypes.length > compiler.MaxReturnValues) return false;
-		if (!isNormalType(sig.returnType())) return false;
-		return true;
-	}
-	def transferFacts(mono: bool, rm: RaMethod) -> RaMethod {
-		var m = rm.orig;
-		rm.norm.facts = m.facts & TRANSFERRABLE_FACTS;
-		rm.norm.source = m.source;
-		if (mono) {
-			rm.raFacts = RaFact.RF_NORMALIZED;
-			m.raMethod = rm;  // cache if monomorphic
-		}
 		return rm;
 	}
 	def makeClass(t: Type) -> RaClass {
 		return RaClass.!(makeType(t));
 	}
-	def makeType(t: Type) -> TypeNorm {
+	def getClass(t: Type) -> RaClass {
+		return RaClass.!(typeMap[t]);
+	}
+	def makeType(t: Type) -> RaType {
 		if (t.open()) return V3.fail1("is open %q", t.render);
-		// first check for primitive types
-		match (t.typeCon.kind) {
-			V3Kind.VOID => return RA_VOID;
-			V3Kind.BOOL => return RA_BOOL;
-		}
-		// now check the hashmap
 		var raType = typeMap[t];
 		if (raType != null) return raType;
 		// not in the hashmap, build appropriately
@@ -583,24 +553,14 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			V3Kind.COMPONENT => {
 				var compDecl = V3.componentDecl(t);
 				deferRecord(prog.getComponentRecord(compDecl));
-				raType = newRaClass(t, Void.TYPE, oldIr.makeIrClass(t), null);
+				raType = newRaClass(t, oldIr.makeIrClass(t), null);
 			}
 			V3Kind.ARRAY => {
 				// normalize element type
-				var enorm = makeType(V3Array.elementType(t));
-				var at: RaArray;
-				if (enorm.size == 0) {
-					raType = at = RaArray.new(t, V3.voidArrayType, null);
-				} else if (enorm.sub == null) {
-					raType = at = RaArray.new(t, V3Array.newType(enorm.newType), null);
-				} else if (compiler.MixedArrays) {
-					raType = at = RaArray.new(t, V3Array.newType(enorm.newType), null);
-					at.enorm = enorm;
-				} else {
-					var et = Arrays.map(enorm.sub, V3Array.newType);
-					raType = at = RaArray.new(t, Tuple.newType(Lists.fromArray(et)), et);
-				}
+				var elem = makeType(V3Array.elementType(t));
+				var at = RaArray.new(t, elem);
 				arrays.put(at);
+				raType = at;
 			}
 			V3Kind.VARIANT => {
 				var ic = oldIr.makeIrClass(t);
@@ -611,7 +571,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 					// make the default variant record for field analysis
 					deferRecord(V3.makeDefaultVariantRecord(prog, t));
 				}
-				var rc = newRaClass(t, t, ic, parent);
+				var rc = newRaClass(t, ic, parent);
 				rc.raFacts |= RaFact.RC_VARIANT;
 				raType = rc;
 			}
@@ -620,56 +580,23 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 				var parent = if(superType != null, makeClass(superType));
 				var ic = oldIr.makeIrClass(t);
 				if (ic == null) ic = IrClass.new(t, null, null, [], []);
-				raType = newRaClass(t, t, ic, parent);
-			}
-			V3Kind.CLOSURE => {
-				// translate closure into (funcref, object) pair
-				var pt = limit(makeType(Function.getParamType(t)), compiler.MaxParams-1);
-				var rt = limit(makeType(Function.getReturnType(t)), compiler.MaxReturnValues);
-				var ft = Function.FUNCREF.create(Lists.cons2(pt.0, rt.0));
-				var ta = [ft, AnyObject.TYPE];
-				raType = RaFuncType.new(t, Tuple.newType(Lists.fromArray(ta)), pt.1, rt.1, ta);
-			}
-			V3Kind.TUPLE => {
-				// flatten tuples
-				var vecT = Vector<Type>.new();
-				var vecO = Vector<int>.new();
-				var vecN = Vector<TypeNorm>.new();
-				for (p = t.nested; p != null; p = p.tail) {
-					var n = makeType(p.head);
-					vecO.put(vecT.length);
-					vecN.put(n);
-					n.addTo(vecT);
-				}
-				var ta = vecT.extract();
-				raType = RaTuple.new(t, Tuple.newType(Lists.fromArray(ta)), ta, vecN.extract(), vecO.extract());
+				raType = newRaClass(t, ic, parent);
 			}
 			_ => {
-				raType = TypeNorm.new(t, t, null);
+				for (l = t.nested; l != null; l = l.tail) makeType(l.head);
+				raType = RaType.new(t);
 			}
 		}
 		typeMap[t] = raType;
 		return raType;
 	}
-	def newRaClass(oldType: Type, newType: Type, ic: IrClass, parent: RaClass) -> RaClass {
-		var sub = if(newType == Void.TYPE, TypeUtil.NO_TYPES);
-		var rc = RaClass.new(oldType, newType, sub, ic, parent);
+	def newRaClass(oldType: Type, ic: IrClass, parent: RaClass) -> RaClass {
+		var rc = RaClass.new(oldType, ic, parent);
 		classes.put(rc);
 		return rc;
 	}
-	def norm(t: Type) -> Type {
-		if (isNormalType(t)) return t;
-		return makeType(t).newType;
-	}
 	def mono(t: Type, spec: IrSpec) -> Type {
 		return if(spec != null, spec.instantiateType(t), t);
-	}
-	def limit(tn: TypeNorm, len: int) -> (Type, Array<Type>) {
-//		XXX.put3("limit %q %q |%d|\n", tn.oldType.render, tn.newType.render, len);
-		if (tn.size <= len) return (tn.newType, TypeUtil.NO_TYPES);
-		if (tn.sub == null) return (Void.TYPE, [tn.newType]);
-		var t = Tuple.fromTypeArray(Arrays.range(tn.sub, 0, len));
-		return (t, Arrays.range(tn.sub, len, tn.sub.length));
 	}
 }
 // Base class which contains facts for all types of entities during analysis
@@ -684,74 +611,14 @@ class RaItem {
 		return true;
 	}
 }
-
-// Representation of a normalized integer type.
-class RaIntType extends TypeNorm {
-	def bigEndian: bool;
-	new(oldType: Type, newType: Type, sub: Array<Type>, bigEndian)
-		super(oldType, newType, sub) { }
-	def bigEndIndex() -> int {
-		return if(bigEndian, 0, size - 1);
-	}
-	def littleEndIndex() -> int {
-		return if(bigEndian, size - 1, 0);
-	}
-	// Select {n} items from {input} corresponding to the low-order words.
-	def getLowestN<T>(inputs: Array<T>, n: int) -> Array<T> {
-		if (bigEndian) return Arrays.range(inputs, inputs.length - n, inputs.length); // [big,vN,...,v0]
-		else return Arrays.range(inputs, 0, n);  // [v0,...,vN,big]
-	}
-	// Create a new array of {n} items, copying the low order words from {inputs} and
-	// extending the upper words with {extend}.
-	def growToN<T>(inputs: Array<T>, n: int, extend: T) -> Array<T> {
-		var result = Array<T>.new(n);
-		if (bigEndian) {
-			var d = n - 1;
-			for (i = inputs.length - 1; i >= 0; i--) result[d--] = inputs[i];
-			while (d >= 0) result[d--] = extend;
-		} else {
-			var d = 0;
-			for (i = 0; i < size; i++) result[d++] = inputs[i];
-			while (d < result.length) result[d++] = extend;
-		}
-		return result;
-	}
-	// Simulate a shift left by {n} words, filling in the vacant entries with {extend}.
-	def shiftLeft<T>(inputs: Array<T>, n: int, extend: T) {
-		shift(true, inputs, n, extend);
-	}
-	// Simulate a shift right by {n} words, filling in the vacant entries with {extend}.
-	def shiftRight<T>(inputs: Array<T>, n: int, extend: T) {
-		shift(false, inputs, n, extend);
-	}
-	def shift<T>(left: bool, inputs: Array<T>, n: int, extend: T) {
-		if (left == bigEndian) {
-			var i = 0;
-			while (i < size - n) { inputs[i] = inputs[i + n]; i++; }
-			while (i < size) { inputs[i] = extend; i++; }
-		} else {
-			var i = size - 1;
-			while (i >= n) { inputs[i] = inputs[i - n]; i--; }
-			while (i >= 0) { inputs[i] = extend; i--; }
-		}
-	}
+// Collects facts about a type used during reachability analysis.
+class RaType(oldType: Type) extends RaItem {
+	var recursive: int;			// 0 if unknown, < 0 if on stack, 1 if not recursive, > 1 if recursive
+	def isRecursive() -> bool { return recursive > 1; }
 }
-// Representation of a tuple
-class RaTuple extends TypeNorm {
-	def nested: Array<TypeNorm>;
-	def offsets: Array<int>;
-	new(oldType: Type, newType: Type, sub: Array<Type>, nested, offsets)
-		super(oldType, newType, sub) { }
-	def getElem<T>(array: Array<T>, index: int) -> Array<T> {
-		var ntn = nested[index], offset = offsets[index];
-		if (ntn == null) return [array[offset]];
-		if (ntn.size == 1) return [array[offset]];
-		return Arrays.range(array, offset, offset + ntn.size);
-	}
-}
-// Representation of a class type during RMA and normalization, which adds
-// representations of the fields and methods of the class
-class RaClass extends TypeNorm {
+// Tracks whether a class is allocated, collects instances, and tracks information
+// about fields and methods.
+class RaClass extends RaType {
 	def orig: IrClass;			// original, polymorphic IrClass
 	def parent: RaClass;			// super class, if any
 	def fields = Array<RaField>.new(orig.fields.length);          // index of fields
@@ -762,19 +629,23 @@ class RaClass extends TypeNorm {
 	var normClass: IrClass;			// normalized class
 	var normFields: Array<IrField>;		// normalized fields
 	var normMethods: Array<IrMethod>;	// normalized methods
-	var recursive: int;			// 0 if unknown, < 0 if on stack, 1 if not recursive, > 1 if recursive
 	var minClassId = -1;			// minimum class ID
 	var maxClassId = -1;			// maximum class ID
+	var dataNorm: DataNorm;			// non-null for flattened variants
+	var newIrType: Type;
 
-	new(oldType: Type, newType: Type, sub: Array<Type>, orig, parent) super(oldType, newType, sub) {
+	new(oldType: Type, orig, parent) super(oldType) {
+		newIrType = oldType;
 		if (parent != null) {
 			parent.children = List.new(this, parent.children);
 			Arrays.copyInto(parent.fields, fields, 0);
 		}
 		if (oldType.typeCon.kind != V3Kind.VARIANT) recursive = 1; // not a variant, can't be recursive
 	}
-	def makeField(f: IrField, fieldType: TypeNorm, size: int) -> RaField {
-		return addField(RaField.new(oldType, f, fieldType, size));
+	def makeField(f: IrField, fieldType: Type) -> RaField {
+		var rf = addField(RaField.new(oldType, f, fieldType));
+		if (oldType.typeCon.kind == V3Kind.VARIANT) rf.addValue(null); // TODO: hack for default variant value
+		return rf;
 	}
 	private def addField(rf: RaField) -> RaField {
 		fields[rf.orig.index] = rf;
@@ -809,41 +680,26 @@ class RaClass extends TypeNorm {
 		return true;
 	}
 }
-// Information about an array, including its live instances
-class RaArray extends TypeNorm {
+// Tracks instances of an array type.
+class RaArray extends RaType {
+	def elem: RaType;
+	var instances: List<Record>;		// list of live records
 	var primitive: bool;
-	var instances: List<Record>;
-	var enorm: TypeNorm; // for mixed arrays
 
-	new(oldType: Type, newType: Type, sub: Array<Type>) super(oldType, newType, sub) {
+	new(oldType: Type, elem) super(oldType) {
 		var elem = oldType.nested.head;
 		match (elem.typeCon.kind) {
 			V3Kind.INT, V3Kind.FLOAT, V3Kind.BOOL, V3Kind.VOID => primitive = true;
 		}
 	}
-	def isMixed() -> bool {
-		return enorm != null && enorm.size > 1;
-	}
-}
-// Information about a function type, which might have a truncated signature
-// because it has more parameters or returns than allowed by the target.
-class RaFuncType extends TypeNorm {
-	def ovfParamTypes: Array<Type>;
-	def ovfReturnTypes: Array<Type>;
-	var ovfParamFields: Array<IrSpec>;
-	var ovfReturnFields: Array<IrSpec>;
-	new(oldType: Type, newType: Type, ovfParamTypes, ovfReturnTypes, sub: Array<Type>) super(oldType, newType, sub) {
-	}
-	def sig() -> Signature {
-		return FuncType.!(sub[0]).sig();
-	}
 }
 // Information about a field, including whether it is initialized, written, read,
 // and facts about each of the values written to the field
-class RaField(receiver: Type, orig: IrField, fieldType: TypeNorm, size: int) extends RaItem {
+class RaField(receiver: Type, orig: IrField, fieldType: Type) extends RaItem {
 	var val: Val;
 	var initFacts = Facts.V_DEFAULT;
 	var writeFacts = Facts.V_FACTS;
+	var typeNorm: TypeNorm;
 	var norm: Array<IrSpec>;
 	var normIndex = -1;
 	def facts() -> Fact.set {
@@ -882,9 +738,11 @@ class RaField(receiver: Type, orig: IrField, fieldType: TypeNorm, size: int) ext
 // across normalization, etc.
 class RaMethod(receiver: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
 	var norm: IrMethod;
+	var funcNorm: FuncNorm;
 	var normIndex = -1;
 	var virtual: RaVirtual;
 	private var cachedSpec: IrSpec;
+
 	def getSpec() -> IrSpec {
 		if (cachedSpec != null) return cachedSpec;
 		if (spec != null) return cachedSpec = spec;
@@ -897,9 +755,6 @@ class RaMethod(receiver: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
 		return virtual != null;
 	}
 }
-// For signatures that have too many parameters or returns, a truncated version of the signature.
-class RaSignature(orig: Signature, norm: Signature, overflowParams: Array<Type>, overflowReturns: Array<Type>) {
-}
 // Extra information about a virtual method.
 class RaVirtual(raMethod: RaMethod) {
 	var mtable: IrMtable;		// mtable used for machine-level virtual calls
@@ -908,7 +763,7 @@ class RaVirtual(raMethod: RaMethod) {
 	var count = 0;
 	def addImpl(rm: RaMethod) {
 		if (count == 0) { devirtual = rm; count = 1; }
-		if (count == 1 && devirtual != rm) { devirtual = null; count = 2; }
+		else if (count == 1 && devirtual != rm) { devirtual = null; count = 2; }
 		for (l = impls; l != null; l = l.tail) {
 			if (l.head == rm) return; // XXX: linear search for RaMethod
 		}
@@ -1141,7 +996,7 @@ class DeadCodeAnalyzer(ra: ReachabilityAnalyzer) {
 			if (m != null && m.ic != null) markMember(m);
 		}
 	}
-	def processType(t: Type, tn: TypeNorm) {
+	def processType(t: Type, tn: RaType) {
 		if (!RaClass.?(tn)) return;
 		var rc = RaClass.!(tn);
 		for (f in rc.fields) {
