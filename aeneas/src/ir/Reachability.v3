@@ -230,7 +230,9 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			for (ml in c.methods) {
 				for (l = ml; l != null; l = l.tail) analyzeVirtual(rc, l.head);
 			}
-			if (c.raFacts.RC_EQUALITY) rc.raFacts |= RaFact.RC_EQUALITY;
+			if (c.raFacts.RC_EQUALITY) {
+				if (!rc.setFact(RaFact.RC_EQUALITY) && V3.isVariant(rc.oldType)) getAndCompareAllFields(rc);
+			}
 		}
 	}
 	// analyze a possible virtual dispatch of the given method on the given type
@@ -287,14 +289,8 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def analyzeMethod(rm: RaMethod) {
 		var graph = rm.orig.ssa;
 		if (graph == null) {
-			if (rm.orig.facts.M_EQUALS) {
-				var receiver = oldIr.getIrClass(rm.orig.receiver);
-				var root = oldIr.getIrClass(V3.getRootType(receiver.ctype));
-				var context = SsaContext.new(compiler, prog);
-				graph = VariantComparatorGen.new(context, root, receiver, rm.orig).generate();
-			} else {
-				graph = compilation.genSsa(rm.getSpec(), 0);
-			}
+			if (rm.orig.facts.M_EQUALS) return; // don't analyze equality methods
+			graph = compilation.genSsa(rm.getSpec(), 0);
 		}
 		if (rm.spec != null) {
 			// analyze a polymorphic method
@@ -343,7 +339,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		match (op.op.opcode) {
 			OverloadedEq,
 			RefEq,
-			VariantEq => analyzeEqualOnType(mono(op.op.typeArgs[0], context), context);
+			VariantEq => getEquality(mono(op.op.typeArgs[0], context), context);
 			ArrayAlloc,
 			ArrayInit => allocation(makeType(mono(op.op.typeArgs[0], context)));
 			ClassAlloc(method) => {
@@ -373,14 +369,26 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		return m;
 	}
 	// analyze an equality comparison
-	def analyzeEqualOnType(t: Type, context: IrSpec) {
+	def getEquality(t: Type, context: IrSpec) {
 		match (t.typeCon.kind) {
 			V3Kind.CLASS => {
-				getClassEquality(t);
+				var rc = makeClass(t);
+				// Set equality on all live subtypes
+				if (!rc.setFact(RaFact.RC_EQUALITY)) {
+					for (l = rc.subtypes; l != null; l = l.tail) {
+						rc.raFacts |= RaFact.RC_EQUALITY;
+					}
+				}
 			}
 			V3Kind.VARIANT => {
 				var rc = generateVariantEquals(t);
-				getClassEquality(t);
+				// Set equality on all live subtypes and mark all fields as read
+				if (!rc.setFact(RaFact.RC_EQUALITY)) {
+					getAndCompareAllFields(rc);
+					for (l = rc.subtypes; l != null; l = l.tail) {
+						if (!l.head.setFact(RaFact.RC_EQUALITY)) getAndCompareAllFields(l.head);
+					}
+				}
 				var rm = makeMethod([rc.oldType], rc.orig.methods[IrUtil.EQUALS_METHOD_INDEX], context);
 				getVirtual(rm);
 			}
@@ -401,12 +409,6 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			// process a newly-live class
 			analyzeLiveClass(RaClass.!(raType));
 		}
-	}
-	def getClassEquality(t: Type) {
-		var rc = makeClass(t);
-		if (rc.raFacts.RC_EQUALITY) return; // already marked.
-		rc.raFacts |= RaFact.RC_EQUALITY;
-		for (l = rc.subtypes; l != null; l = l.tail) l.head.raFacts |= RaFact.RC_EQUALITY;
 	}
 	def getVirtual(rm: RaMethod) {
 		if (rm.isVirtual()) return;
@@ -430,6 +432,14 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def getField(rf: RaField) {
 		if (rf.setFact(RaFact.RF_READ)) return;
 		queue.add(analyzeGetField, (makeClass(rf.receiver), rf));
+	}
+	def getAndCompareAllFields(rc: RaClass) {
+		var typeArgs = V3.getTypeArgs(rc.oldType);
+		for (f in rc.orig.fields) {
+			var rf = makeField2(rc, f);
+			getField(rf);
+			getEquality(if(rf.fieldType == null, f.fieldType, rf.fieldType.oldType), null);
+		}
 	}
 	def getAndSetField(rf: RaField) {
 		getField(rf);
@@ -461,25 +471,36 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def makeField(op: SsaApplyOp, f: IrField, context: IrSpec) -> RaField {
 		var rf = f.raField;
 		if (rf != null) return rf;
-		var receiver = f.receiver, raType: RaClass;
-		if (!receiver.open()) {
-			// monomorphic receiver type
-			raType = makeClass(receiver);
-			if (isNormalType(f.fieldType)) {
-				// the field is a simple, monomorphic, normalized field
-				rf = raType.makeField(f, null, 1);
-				return f.raField = rf;
-			}
-		} else {
-			// polymorphic receiver type
-			receiver = mono(op.op.typeArgs[0], context);
-			raType = makeClass(receiver);
+		// try to make a simple field first
+		var receiver = f.receiver;
+		if (!receiver.open()) return makeSimpleField(makeClass(receiver), f);
+		// get polymorphic receiver type from operator
+		receiver = mono(op.op.typeArgs[0], context);
+		return makePolyField(makeClass(receiver), f);
+	}
+	def makeSimpleField(raType: RaClass, f: IrField) -> RaField {
+		// monomorphic receiver type
+		if (isNormalType(f.fieldType)) {
+			// the field is a simple, monomorphic, normalized field
+			return f.raField = raType.makeField(f, null, 1);
 		}
-		rf = raType.fields[f.index];
+		return makePolyField(raType, f);
+	}
+	def makeField2(raType: RaClass, f: IrField) -> RaField {
+		var rf = f.raField;
+		if (rf != null) return rf;
+		// try to make a simple field first
+		var receiver = f.receiver;
+		if (!receiver.open()) return makeSimpleField(raType, f);
+		// make a polymorphic field
+		return makePolyField(raType, f);
+	}
+	def makePolyField(raType: RaClass, f: IrField) -> RaField {
+		var rf = raType.fields[f.index];
 		if (rf == null) {
 			// create the RaField from the normalized type
 			var ft = f.fieldType;
-			if (ft.open()) ft = f.fieldType.substitute(V3.getTypeArgs(receiver));
+			if (ft.open()) ft = f.fieldType.substitute(V3.getTypeArgs(raType.oldType));
 			var fieldType = makeType(ft);
 			rf = raType.makeField(f, fieldType, fieldType.size);
 		}
