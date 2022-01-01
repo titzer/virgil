@@ -31,6 +31,9 @@ Virgil focuses on balancing these main features in a statically-typed language:
 Virgil can compile to native binaries for Linux or Darwin, to jar files for the
 JVM, or to WebAssembly modules. Linux binaries can run successfully under
 Windows using Window's Linux system call layer.
+The compiler is naturally a cross-compiler, able to compile from any supported
+platform to any other supported platform, so you need only be able to run on
+one of these platforms in order to target any of the others.
 
 * x86-darwin : 32-bit Darwin kernels (MacOS)
 * x86-linux : 32-bit Linux kernels
@@ -42,12 +45,16 @@ Windows using Window's Linux system call layer.
 
 Virgil is fully self-hosted: its entire compiler and runtime system is
 implemented in Virgil.
-The compiler can bootstrap on any of the target platforms; it's naturally a
-cross-compiler.
+It was originally designed as a language for embedded systems, particularly
+microcontrollers, but now supports more mainstream targets.
+The compiler includes sophisticated whole-program optimizations that achieve
+great performance and small binaries.
 Native binaries compiled from your programs can be as small as a few hundred
 bytes in size and consume just kilobytes of memory at runtime.
 
 ## Documentation ##
+
+Learn how to [get started](start/README.md) using Virgil.
 
 The most up-to-date documentation is, as always, the implementation in this repository!
 
