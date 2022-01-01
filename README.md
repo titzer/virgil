@@ -1,19 +1,22 @@
 # virgil: A Fast and Lightweight Programming Language
 
 Virgil is a programming language designed for fast, dependency-free programs.
-Its design blends functional and object-oriented programming paradigms for expressiveness
-without a lot of overhead, either syntactically or at runtime.
-Its implementation is focused primarily on static compilation to produce native
-executables that are standalone.
-It is well-suited to writing small and fast programs.
-That makes it ideal for building certain kinds of programs like compilers and virtual
-machines.
-It is currently being used for virtual machine and programming language research.
+Its design blends functional and object-oriented programming paradigms for
+expressiveness and performance.
+Virgil's compiler produces optimized, standalone native executables, WebAssembly
+modules, or JARs for the JVM, or programs can also be run directly on a built-in
+interpreter.
+It is well-suited to writing small and fast programs, which makes it ideal for
+building certain kinds of programs like compilers and virtual machines.
+It is currently being used for virtual machine and programming language
+research, in particular the development of a next-generation WebAssembly virtual
+machine, [Wizard](https://github.com/titzer/wizard-engine).
 
-This repository includes the entire compiler, runtime system, some libraries, tests, and supporting code
-for Virgil's various compilation targets.
+This repository includes the entire compiler, runtime system, some libraries,
+tests, documentation and supporting code for Virgil's various compilation
+targets.
 
-## Features ##
+## Design ##
 
 Virgil focuses on balancing these main features in a statically-typed language:
 
@@ -25,9 +28,9 @@ Virgil focuses on balancing these main features in a statically-typed language:
 
 ## Supported Targets ##
 
-Virgil can compile to x86 binaries for Linux or Darwin, to jar files for the JVM,
-or to WebAssembly. Linux binaries can run successfully under Windows using Window's
-Linux system call layer.
+Virgil can compile to native binaries for Linux or Darwin, to jar files for the
+JVM, or to WebAssembly modules. Linux binaries can run successfully under
+Windows using Window's Linux system call layer.
 
 * x86-darwin : 32-bit Darwin kernels (MacOS)
 * x86-linux : 32-bit Linux kernels
@@ -37,12 +40,12 @@ Linux system call layer.
 
 ## Implementation ##
 
-Virgil is fully self-hosted: its entire compiler and runtime system is implemented
-in Virgil.
-The compiler can bootstrap (i.e. compile itself and all runtime code) on any of the
-target platforms.
-Native binaries compiled from your programs can be as small as a few hundred bytes in size
-and consume just kilobytes of memory at runtime.
+Virgil is fully self-hosted: its entire compiler and runtime system is
+implemented in Virgil.
+The compiler can bootstrap on any of the target platforms; it's naturally a
+cross-compiler.
+Native binaries compiled from your programs can be as small as a few hundred
+bytes in size and consume just kilobytes of memory at runtime.
 
 ## Documentation ##
 
