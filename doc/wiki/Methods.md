@@ -1,6 +1,6 @@
 # Methods #
 
-Methods are the fundamental building block of Virgil III code. Just as with variables, a method is declared within a _scope_, such as a file, a  [class](TutorialClasses.md) or [component](TutorialComponents.md). We've already seen the definition of a _main_ method for a program. Let's look at another method.
+Methods are the fundamental building block of Virgil III code. Just as with variables, a method is declared within a _scope_, such as a file, a  [class](Classes.md) or [component](Components.md). We've already seen the definition of a _main_ method for a program. Let's look at another method.
 
 ```
 // recursive computation of fibonacci sequence
@@ -95,4 +95,4 @@ def fifth() {
 }
 ```
 
-Why is chaining in this way useful? It turns out that it works really well with [type parameters](TutorialTypeparams.md). Returning the implicit `void` result of another call can often save a line of code, for example, by shortening a branch to a single line, like in the example of the `third` method above.
+Why is chaining in this way useful? It turns out that it works really well with [type parameters](Typeparams.md). Returning the implicit `void` result of another call can often save a line of code, for example, by shortening a branch to a single line, like in the example of the `third` method above.

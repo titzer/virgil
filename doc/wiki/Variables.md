@@ -34,4 +34,4 @@ def getMessage() -> string {
 
 Each variable has a _scope_, which is the range of the program in which it is active and accessible. Here we saw variables declared within a file. These variables are local to the file but live for the entire program.
 
-Later, we will see that we can declare variables in the scope of a [method](TutorialMethods.md) (a local variable) and within the scope of a [class](TutorialClasses.md) (an instance variable). In both cases, we use the same syntax and can define both mutable and immutable variables.
+Later, we will see that we can declare variables in the scope of a [method](Methods.md) (a local variable) and within the scope of a [class](Classes.md) (an instance variable). In both cases, we use the same syntax and can define both mutable and immutable variables.
