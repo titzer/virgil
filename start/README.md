@@ -2,7 +2,7 @@
 
 ## Step 1 - Clone This Repository ##
 
-This repository is not only main source control system for Virgil, including all of its
+This repository is not only the main source control system for Virgil, including all of its
 development history, it is also an up-to-date, self-contained archive that is ready to
 run, without any build steps.
 That means that simply cloning this repository will get you the latest bleeding-edge
