@@ -85,7 +85,7 @@ Notice that in the body of the `map` method, we can create an array with element
 
 ## Tuples, Functions, and Type Parameters ##
 
-We've seen that tuples and functions work together [well](TutorialFunctions.md), and here we've seen that functions and type parameters work together well. Surprisingly, thanks to the universal nature of type parameters, all three features work together nicely as well. For example, we can use all three features to write a `time` utility that can be applied to _any_ function with _any_ parameters and returns both the elapsed microseconds and the result of the function. [1]
+We've seen that tuples and functions work together [well](Functions.md), and here we've seen that functions and type parameters work together well. Surprisingly, thanks to the universal nature of type parameters, all three features work together nicely as well. For example, we can use all three features to write a `time` utility that can be applied to _any_ function with _any_ parameters and returns both the elapsed microseconds and the result of the function. [1]
 
 ```
 var x: (int, int) = time(square, 5);  // int -> int

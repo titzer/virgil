@@ -133,7 +133,7 @@ def name(o: VirtualMethodA) -> string {
 
 ## Initialization order ##
 
-Recall that classes have a careful [initialization order](TutorialClasses.md) where the field initializers are executed before the body of the constructor. For classes that have a super class, these field initializations happen before the call to the super constructor.
+Recall that classes have a careful [initialization order](Classes.md) where the field initializers are executed before the body of the constructor. For classes that have a super class, these field initializations happen before the call to the super constructor.
 
 The overall execution order of initialization is therefore:
 

@@ -73,7 +73,7 @@ def m2(a: int, b: int, c: int) -> int {
 
 ## Multi-return functions ##
 
-Tuples and functions together make for powerful reusability. With tuples we can easily return multiple values from a function and seamlessly pass the result to the next function, just as we did for [methods](TutorialTuplesAndMethods.md).
+Tuples and functions together make for powerful reusability. With tuples we can easily return multiple values from a function and seamlessly pass the result to the next function, just as we did for [methods](TuplesAndMethods.md).
 
 ## Composability ##
 
@@ -149,7 +149,7 @@ var i: (Array<byte>, Array<byte>) -> bool = Array<byte>.==;
 var j: (Array<byte>, Array<byte>) -> bool = Array<byte>.!=;
 ```
 
-`*` note that some types are currently not supported on the left hand side of the member operator `.` These functions can be accessed through a [parameterized](TutorialTypeparams.md) method, however.
+`*` note that some types are currently not supported on the left hand side of the member operator `.` These functions can be accessed through a [parameterized](Typeparams.md) method, however.
 
 ## Array functions ##
 

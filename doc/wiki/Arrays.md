@@ -82,7 +82,7 @@ def main() {
 
 ## Composability ##
 
-Unlike most other languages, Virgil arrays can be constructed with _any_ element type, even `void`. There are no special cases or exceptions to remember. For any valid type `T`, `Array<T>` is also a valid type. This works with [primitives](TutorialPrimitives.md), `void`, [tuples](TutorialTuples.md), arrays, [classes](TutorialClasses.md), and [functions](TutorialFunctions.md). No exceptions!
+Unlike most other languages, Virgil arrays can be constructed with _any_ element type, even `void`. There are no special cases or exceptions to remember. For any valid type `T`, `Array<T>` is also a valid type. This works with [primitives](Primitives.md), `void`, [tuples](Tuples.md), arrays, [classes](Classes.md), and [functions](Functions.md). No exceptions!
 
 ```
 // if T is a legal type, then Array<T> is a legal type, even T=void
@@ -91,7 +91,7 @@ var b: Array<void> = [(), (), ()];
 var c: Array<void> = [];
 ```
 
-Why is this useful? Composability makes the language regular so that you don't have to remember special cases. It means that arrays compose well with [functions](TutorialFunctions.md) and [type parameters](TutorialTypeparams.md), as we will see later.
+Why is this useful? Composability makes the language regular so that you don't have to remember special cases. It means that arrays compose well with [functions](Functions.md) and [type parameters](Typeparams.md), as we will see later.
 
 ## Type inference ##
 
@@ -105,4 +105,4 @@ var b: Array<bool> = Array.new(7);
 
 ## Not co-variant ##
 
-Unlike Java, Virgil arrays are _not_ co-variantly typed. See the section on [variance](TutorialVariance.md) for more details.
+Unlike Java, Virgil arrays are _not_ co-variantly typed. See the section on [variance](Variance.md) for more details.

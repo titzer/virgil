@@ -152,7 +152,7 @@ Accesses of uninitialized fields are disallowed by checking that each field's in
 
 ## Method Type Parameters ##
 
-Just like methods outside of classes, methods inside of classes can have [type parameters](TutorialTypeparams.md). The syntax is exactly the same, and usage of parameterized class methods is similar to that for parameterized component methods.
+Just like methods outside of classes, methods inside of classes can have [type parameters](Typeparams.md). The syntax is exactly the same, and usage of parameterized class methods is similar to that for parameterized component methods.
 
 ```
 class Searcher {

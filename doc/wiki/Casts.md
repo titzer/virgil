@@ -89,7 +89,7 @@ The above example implements a method that plays with pets and illustrates how u
 
 ## Functions ##
 
-Function types support casts that follow the rules of [variance](TutorialVariance.md).
+Function types support casts that follow the rules of [variance](Variance.md).
 
 ## Rules for `null` ##
 
