@@ -1,0 +1,374 @@
+// Copyright 2022 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Local register allocator that spills everything to the stack between basic blocks.
+def verbose = false;
+def paranoid = true;
+class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
+	def regState = Array<int>.new(regSet.physRegs);			// indices into {allocated}
+	def allocated = Array<(VReg, int)>.new(regSet.physRegs);	// (VReg, pos)
+	def parmoveDests = Vector<(VReg, List<Operand.Def>)>.new();
+	def moveResolver = MoveResolver.new(codegen.mach.prog.ERROR);
+	def moves = MoveSet.new(regSet);
+	var cursor: int;
+	var pos: int;
+	var buf = ArchInstrBuffer.new(codegen, codegen.mach.prog, regSet);
+	var prev: ArchInstr;
+	var cur: ArchInstr;
+	var next: ArchInstr;
+
+	def allocate() {
+		clear();
+		cur = codegen.last;
+		while (cur != null) {
+			if (verbose) dumpState("before instr");
+			if (verbose) Terminal.put(buf.putInstrV(cur).toString());
+			if (paranoid) sanityCheck();
+			pos++;
+			prev = cur.prev;
+			next = cur.next;
+			var opcode = cur.opcode();
+			if (opcode == ArchInstrs.ARCH_PARMOVE) { // perform parallel move
+				cur.remove();
+				parmoveDests.resize(0);
+				codegen.gatherParallelMoveDests(cur, parmoveDests);
+				for (j < parmoveDests.length) recursivelyEmitMoves(j, next);
+				cur = prev;
+				continue;
+			}
+			if (opcode == ArchInstrs.ARCH_BLOCK) {
+				var block = Operand.Label.!(cur.operands[0]).block;
+				if (block.preds.length != 0) {  // not the entry block
+					for (i < cursor) { // Load all live registers out of their spill slots
+						var a = allocated[i];
+						var vreg = a.0;
+						regState[vreg.reg] = -1;
+						allocSpill(vreg);
+						codegen.insertRestoreLocal(vreg, vreg.reg, next);
+						vreg.reg = 0;
+					}
+					cursor = 0;
+				}
+				cur = prev;
+				continue;
+			}
+			if (opcode == ArchInstrs.ARCH_BLOCK_END) {
+				cur = prev;
+				continue;
+			}
+			var operands = cur.operands;
+			// process defs and kills
+			moves.clear();
+			// first pass on defs; free registers of anything defined in this instruction, but don't clear vreg.reg
+			for (j < operands.length) match (operands[j]) {
+				Def(vreg, constraint) 			=> freeReg(vreg.reg, false);
+				Overwrite(vreg, use, constraint) 	=> freeReg(vreg.reg, false);
+				_ => ;
+			}
+			// second pass on defs; allocate (new) registers and shuffle into previous vreg.reg
+			for (j < operands.length) match (operands[j]) {
+				Def(vreg, constraint) => {
+					var loc = allocDefReg(vreg, constraint);
+					operands[j] = Operand.Def(vreg, loc);
+				}
+				Overwrite(vreg, use, constraint) => {
+					var loc = allocDefReg(vreg, constraint);
+					operands[j] = Operand.Overwrite(vreg, use, loc);
+				}
+				_ => ;
+			}
+			pos++;
+			if (verbose) dumpState("after defs  ");
+			// process uses
+			for (j < operands.length) match (operands[j]) {
+				Def(vreg, assignment) => {
+					freeReg(assignment, true);
+				}
+				Overwrite(dst, use, assignment) => {
+					freeReg(assignment, true);
+					allocUseReg(use, assignment);
+				}
+				Kill(constraint) => {
+					if (constraint < regSet.regSets.length) {
+						for (reg in regSet.regSets[constraint]) {
+							spillReg(reg, next);
+							freeReg(reg, true);
+						}
+					}
+				}
+				Use(vreg, constraint) => {
+					var loc = allocUseReg(vreg, constraint);
+					operands[j] = Operand.Use(vreg, loc);
+				}
+				_ => ;
+			}
+			moves.emit(codegen, cur.next);
+			if (opcode == ArchInstrs.ARCH_ENTRY) {
+				for (j < cursor) {
+					var vreg = allocated[j].0;
+					if (vreg.isConst()) codegen.insertMoveValLoc(vreg, (vreg, vreg.reg), vreg.regClass, next);
+				}
+			}
+			cur = prev;
+		}
+	}
+	def allocUseReg(vreg: VReg, constraint: int) -> int {
+		var prevReg = vreg.reg, loc: int = prevReg;
+		if (regSet.isStack(constraint)) {
+			if (vreg.isConst()) {
+				codegen.insertMoveValLoc(vreg, (vreg, constraint), vreg.regClass, prev.next);
+			} else {
+				if (prevReg != 0) {
+					updateUsePos(prevReg);
+					codegen.insertMoveLocLoc((vreg, prevReg), (vreg, constraint), vreg.regClass, prev.next);
+				} else {
+					allocSpill(vreg); // insert a save instruction before and alloc reg independently for it
+					codegen.insertMoveLocLoc((vreg, vreg.spill), (vreg, constraint), vreg.regClass, prev.next);
+				}
+			}
+			return constraint;
+		} else if (isOk(vreg, constraint)) {
+			updateUsePos(prevReg);
+		} else {
+			if (isUsedInThisInstr(prevReg)) {
+				freeReg(prevReg, true);
+				loc = reassignReg(vreg, findBestLoc(vreg.regClass, vreg.hint, constraint));
+				codegen.insertMoveLocLoc((vreg, loc), (vreg, prevReg), vreg.regClass, prev.next);
+			} else {
+				spillReg(prevReg, next);
+				freeReg(prevReg, true);
+				loc = reassignReg(vreg, findBestLoc(vreg.regClass, vreg.hint, constraint));
+			}
+		}
+		if (paranoid) sanityCheck();
+		return loc;
+	}
+	def updateUsePos(reg: byte) {
+		var i = regState[reg];
+		if (i < 0) return;
+		var t = allocated[i];
+		allocated[i] = (t.0, pos);
+	}
+	def allocDefReg(vreg: VReg, constraint: int) -> int {
+		var prevReg = vreg.reg;
+		vreg.reg = 0;
+		var loc = reassignReg(vreg, findBestLoc(vreg.regClass, prevReg, constraint));
+		if (prevReg != 0) moves.addRegMove(vreg, loc, prevReg);
+		if (vreg.spill != 0) moves.saves.put(vreg, loc, vreg.spill);
+		if (paranoid) sanityCheck();
+		return loc;
+	}
+	def dumpState(str: string) {
+		buf.reset();
+		buf.puts(str);
+		buf.puts(" regState = [");
+		for (j < regState.length) {
+			var i = regState[j];
+			if (i < 0) continue;
+			var a = allocated[i];
+			buf.puts(regSet.identify(j)).putc('=');
+			buf.putVReg("", a.0);
+			buf.putc('^');
+			buf.putd(a.1);
+			buf.csp();
+		}
+		Terminal.put(buf.puts("]").ln().toString());
+	}
+	def spillReg(reg: byte, next: ArchInstr) {
+		var i = regState[reg];
+		if (i < 0) return;
+		var vreg = allocated[i].0;
+		allocSpill(vreg);
+		codegen.insertRestoreLocal(vreg, reg, next);
+	}
+	def allocSpill(vreg: VReg) {
+		if (vreg.spill == 0) vreg.spill = codegen.frame.allocSpill(vreg.regClass);
+	}
+	def freeReg(loc: int, clear: bool) {
+		if (loc >= regState.length) return;
+		var i = regState[loc];
+		if (i < 0) return;
+		var o = allocated[i];
+		var a = allocated[--cursor];
+		if (cursor > 0) { 
+			allocated[i] = a;
+			regState[a.0.reg] = i;
+		}
+		regState[loc] = -1;
+		if (clear) o.0.reg = 0;
+	}
+	def isOk(vreg: VReg, constraint: int) -> bool {
+		if (vreg.reg == 0) return false;
+		if (constraint >= regSet.regSets.length) return false;
+		if (constraint == 0) return true;
+		return regSet.isInRegSet(vreg.reg, constraint);
+	}
+	def isUsedInThisInstr(reg: byte) -> bool {
+		var i = regState[reg];
+		if (i < 0) return false;
+		return allocated[i].1 == pos;
+	}
+	def findBestLoc(regClass: RegClass, hint: int, constraint: int) -> int {
+		if (constraint >= regSet.regSets.length) return constraint; // constraint is for spill slot
+		if (constraint == 0) constraint = regSet.regClasses[regClass.tag];
+		if (hint != 0) { // try hint register first
+			var i = regState[hint];
+			if (i < 0 && regSet.isInRegSet(hint, constraint)) return hint; // hint register is free
+		}
+		// Find a register from the constraint set; a free one, or the one used farthest in future
+		var minpos = int.max, newReg: byte = 0;
+		for (reg in regSet.regSets[constraint]) {
+			var i = regState[reg];
+			if (i < 0) return reg; // found a free register in the set
+			var a = allocated[i];
+			if (a.1 < minpos) {
+				minpos = a.1;
+				newReg = reg;
+			}
+		}
+		if (newReg == 0) codegen.context.fail("no registers available");
+		return newReg;
+	}
+	def reassignReg(vreg: VReg, reg: int) -> int {
+		if (reg > regSet.physRegs) return reg;
+		var i = regState[reg];
+		if (i < 0) {
+			regState[reg] = cursor;
+			allocated[cursor++] = (vreg, pos);
+		} else {
+			var old = allocated[i].0;
+			allocated[i] = (vreg, pos);
+			allocSpill(old);
+			moves.reloads.put(old, reg);
+			old.reg = 0;
+		}
+		return vreg.reg = byte.!(reg);
+	}
+	def sanityCheck() {
+//		dumpState("sanity");
+		if (regState[0] >= 0) return V3.fail("regState[unassigned] is allocated");
+		for (j < regState.length) {
+			var i = regState[j];
+			if (i < 0) continue;
+			if (i >= cursor) return V3.fail1("regState[%s] index oob", regSet.identify(j));
+			var a = allocated[i], vreg = a.0;
+			if (vreg == null) return V3.fail1("allocated[%d] unallocated", i);
+			if (vreg.reg != j) return V3.fail(Strings.format2("v%d.reg != %s", vreg.varNum, regSet.identify(j)));
+		}
+		for (i < cursor) {
+			var a = allocated[i], vreg = a.0;
+			if (vreg == null) return V3.fail1("allocated[%d] unallocated", i);
+			if (vreg.reg <= 0) return V3.fail(Strings.format2("allocated[%d]=v%d mismatch", i, vreg.varNum));
+			if (vreg.reg >= allocated.length) return V3.fail1("allocated[%d] mismatch", i);
+			if (a.1 > pos) return V3.fail1("allocated[%d] pos too big", i);
+		}
+		for (j < codegen.vars.length) {
+			if (true) continue; // TODO
+			var vreg = codegen.vars[j];
+			if (vreg == null) continue;
+			if (vreg.reg != 0) {
+				var i = regState[vreg.reg];
+				if (i < 0) return V3.fail(Strings.format2("regState[@%d, %s] mismatched", j, regSet.identify(vreg.reg)));
+				if (i >= cursor) return V3.fail(Strings.format2("regState[@%d, %s] mismatched", j, regSet.identify(vreg.reg)));
+				var a = allocated[i];
+				if (a.0 != vreg) return V3.fail(Strings.format2("regState[@%d, %s] mismatched", j, regSet.identify(vreg.reg)));
+			}
+		}
+	}
+	def clear() {
+		for (i < allocated.length) allocated[i] = (null, -1);
+		for (i < regState.length) regState[i] = -1;
+		cursor = 0;
+		pos = 0;
+	}
+	def recursivelyEmitMoves(j: int, next: ArchInstr) {
+		var t = parmoveDests[j], vreg = t.0, dest = t.1;
+		if (vreg.parmoveState <= 0) return; // already done on or stack
+		vreg.parmoveState = ON_STACK;
+		for (l = dest; l != null; l = l.tail) {
+			var o = l.head, dreg = o.vreg, index = dreg.parmoveState;
+			allocSpill(dreg);
+			if (index == ON_STACK) {
+				// destination is already on stack; cycle; load to temp
+				dreg.parmoveState = IN_CYCLE;
+				codegen.insertRestoreLocal(dreg, getParallelMoveReg(dreg.regClass, 1), next);
+			}
+			if (index > 0) recursivelyEmitMoves(index - 1, next);
+		}
+		allocSpill(vreg);
+		var loc: int;
+		if (vreg.parmoveState == IN_CYCLE) {
+			loc = getParallelMoveReg(vreg.regClass, 1);
+		} else {
+			loc = getParallelMoveReg(vreg.regClass, 0);
+			codegen.insertRestoreLocal(vreg, loc, next);
+		}
+		for (l = dest; l != null; l = l.tail) {
+			codegen.insertSaveLocal(loc, l.head.vreg, next);
+		}
+		vreg.parmoveState = 0;
+	}
+	def getParallelMoveReg(rcl: RegClass, which: int) -> int {
+		var set = regSet.regClasses[rcl.tag];
+		var loc = regSet.regSets[set][which];
+		return loc;
+	}
+}
+def LIVE: i8 = 0;
+def ON_STACK: i8 = -1;
+def IN_CYCLE: i8 = -2;
+def DEAD: i8 = -3;
+
+class MoveSet(regSet: MachRegSet) {
+	def regindex = Array<int>.new(regSet.physRegs);		// where each register occurs, if all, in regmoves
+	def regmoves = Vector<(i8, VReg, int, byte)>.new();	// (state, VReg, src, reg)
+	def saves = Vector<(VReg, int, int)>.new();		// (VReg, src, dst)
+	def reloads = Vector<(VReg, int)>.new();		// (VReg, dst)
+
+	def addRegMove(vreg: VReg, src: int, dst: byte) {
+		if (src == dst)	return;
+		var index = regmoves.length;
+		regmoves.put(LIVE, vreg, src, dst);
+		if (regSet.isReg(src)) regindex[src] = index;
+	}
+	def emit(codegen: SsaMachGen, next: ArchInstr) {
+		for (j < saves.length) {
+			var s = saves[j], vreg = s.0, src = s.1, dst = s.2;
+			if (src != dst) codegen.insertMoveLocLoc((vreg, src), (vreg, dst), vreg.regClass, next);
+		}
+		for (j < regmoves.length) emit0(codegen, j, next);
+		for (j < reloads.length) {
+			var t = reloads[j], vreg = t.0;
+			if (vreg.isConst()) codegen.insertMoveValLoc(vreg, (vreg, t.1), vreg.regClass, next);
+			else codegen.insertMoveLocLoc((vreg, vreg.spill), (vreg, t.1), vreg.regClass, next);
+		}
+	}
+	def emit0(codegen: SsaMachGen, j: int, next: ArchInstr) {
+		var t = regmoves[j], state = t.0, vreg = t.1, src = t.2, dst = t.3;
+		if (state < LIVE) return; // already done on or stack
+		regmoves[j] = (ON_STACK, vreg, src, dst);
+		var d = regindex[dst];
+		if (d >= 0) { // is the source of some regmove
+			var u = regmoves[d];
+			if (u.0 == ON_STACK) {
+				var regClass = u.1.regClass;
+				var scratch = regSet.scratch[regClass.tag];
+				regmoves[d] = (IN_CYCLE, u.1, u.2, scratch);
+				codegen.insertMoveLocLoc((vreg, dst), (vreg, scratch), regClass, next);
+			} else if (u.0 == LIVE) {
+				emit0(codegen, d, next);
+			}
+		}
+		// reload entry after recursion
+		t = regmoves[j];
+		if (t.0 == IN_CYCLE) src = t.3; // use scratch of entry
+		codegen.insertMoveLocLoc((vreg, src), (vreg, dst), vreg.regClass, next);
+		regmoves[j] = (DEAD, null, 0, 0);
+	}
+	def clear() {
+		for (i < regindex.length) regindex[i] = -1;
+		regmoves.resize(0);
+		saves.resize(0);
+		reloads.resize(0);
+	}
+}

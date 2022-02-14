@@ -278,7 +278,7 @@ class SsaX86_64Gen extends SsaMachGen {
 			}
 			PtrCmpSwp => {
 				var t = matchMrrsd(i.input0());
-				useMrrsd(t);
+				useMrrsdConstrained(t, Regs.NOT_RAX);
 				var vi = i.inputs[2].dest;
 				useFixed(vi, Regs.NOT_RAX);
 				var expect = useFixed(i.input1(), Regs.RAX); // expect in RAX as extra operand
@@ -477,8 +477,7 @@ class SsaX86_64Gen extends SsaMachGen {
 			cond = cond.commute;
 		}
 		if (tryUseImm32(y)) {
-			var yop = operands[0];
-			operands.resize(0); // XXX: manual operands vector reorder
+			var yop = popLastOperand();
 			emit2(opcode | (AM_OP_IMM << AM_SHIFT), use(x), op(yop));
 		} else {
 			useReg(x);
@@ -523,7 +522,7 @@ class SsaX86_64Gen extends SsaMachGen {
 			useImm(target);
 			if (target == null || target.val == null || V3.isComponent(target.val.receiver)) skip = 1;
 		} else {
-			useReg(func);
+			useFixed(func, Regs.NOT_PARAM);
 		}
 
 		// use the arguments to the call
@@ -543,7 +542,7 @@ class SsaX86_64Gen extends SsaMachGen {
 					var r = rv[i];
 					if (r != null) dfnFixed(r, X86_64Linux.KERNEL_RETURN_REGS[i]); // TODO: eflags?
 				}
-
+				kill(Regs.ALL);
 				// use the arguments to the call
 				var inputs = call.inputs;
 				for (i < inputs.length) {
@@ -561,13 +560,22 @@ class SsaX86_64Gen extends SsaMachGen {
 			var shiftor = if(m.wide, u6.view(m.ylong), u5.view(m.yint));
 			return emit2(opcode | (AM_OP_IMM << AM_SHIFT), ovwReg(i, m.x), useInt(shiftor));
 		}
-		return emit2(opcode | (AM_OP << AM_SHIFT), ovwReg(i, m.x), useFixed(m.y, Regs.RCX));
+		return emit2(opcode | (AM_OP << AM_SHIFT), ovwRegFixed(i, m.x, Regs.NOT_RCX), useFixed(m.y, Regs.RCX));
 	}
 	def useMrrsd(x: SsaInstr, y: SsaInstr, scale: byte, disp: Val) {
 		if (x == null) useInt(0); // no base register, will ignore
 		else useReg(x);
 		if (y == null) useInt(0); // no index register, will ignore
 		else useReg(y);
+		useInt(scale);
+		useImm(disp);
+	}
+	def useMrrsdConstrained(t: (SsaInstr, SsaInstr, byte, Val), constraint: int) {
+		var x = t.0, y = t.1, scale = t.2, disp = t.3;
+		if (x == null) useInt(0); // no base register, will ignore
+		else useFixed(x, constraint);
+		if (y == null) useInt(0); // no index register, will ignore
+		else useFixed(y, constraint);
 		useInt(scale);
 		useImm(disp);
 	}
@@ -584,6 +592,11 @@ class SsaX86_64Gen extends SsaMachGen {
 			}
 		}
 		return false;
+	}
+	def popLastOperand() -> Operand { // XXX: clean up uses of this
+		var o = operands[operands.length - 1];
+		operands.resize(operands.length - 1);
+		return o;
 	}
 	def matchMrrsd(i: SsaInstr) -> (SsaInstr, SsaInstr, byte, Val) {
 		if (SsaConst.?(i)) return (null, null, 1, SsaConst.!(i).val);
@@ -683,8 +696,8 @@ class SsaX86_64Gen extends SsaMachGen {
 	}
 
 	def genSaveLocal(loc: int, v: VReg) {
-		if (Regs.SET.isCallerStack(loc)) return; // defined by caller, nothing to do
-		if (Regs.SET.isStack(loc)) {
+		if (regSet.isCallerStack(loc)) return; // defined by caller, nothing to do
+		if (regSet.isStack(loc)) {
 			var scratch = Regs.SCRATCH_GPR;
 			var opcode = if(v.regClass == RegClass.I32, I_MOVD, I_MOVQ); // no need for XMM for stack-to-stack
 			emit2(opcode | (AM_REG_OP << AM_SHIFT), op(Operand.Def(null, scratch)), op(Operand.Use(null, loc)));
@@ -721,12 +734,11 @@ class SsaX86_64Gen extends SsaMachGen {
 	}
 	def genRestoreLocal(v: VReg, loc: int) {
 		var from: int;
-		if (Regs.SET.isStack(loc)) {
+		if (regSet.isStack(loc)) {
 			// destination is stack
 			var opcode = if(v.regClass == RegClass.I32, I_MOVD, I_MOVQ);
 			if (v.isConst() && tryUseImm32(v.ssa)) { // emit move immediate directly into stack
-				var yop = operands[0];
-				operands.resize(0); // XXX: manual operands vector reorder
+				var yop = popLastOperand();
 				emit2(opcode | (AM_OP_IMM << AM_SHIFT), op(Operand.Def(null, loc)), op(yop));
 				return;
 			}
@@ -749,6 +761,87 @@ class SsaX86_64Gen extends SsaMachGen {
 			genLoadLocalIntoReg(v, loc);
 		}
 	}
+	def genRegRegMove(src: int, dst: int) {
+		var xmmd = Regs.toXmmr(dst);
+		if (xmmd != null) {
+			emit2(I_MOVSD | (AM_XMM_OP << AM_SHIFT), op(Operand.Def(null, dst)), op(Operand.Use(null, src)));
+		} else {
+			emit2(I_MOVQ | (AM_REG_OP << AM_SHIFT), op(Operand.Def(null, dst)), op(Operand.Use(null, src)));
+		}
+	}
+
+	def moveOpcode(regClass: RegClass) -> int {
+		return if(regClass == RegClass.I32 || regClass == RegClass.F32, I_MOVD, I_MOVQ);
+	}
+	def genMoveLocLoc(src: (VReg, int), dst: (VReg, int), regClass: RegClass) {
+		var from: int;
+		if (regSet.isStack(dst.1)) {
+			if (regSet.isStack(src.1)) {
+				var opcode = moveOpcode(regClass), srcloc = src.1;
+				emit2(opcode | (AM_REG_OP << AM_SHIFT), op(Operand.Def(null, Regs.SCRATCH_GPR)), op(Operand.Use(src)));
+				emit2(opcode | (AM_OP_REG << AM_SHIFT), op(Operand.Def(dst)), op(Operand.Use(null, Regs.SCRATCH_GPR)));
+			} else {
+				var xmm = Regs.toXmmr(src.1);
+				if (xmm != null) {
+					var opcode = if(regClass == RegClass.F32, I_MOVSS, I_MOVSD);
+					emit2(opcode | (AM_OP_XMM << AM_SHIFT), op(Operand.Def(dst)), op(Operand.Use(src)));
+				} else {
+					var opcode = moveOpcode(regClass), srcloc = src.1;
+					emit2(opcode | (AM_OP_REG << AM_SHIFT), op(Operand.Def(dst)), op(Operand.Use(src)));
+				}
+			}
+		} else {
+			var xmm = Regs.toXmmr(dst.1);
+			if (xmm != null) {
+				var opcode = if(regClass == RegClass.F32, I_MOVSS, I_MOVSD);
+				emit2(opcode | (AM_XMM_OP << AM_SHIFT), op(Operand.Def(dst)), op(Operand.Use(src)));
+			} else {
+				var opcode = moveOpcode(regClass);
+				emit2(opcode | (AM_REG_OP << AM_SHIFT), op(Operand.Def(dst)), op(Operand.Use(src)));
+			}
+		}
+	}
+	def genMoveValLoc(src: VReg, dst: (VReg, int), regClass: RegClass) {
+		var isImm32 = tryUseImm32(src.ssa), immOp = if(isImm32, popLastOperand());
+		if (regSet.isStack(dst.1)) {
+			if (isImm32) { // emit move immediate directly into stack
+				var opcode = moveOpcode(regClass);
+				emit2(opcode | (AM_OP_IMM << AM_SHIFT), op(Operand.Def(dst)), op(immOp));
+				return;
+			}
+			var scratch = Regs.SCRATCH_GPR;
+			genMoveValLoc(src, (null, scratch), regClass);
+			genMoveLocLoc((null, scratch), dst, regClass);
+		} else {
+			var xmm = Regs.toXmmr(dst.1);
+			if (xmm != null) {
+				var scratch = Regs.SCRATCH_GPR;
+				genMoveValLoc(src, (null, scratch), regClass);
+				var opcode = if(regClass == RegClass.F32, I_MOVSS, I_MOVSD);
+				emit2(opcode | (AM_XMM_REG << AM_SHIFT), op(Operand.Def(dst)), op(Operand.Use(null, scratch)));
+			} else {
+				var opcode = moveOpcode(regClass);
+				if (isImm32) {
+					var opcode = if(regClass == RegClass.I32, I_MOVD, I_MOVQ);
+					emit2(opcode | (AM_OP_IMM << AM_SHIFT), op(Operand.Def(dst)), op(immOp));
+				} else {
+					var val = SsaConst.!(src.ssa).val;
+					var bits: long;
+					match (val) {
+						x: Box<long> => bits = x.val;
+						x: Float64Val => bits = long.view(x.bits);
+						_ => return emit2(I_MOVD | (AM_OP_IMM << AM_SHIFT), op(Operand.Def(dst)), op(Operand.Immediate(val)));
+
+					}
+					var addr = mach.getLongConstAddr(bits);
+					op(Operand.Def(dst));
+					useMrrsd(null, null, 1, addr);
+					emitN(I_MOVQ | (AM_REG_MRRSD << AM_SHIFT));
+				}
+			}
+		}
+	}
+
 	def emitFloatBinop(i: SsaApplyOp, opcode: int) {
 		var d = getVReg(i), u = getVReg(i.input0()), reg = anyReg(d);
 		emit2(opcode | (AM_XMM_OP << AM_SHIFT), ovwv(d, u, reg), use(i.input1()));
@@ -966,6 +1059,8 @@ class SsaX86_64Gen extends SsaMachGen {
 			I_MULSD => asm.mulsd_s_s(a, b);
 			I_DIVSD => asm.divsd_s_s(a, b);
 			I_SQRTSD => asm.sqrtsd_s_s(a, b);
+			I_MOVSS => asm.movss_s_s(a, b);
+			I_MOVSD => asm.movsd_s_s(a, b);
 			I_CVTSS2SD => asm.cvtss2sd_s_s(a, b);
 			I_CVTSD2SS => asm.cvtsd2ss_s_s(a, b);
 			I_PCMPEQD => asm.pcmpeqd_s_s(a, b);
@@ -1394,12 +1489,12 @@ class SsaX86_64Gen extends SsaMachGen {
 
 	def loc_r(loc: int) -> X86_64Gpr {
 		var gpr = Regs.toGpr(loc);
-		if (gpr == null) return V3.fail1("expected GPR, got %s", Regs.SET.identify(loc));
+		if (gpr == null) return V3.fail1("expected GPR, got %s", regSet.identify(loc));
 		return gpr;
 	}
 	def loc_s(loc: int) -> X86_64Xmmr {
 		var xmm = Regs.toXmmr(loc);
-		if (xmm == null) return V3.fail1("expected XMM, got %s", Regs.SET.identify(loc));
+		if (xmm == null) return V3.fail1("expected XMM, got %s", regSet.identify(loc));
 		return xmm;
 	}
 	def loc_m(loc: int) -> X86_64Addr {
@@ -1412,7 +1507,7 @@ class SsaX86_64Gen extends SsaMachGen {
 		} else if (loc >= regSet.spillStart) {
 			offset = wordSize * (loc - regSet.spillStart + frame.spillArgs);
 		} else {
-			return V3.fail1("invalid spill location %s", Regs.SET.identify(loc));
+			return V3.fail1("invalid spill location %s", regSet.identify(loc));
 		}
 		return X86_64Regs.RSP.plus(offset);
 	}
@@ -1435,6 +1530,7 @@ class X86InstrBuffer extends ArchInstrBuffer {
 			I_ADCD => name = "adcd";
 			I_ANDD => name = "andd";
 			I_SUBD => name = "subd";
+			I_XORD => name = "xord";
 			I_CMPD => name = "cmpd";
 			I_CMPB => name = "cmpb";
 			I_MULD => name = "imuld";
@@ -1449,6 +1545,7 @@ class X86InstrBuffer extends ArchInstrBuffer {
 			I_ADCQ => name = "adcq";
 			I_ANDQ => name = "andq";
 			I_SUBQ => name = "subq";
+			I_XORQ => name = "xorq";
 			I_CMPQ => name = "cmpq";
 			I_MULQ => name = "imulq";
 			I_DIVQ => name = "divq";
