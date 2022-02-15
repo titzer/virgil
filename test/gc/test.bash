@@ -5,7 +5,7 @@
 if [ $# -gt 0 ]; then
   TESTS="$*"
 else
-  TESTS=$(cat execute.gc variants.gc large.gc)
+  TESTS=$(cat core.gc variants.gc large.gc)
 fi
 
 function compile_gc_tests() {
