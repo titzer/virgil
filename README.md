@@ -58,7 +58,7 @@ Learn how to [get started](start/README.md) using Virgil.
 
 The most up-to-date documentation is, as always, the implementation in this repository!
 
-A basic [wiki](doc/wiki) is available, though not all new features are covered.
+A basic [tutorial](doc/tutorial) is available, though not all new features are covered.
 Virgil now supports algebraic data types, enums, and floating point.
 
 ### Tutorial programs
