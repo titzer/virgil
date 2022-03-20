@@ -41,13 +41,14 @@ But Virgil has these features that neither of these languages have:
   * fully combinatoric generics: any type can be a type argument (e.g. Java has erasure; C\# lacks void)
   * algebraic data types: immutable, referentially transparent, matchable data structures
   * robust constructor chaining with truly immutable fields
+  * `this` as a return type for chaining method calls
   * compact array expressions
-  * a whole-program, static, optimizing compiler
-  * direct support for calling the kernel on supported platforms
   * for-less-than loops
   * colon-type declaration syntax
   * a slightly different ternary operator syntax
   * fully self-hosted implementation
+  * a whole-program, static, optimizing compiler
+  * direct support for calling the kernel on supported platforms
 
 
 ## Coming from JavaScript
