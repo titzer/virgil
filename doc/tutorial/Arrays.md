@@ -6,7 +6,7 @@ Virgil III provides arrays for efficient storage of a fixed-size, indexable coll
 // create a new array with Array<Type>.new(length)
 var a: Array<int> = Array<int>.new(3);
 var b: Array<bool> = Array<bool>.new(7);
-// with inferred type
+// we can omit the variable type when it's clear from context
 var c = Array<bool>.new(7);
 ```
 
