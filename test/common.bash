@@ -235,7 +235,7 @@ function execute_tests() {
 function set_os_sources() {
     target=$1
     if [ "$target" = "x86-darwin" ]; then
-	export OS_SOURCES="$RT_LOC/darwin/*.v3"
+	export OS_SOURCES="$RT_LOC/x86-darwin/*.v3"
     elif [ "$target" = "x86-linux" ]; then
 	export OS_SOURCES="$RT_LOC/x86-linux/*.v3"
     elif [ "$target" = "x86-64-linux" ]; then
