@@ -16,7 +16,7 @@ This repository includes the entire compiler, runtime system, some libraries,
 tests, documentation and supporting code for Virgil's various compilation
 targets.
 
-## Design ##
+## Language Design
 
 Virgil focuses on balancing these main features in a statically-typed language:
 
@@ -26,7 +26,9 @@ Virgil focuses on balancing these main features in a statically-typed language:
   * Type parameters - for powerful and clean abstraction over types
   * Algebraic data types - for easy building and matching of data structures
 
-## Supported Targets ##
+For more, see the [tutorial](doc/tutorial).
+
+## Supported Targets
 
 Virgil can compile to native binaries for Linux or Darwin, to jar files for the
 JVM, or to WebAssembly modules. Linux binaries can run successfully under
@@ -41,7 +43,7 @@ one of these platforms in order to target any of the others.
 * jar : JAR files for the Java Virtual Machine
 * wasm : WebAssembly module for any Wasm engine
 
-## Implementation ##
+## Implementation
 
 Virgil is fully self-hosted: its entire compiler and runtime system is
 implemented in Virgil.
@@ -52,16 +54,12 @@ great performance and small binaries.
 Native binaries compiled from your programs can be as small as a few hundred
 bytes in size and consume just kilobytes of memory at runtime.
 
-## Documentation ##
+## Documentation
 
-Learn how to [get started](start/README.md) using Virgil.
+The most up-to-date documentation is, as always, this repository!
+Learn how to [get started](start/README.md) using Virgil and browse the [tutorial](doc/tutorial).
 
-The most up-to-date documentation is, as always, the implementation in this repository!
-
-A basic [tutorial](doc/tutorial) is available, though not all new features are covered.
-Virgil now supports algebraic data types, enums, and floating point.
-
-### Tutorial programs
+### Example programs
 
 There are lots of example programs in [doc/tutorial](doc/tutorial).
 
@@ -90,4 +88,3 @@ Conference on Object-Oriented Systems, Languages, and Applications (OOPSLA '06).
 ## License
 
 Licensed under the Apache License, Version 2.0. ([rt/LICENSE](LICENSE) or https://www.apache.org/licenses/LICENSE-2.0)
-

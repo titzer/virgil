@@ -88,6 +88,3 @@ Compiling (/Users/titzer/virgil/bin/bootstrap/jar/Aeneas -> /Users/titzer/virgil
 -rwxr-xr-x  1 titzer  staff      290 Jan  1 14:18 /Users/titzer/virgil/bin/current/jar/Aeneas
 -rw-r--r--  1 titzer  staff  3075402 Jan  1 14:18 /Users/titzer/virgil/bin/current/jar/Aeneas.jar
 ```
-
-If you are running on an M1 mac (i.e. `arm64-darwin`), you might need to run `aeneas bootstrap jar`, to
-bootstrap and run on the JVM, because there isn't a native port for this platform yet.
