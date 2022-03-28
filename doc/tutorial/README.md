@@ -22,21 +22,22 @@ That way, you can jump right into a topic.
 * Logic is done with familiar control constructs.
   * [Branches](Branches.md)
   * [Loops](Loops.md)
-* Virgil has switches and pattern [matching](Matches.md)
+* [Algebraic data types](ADTs.md) allow building structured data.
+* Virgil has switches and [pattern matching](Matches.md)
 * [Ternary Expressions](Ternary.md) expressions have a slightly different syntax in Virgil.
 * [Logical](Logical.md) operations are like arithmetic on booleans.
-* First-class functions and partial application give a flavor of functional programming.
-  * [Functions](Functions.md)
+* First-class functions and partial application support a somewhat functional programming style.
+  * [Functions](Functions.md) are first-class values in Virgil.
   * [Partial Application](PartialApp.md)
+  * Methods from objects or classes can be used for [functional programming](ClassesAndFunctions.md).
 * Methods can have [type parameters](Typeparams.md) and be generic in their type.
 * [Classes](Classes.md) are part of Virgil's support for object-oriented programming.
 * Classes can [inherit](Inheritance.md) members from superclasses.
 * Classes have a nice syntax for immutable fields (called [class parameters](ClassParameters.md)).
-* Classes and objects interact well with Virgil's [functional programming](ClassesAndFunctions.md) support.
 * Classes, too, can have [type parameters](ClassTypeParams.md) and thus be generic.
 * [Casts](Casts.md) allow us to convert one type of data to another, and query the type of data or objects.
 * Type parameters don't have [variance](Variance.md) in Virgil; only subtyping on functions.
-* Put it all together [synthesis](Synthesis.md).
+* Putting it all together, [synthesis](Synthesis.md).
 * Virgil doesn't yet have [exceptions](Exceptions.md).
 * What kind of programming [style](Style.md) should I use?
 * Some [techniques](ImplNotes.md) that are used to make Virgil fast.

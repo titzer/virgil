@@ -112,9 +112,9 @@ class B(foo: int) extends A { }
 class C(bar: int) extends A { }
 def do(a: A) -> int {
     match (a) {
-        x: B => return x.foo; // x is of type B
-        x: C => return x.bar; // x is of type C
-        x: A => return 33;    // x is of type A
+        x: B => return x.foo; // x here is of type B
+        x: C => return x.bar; // x here is of type C
+        x: A => return 33;    // x here is of type A
     }
     return -1; // can happen with null
 }
@@ -122,7 +122,9 @@ def do(a: A) -> int {
 
 ## Matching on ADTs ##
 
-Virgil allows match statements to pattern-match on values of an abstract datatype. We use a syntax that mirrors the declaration of the ADT and allows us to bind to the parameters of each case of the ADT. Match statements on ADTs are checked to be exhaustive: i.e. they must cover every case of the ADT, even if just by defining a default case.
+Virgil allows match statements to pattern-match on values of an algebraic datatype.
+We use a syntax that mirrors the declaration of the ADT and allows us to bind to the parameters of each case of the ADT.
+Match statements on ADTs are checked to be exhaustive: i.e. they must cover every case of the ADT, even if just by defining a default case.
 
 ```
 type A {
