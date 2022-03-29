@@ -36,6 +36,7 @@ That way, you can jump right into a topic.
 * Classes have a nice syntax for immutable fields (called [class parameters](ClassParameters.md)).
 * Classes, too, can have [type parameters](ClassTypeParams.md) and thus be generic.
 * [Casts](Casts.md) allow us to convert one type of data to another, and query the type of data or objects.
+* [Pointers](Pointers.md) are used in platform-specific parts of the runtime.
 * Type parameters don't have [variance](Variance.md) in Virgil; only subtyping on functions.
 * Putting it all together, [synthesis](Synthesis.md).
 * Virgil doesn't yet have [exceptions](Exceptions.md).
