@@ -26,7 +26,7 @@ Virgil focuses on balancing these main features in a statically-typed language:
   * Type parameters - for powerful and clean abstraction over types
   * Algebraic data types - for easy building and matching of data structures
 
-For more, see the [tutorial](doc/tutorial).
+For more, see the [tutorial](doc/tutorial/Overview.md).
 
 ## Supported Targets
 
