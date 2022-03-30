@@ -23,6 +23,7 @@ That way, you can jump right into a topic.
   * [Branches](Branches.md)
   * [Loops](Loops.md)
 * [Algebraic data types](ADTs.md) allow building structured data.
+* [Enums](Enums.md) allow expressing fixed sets of values and even tables.
 * Virgil has switches and [pattern matching](Matches.md)
 * [Ternary Expressions](Ternary.md) expressions have a slightly different syntax in Virgil.
 * [Logical](Logical.md) operations are like arithmetic on booleans.
