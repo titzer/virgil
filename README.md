@@ -57,11 +57,7 @@ bytes in size and consume just kilobytes of memory at runtime.
 ## Documentation
 
 The most up-to-date documentation is, as always, this repository!
-Learn how to [get started](start/README.md) using Virgil and browse the [tutorial](doc/tutorial).
-
-### Example programs
-
-There are lots of example programs in [doc/tutorial](doc/tutorial).
+Learn how to [get started](start/README.md) using Virgil and browse the [tutorial](doc/tutorial/Overview.md), where many [example](doc/tutorial/examples) programs exist.
 
 ### Research Papers
 
