@@ -19,6 +19,9 @@
     (,virgil-decls-regexp . font-lock-keyword-face)
     (,virgil-stmts-regexp . font-lock-constant-face)
     (,virgil-builtins-regexp . font-lock-type-face)
+    (,"#unboxed" . font-lock-type-face)
+    (,"#boxed" . font-lock-type-face)
+    (,"#packed" . font-lock-type-face)
 ))
 
 (setq indent-tabs-mode t)
