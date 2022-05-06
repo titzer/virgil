@@ -17,7 +17,7 @@ They aren't "armored vehicles", but more like kitchen knives--they have a sharp 
 
 In `lib/util` we can find:
 
-* [Vectors](lib/util/Vector.v3) - growable, indexable, appendable arrays with efficient storage
+* [Vectors](../../lib/util/Vector.v3) - growable, indexable, appendable arrays with efficient storage
 * String utilities - comparison, matching
 * String formatting - print out data and strings in textual format
 * IO - Read and write from files using in-memory buffers
