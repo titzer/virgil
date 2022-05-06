@@ -18,12 +18,23 @@ They aren't "armored vehicles", but more like kitchen knives--they have a sharp 
 In `lib/util` we can find:
 
 * [Vectors](../../lib/util/Vector.v3) - growable, indexable, appendable arrays with efficient storage
-* String utilities - comparison, matching
-* String formatting - print out data and strings in textual format
-* IO - Read and write from files using in-memory buffers
-* Decoding / Encoding - utilities for reading and writing binary data
-* HashMap - efficient general mapping of key type to value type
-* Lists - linked lists and associated utilities like `map`, `fold`, etc
+* [String utilities](../../lib/util/Strings.v3) - comparison, matching of strings
+* [String formatting](../../lib/util/StringBuilder.v3) - print out data and strings in textual format
+* [IO](../../lib/util/IO.v3) - Read and write from files using in-memory buffers
+* [Decoding](../../lib/util/DataReader.v3) / [Encoding](../../lib/util/DataWriter.v3) - utilities for reading and writing binary data
+* [HashMap](../../lib/util/Map.v3) - efficient general mapping of key type to value type
+* [Lists](../../lib/util/List.v3) - linked lists and associated utilities like `map`, `fold`, etc
 * Array utils - additional utilities on arrays, like copying, ranges, `map`, etc
-* Ints - read/write integers from strings
-* Options - utilities for dealing with command line arguments
+* [Ints](../../lib/util/Ints.v3) and [Longs](../../lib/util/Longs.v3) - read/write integers from strings
+* [Options](../../lib/util/Option.v3) - utilities for dealing with command line arguments
+* [Globs](../../lib/util/GlobMatcher.v3) - utility for matching globs (strings with `?` and `*` wildcards)
+
+## Demoing `lib/util`
+
+Reading the source code of libraries is long and tedious, even when documented well.
+While it may help to familiarize yourself with how Virgil code is written, libraries don't tell you how they are _supposed_ to be used.
+For this, how about a demo?
+
+Take a look at a [demo](../../apps/Demo) that has various sections on each of the utilities above.
+The demo teaches you, on a class-by-class basis, how to use each utility.
+
