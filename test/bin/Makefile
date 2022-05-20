@@ -15,7 +15,7 @@ progress-x86-darwin: src/progress.*
 	strip $@
 
 progress-x86-linux: src/progress.*
-	cc -m32 ${OPTS} -o $@ -Isrc src/progress.c
+	cc -flto -m32 ${OPTS} -o $@ -Isrc src/progress.c
 	strip $@
 
 progress-x86-64-darwin: src/progress.*
@@ -27,7 +27,7 @@ progress-arm64-darwin: src/progress.*
 	strip $@
 
 progress-x86-64-linux: src/progress.*
-	cc -m64 ${OPTS} -o $@ -Isrc src/progress.c
+	cc -flto -m64 ${OPTS} -o $@ -Isrc src/progress.c
 	strip $@
 
 execute-x86-darwin-test: src/execute-arch-posix.c

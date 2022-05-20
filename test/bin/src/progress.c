@@ -231,12 +231,14 @@ void report_test_begin(char *name) {
         case LINES:
             outs(name);
             outs("...");
+            fflush(stdout);
             break;
         case INLINE:
             clearln();
             output_passed_count();
             outs(" | ");
             outs(name);
+            fflush(stdout);
             break;
         default: ;
     }
@@ -251,14 +253,17 @@ void report_test_passed() {
             clearln();
             output_passed_count();
             outs(" | ");
+            fflush(stdout);
             break;
         case CHARACTER:
             green("o");
             space();
+            fflush(stdout);
             break;
         case LINES:
             green("ok");
             outln();
+            fflush(stdout);
             break;
         case SUMMARY: ;
     }
@@ -280,14 +285,17 @@ void report_test_failed(char *error, int is_dynamic) {
             if (failed == 1)
                 outln();
             output_failure(f);
+            fflush(stdout);
             break;
         case CHARACTER:
             red("X");
             space();
+            fflush(stdout);
             break;
         case LINES:
             red("failed");
             outln();
+            fflush(stdout);
             break;
         case SUMMARY: ;
     }
@@ -331,6 +339,7 @@ int report_finish() {
             output_passed_count();
             printf("\n");
     }
+    fflush(stdout);
     if (head != NULL)
         free_list(&head);
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
