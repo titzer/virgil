@@ -1,0 +1,273 @@
+// Copyright 2022 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+component X86_64DarwinTargets {
+	new() {
+		Aeneas.registerTarget(X86_64DarwinTarget.new("x86-64-darwin-test", true));
+		Aeneas.registerTarget(X86_64DarwinTarget.new("x86-64-darwin", false));
+	}
+}
+
+def SPACE = AddressSpace.new("mem", false, 64, 8,
+	Alignment.new(4096), Alignment.new(8));
+// Darwin target for x86 architecture. Generates an Mach-O binary directly.
+class X86_64DarwinTarget extends Target {
+	def test: bool;
+
+	new(name: string, test) super(name) { }
+
+	def configureCompiler(compiler: Compiler) {
+		compiler.Reachability = true;
+	}
+	def configureProgram(prog: Program) {
+		def space = SPACE;
+		def intNorm = IntNormalizers.I64LE;
+		var mach = MachProgram.new(prog, space, space, intNorm);
+		prog.tprog = mach;
+		var rt = MachRuntime.new(mach);
+		mach.runtime = rt;
+		MachModule.install(prog, mach); // installs "Pointer" typecon
+		DarwinModule.install(prog); // installs "Darwin" component
+		prog.typeEnv.add(rt.typeCon); // installs "CiRuntime" component (for RiRuntime code)
+	}
+	def computeFieldOffsets(prog: Program, b: Vector<IrField>, start: int) {
+		getRuntime(prog).mach.computeFieldOffsets(prog, b, start);
+	}
+	def addRoots(compiler: Compiler, prog: Program) {
+		getRuntime(prog).addRoots();
+	}
+	private def getRuntime(prog: Program) -> MachRuntime {
+		return MachProgram.!(prog.tprog).runtime;
+	}
+	def emitDBG(compiler: Compiler, prog: Program) {
+		var rt = getRuntime(prog), mach = rt.mach;
+		mach.build(compiler, MachLoweringConfig.new());
+
+		var header = MachO_Header.new(true);
+		var pageAlign = rt.codeRegion.space.pageAlign;
+		header.cputype = MachO.CPU_TYPE_X86_64;
+		header.cpusubtype = 3;
+		header.filetype = MachO.MH_EXECUTE;
+
+		// protect page zero for trapping null accesses
+		//var pz = newSegmentLoad(header, "__NULL", 0);
+		//pz.vmsize = pageAlign.size;
+		//var cs = newSegmentLoad(header, "__TEXT", MachO.VM_PROT_RX);
+		//var ds = newSegmentLoad(header, "__DATA", MachO.VM_PROT_RW);
+		var w = MachDataWriter.new(rt.codeRegion.space.pageAlign,
+			0, 300 + mach.numMethods * 50);
+		// skip mach-o headers
+		w.skipN(header.totalsize);
+		// skip page zero
+		w.skipPage();
+		// encode header at position 0 now that all addresses and offsets are known
+		header.encode(w.at(0));
+		header.encodeCmds(w);
+		// open the output file
+		var file = compiler.getOutputFileName(prog.name(), null);
+		var fd = System.fileOpen(file, false);
+		if (fd < 0) return prog.ERROR.OutputError(file);
+		// write the entire file from the buffer array
+		System.fileWriteK(fd, w.data, 0, w.end());
+		System.fileClose(fd);
+		// change permissions to make binary executable
+		compiler.makeExecutable(file);
+	}
+	def emit(compiler: Compiler, prog: Program) {
+		var rt = getRuntime(prog), mach = rt.mach;
+		mach.build(compiler, MachLoweringConfig.new());
+
+		var header = MachO_Header.new(true);
+		var pageAlign = rt.codeRegion.space.pageAlign;
+		header.cputype = MachO.CPU_TYPE_X86_64;
+		header.cpusubtype = 3;
+		header.filetype = MachO.MH_EXECUTE;
+
+		// protect page zero for trapping null accesses
+		var pz = newSegmentLoad(header, "__NULL", 0);
+		pz.vmsize = pageAlign.size;
+		// code (text) segment starts at page 1
+		var cs = newSegmentLoad(header, "__TEXT", MachO.VM_PROT_RX);
+		// data segment immediately follows code segment
+		var ds = newSegmentLoad(header, "__DATA", MachO.VM_PROT_RW);
+		// initial thread state for registers (includes starting IP)
+		var ts = MachO_X86_64ThreadState.new();
+		header.addCmd(ts);
+		// ex segment for trapping explicit checks
+		var ex = if(rt.src != null, newSegmentLoad(header, "__EX", 0));
+		// create the buffer
+		var w = MachDataWriter.new(rt.codeRegion.space.pageAlign,
+			0, 300 + mach.numMethods * 50);
+		// skip mach-o headers
+		w.skipN(header.totalsize);
+		// skip page zero
+		w.skipPage();
+		// generate code and runtime tables into buffer
+		// encodeCode(w, cs, ts);
+		var backend = X86_64DarwinBackend.new(compiler, prog, mach, w, test);
+		ts.eip = w.endAddr();
+		cs.vmaddr = w.endPageAddr();
+		rt.recordCodeStart(ts.eip);
+		backend.genAllCode();
+		var size = w.end();
+		if (size < pageAlign.size) {
+			// TODO: Santa or MacOS rejects binaries with text segments smaller than a page!
+			w.skipN(pageAlign.size - size);
+		}
+		rt.recordCodeEnd(w.endAddr());
+		mach.layoutMeta(w);
+		mach.layoutRuntime(w);
+		cs.filesize = w.end();
+		cs.vmsize = pageAlign.alignUp(cs.filesize);
+		cs.fileoff = 0;
+		// generate the unmapped "ex" region for trapping explicit checks
+		if (ex != null) {
+			w.skipPage();
+			var exStart = w.endPageAddr();
+			var exSize = pageAlign.alignUp(rt.src.layoutExRegion(exStart));
+			w.startAddr = w.startAddr + exSize;
+			ex.vmaddr = exStart;
+			ex.vmsize = exSize;
+			ex.filesize = 0;
+			ex.fileoff = 0;
+		}
+		// generate data into buffer
+		w.skipPage();
+		// compute starting location of data
+		w.atEnd().align(mach.data.addressSize);
+		ds.vmaddr = w.endPageAddr();
+		ds.fileoff = ds.vmaddr - w.startAddr;
+		rt.recordDataStart(w.endAddr());
+		mach.layoutData(w);
+		rt.recordDataEnd(w.endAddr());
+		rt.addHeapPointers(w);
+		ds.filesize = w.end() - ds.fileoff;
+		ds.vmsize = pageAlign.alignUp(ds.filesize + int.view(rt.heapSize));
+		// patch all addresses in the binary
+		w.patch(backend.patchCodeAddr);
+		// encode header at position 0 now that all addresses and offsets are known
+		header.encode(w.at(0));
+		header.encodeCmds(w);
+		// open the output file
+		var file = compiler.getOutputFileName(prog.name(), null);
+		var fd = System.fileOpen(file, false);
+		if (fd < 0) return prog.ERROR.OutputError(file);
+		// write the entire file from the buffer array
+		System.fileWriteK(fd, w.data, 0, w.end());
+		System.fileClose(fd);
+		// change permissions to make binary executable
+		compiler.makeExecutable(file);
+	}
+	def newSegmentLoad(header: MachO_Header, name: string, prot: int) ->  MachO_SegmentLoad {
+		var s = MachO_SegmentLoad.new(name);
+		s.initprot = prot;
+		s.maxprot = prot;
+		header.addCmd(s);
+		return s;
+	}
+	}
+
+// Darwin-specific backend code generation.
+class X86_64DarwinBackend extends X86Backend {
+	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, test: bool) super(compiler, prog, mach, w, test) {
+	}
+	def asm_exit_code(code: int) {
+		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
+		asm.push_i(code);
+		asm.push_i(0);
+		asm.intK(0x80);
+	}
+	def asm_exit_rm(rm: X86Rm) {
+		asm.push(rm);
+		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
+		asm.push_i(0);
+		asm.intK(0x80);
+	}
+	def genTestOutput(frame: MachFrame) {
+		// output the return register as a 4-byte integer to stdout
+		asm.push(asm.loc_rm(frame, frame.conv.callerRet(0)));
+		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
+		asm.push_i(4);			// size to write
+		asm.push(X86Regs.EBX);		// pointer into stack
+		asm.push_i(1);			// stdout
+		asm.push_i(0);
+		asm.movd_rm_i(X86Regs.EAX, 4); // write()
+		asm.intK(0x80);
+	}
+	def genSignalHandlerStub() {
+		// Specialized assembly to directly handle a signal from the kernel
+		var frame = getFrame(ri_signal.ssa);
+		CiRuntimeModule.SIGNAL_STUB.setAbs(mach.runtime, asm.machBuffer.posAddr());
+		// "this" = null
+		asm.movd_rm_i(asm.loc_rm(frame, frame.conv.calleeParam(0)), 0); // "this" = null
+		var scratch = X86RegSet.SCRATCH;
+		// param 1 = signum @ [esp + 12]
+		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(1)), X86Regs.ESP.plus(3 * mach.data.addressSize), scratch);
+		// param 2 = siginfo @ [esp + 16]
+		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(2)), X86Regs.ESP.plus(4 * mach.data.addressSize), scratch);
+		// param 3 = ucontext @ [esp + 20]
+		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(3)), X86Regs.ESP.plus(5 * mach.data.addressSize), scratch);
+		// call RiRuntime.signal(signum: int, siginfo: Pointer, ucontext: Pointer)
+		asm.call_addr(mach.addrOfMethod(ri_signal));
+		// should not return
+	}
+	def genFatalStub(ex: string, addr: Addr) {
+		var asm = X86Assembler.new(w);
+		addr.absolute = w.endAddr();
+		// 1. encode a call to write() on stderr
+		asm.push_i(ex.length + 1);			// size to write
+		asm.push_i(X86Addrs.ABS_CONST);			// pointer to msg
+		var msgAddrPos = asm.pos() - 4;
+		asm.push_i(2);					// stderr
+		asm.push_i(0);					// unused
+		asm.movd_rm_i(X86Regs.EAX, 4);			// write()
+		asm.intK(0x80);
+		// 2. encode a call to exit()
+		asm.push_i(-1);
+		asm.push_i(-1);
+		asm.movd_rm_i(X86Regs.EAX, 1);			// exit()
+		asm.intK(0x80);
+		// 3. output message at end of code
+		var msgAddr = w.posAddr();
+		w.putb('!');
+		w.puta(ex);
+		w.at(msgAddrPos).put_b32(msgAddr);
+		w.atEnd();
+	}
+	// generate code that installs a signal handler
+	def genSigHandlerInstall(signo: int, handler: Addr) {
+		asm.push_i(0);			// sa_flags
+		asm.push_i(0);			// sa_mask
+		asm.push_i(X86Addrs.ABS_CONST);	// sa_handler: handler address
+		recordPatch(handler);
+		asm.push_i(2);			// TODO: why a nonzero value here?
+		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
+		asm.push_i(0);			// sigaction *oact
+		asm.push(X86Regs.EBX);		// sigaction *act
+		asm.push_i(signo);		// signal number
+		asm.push_i(0);			// "dummy" value
+		asm.movd_rm_i(X86Regs.EAX, 46); // sigaction
+		asm.intK(0x80);
+		asm.add.rm_i(X86Regs.ESP, 32);	// pop params off stack
+	}
+}
+// a mach-O thread state command for x86
+class MachO_X86_64ThreadState extends MachO_LoadCmd {
+	var eip: int;
+	def encode(is64: bool, w: DataWriter) {
+		Terminal.put2("ThreadState command with size %d, flavor 6: starts at %d", size(true), w.pos);
+		w.put_b32(0x5); // unix thread
+		w.put_b32(21 * 8 + 4 * 4);  // 80 bytes for x86
+		w.put_b32(4);   // X86-64 thread state flavor
+		w.put_b32(42);  // number of words
+		w.zeroN(21 * 8);
+		var current_pos = w.pos;
+		w.at(w.pos - 5 * 8);
+		w.put_b64(eip);
+		w.at(current_pos);
+		Terminal.put1(", ends at position %d\n", w.pos);
+	}
+	def size(is64: bool) -> int {
+		return 21 * 8 + 4 * 4;
+	}
+}
