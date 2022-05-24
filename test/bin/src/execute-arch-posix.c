@@ -288,6 +288,7 @@ int exec_run(v3_run *run, char *binFile) {
   }
   argv[num + 1] = NULL;
   execve(binFile, argv, NULL);
+  return 0;
 }
 
 int check_result(v3_run *run, run_output *result) {
