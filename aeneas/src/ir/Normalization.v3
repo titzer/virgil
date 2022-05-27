@@ -13,7 +13,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	var newIr = IrModule.new();
 	var specializer: Specializer;
 	var virtuals: List<RaVirtual>;
-	var ovfAlloc: OverflowFieldAllocator;  // OVF where to allocate the fields?
+	var ovfAlloc: OverflowFieldAllocator;
 
 	def normalize() {
 		if (Aeneas.PRINT_DEAD_CODE.get()) DeadCodeAnalyzer.new(ra).report();
@@ -47,6 +47,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			while (ic.parent != null) ic = ic.parent; // start at root
 
 			if (V3.isVariant(ic.oldType)) {
+				norm(ic.oldType);
 				numberVariant(ic);
 			} else {
 				layoutClass(ic);
@@ -72,7 +73,11 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			}
 		} else {
 			// synthesize a component type for flattened data types and variants
-			var decl = VstComponent.new(false, V3.classDecl(rc.oldType).token, null);
+			var buf = StringBuilder.new();
+			rc.oldType.render(buf);
+			var oldToken = V3.classDecl(rc.oldType).token;
+			var token = Token.new(oldToken.fileName, buf.toString(), oldToken.beginLine, oldToken.beginColumn);
+			var decl = VstComponent.new(false, token, null);
 			rc.newIrType = V3Component_TypeCon.new(decl, ra.prog.typeCache).create(rc.oldType.nested);
 		}
 		for (ml in rc.methods) {
@@ -81,7 +86,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 				var rm = l.head, m = rm.orig;
 				if (rm.norm != null) continue; // already done
 				var ftype = if(rm.spec == null, m.sig.funcType(), rm.spec.getMethodType());
-				if (rc.raFacts.RC_FLAT) {
+				if (rc.raFacts.RC_UNBOXED) {
 					// move flattened data type receiver to function sig
 					ftype = Function.prependParamTypes(rc.dataNorm.sub, ftype);
 				}
@@ -170,22 +175,8 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			V3Kind.VARIANT => {
 				// try flattening variants and data types
 				var rc = ra.getClass(t);
-				if (rc != null) {
-					if (rc.dataNorm != null) tn = rc.dataNorm;
-					else {
-						var prev = rc.recursive;
-						def ON_STACK = 3; // XXX: just needs to be larger than recursive
-						if (prev < ON_STACK) {
-							rc.recursive = ON_STACK;
-							layoutVariant(rc);
-							tn = rc.dataNorm;
-							rc.recursive = prev;
-						}
-					}
-					if (tn == null) tn = TypeNorm.new(t, t, null);
-				} else {
-					tn = TypeNorm.new(t, t, null);
-				}
+				if (rc != null) tn = normVariant(t, rc);
+				else tn = TypeNorm.new(t, t, null);
 			}
 			V3Kind.ENUM => {
 				tn = TypeNorm.new(t, V3.getVariantTagType(t), null);
@@ -223,13 +214,11 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	// number a variant and children consistent with tagging order
 	def numberVariant(rc: RaClass) {
 		rc.minClassId = liveClasses.length;
-		makeNormFields(rc);
 		if (rc.children  == null) {
 			liveClasses.put(rc); // special case of a data type
 		} else {
 			for (l = rc.children; l != null; l = l.tail) {
 				var c = l.head;
-				makeNormFields(c);
 				var index = rc.minClassId + V3.getVariantTag(c.oldType);
 				c.minClassId = index;
 				c.maxClassId = index + 1;
@@ -241,26 +230,55 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		rc.maxClassId = liveClasses.length;
 	}
 	// lay out a variant's fields, which may be flattened
-	def layoutVariant(rc: RaClass) {
-		if (rc.normFields != null) return; // already done
+	def normVariant(t: Type, rc: RaClass) -> TypeNorm {
+		if (rc.dataNorm != null) return rc.dataNorm; // already unboxed
+		if (rc.orig.boxing == Boxing.BOXED) mapSimple(t); // XXX, ugly, don't recurse through explicitly boxed types
+
+		var prev = rc.recursive;
+		match (rc.recursive) {
+			ON_STACK => {
+				rc.recursive = 2; // cycle detected; box
+			}
+			0 => {
+				rc.recursive = ON_STACK;
+				tryUnboxing(rc);
+				if (rc.recursive == ON_STACK) rc.recursive = 1;
+				if (rc.dataNorm != null) return rc.dataNorm;
+			}
+			// recursive or not; there was no data norm, so box
+		}
+		rc.raFacts |= RaFact.RC_BOXED;
+		return mapSimple(t);
+	}
+	def mapSimple(t: Type) -> TypeNorm {
+		return typeMap[t] = TypeNorm.new(t, t, null);
+	}
+	def tryUnboxing(rc: RaClass) -> bool {
+		if (rc.normFields != null) return rc.dataNorm != null; // already done
 
 		while (rc.parent != null) rc = rc.parent;
 		makeNormFields(rc);
-		var isEmpty = rc.normFields.length == 0;
+		var isEmpty = rc.normFields.length == 0, closure = rc.raFacts.RC_CLOSURE;
 		for (l = rc.children; l != null; l = l.tail) {
 			var c = l.head;
 			makeNormFields(c);
 			if (c.normFields.length > 0) isEmpty = false;
+			closure |= c.raFacts.RC_CLOSURE;
 		}
-		if (isEmpty && !rc.raFacts.RC_CLOSURE) {
+		if (isEmpty && !closure) {
 			// normalize empty variant to just its tag; i.e. become an enum
 			var tagType = V3.getVariantTagType(rc.oldType);
-			setDataNormForChildren(rc, tagType, [tagType], RaFact.RC_ENUM | RaFact.RC_FLAT);
-			return;
+			setDataNormForChildren(rc, tagType, [tagType], RaFact.RC_ENUM | RaFact.RC_UNBOXED);
+			return true;
 		}
-		if (rc.children != null) return; // only flatten data types for now
-		if (rc.normFields.length > ra.compiler.MaxFlatDataValues) return; // flattened value would be too many scalars
-		if (rc.recursive > 1 || rc.raFacts.RC_CLOSURE) return; // recursive or closed over
+		if (rc.children != null) return false; // only flatten data types for now
+		match (rc.orig.boxing) {
+			BOXED => return false; // program specified boxed
+			AUTO => if (rc.normFields.length > ra.compiler.MaxFlatDataValues) return false; // auto unbox up to compiler limit
+			UNBOXED => ; // program specified unboxed; TODO: recursion or closure should be an error
+		}
+		if (rc.recursive > 1 || closure) return false; // recursive or closed over
+
 
 		// Flatten a data type
 		var of = rc.orig.fields;
@@ -274,7 +292,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 			if (i <= rc.fields.length) {
 				var rf = rc.fields[i];
 				if (rf != null) {
-					rf.raFacts |= RaFact.RC_FLAT;
+					rf.raFacts |= RaFact.RC_UNBOXED;
 					if (rf.normIndex >= 0) {
 						if (rf.typeNorm != null) {
 							rf.typeNorm.addTo(vecT);
@@ -294,7 +312,8 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		}
 		var ta = vecT.extract();
 		rc.dataNorm = DataNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(ta)), null, origRanges, normRanges, ta);
-		rc.raFacts |= RaFact.RC_FLAT;
+		rc.raFacts |= RaFact.RC_UNBOXED;
+		return true;
 	}
 	def setDataNormForChildren(rc: RaClass, tagType: IntType, sub: Array<Type>, facts: RaFact.set) {
 		rc.dataNorm = DataNorm.new(rc.oldType, tagType, tagType, NO_RANGES, NO_RANGES, sub);
@@ -464,7 +483,7 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 		var table = Array<IrMethod>.new(size), mtable = IrMtable.new(rm.norm, rc.minClassId, table);
 		rv.mtable = mtable;
 
-		if (rc.raFacts.RC_FLAT) {
+		if (rc.raFacts.RC_UNBOXED) {
 			var ft = Function.funcRefType(rm.norm.getMethodType());
 			mtable.record = ra.prog.newRecord(V3Array.newType(ft), size);
 		}
@@ -552,7 +571,8 @@ class ReachabilityNormalizer(ra: ReachabilityAnalyzer) {
 	}
 	def createIrClass(rc: RaClass) {
 		var sc = if(rc.parent != null, rc.parent.normClass);
-		var ic = IrClass.new(rc.newIrType, null, sc, rc.normFields, rc.normMethods);
+		var normFields = if(rc.raFacts.RC_UNBOXED, NO_FIELDS, rc.normFields);
+		var ic = IrClass.new(rc.newIrType, null, sc, normFields, rc.normMethods);
 		ic.minClassId = rc.minClassId;
 		ic.maxClassId = rc.maxClassId;
 		rc.normClass = ic;
@@ -649,3 +669,5 @@ def live(facts: RaFact.set) -> bool {
 }
 def NO_VALUES = Array<Val>.new(0);
 def NO_RANGES = Array<(int, int)>.new(0);
+def ON_STACK = -1;
+def NO_FIELDS = Array<IrField>.new(0);

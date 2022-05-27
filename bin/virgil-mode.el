@@ -7,7 +7,7 @@
   "Virgil statement keywords.")
 
 (defvar virgil-builtins
-  '("void" "int" "byte" "bool" "long" "Array" "true" "false" "this" "string")
+  '("void" "int" "byte" "bool" "long" "Array" "true" "false" "this" "string" "float" "double")
   "Virgil builtin types and values.")
 
 (defvar virgil-decls-regexp (regexp-opt virgil-decls 'words))
@@ -19,6 +19,9 @@
     (,virgil-decls-regexp . font-lock-keyword-face)
     (,virgil-stmts-regexp . font-lock-constant-face)
     (,virgil-builtins-regexp . font-lock-type-face)
+    (,"#unboxed" . font-lock-type-face)
+    (,"#boxed" . font-lock-type-face)
+    (,"#packed" . font-lock-type-face)
 ))
 
 (setq indent-tabs-mode t)

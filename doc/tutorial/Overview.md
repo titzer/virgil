@@ -1,6 +1,6 @@
 # Overview
 
-This tutorial will teach you to the basic concepts of Virgil III, starting from basic concepts and progressing to more complex features.
+This tutorial will teach you to the basic language concepts of Virgil III, starting from basic concepts and progressing to more complex features.
 It assumes a passing familiarity with at least one programming language that favors curly-braced syntax.
 
 If you're already fairly skilled at *another* programming language, see [Coming From](ComingFrom.md) which gives a basic flavor of Virgil in relation to other languages.
@@ -40,6 +40,7 @@ That way, you can jump right into a topic.
 * [Pointers](Pointers.md) are used in platform-specific parts of the runtime.
 * Type parameters don't have [variance](Variance.md) in Virgil; only subtyping on functions.
 * Putting it all together, [synthesis](Synthesis.md).
+* Know enough of the language? Learn how to use some [libraries](LibUtil.md).
 * Virgil doesn't yet have [exceptions](Exceptions.md).
 * What kind of programming [style](Style.md) should I use?
 * Some [techniques](ImplNotes.md) that are used to make Virgil fast.

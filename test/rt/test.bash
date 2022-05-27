@@ -43,6 +43,22 @@ function compile_run_target() {
     fi
 }
 
+function do_gc_test() {
+    TEST=$1
+    print_compiling "$target-gc" $TEST
+    V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS -heap-size=1k -output=$T $TEST.v3 &> $T/$TEST.compile.out
+    check_no_red $? $T/$TEST.compile.out
+
+    print_status Running "$target" $TEST
+
+    if [ -x $CONFIG/run-$target ]; then
+        $T/$TEST &> $T/$TEST.run.out
+        check $?
+    else
+	echo "${YELLOW}skipped${NORM}"
+    fi
+}
+
 function do_test() {
     set_os_sources $target
     T=$OUT/$target
@@ -68,18 +84,9 @@ function do_test() {
     V3C_OPTS=-stack-size=64k compile_run_target stackoverflow
     compile_run_target usercode
 
-    print_compiling "$target-gc" FinalizerTest
-    V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS -heap-size=1k -output=$T FinalizerTest.v3 &> $T/FinalizerTest.compile.out
-    check_no_red $? $T/FinalizerTest.compile.out
+    do_gc_test FinalizerTest
 
-    print_status Running "$target" FinalizerTest
-
-    if [ -x $CONFIG/run-$target ]; then
-        $T/FinalizerTest &> $T/FinalizerTest.run.out
-        check $?
-    else
-	echo "${YELLOW}skipped${NORM}"
-    fi
+    do_gc_test ScannerTest
 }
 
 for target in $TEST_TARGETS; do
