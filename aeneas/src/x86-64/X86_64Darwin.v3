@@ -8,9 +8,13 @@ component X86_64DarwinTargets {
 	}
 }
 
+def Regs: X86_64Regs;
+def MRegs: X86_64RegSet;
+
 def SPACE = AddressSpace.new("mem", false, 64, 8,
 	Alignment.new(4096), Alignment.new(8));
-// Darwin target for x86 architecture. Generates an Mach-O binary directly.
+
+// Darwin target for x86-64 architecture. Generates an Mach-O binary directly.
 class X86_64DarwinTarget extends Target {
 	def test: bool;
 
@@ -39,40 +43,6 @@ class X86_64DarwinTarget extends Target {
 	private def getRuntime(prog: Program) -> MachRuntime {
 		return MachProgram.!(prog.tprog).runtime;
 	}
-	def emitDBG(compiler: Compiler, prog: Program) {
-		var rt = getRuntime(prog), mach = rt.mach;
-		mach.build(compiler, MachLoweringConfig.new());
-
-		var header = MachO_Header.new(true);
-		var pageAlign = rt.codeRegion.space.pageAlign;
-		header.cputype = MachO.CPU_TYPE_X86_64;
-		header.cpusubtype = 3;
-		header.filetype = MachO.MH_EXECUTE;
-
-		// protect page zero for trapping null accesses
-		//var pz = newSegmentLoad(header, "__NULL", 0);
-		//pz.vmsize = pageAlign.size;
-		//var cs = newSegmentLoad(header, "__TEXT", MachO.VM_PROT_RX);
-		//var ds = newSegmentLoad(header, "__DATA", MachO.VM_PROT_RW);
-		var w = MachDataWriter.new(rt.codeRegion.space.pageAlign,
-			0, 300 + mach.numMethods * 50);
-		// skip mach-o headers
-		w.skipN(header.totalsize);
-		// skip page zero
-		w.skipPage();
-		// encode header at position 0 now that all addresses and offsets are known
-		header.encode(w.at(0));
-		header.encodeCmds(w);
-		// open the output file
-		var file = compiler.getOutputFileName(prog.name(), null);
-		var fd = System.fileOpen(file, false);
-		if (fd < 0) return prog.ERROR.OutputError(file);
-		// write the entire file from the buffer array
-		System.fileWriteK(fd, w.data, 0, w.end());
-		System.fileClose(fd);
-		// change permissions to make binary executable
-		compiler.makeExecutable(file);
-	}
 	def emit(compiler: Compiler, prog: Program) {
 		var rt = getRuntime(prog), mach = rt.mach;
 		mach.build(compiler, MachLoweringConfig.new());
@@ -80,7 +50,7 @@ class X86_64DarwinTarget extends Target {
 		var header = MachO_Header.new(true);
 		var pageAlign = rt.codeRegion.space.pageAlign;
 		header.cputype = MachO.CPU_TYPE_X86_64;
-		header.cpusubtype = 3;
+		header.cpusubtype = MachO.CPU_SUBTYPE_X86_64;
 		header.filetype = MachO.MH_EXECUTE;
 
 		// protect page zero for trapping null accesses
@@ -105,15 +75,11 @@ class X86_64DarwinTarget extends Target {
 		// generate code and runtime tables into buffer
 		// encodeCode(w, cs, ts);
 		var backend = X86_64DarwinBackend.new(compiler, prog, mach, w, test);
-		ts.eip = w.endAddr();
+		ts.rip = w.endAddr();
 		cs.vmaddr = w.endPageAddr();
-		rt.recordCodeStart(ts.eip);
+		rt.recordCodeStart(ts.rip);
 		backend.genAllCode();
 		var size = w.end();
-		if (size < pageAlign.size) {
-			// TODO: Santa or MacOS rejects binaries with text segments smaller than a page!
-			w.skipN(pageAlign.size - size);
-		}
 		rt.recordCodeEnd(w.endAddr());
 		mach.layoutMeta(w);
 		mach.layoutRuntime(w);
@@ -165,107 +131,136 @@ class X86_64DarwinTarget extends Target {
 		header.addCmd(s);
 		return s;
 	}
-	}
+}
 
 // Darwin-specific backend code generation.
-class X86_64DarwinBackend extends X86Backend {
+class X86_64DarwinBackend extends X86_64Backend {
+	def SYSNUM = Regs.RAX;
+        def PARAM0 = Regs.RDI;
+        def PARAM1 = Regs.RSI;
+        def PARAM2 = Regs.RDX;
+        def PARAM3 = Regs.R10;
+        def PARAM4 = Regs.R8;
+        def PARAM5 = Regs.R9;
+
 	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, test: bool) super(compiler, prog, mach, w, test) {
 	}
 	def asm_exit_code(code: int) {
-		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
-		asm.push_i(code);
-		asm.push_i(0);
-		asm.intK(0x80);
+		asm.movd_r_i(SYSNUM, 60);
+		asm.movd_r_i(PARAM0, code);
+		asm.syscall();
 	}
-	def asm_exit_rm(rm: X86Rm) {
-		asm.push(rm);
-		asm.movd_rm_i(X86Regs.EAX, 1); // sys_exit() = 1
-		asm.push_i(0);
-		asm.intK(0x80);
+	def asm_exit_r(r: X86_64Gpr) {
+		asm.movq_r_r(PARAM0, r);
+		asm.movd_r_i(SYSNUM, 60);
+		asm.syscall();
 	}
-	def genTestOutput(frame: MachFrame) {
+	def genTestOutput(main: IrMethod, frame: MachFrame) {
 		// output the return register as a 4-byte integer to stdout
-		asm.push(asm.loc_rm(frame, frame.conv.callerRet(0)));
-		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
-		asm.push_i(4);			// size to write
-		asm.push(X86Regs.EBX);		// pointer into stack
-		asm.push_i(1);			// stdout
-		asm.push_i(0);
-		asm.movd_rm_i(X86Regs.EAX, 4); // write()
-		asm.intK(0x80);
+		var rt = main.sig.returnType();
+		var gpr = loc_gpr(frame, frame.conv.callerRet(0));
+		match (rt) { // sign- or zero-extend subword return values
+			x: IntType => if (x.width < 32) {
+				if (x.signed) {
+					if (x.width <= 8) asm.movbsx_r_r(gpr, gpr);
+					else if (x.width <= 16) asm.movwsx_r_r(gpr, gpr);
+				} else {
+					if (x.width <= 8) asm.movbzx_r_r(gpr, gpr);
+					else if (x.width <= 16) asm.movwzx_r_r(gpr, gpr);
+				}
+			}
+			_ => match (mach.sizeOf(rt)) {
+				0 => asm.movd_r_i(gpr, 0);
+				1 => asm.movbzx_r_r(gpr, gpr);
+				2 => asm.movwzx_r_r(gpr, gpr);
+			}
+		}
+		asm.pushq_r(gpr);
+		asm.movd_r_i(SYSNUM, 1);	// sys_write() = 1
+		asm.movd_r_i(PARAM0, 1);	// stdout
+		asm.movq_r_r(PARAM1, Regs.RSP);	// integer is on stack
+		asm.movd_r_i(PARAM2, 4);	// size to write
+		asm.syscall();
 	}
 	def genSignalHandlerStub() {
-		// Specialized assembly to directly handle a signal from the kernel
-		var frame = getFrame(ri_signal.ssa);
-		CiRuntimeModule.SIGNAL_STUB.setAbs(mach.runtime, asm.machBuffer.posAddr());
-		// "this" = null
-		asm.movd_rm_i(asm.loc_rm(frame, frame.conv.calleeParam(0)), 0); // "this" = null
-		var scratch = X86RegSet.SCRATCH;
-		// param 1 = signum @ [esp + 12]
-		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(1)), X86Regs.ESP.plus(3 * mach.data.addressSize), scratch);
-		// param 2 = siginfo @ [esp + 16]
-		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(2)), X86Regs.ESP.plus(4 * mach.data.addressSize), scratch);
-		// param 3 = ucontext @ [esp + 20]
-		asm.movd_rm_rm(asm.loc_rm(frame, frame.conv.calleeParam(3)), X86Regs.ESP.plus(5 * mach.data.addressSize), scratch);
-		// call RiRuntime.signal(signum: int, siginfo: Pointer, ucontext: Pointer)
-		asm.call_addr(mach.addrOfMethod(ri_signal));
-		// should not return
+//		var handler_meth = mach.runtime.getRiSignal();
+//		if (handler_meth == null) return;
+//		var frame = getFrame(handler_meth.ssa);
+//		CiRuntimeModule.SIGNAL_STUB.setAbs(mach.runtime, w.endAddr());
+//
+//		// save RBP; V3 execution uses it as scratch
+//		asm.pushq_r(Regs.RBP);
+//		// from kernel:
+//		asm.pushq_r(Regs.RDX); // ucontext
+//		asm.pushq_r(Regs.RSI); // siginfo
+//		asm.pushq_r(Regs.RDI); // signal number
+//		// "this" = null
+//		asm.movd_r_i(MRegs.toGpr(frame.conv.calleeParam(0)), 0); // "this" = null
+//		// param 1 = signum
+//		asm.popq_r(MRegs.toGpr(frame.conv.calleeParam(1)));
+//		// param 2 = siginfo
+//		asm.popq_r(MRegs.toGpr(frame.conv.calleeParam(2)));
+//		// param 3 = ucontext
+//		asm.popq_r(MRegs.toGpr(frame.conv.calleeParam(3)));
+//
+//		// call RiRuntime.signal(signum: int, siginfo: Pointer, ucontext: Pointer)
+//		asm.callr_v3(mach.addrOfMethod(handler_meth));
+//		// RiRuntime.signal may return
+//		asm.popq_r(Regs.RBP);
+//		asm.ret();
+//		// restorer stub for X86-64
+//		CiRuntimeModule.SIGNAL_RESTORER.setAbs(mach.runtime, w.endAddr());
+//		asm.movd_r_i(SYSNUM, 15);	// sys_rt_sigreturn() = 15
+//		asm.syscall();
 	}
 	def genFatalStub(ex: string, addr: Addr) {
-		var asm = X86Assembler.new(w);
-		addr.absolute = w.endAddr();
-		// 1. encode a call to write() on stderr
-		asm.push_i(ex.length + 1);			// size to write
-		asm.push_i(X86Addrs.ABS_CONST);			// pointer to msg
-		var msgAddrPos = asm.pos() - 4;
-		asm.push_i(2);					// stderr
-		asm.push_i(0);					// unused
-		asm.movd_rm_i(X86Regs.EAX, 4);			// write()
-		asm.intK(0x80);
-		// 2. encode a call to exit()
-		asm.push_i(-1);
-		asm.push_i(-1);
-		asm.movd_rm_i(X86Regs.EAX, 1);			// exit()
-		asm.intK(0x80);
-		// 3. output message at end of code
-		var msgAddr = w.posAddr();
-		w.putb('!');
-		w.puta(ex);
-		w.at(msgAddrPos).put_b32(msgAddr);
-		w.atEnd();
+//		// 1. encode a call to write() on stderr
+//		var msgAddr = Addr.new(mach.codeRegion, null, 0);
+//		asm.movd_r_i(SYSNUM, 1);			// sys_write() = 1
+//		asm.movd_r_i(PARAM0, 2);			// stderr
+//		asm.lea(PARAM1, X86_64AddrRef.new(null, null, 1, msgAddr, false));	// buffer
+//		asm.movd_r_i(PARAM2, ex.length + 1);		// write size
+//		asm.syscall();
+//		// 2. encode a call to exit()
+//		asm_exit_code(-1);
+//		// 3. output message at end of code
+//		msgAddr.absolute = w.endAddr();
+//		w.putb('!');
+//		w.puta(ex);
+//		w.atEnd();
 	}
-	// generate code that installs a signal handler
 	def genSigHandlerInstall(signo: int, handler: Addr) {
-		asm.push_i(0);			// sa_flags
-		asm.push_i(0);			// sa_mask
-		asm.push_i(X86Addrs.ABS_CONST);	// sa_handler: handler address
-		recordPatch(handler);
-		asm.push_i(2);			// TODO: why a nonzero value here?
-		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
-		asm.push_i(0);			// sigaction *oact
-		asm.push(X86Regs.EBX);		// sigaction *act
-		asm.push_i(signo);		// signal number
-		asm.push_i(0);			// "dummy" value
-		asm.movd_rm_i(X86Regs.EAX, 46); // sigaction
-		asm.intK(0x80);
-		asm.add.rm_i(X86Regs.ESP, 32);	// pop params off stack
+//		// XXX: reduce duplication with RiOS.installHandler
+//		// construct sigaction (in reverse order) on the stack
+//		asm.pushq_i(0); // sa_mask
+//		asm.pushq_i(0x08000000); // sa_restorer (fatal signal handlers never return)
+//		asm.pushq_i(0x04000000); // sa_flags
+//		asm.lea(Regs.RBP, X86_64AddrRef.new(null, null, 1, handler, false)); // XXX: pushq_i with patch
+//		asm.pushq_r(Regs.RBP); // sa_handler
+//		def struct_size = 4 * 8;
+//
+//		asm.movd_r_i(SYSNUM, 13);	// sys_rt_sigaction() = 13
+//		asm.movd_r_i(PARAM0, signo);	// signo
+//		asm.movq_r_r(PARAM1, Regs.RSP);	// sigaction*
+//		asm.movd_r_i(PARAM2, 0);	// old sigaction*
+//		asm.movd_r_i(PARAM3, 8);	// sigsetsize
+//		asm.syscall();
+//		asm.add_r_i(Regs.RSP, struct_size);
 	}
 }
 // a mach-O thread state command for x86
 class MachO_X86_64ThreadState extends MachO_LoadCmd {
-	var eip: int;
+	var rip: int;
 	def encode(is64: bool, w: DataWriter) {
-		Terminal.put2("ThreadState command with size %d, flavor 6: starts at %d", size(true), w.pos);
 		w.put_b32(0x5); // unix thread
 		w.put_b32(21 * 8 + 4 * 4);  // 80 bytes for x86
-		w.put_b32(4);   // X86-64 thread state flavor
+		w.put_b32(MachO.X86_64_THREAD_STATE_FLAVOR);   // X86-64 thread state flavor
 		w.put_b32(42);  // number of words
 		w.zeroN(21 * 8);
 		var current_pos = w.pos;
 		w.at(w.pos - 5 * 8);
-		w.put_b64(eip);
+		w.put_b64(rip);
 		w.at(current_pos);
-		Terminal.put1(", ends at position %d\n", w.pos);
 	}
 	def size(is64: bool) -> int {
 		return 21 * 8 + 4 * 4;
