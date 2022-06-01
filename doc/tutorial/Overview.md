@@ -15,6 +15,7 @@ That way, you can jump right into a topic.
 * [Methods](Methods.md) make up most of the logic of programs.
 * [Local Variables](Locals.md) are how we store data in methods.
 * [Arithmetic](Arith.md) on numbers in Virgil is a lot more general than other programming languages.
+* [Fixed-sized Integers](FixedSizeIntegers.md) allow intuitive systems programming and save memory.
 * [Arrays](Arrays.md) are key for storing large amounts of data.
 * [Strings](Strings.md) are key for dealing with files, text, etc.
 * [Tuples](Tuples.md) allow using multiple values where one value is expected.
