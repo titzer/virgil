@@ -20,6 +20,8 @@ for target in $ALL_TEST_TARGETS; do
 	continue # TODO: skip because cmpswp
     elif [ "$target" = x86-64-linux ]; then
 	continue # skip because 64-bit
+    elif [ "$target" = x86-64-darwin ]; then
+	continue # skip because 64-bit
     else
 	TEST_TARGETS="$TEST_TARGETS $target"
     fi
