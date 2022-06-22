@@ -79,6 +79,8 @@ for target in $TEST_TARGETS; do
 	continue # TODO: stacktrace tests on wasm
     elif [ "$target" = x86-darwin ]; then
 	do_tests $target
+    elif [ "$target" = x86-64-darwin ]; then
+	do_tests $target
     elif [ "$target" = x86-linux ]; then
 	do_tests $target
     elif [ "$target" = x86-64-linux ]; then
