@@ -41,9 +41,9 @@ start:
 	mov r12, 0x112233b4
 	mov r13, 0x112233b5
 	mov r14, 0x112233b6
-	mov r15, 0x112233b7
+	mov r15, 0x11223307
 
-	mov [r15], rax 		; trap
+	mov [r15 + 0xb0], rax 		; trap
 
 	    mov     rax, 0x2000004 ; write
 	    mov     rdi, 1	   ; stdout
