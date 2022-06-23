@@ -5,8 +5,7 @@ Its design blends functional and object-oriented programming paradigms for
 expressiveness and performance.
 Virgil's compiler produces optimized, standalone native executables, WebAssembly
 modules, or JARs for the JVM.
-For quick turnaround in testing debugging, programs can also be run directly on a built-in
-interpreter.
+For quick turnaround in testing and debugging, programs can also be run directly on a built-in interpreter.
 It is well-suited to writing small and fast programs, which makes it ideal for
 building certain kinds of programs like compilers and virtual machines.
 It is currently being used for virtual machine and programming language
