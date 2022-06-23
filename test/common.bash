@@ -256,7 +256,11 @@ function compile_aeneas() {
 
     pushd ${VIRGIL_LOC} > /dev/null
     local SRCS="aeneas/src/*/*.v3 $(cat aeneas/DEPS)"
-    V3C=$HOST_AENEAS bin/v3c-$target $V3C_HEAP_SIZE $V3C_OPTS -fp -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
+    CMD=bin/v3c-$target
+    if [ ! -x $CMD ]; then
+	CMD=bin/dev/v3c-$target
+    fi
+    V3C=$HOST_AENEAS $CMD $V3C_HEAP_SIZE $V3C_OPTS -fp -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
     EXIT_CODE=$?
     popd > /dev/null
     if [ $EXIT_CODE != 0 ]; then

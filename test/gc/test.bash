@@ -55,6 +55,8 @@ for target in $TEST_TARGETS; do
     # TODO: gc tests for wasm
     if [ "$target" = "x86-darwin" ]; then
 	do_test
+    elif [ "$target" = "x86-64-darwin" ]; then
+	do_test
     elif [ "$target" = "x86-linux" ]; then
 	do_test
     elif [ "$target" = "x86-64-linux" ]; then
