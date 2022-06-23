@@ -39,6 +39,7 @@ platform to any other supported platform, so you need only be able to run on
 one of these platforms in order to target any of the others.
 
 * x86-darwin : 32-bit Darwin kernels (MacOS)
+* x86-64-darwin : 64-bit Darwin kernels (MacOS)
 * x86-linux : 32-bit Linux kernels
 * x86-64-linux : 64-bit Linux kernels
 * jar : JAR files for the Java Virtual Machine
