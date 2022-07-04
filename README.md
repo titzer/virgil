@@ -85,4 +85,4 @@ Conference on Object-Oriented Systems, Languages, and Applications (OOPSLA '06).
 
 ## License
 
-Licensed under the Apache License, Version 2.0. ([rt/LICENSE](LICENSE) or https://www.apache.org/licenses/LICENSE-2.0)
+Licensed under the Apache License, Version 2.0. ([rt/LICENSE](rt/LICENSE) or https://www.apache.org/licenses/LICENSE-2.0)
