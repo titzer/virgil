@@ -47,7 +47,7 @@ class Cat extends Animal {
 }
 def apply<T>(list: List<T>, f: T -> void) {
     for (l = list; l != null; l = l.tail) {
-        f(list.head);
+        f(l.head);
     }
 }
 def main() {
