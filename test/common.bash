@@ -206,8 +206,8 @@ function execute_target_tests() {
     if [ "$TORUN" != "" ]; then
 	print_status "  running" ""
 
-	if [ -x $CONFIG/execute-$target-test ]; then
-	    $CONFIG/execute-$target-test $OUT/$target $TORUN | tee $OUT/$target/run.out | $PROGRESS i
+	if [ -x $CONFIG/test-$target ]; then
+	    $CONFIG/test-$target $OUT/$target $TORUN | tee $OUT/$target/run.out | $PROGRESS i
 	else
 	    count=$(echo $(echo $TORUN | wc -w))
 	    printf "$count ${YELLOW}skipped${NORM}\n"
