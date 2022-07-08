@@ -81,6 +81,18 @@ function trace_test_start() {
     printf "##+%s\n" $1
 }
 
+function trace_test_ok() {
+    if [ "$1" != "" ]; then
+	printf "##-ok: %s\n" $1
+    else
+	printf "##-ok\n"
+    fi
+}
+
+function trace_test_fail() {
+    printf "##-fail: %s\n" $1
+}
+
 function trace_test_retval() {
     if [ "$1" = 0 ]; then
 	printf "##-ok\n"
@@ -119,7 +131,7 @@ function run_io_test() {
     local args="$3"
     local expected="$4"
     R=$CONFIG/run-$target
-    
+
     if [ -x $R ]; then
 	P=$OUT/$target/$test.out
         $R $OUT/$target $test $args &> $P
@@ -128,6 +140,50 @@ function run_io_test() {
 	echo "target $target ${YELLOW}skipped${NORM}"
 	return 1
     fi
+}
+
+function run_io_test2() {
+    target=$1
+    local test=$2
+    local sub=$3
+    local args=""
+
+    trace_test_start $test
+
+    if [ -f $test.args ]; then
+	args=$(cat $test.args)
+    fi
+
+    RUNNER=$CONFIG/run-${target}${sub}
+    local T=$OUT/$target
+
+    if [ ! -x $RUNNER ]; then
+	trace_test_ok "skipped"
+	return 0
+    fi
+
+    local P=$T/$test
+
+
+    if [ -f $test.in ]; then
+	$RUNNER $T $test $args < $test.in > $P.out 2> $P.err
+    else
+	$RUNNER $T $test $args > $P.out 2> $P.err
+    fi
+    echo $? > $P.exit
+
+    for check in "out" "err" "exit"; do
+	if [ -f $test.$check ]; then
+	    diff $test.$check $P.$check | tee $P.$check.diff
+	    DIFF=${PIPESTATUS[0]}
+	    if [ "$DIFF" != 0 ]; then
+		trace_test_fail $P.$check.diff
+		return 1
+	    fi
+	fi
+    done
+
+    trace_test_ok
 }
 
 function run_v3c() {
