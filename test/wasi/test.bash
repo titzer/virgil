@@ -16,7 +16,7 @@ T=$OUT/$target
 mkdir -p $T
 
 print_compiling "$target" ""
-$AENEAS_TEST -heap-size=1m -target=wasm -entry-export="_start" -main-export="_start" -output=$T -multiple -rt.files=$RT $TESTS | $PROGRESS i
+$AENEAS_TEST -heap-size=1m -target=wasm -entry-export="_start" -main-export="_start" -output=$T -multiple -rt.files=$RT $V3C_OPTS $TESTS | $PROGRESS i
 
 function run_tests() {
     trace_test_count $#

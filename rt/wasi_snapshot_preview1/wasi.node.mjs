@@ -7,10 +7,9 @@ var program_args = argv.slice(3);
 const wasi = new WASI({
   args: program_args,
   env,
-/*  preopens: {
-    '/sandbox': '/some/real/path/that/wasm/can/access'
+  preopens: {
+    '/sandbox': process.cwd()
   }
-*/
 });
 
 // Some WASI binaries require:
