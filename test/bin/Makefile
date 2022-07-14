@@ -1,12 +1,12 @@
 all: V3S_Tester.class
 
-x86-linux: progress-x86-linux execute-x86-linux-test
+x86-linux: progress-x86-linux test-x86-linux
 
-x86-64-linux: progress-x86-64-linux execute-x86-64-linux-test
+x86-64-linux: progress-x86-64-linux test-x86-64-linux
 
-x86-darwin: progress-x86-darwin execute-x86-darwin-test
+x86-darwin: progress-x86-darwin test-x86-darwin
 
-x86-64-darwin: progress-x86-64-darwin execute-x86-64-darwin-test
+x86-64-darwin: progress-x86-64-darwin test-x86-64-darwin
 
 OPTS=-static -O2
 
@@ -30,19 +30,19 @@ progress-x86-64-linux: src/progress.*
 	cc -flto -m64 ${OPTS} -o $@ -Isrc src/progress.c
 	strip $@
 
-execute-x86-darwin-test: src/execute-arch-posix.c
+test-x86-darwin: src/execute-arch-posix.c
 	cc -m32 ${OPTS} -o $@ src/execute-arch-posix.c
 	strip $@
 
-execute-x86-64-darwin-test: src/execute-arch-posix.c
+test-x86-64-darwin: src/execute-arch-posix.c
 	cc -m64 ${OPTS} -o $@ src/execute-arch-posix.c
 	strip $@
 
-execute-x86-linux-test: src/execute-arch-posix.c
+test-x86-linux: src/execute-arch-posix.c
 	cc -m32 ${OPTS} -pthread -o $@ src/execute-arch-posix.c
 	strip $@
 
-execute-x86-64-linux-test: src/execute-arch-posix.c
+test-x86-64-linux: src/execute-arch-posix.c
 	cc -m64 ${OPTS} -pthread -o $@ src/execute-arch-posix.c
 	strip $@
 

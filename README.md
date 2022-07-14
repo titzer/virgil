@@ -4,8 +4,8 @@ Virgil is a programming language designed for fast, dependency-free programs.
 Its design blends functional and object-oriented programming paradigms for
 expressiveness and performance.
 Virgil's compiler produces optimized, standalone native executables, WebAssembly
-modules, or JARs for the JVM, or programs can also be run directly on a built-in
-interpreter.
+modules, or JARs for the JVM.
+For quick turnaround in testing and debugging, programs can also be run directly on a built-in interpreter.
 It is well-suited to writing small and fast programs, which makes it ideal for
 building certain kinds of programs like compilers and virtual machines.
 It is currently being used for virtual machine and programming language
@@ -39,6 +39,7 @@ platform to any other supported platform, so you need only be able to run on
 one of these platforms in order to target any of the others.
 
 * x86-darwin : 32-bit Darwin kernels (MacOS)
+* x86-64-darwin : 64-bit Darwin kernels (MacOS)
 * x86-linux : 32-bit Linux kernels
 * x86-64-linux : 64-bit Linux kernels
 * jar : JAR files for the Java Virtual Machine
@@ -84,4 +85,4 @@ Conference on Object-Oriented Systems, Languages, and Applications (OOPSLA '06).
 
 ## License
 
-Licensed under the Apache License, Version 2.0. ([rt/LICENSE](LICENSE) or https://www.apache.org/licenses/LICENSE-2.0)
+Licensed under the Apache License, Version 2.0. ([rt/LICENSE](rt/LICENSE) or https://www.apache.org/licenses/LICENSE-2.0)

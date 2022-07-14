@@ -36,5 +36,5 @@ print_line
 compile_target_tests $target "-fatal -print-ssa -print-mach -print-stackify -rt.symtab"
 cat $T/compile.out
 print_line
-echocute $DIR/config/execute-$target-test $T $TESTS | tee $T/${TEST_NO_EXT}.run.out
+echocute $DIR/config/test-$target $T $TESTS | tee $T/${TEST_NO_EXT}.run.out
 echo gdb $T/${TEST_NO_EXT}
