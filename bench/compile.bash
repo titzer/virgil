@@ -32,7 +32,7 @@ fi
 
 function do_compile() {
     p=$1
-    opts="$V3C_OPTS"
+    opts="${V3C_OPTS[@]}"
     PROG=$p-$target
     EXE=$TMP/$PROG
 
@@ -61,7 +61,7 @@ function do_compile() {
 	return 0
     else
 	# compile to the given target architecture
-	v3c-$target -output=$TMP -program-name=$PROG $opts $files
+	v3c-$target -output=$TMP -program-name=$PROG "${opts[@]}" $files
 	return $?
     fi
 }
