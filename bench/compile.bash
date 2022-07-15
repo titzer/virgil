@@ -1,51 +1,79 @@
 #!/bin/bash
 
-TMP=/tmp/$USER/virgil-bench/
-
-if [ -z "$RUN_COUNT" ]; then
-	COUNT=5
-else
-	COUNT=$RUN_COUNT
-fi
-
 if [ $# = 0 ]; then
-	echo "Usage: compile <targets> [benchmarks]"
+	echo "Usage: compile.bash <target> [benchmarks]"
 	exit 1
 fi
 
-targets="$1"
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
+VIRGIL_LOC=${VIRGIL_LOC:=$(cd $DIR/.. && pwd)}
+
+cd $DIR
+
+TMP=/tmp/$USER/virgil-bench/
+mkdir -p $TMP
+
+target="$1"
 shift
 
 if [ $# = 0 ]; then
-	programs=$(echo $(ls */*.v3 | sort | cut -d/ -f1 | uniq))
+	benchmarks=$(./list-benchmarks.bash)
 else
-	programs="$*"
+	benchmarks="$*"
 	shift
 fi
 
-mkdir -p $TMP
+function do_compile() {
+    p=$1
+    opts="$V3C_OPTS"
+    PROG=$p-$target
+    EXE=$TMP/$PROG
 
-if [ ! -x $TMP/btime ]; then
-	echo Compiling btime.c...
-	gcc -O2 -o $TMP/btime btime.c
-fi
+    files="Common.v3 $p/*.v3"
+    if [ -x "$p/$p.bash" ]; then
+	files=$($p/$p.bash $TMP)
+    fi
+    if [ -f "$p/v3c-opts" ]; then
+	opts="$opts $(cat $p/v3c-opts)"
+    fi
+    if [ -f "$p/v3c-opts-$target" ]; then
+	opts="$opts $(cat $p/v3c-opts-$target)"
+    fi
 
-for p in $programs; do
-	for t in $targets; do
-		printf "$p ($t): "
+    if [ "$target" = "v3i" ]; then
+	# v3i is a special target that runs the V3C interpreter
+	echo "#!/bin/bash" > $EXE
+	echo "exec v3i $files \"$@\"" >> $EXE
+	chmod 755 $EXE
+	return 0
+    elif [ "$target" = "v3i-ra" ]; then
+	# v3i is a special target that runs the V3C interpreter (with -ra)
+	echo "#!/bin/bash" > $EXE
+	echo "exec v3i -ra $files \"$@\"" >> $EXE
+	chmod 755 $EXE
+	return 0
+    else
+	# compile to the given target architecture
+	v3c-$target -output=$TMP -program-name=$PROG $opts $files
+	return $?
+    fi
+}
 
-		files="Common.v3 $p/$p.v3"
-		if [ -x "$p/$p.bash" ]; then
-			files=$($p/$p.bash $TMP)
-		fi
+for p in $benchmarks; do
+	printf "##+compiling (%s) %s\n" $target $p
 
-		COMMAND="$(which v3c-$t) -output=$TMP $files"
+	do_compile $p
 
-		if [ $? = 0 ]; then
-			printf "$COMMAND $args\n"
-		else
-			echo "  Failed compiling ($t) $p"
-		fi
-		$TMP/btime $TMP/$p-$t $COUNT $COMMAND
-	done
+	if [ $? != 0 ]; then
+	    printf "##-fail\n"
+	else
+	    printf "##-ok\n"
+	fi
 done
