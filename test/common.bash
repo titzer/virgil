@@ -144,8 +144,8 @@ function run_io_test() {
 
 function run_io_test2() {
     target=$1
-    local test=$2
-    local sub=$3
+    local runner=$2
+    local test=$3
     local args=""
 
     trace_test_start $test
@@ -154,10 +154,9 @@ function run_io_test2() {
 	args=$(cat $test.args)
     fi
 
-    RUNNER=$CONFIG/run-${target}${sub}
     local T=$OUT/$target
 
-    if [ ! -x $RUNNER ]; then
+    if [ ! -x $runner ]; then
 	trace_test_ok "skipped"
 	return 0
     fi
@@ -166,9 +165,9 @@ function run_io_test2() {
 
 
     if [ -f $test.in ]; then
-	V3C=$AENEAS_TEST $RUNNER $T $test $args < $test.in > $P.out 2> $P.err
+	V3C=$AENEAS_TEST $runner $T $test $args < $test.in > $P.out 2> $P.err
     else
-	V3C=$AENEAS_TEST $RUNNER $T $test $args > $P.out 2> $P.err
+	V3C=$AENEAS_TEST $runner $T $test $args > $P.out 2> $P.err
     fi
     echo $? > $P.exit
 
@@ -191,17 +190,47 @@ function run_io_tests() {
     shift
     trace_test_count $#
     for t in $@; do
-	run_io_test2 $target $t ""
+	run_io_test2 $target $CONFIG/run-$target $t
+    done
+}
+
+function run_io_tests2() {
+    local target=$1
+    shift
+    local runner=$1
+    shift
+    trace_test_count $#
+    for t in $@; do
+	run_io_test2 $target $runner $t
     done
 }
 
 function run_or_skip_io_tests() {
     local target=$1
-    if [[ ! -x $CONFIG/run-$target ]]; then
-	echo "${YELLOW}skipped${NORM}"
-    else
-	run_io_tests $@ | tee $OUT/$target/run.out | $PROGRESS i
+    shift
+
+    PREFIX=$CONFIG/run-$target-
+    local runners=$(ls ${PREFIX}*)
+
+    if [ -z "$runners" ]; then
+	runners=$CONFIG/run-$target
+	if [[ ! -x $runners ]]; then
+	    echo "${YELLOW}skipped${NORM}"
+	    return 0
+	fi
     fi
+
+    for runner in $runners; do
+	sub=${runner/${PREFIX}/}
+	print_status Running $sub
+	run_io_tests2 $target $runner $@ | tee $OUT/$target/run-$sub.out | $PROGRESS i
+    done
+
+#    if [[ ! -x $CONFIG/run-$target ]]; then
+#	echo "${YELLOW}skipped${NORM}"
+#    else
+#	run_io_tests $@ | tee $OUT/$target/run.out | $PROGRESS i
+#    fi
 }
 
 function run_v3c() {
