@@ -16,15 +16,7 @@ T=$OUT/$target
 mkdir -p $T
 
 print_compiling "$target" ""
-$AENEAS_TEST -heap-size=1m -target=wasm -entry-export=_start -main-export=_start -output=$T -multiple -rt.files=$RT $V3C_OPTS $TESTS | $PROGRESS i
-
-function run_tests() {
-    trace_test_count $#
-    for t in $@; do
-	run_io_test2 $target $t ""
-    done
-}
-
+V3C_OPTS="$V3C_OPTS -heap-size=1m -target=wasm -entry-export=_start -main-export=_start -output=$T -rt.files=$RT" run_v3c_multiple ""  $TESTS | tee $T/compile.out | $PROGRESS i
 
 print_status Running $target
-run_tests $TESTS | $PROGRESS i
+run_or_skip_io_tests $target $TESTS
