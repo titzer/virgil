@@ -10,11 +10,14 @@ fi
 function compile_tests() {
     target=$1
     trace_test_count $(echo $TESTS | wc -w)
-    # TODO: use -rt.files when that v3c option is in stable
     for t in $TESTS; do
 	trace_test_start $t
 	# XXX: use bin/dev/target-nogc?
-	V3C=$AENEAS_TEST $VIRGIL_LOC/bin/v3c-$target $V3C_OPTS -output=$T $t
+	CMD=$VIRGIL_LOC/bin/v3c-$target
+	if [ ! -x $CMD ]; then
+	    CMD=$VIRGIL_LOC/bin/dev/v3c-$target
+	fi
+	V3C=$AENEAS_TEST $CMD $V3C_OPTS -output=$T $t
 	EXIT_CODE=$?
 	trace_test_retval $EXIT_CODE
     done
@@ -78,6 +81,8 @@ for target in $TEST_TARGETS; do
     elif [ "$target" = wasm-js ]; then
 	continue # TODO: stacktrace tests on wasm
     elif [ "$target" = x86-darwin ]; then
+	do_tests $target
+    elif [ "$target" = x86-64-darwin ]; then
 	do_tests $target
     elif [ "$target" = x86-linux ]; then
 	do_tests $target

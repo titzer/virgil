@@ -81,7 +81,7 @@ function do_test() {
 
     compile_run_target jit
     compile_run_target signal
-    V3C_OPTS=-stack-size=64k compile_run_target stackoverflow
+    V3C_OPTS=-stack-size=256k compile_run_target stackoverflow
     compile_run_target usercode
 
     do_gc_test FinalizerTest
@@ -91,6 +91,8 @@ function do_test() {
 
 for target in $TEST_TARGETS; do
     if [ "$target" = x86-darwin ]; then
+        do_test
+    elif [ "$target" = x86-64-darwin ]; then
         do_test
     elif [ "$target" = x86-linux ]; then
         do_test
