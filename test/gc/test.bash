@@ -9,11 +9,16 @@ else
 fi
 
 function compile_gc_tests() {
-    trace_test_count $#
-    for f in $@; do
-	trace_test_start $f
-	run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k $f $OS_SOURCES $NATIVE_SOURCES $GC_SOURCES
-	trace_test_retval $?
+    local SHARDING=100
+    local target=$1
+    shift
+    
+    RT_FILES="-rt.files=$(echo $OS_SOURCES $NATIVE_SOURCES $GC_SOURCES)"
+    local i=1
+    while [ $i -le $# ]; do
+	local args=${@:$i:$SHARDING}
+	run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k "$RT_FILES" -multiple $args
+	i=$(($i + $SHARDING))
     done
 }
 
@@ -21,14 +26,12 @@ function do_test() {
     set_os_sources $target
     T=$OUT/$target
     mkdir -p $T
-
     C=$T/compile.out
     ALL=$T/compile.all.out
     rm -f $ALL
 
-    # TODO: use -rt.files when that v3c option is in stable
     print_compiling "$target" ""
-    compile_gc_tests $TESTS | tee $T/compile.all.out | $PROGRESS i
+    compile_gc_tests $target $TESTS | tee $T/compile.all.out | $PROGRESS i
 
     execute_target_tests $target
 
