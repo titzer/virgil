@@ -7,87 +7,22 @@ else
 	TESTS=*.v3
 fi
 
-function compile_tests() {
-    target=$1
-    trace_test_count $(echo $TESTS | wc -w)
-    for t in $TESTS; do
-	trace_test_start $t
-	# XXX: use bin/dev/target-nogc?
-	CMD=$VIRGIL_LOC/bin/v3c-$target
-	if [ ! -x $CMD ]; then
-	    CMD=$VIRGIL_LOC/bin/dev/v3c-$target
-	fi
-	V3C=$AENEAS_TEST $CMD $V3C_OPTS -output=$T $t
-	EXIT_CODE=$?
-	trace_test_retval $EXIT_CODE
-    done
-}
-
-function run_compiled_tests() {
-    target=$1
-    trace_test_count $(echo $TESTS | wc -w)
-    for t in $TESTS; do
-	trace_test_start $t
-	exe=${t%*.*}
-	echo $T/$exe
-	$T/$exe 2> $T/$t.err
-	diff $t.expect $T/$t.err
-	EXIT_CODE=$?
-	trace_test_retval $EXIT_CODE
-    done
-}
-
-function run_int_tests() {
-    target=$1
-    trace_test_count $(echo $TESTS | wc -w)
-    # TODO: run multiple stacktrace tests in one Aeneas?
-    for t in $TESTS; do
-	trace_test_start $t
-	$AENEAS_TEST -run $t > $T/$t.out
-	diff $t.expect $T/$t.out
-	EXIT_CODE=$?
-	trace_test_retval $EXIT_CODE
-    done
-}
-
-function do_tests() {
-    print_compiling $target
-    compile_tests $1 | tee $T/compile.out | $PROGRESS i
-    print_status "Running" ""
-    if [ -x $CONFIG/run-$target ]; then
-	run_compiled_tests $1 | tee $T/run.out | $PROGRESS i
-    else
-	echo "${YELLOW}skipped${NORM}"
-    fi
-}
-
-function do_int_tests() {
-    opt=$1
-    print_status "Running" "int $opt"
-    run_int_tests $1 | tee $T/run.out | $PROGRESS i
-}
-
-## Main loop over all targets
 for target in $TEST_TARGETS; do
+    if [ "$target" = "wasm-js" ]; then
+	target=wave
+        continue # TODO: stacktrace tests for wave
+    elif [ "$target" = "jvm" ]; then
+	target=jar 
+        continue #TODO: stacktrace tests for jar
+    fi
+
     T=$OUT/$target
     mkdir -p $T
 
-    if [ "$target" = int ]; then
-	do_int_tests
-	do_int_tests -ra
-	
-    elif [[ "$target" = jvm || "$target" = jar ]]; then
-	continue # TODO: stacktrace tests on jvm
-    elif [ "$target" = wasm-js ]; then
-	continue # TODO: stacktrace tests on wasm
-    elif [ "$target" = x86-darwin ]; then
-	do_tests $target
-    elif [ "$target" = x86-64-darwin ]; then
-	do_tests $target
-    elif [ "$target" = x86-linux ]; then
-	do_tests $target
-    elif [ "$target" = x86-64-linux ]; then
-	do_tests $target
+    if [[ ! "$target" =~ ^int ]]; then
+        print_status Compiling $target
+        V3C_OPTS="$V3C_OPTS -output=$T" run_v3c_multiple 100 $target $TESTS | tee $T/compile.out | $PROGRESS i
     fi
+    
+    run_or_skip_io_tests $target $TESTS
 done
-

@@ -15,7 +15,7 @@ function do_test() {
     if [ $int = 0 ]; then
 	run_io_test $target "${1%*.*}" "$params" "$expect"
     else
-	run_v3c "" -run $1 $params > $out
+	run_v3c "" -run $1 $params > $out 2>&1 
 	diff $expect $out
     fi
     trace_test_retval $?

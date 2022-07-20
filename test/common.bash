@@ -209,20 +209,26 @@ function run_or_skip_io_tests() {
     local target=$1
     shift
 
-    PREFIX=$CONFIG/run-$target-
-    local runners=$(ls ${PREFIX}*)
+    PREFIX=$CONFIG/run-$target
+    local runners=$(echo ${PREFIX}*)
 
-    if [ -z "$runners" ]; then
+    if [ "$runners" = "${PREFIX}*" ]; then
 	runners=$CONFIG/run-$target
 	if [[ ! -x $runners ]]; then
+	    print_status Running $target
 	    echo "${YELLOW}skipped${NORM}"
 	    return 0
 	fi
     fi
 
     for runner in $runners; do
-	sub=${runner/${PREFIX}/}
-	print_status Running $sub
+	if [ "$runner" = "$PREFIX" ]; then
+	    sub=""
+	    print_status Running $target
+	else
+	    sub=${runner/${PREFIX}-/}
+	    print_status Running $target-$sub
+	fi
 	run_io_tests2 $target $runner $@ | tee $OUT/$target/run-$sub.out | $PROGRESS i
     done
 
@@ -247,18 +253,28 @@ function run_v3c() {
     fi
 }
 
-function run_v3c_multiple() { # TODO: sharding
+function run_v3c_multiple() {
+    local SHARDING=$1
+    shift
     local target=$1
     shift
-    if [ -z "$target" ]; then
-	$AENEAS_TEST $V3C_OPTS -multiple "$@"
-    else
-        local F=$VIRGIL_LOC/bin/dev/v3c-$target
-        if [ ! -x "$F" ]; then
-            F=$VIRGIL_LOC/bin/v3c-$target
-        fi
-	V3C=$AENEAS_TEST $F $V3C_OPTS -multiple "$@"
-    fi
+
+    local i=1
+    while [ $i -le $# ]; do
+
+	local args=${@:$i:$SHARDING}
+	
+	if [ -z "$target" ]; then
+	    $AENEAS_TEST $V3C_OPTS -multiple $args
+	else
+            local F=$VIRGIL_LOC/bin/dev/v3c-$target
+            if [ ! -x "$F" ]; then
+		F=$VIRGIL_LOC/bin/v3c-$target
+            fi
+	    V3C=$AENEAS_TEST $F $V3C_OPTS -multiple $args
+	fi
+	i=$(($i + $SHARDING))
+    done
 }
 
 function execute_int_tests() {
@@ -276,7 +292,7 @@ function compile_target_tests() {
     mkdir -p $OUT/$target
     C=$OUT/$target/compile.out
     print_compiling $target
-    V3C_OPTS="$V3C_OPTS $opts -set-exec=false -target=$target-test -output=$OUT/$target" run_v3c_multiple ""  $TESTS | tee $C | $PROGRESS i
+    V3C_OPTS="$V3C_OPTS $opts -set-exec=false -target=$target-test -output=$OUT/$target" run_v3c_multiple 5000 ""  $TESTS | tee $C | $PROGRESS i
 }
 
 function check_cached_target_tests() {
