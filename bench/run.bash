@@ -1,32 +1,45 @@
 #!/bin/bash
 
-TMP=/tmp/$USER/virgil-bench/
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-if [ -z "$RUN_COUNT" ]; then
-	COUNT=5
-else
-	COUNT=$RUN_COUNT
-fi
+function usage() {
+    echo "Usage: run.bash <tiny|small|large|huge> [target [benchmarks]]"
+    exit 1
+}
+
+VIRGIL_LOC=${VIRGIL_LOC:=$(cd $DIR/.. && pwd)}
+RUNS=${RUNS:=5}
+
+cd $DIR
+
+TMP=/tmp/$USER/virgil-bench
+mkdir -p $TMP
+
 
 if [ $# = 0 ]; then
-	echo "Usage: run [tiny|small|large|huge] <engines>"
-	exit 1
+	usage
 fi
 
 size=$1
 shift
 
 if [ $# = 0 ]; then
-	engines="aeneas"
+	target="v3i"
 else
-	engines="$1"
+	target="$1"
 	shift
 fi
 
 if [ $# = 0 ]; then
-	programs=$(echo $(ls */*.v3 | sort | cut -d/ -f1 | uniq))
+	benchmarks=$(./list-benchmarks.bash)
 else
-	programs="$*"
+	benchmarks="$*"
 	shift
 fi
 
@@ -43,32 +56,24 @@ if [ ! -x $BTIME ]; then
 	gcc -m32 -lm -O2 -o $BTIME btime.c
 fi
 
-for p in $programs; do
+#./compile.bash $target $benchmarks
+
+# Check that binaries exist in $TMP
+for p in $benchmarks; do
+    PROG=$TMP/$p-$target
+    if [ ! -x $PROG ]; then
+	./compile.bash $target $p
+    fi
+done
+
+for p in $benchmarks; do
 	if [ ! -f "$p/args-$size" ]; then
 		continue
 	fi
 
+	PROG=$TMP/$p-$target
 	args=$(cat $p/args-$size)
-	for e in $engines; do
-		printf "$p ($size): "
-
-		flags=""
-		if [ -f $p/flags-$e ]; then
-			flags=$(cat $p/flags-$e)
-		fi
-
-		files="Common.v3 $p/$p.v3"
-		if [ -x "$p/$p.bash" ]; then
-			files=$($p/$p.bash $TMP)
-		fi
-
-		COMMAND=$(./target-$e $TMP "$p" "$flags" "$files")
-
-		if [ $? = 0 ]; then
-			printf "$COMMAND $args\n"
-			$BTIME $TMP/$p-$e $COUNT $COMMAND $args
-		else
-			echo "  Failed compiling ($e) $p"
-		fi
-	done
+	
+	echo "$p ($size): $PROG $args"
+	$BTIME $RUNS $PROG $args
 done

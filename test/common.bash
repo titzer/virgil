@@ -144,8 +144,8 @@ function run_io_test() {
 
 function run_io_test2() {
     target=$1
-    local test=$2
-    local sub=$3
+    local runner=$2
+    local test=$3
     local args=""
 
     trace_test_start $test
@@ -154,10 +154,9 @@ function run_io_test2() {
 	args=$(cat $test.args)
     fi
 
-    RUNNER=$CONFIG/run-${target}${sub}
     local T=$OUT/$target
 
-    if [ ! -x $RUNNER ]; then
+    if [ ! -x $runner ]; then
 	trace_test_ok "skipped"
 	return 0
     fi
@@ -166,9 +165,9 @@ function run_io_test2() {
 
 
     if [ -f $test.in ]; then
-	$RUNNER $T $test $args < $test.in > $P.out 2> $P.err
+	V3C=$AENEAS_TEST $runner $T $test $args < $test.in > $P.out 2> $P.err
     else
-	$RUNNER $T $test $args > $P.out 2> $P.err
+	V3C=$AENEAS_TEST $runner $T $test $args > $P.out 2> $P.err
     fi
     echo $? > $P.exit
 
@@ -186,6 +185,54 @@ function run_io_test2() {
     trace_test_ok
 }
 
+function run_io_tests() {
+    local target=$1
+    shift
+    trace_test_count $#
+    for t in $@; do
+	run_io_test2 $target $CONFIG/run-$target $t
+    done
+}
+
+function run_io_tests2() {
+    local target=$1
+    shift
+    local runner=$1
+    shift
+    trace_test_count $#
+    for t in $@; do
+	run_io_test2 $target $runner $t
+    done
+}
+
+function run_or_skip_io_tests() {
+    local target=$1
+    shift
+
+    PREFIX=$CONFIG/run-$target-
+    local runners=$(ls ${PREFIX}*)
+
+    if [ -z "$runners" ]; then
+	runners=$CONFIG/run-$target
+	if [[ ! -x $runners ]]; then
+	    echo "${YELLOW}skipped${NORM}"
+	    return 0
+	fi
+    fi
+
+    for runner in $runners; do
+	sub=${runner/${PREFIX}/}
+	print_status Running $sub
+	run_io_tests2 $target $runner $@ | tee $OUT/$target/run-$sub.out | $PROGRESS i
+    done
+
+#    if [[ ! -x $CONFIG/run-$target ]]; then
+#	echo "${YELLOW}skipped${NORM}"
+#    else
+#	run_io_tests $@ | tee $OUT/$target/run.out | $PROGRESS i
+#    fi
+}
+
 function run_v3c() {
     local target=$1
     shift
@@ -197,6 +244,20 @@ function run_v3c() {
             F=$VIRGIL_LOC/bin/v3c-$target
         fi
 	V3C=$AENEAS_TEST $F $V3C_OPTS "$@"
+    fi
+}
+
+function run_v3c_multiple() { # TODO: sharding
+    local target=$1
+    shift
+    if [ -z "$target" ]; then
+	$AENEAS_TEST $V3C_OPTS -multiple "$@"
+    else
+        local F=$VIRGIL_LOC/bin/dev/v3c-$target
+        if [ ! -x "$F" ]; then
+            F=$VIRGIL_LOC/bin/v3c-$target
+        fi
+	V3C=$AENEAS_TEST $F $V3C_OPTS -multiple "$@"
     fi
 }
 
@@ -215,8 +276,7 @@ function compile_target_tests() {
     mkdir -p $OUT/$target
     C=$OUT/$target/compile.out
     print_compiling $target
-#    echo run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS &> $C
-    run_v3c "" -multiple $opts -set-exec=false -target=$target-test -output=$OUT/$target $TESTS | tee $C | $PROGRESS i
+    V3C_OPTS="$V3C_OPTS $opts -set-exec=false -target=$target-test -output=$OUT/$target" run_v3c_multiple ""  $TESTS | tee $C | $PROGRESS i
 }
 
 function check_cached_target_tests() {

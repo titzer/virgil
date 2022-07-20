@@ -55,6 +55,7 @@ The compiler includes sophisticated whole-program optimizations that achieve
 great performance and small binaries.
 Native binaries compiled from your programs can be as small as a few hundred
 bytes in size and consume just kilobytes of memory at runtime.
+You can learn more in the [Implementation Guide](doc/impl/README.md).
 
 ## Documentation
 

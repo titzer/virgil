@@ -8,7 +8,7 @@ const wasi = new WASI({
   args: program_args,
   env,
   preopens: {
-    '/sandbox': process.cwd()
+    '.': '.'
   }
 });
 
