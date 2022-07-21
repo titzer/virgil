@@ -176,6 +176,12 @@ function run_io_test2() {
 	    diff $test.$check $P.$check | tee $P.$check.diff
 	    DIFF=${PIPESTATUS[0]}
 	    if [ "$DIFF" != 0 ]; then
+		if [ -f failures.$target ]; then
+		    grep $test failures.$target
+		    if [ $? = 0 ]; then
+			continue # test was found in expected failures
+		    fi
+		fi
 		trace_test_fail $P.$check.diff
 		return 1
 	    fi
@@ -391,4 +397,14 @@ function compile_aeneas() {
     if [ "$QUIET_COMPILE" != 1 ]; then
 	wc -c $TARGET_DIR/* | sed 's/^/  /'
     fi
+}
+
+function convert_to_io_target() {
+    target=$1
+    if [ "$target" = "jvm" ]; then
+	target=jar
+    elif [ "$target" = "wasm-js" ]; then
+	target=wave
+    fi
+    echo $target
 }

@@ -59,11 +59,8 @@ function do_compiled() {
 for target in $TEST_TARGETS; do
     if [ "$target" = int ]; then
 	do_int
-	continue
-    elif [ "$target" = wasm-js ]; then
-	continue # TODO: skip wasm-js lib tests
-    elif [ "$target" = jvm ]; then
-	target=jar
+    else
+	target=$(convert_to_io_target $target)
+	do_compiled
     fi
-    do_compiled
 done

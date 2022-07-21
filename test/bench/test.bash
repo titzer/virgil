@@ -51,10 +51,7 @@ function do_test() {
 for target in $TEST_TARGETS; do
     if [ "$target" = int ]; then
 	continue
-    elif [ "$target" = wasm-js ]; then
-	continue
-    elif [ "$target" = jvm ]; then
-	target=jar
     fi
+    target=$(convert_to_io_target $target)
     do_test
 done

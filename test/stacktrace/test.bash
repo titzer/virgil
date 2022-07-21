@@ -8,12 +8,11 @@ else
 fi
 
 for target in $TEST_TARGETS; do
-    if [ "$target" = "wasm-js" ]; then
-	target=wave
+    target=$(convert_to_io_target $target)
+    if [ "$target" = "wave" ]; then
         continue # TODO: stacktrace tests for wave
-    elif [ "$target" = "jvm" ]; then
-	target=jar 
-        continue #TODO: stacktrace tests for jar
+    elif [ "$target" = "jar" ]; then
+        continue # TODO: stacktrace tests for jar
     fi
 
     T=$OUT/$target
