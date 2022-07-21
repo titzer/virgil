@@ -222,21 +222,11 @@ function run_or_skip_io_tests() {
     fi
 
     for runner in $runners; do
-	if [ "$runner" = "$PREFIX" ]; then
-	    sub=""
-	    print_status Running $target
-	else
-	    sub=${runner/${PREFIX}-/}
-	    print_status Running $target-$sub
-	fi
-	run_io_tests2 $target $runner $@ | tee $OUT/$target/run-$sub.out | $PROGRESS i
+	R=$CONFIG/run-
+	tname=${runner/$R/}
+	print_status Running $tname
+	run_io_tests2 $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS i
     done
-
-#    if [[ ! -x $CONFIG/run-$target ]]; then
-#	echo "${YELLOW}skipped${NORM}"
-#    else
-#	run_io_tests $@ | tee $OUT/$target/run.out | $PROGRESS i
-#    fi
 }
 
 function run_v3c() {

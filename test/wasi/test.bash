@@ -23,7 +23,7 @@ for target in $TEST_TARGETS; do
     mkdir -p $T
 
     print_compiling "$target" ""
-    V3C_OPTS="$V3C_OPTS -heap-size=1m -target=wasm -entry-export=_start -main-export=_start -output=$T -rt.files=$RT" run_v3c_multiple ""  $TESTS | tee $T/compile.out | $PROGRESS i
+    V3C_OPTS="$V3C_OPTS -heap-size=1m -target=wasm -entry-export=_start -main-export=_start -output=$T -rt.files=$RT" run_v3c_multiple 100 ""  $TESTS | tee $T/compile.out | $PROGRESS i
 
     run_or_skip_io_tests $target $TESTS
 done
