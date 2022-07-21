@@ -2,49 +2,36 @@
 
 . ../common.bash targets
 
-mkdir -p $OUT
-
 if [ $# -gt 0 ]; then
 	TESTS="$@"
 else
 	TESTS=*.v3
 fi
 
-# test the interpreter first
-function run_interpreter() {
-    for test in $TESTS; do
-        local expect=$test.expect
-        local out=$OUT/$test.out
-        
-        printf "  Running      (int) ${test}..."
-        run_v3c "" -run $test > $out
-        diff $expect $out > /dev/null
-        check $?
-    done
-}
+ALL_TARGETS=""
 
-run_interpreter
+# expand targets to include the -nogc and -nort versions
+for target in $TEST_TARGETS; do
+    target=$(convert_to_io_target $target)
+    if [ "$target" = "wave" ]; then
+	ALL_TARGETS="$ALL_TARGETS wave wave-nogc"
+    elif [ "$target" = "int" ]; then
+	ALL_TARGETS="$ALL_TARGETS int int-ra"
+    elif [[ "$target" =~ ^x86 ]]; then
+	ALL_TARGETS="$ALL_TARGETS $target $target-nogc $target-nort"
+    else
+	ALL_TARGETS="$ALL_TARGETS $target"
+    fi
+done
 
-function run_target() {
-    local target=$1
+for target in $ALL_TARGETS; do
+    T=$OUT/$target
+    mkdir -p $T
+
+    if [[ ! "$target" =~ ^int ]]; then
+        print_status Compiling $target
+        V3C_OPTS="$V3C_OPTS -output=$T" run_v3c_multiple 100 $target $TESTS | tee $T/compile.out | $PROGRESS i
+    fi
     
-    for test in $TESTS; do
-        local expect=$test.expect
-        local T=$OUT/$target
-        mkdir -p $T
-        print_compiling "$target" $test
-        local out=$T/$1.compile.out
-        run_v3c $target -output=$T $test &> $out
-        local ok=$?
-        check $ok
-        
-        bin="$(echo $test | sed -es/.v3\$//g)"
-        run_io_test $target $bin "" $expect
-	check $?
-    done
-}
-
-targets="x86-darwin-nort x86-darwin-nogc x86-darwin x86-linux-nort x86-linux-nogc x86-linux jar wave wave-nogc"
-for target in $targets; do
-    run_target $target
+    run_or_skip_io_tests $target $TESTS
 done
