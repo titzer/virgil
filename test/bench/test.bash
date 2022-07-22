@@ -21,19 +21,30 @@ function compile_benchmarks() {
 }
 
 function run_benchmarks() {
+    local R=$CONFIG/run-$target
     trace_test_count $#
     for t in $@; do
 	trace_test_start $t
-	if [ -f $t/args-test ]; then
-	    run_io_test $target $t "$(cat $t/args-test)" $t/output-test
+	if [ ! -f $t/args-test ]; then
+	    trace_test_ok "no test arguments"
+	elif [ ! -x $R ]; then
+	    trace_test_ok "skipped $target"
 	else
-	    echo skipped
+	    local args="$(cat $t/args-test)"
+	    local P=$OUT/$target/$t.out
+            $R $OUT/$target $t $args &> $P
+	    diff $t/output-test $P > $OUT/$target/$t.diff
+	    trace_test_retval $?
 	fi
-	trace_test_retval $?
     done
 }
 
-function do_test() {
+for target in $TEST_TARGETS; do
+    if [ "$target" = int ]; then
+	continue # TODO: too slow
+    fi
+    target=$(convert_to_io_target $target)
+
     T=$OUT/$target
     mkdir -p $T
 
@@ -46,12 +57,4 @@ function do_test() {
     else
 	run_benchmarks $BENCHMARKS | tee $T/run.out | $PROGRESS i
     fi
-}
-
-for target in $TEST_TARGETS; do
-    if [ "$target" = int ]; then
-	continue
-    fi
-    target=$(convert_to_io_target $target)
-    do_test
 done

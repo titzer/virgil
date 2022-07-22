@@ -125,23 +125,6 @@ function check_no_red() {
     fi
 }
 
-function run_io_test() {
-    target=$1
-    local test=$2
-    local args="$3"
-    local expected="$4"
-    R=$CONFIG/run-$target
-
-    if [ -x $R ]; then
-	P=$OUT/$target/$test.out
-        $R $OUT/$target $test $args &> $P
-	diff $expected $P > $OUT/$target/$test.diff
-    else
-	echo "target $target ${YELLOW}skipped${NORM}"
-	return 1
-    fi
-}
-
 function run_io_test2() {
     target=$1
     local runner=$2
@@ -189,15 +172,6 @@ function run_io_test2() {
     done
 
     trace_test_ok
-}
-
-function run_io_tests() {
-    local target=$1
-    shift
-    trace_test_count $#
-    for t in $@; do
-	run_io_test2 $target $CONFIG/run-$target $t
-    done
 }
 
 function run_io_tests2() {
