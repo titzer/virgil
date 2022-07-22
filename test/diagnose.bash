@@ -33,7 +33,7 @@ print_line
 echocute cat $TESTS
 
 print_line
-compile_target_tests $target "-fatal -print-ssa -print-mach -print-stackify -rt.symtab"
+compile_target_tests $target "-fatal -print-ssa -print-mach -print-stackify -symbols"
 cat $T/compile.out
 print_line
 echocute $DIR/config/test-$target $T $TESTS | tee $T/${TEST_NO_EXT}.run.out
