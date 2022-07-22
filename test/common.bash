@@ -125,7 +125,7 @@ function check_no_red() {
     fi
 }
 
-function run_io_test2() {
+function run_io_test() {
     target=$1
     local runner=$2
     local test=$3
@@ -174,14 +174,14 @@ function run_io_test2() {
     trace_test_ok
 }
 
-function run_io_tests2() {
+function run_io_tests() {
     local target=$1
     shift
     local runner=$1
     shift
     trace_test_count $#
     for t in $@; do
-	run_io_test2 $target $runner $t
+	run_io_test $target $runner $t
     done
 }
 
@@ -205,7 +205,7 @@ function run_or_skip_io_tests() {
 	R=$CONFIG/run-
 	tname=${runner/$R/}
 	print_status Running $tname
-	run_io_tests2 $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS i
+	run_io_tests $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS i
     done
 }
 
