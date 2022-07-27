@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { WASI } from 'wasi';
 import { argv, env } from 'node:process';
 
-var program_args = argv.slice(3);
+var program_args = argv.slice(2);
 
 const wasi = new WASI({
   args: program_args,
