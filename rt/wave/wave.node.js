@@ -1,6 +1,6 @@
 const fs = require("fs");
 const util = require("util");
-var args = process.argv.slice(3);
+var args = process.argv.slice(2);
 var memory = undefined;
 
 function extract_path(ptr, len) {
