@@ -31,11 +31,13 @@ def main(args: Array<string>) {
 }
 ```
 
-In Virgil a `for` loop _always_ introduces a new iteration variable. The three parts of the `for` loop are the _initialization_ which declares and initializes the iteration variable, the _condition_ which is evaluated at the start and at each iteration of the loop, and the _update_ which is executed at the end of each iteration.
+In Virgil a `for` loop _always_ introduces a new iteration variable.
+The three parts of the `for` loop are the _initialization_ which declares and initializes the iteration variable, the _condition_ which is evaluated at the start and at each iteration of the loop, and the _update_ which is executed at the end of each iteration.
 
-## `for` each on arrays ##
+## `for`-in on arrays ##
 
 Virgil supports a simplified version of the `for` loop that allows iteration over the elements of an array.
+The keyword `in` to differentiates between the a three-part `for` and `for`-in
 
 ```
 def main(args: Array<string>) {
@@ -46,11 +48,34 @@ def main(args: Array<string>) {
 }
 ```
 
-Like the three-part form, a `for` over the contents of an array always introduces a new loop iteration variable. Virgil uses the keyword `in` to differentiate between the two types of `for` loops. Assignments to the loop iteration variable are not allowed.
+Like the three-part form, a `for` over the contents of an array always introduces a new loop iteration variable.
+For this type of loop, assignments to the loop iteration variable inside the body are not allowed.
+
+## `for`-less-than shortened form for induction ##
+
+Virgil supports another simplified version of the `for` loop that allows iteration from `0` to a limit, incrementing the iteration variable by `1` each iteration.
+The type of the variable is the inferred to be the type of the limit expression.
+
+```
+def main(args: Array<string>) {
+    for (i < 5) { // iterates over { 0, 1, 2, 3, 4 } in order
+        System.puti(i);
+        System.puts("\n");
+    }
+    // equivalent three-far for:
+    for (i = 0; i < 5; i++) {
+        System.puti(i);
+        System.puts("\n");
+    }
+}
+```
+
+Like `for`-in, `for`-less-than always introduces a new loop iteration variable.
+For this type of loop, assignments to the loop iteration variable inside the body are not allowed.
 
 ## `break` and `continue` ##
 
-Virgil supports the standard `break` and `continue` statements to either terminate or repeat a loop early from within its body.
+Virgil supports the standard `break` and `continue` statements to either exit or repeat a loop from within its body.
 
 ```
 def main() {
