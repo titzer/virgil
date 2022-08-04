@@ -34,23 +34,6 @@ def main(args: Array<string>) {
 In Virgil a `for` loop _always_ introduces a new iteration variable.
 The three parts of the `for` loop are the _initialization_ which declares and initializes the iteration variable, the _condition_ which is evaluated at the start and at each iteration of the loop, and the _update_ which is executed at the end of each iteration.
 
-## `for`-in on arrays ##
-
-Virgil supports a simplified version of the `for` loop that allows iteration over the elements of an array.
-The keyword `in` to differentiates between the a three-part `for` and `for`-in
-
-```
-def main(args: Array<string>) {
-    for (e in args) {
-        System.puts(e);
-        System.puts("\n");
-    }
-}
-```
-
-Like the three-part form, a `for` over the contents of an array always introduces a new loop iteration variable.
-For this type of loop, assignments to the loop iteration variable inside the body are not allowed.
-
 ## `for`-less-than shortened form for induction ##
 
 Virgil supports another simplified version of the `for` loop that allows iteration from `0` to a limit, incrementing the iteration variable by `1` each iteration.
@@ -70,8 +53,40 @@ def main(args: Array<string>) {
 }
 ```
 
-Like `for`-in, `for`-less-than always introduces a new loop iteration variable.
-For this type of loop, assignments to the loop iteration variable inside the body are not allowed.
+A `for`-less-than loop always introduces a new loop iteration variable that cannot be assigned in the loop body.
+
+## `for`-in on arrays ##
+
+Virgil supports a simplified version of the `for` loop that allows iteration over the elements of an array.
+The keyword `in` to differentiates between the a three-part `for` and `for`-in.
+
+```
+def main(args: Array<string>) {
+    for (e in args) {
+        System.puts(e);
+        System.puts("\n");
+    }
+}
+```
+
+A `for`-in loop always introduces a new loop variable that cannot be assigned in the loop body.
+
+## `for`-in on an enum ##
+
+The `for`-in loop form also allows iteration over the values in an enum.
+
+```
+enum State { OPEN, READING, CLOSED }
+
+def main(args: Array<string>) {
+    for (e in State) {
+        System.puts(e.name);
+        System.puts("\n");
+    }
+}
+```
+
+Like the other short forms, `for`-in over an enum always a new loop variable that cannot be assigned in the body.
 
 ## `break` and `continue` ##
 
@@ -95,14 +110,16 @@ def main() {
     while(a < 3) {
         System.puts("hello ");
         if (a == 2) continue; // go back to start of while loop
-    a++;
+        a++;
     }
     System.puts("\n");
 }
 ```
 
-Unlike C, C++, and Java, Virgil supports neither `goto` nor _labelled_ `break` or `continue` statements. All `break` and `continue` statements refer to the innermost enclosing loop.
+Unlike C, C++, and Java, Virgil supports neither `goto` nor _labelled_ `break` or `continue` statements.
+All `break` and `continue` statements refer to the innermost enclosing loop.
 
 ## Summary ##
 
-Virgil inherits the basic `while` and `for` loops from C, while adding a simplified `for`-each loop for arrays only. No `goto` s are allowed and all `break` and `continue` statements refer to their nearest enclosing loop.
+Virgil inherits the basic `while` and `for` loops from C, while adding several shorter `for`-each and `for`-in forms.
+No `goto`s are allowed and all `break` and `continue` statements refer to their nearest enclosing loop.
