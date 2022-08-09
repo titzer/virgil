@@ -7,5 +7,5 @@ if [ "$WIZENG_LOC" = "" ]; then
     exit 0
 fi
 
-V3C=$AENEAS_TEST
+export V3C=$AENEAS_TEST
 $WIZENG_LOC/test/unit.sh
