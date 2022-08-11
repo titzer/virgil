@@ -24,5 +24,14 @@ else
 	TESTS=*.v3
 fi
 
+# TODO: for now, filter out all test targets that are not the interpreter
+PREVIOUS_TARGETS=$TEST_TARGETS
+TEST_TARGETS=""
+for t in $PREVIOUS_TARGETS; do
+    if [[ $t =~ "int" ]]; then
+	TEST_TARGETS+=$t
+    fi
+done
+
 execute_tests
 exit $?
