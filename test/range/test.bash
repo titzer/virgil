@@ -24,8 +24,15 @@ else
 	TESTS=*.v3
 fi
 
-# TODO: for now, filter out all test targets that are not the interpreter
-execute_int_tests "int" ""
-execute_int_tests "int-ra" "-ra"
-execute_int_tests "int-ma" "-ra -ma"
+if [ $# -gt 0 ]; then
+	TESTS="$@"
+else
+	(do_parser_tests)
+	(do_seman_tests)
+
+	TESTS=*.v3
+fi
+
+execute_tests
 exit $?
+
