@@ -1,5 +1,11 @@
 # virgil: A Fast and Lightweight Programming Language
 
+```
+def main() {
+    System.puts("Virgil is fast and lightweight!\n");
+}
+```
+
 Virgil is a programming language designed for fast, dependency-free programs.
 Its design blends functional and object-oriented programming paradigms for
 expressiveness and performance.
