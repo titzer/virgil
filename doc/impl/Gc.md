@@ -11,7 +11,7 @@ In addition to simplifying the Virgil runtime, this allows interaction with the 
 When compiling Virgil to native targets, like `x86` (or to portable but low-level targets like `wasm`) the compiler and runtime system must work together to manage memory.
 Here, the compiler's primarily responsibility is to lay out objects and code to be inspectable to the garbage collector, while the runtime's system responsibility is to dynamically manage objects on the heap.
 While "the compiler" clearly refers to the program (`v3c`, aka `Aeneas`) that translates Virgil to machine code, "the runtime system" refers to additional code added to your program's binary that implements all of the runtime services, including garbage collection.
-The runtime is written in Virgil and lives in a separate directory in the repository (typically `rt/<platform>/).
+The runtime is written in Virgil and lives in a separate directory in the repository (typically `rt/\<platform\>/`).
 
 The interface between the compiler and runtime revolves around the two agreeing on:
 
@@ -115,19 +115,19 @@ It's particularly important that this metadata be encoded in a space- and time- 
 
 Key primitive types are:
 
- * the `length-bitmap#N` type: a N-bit word, where the highest `1` bit set indicates the length, and the remaining low-order bits represent a bitmap of that length. If bit `N-1` is set, then the low `N-1` bits represent an index into an entry in an extended table that encodes larger bitmaps.
+ * the `length-bitmap#N` type: a N-bit word, where the highest `1` bit set indicates the length, and the remaining low-order bits represent a bitmap of that length. If bit `N` is set, then the low `N-1` bits represent an index into an entry in an extended table that encodes larger bitmaps.
 
 ### Organization of GC stackmap metadata
 
-The GC stackmap metadata has many entries--one per GC safepoint--and is processed on every GC when walking the stack, thus making it critical.
-Its purpose is to locate all references on the stack at a safepoint, allowing the garbage collector to be *precise* and move objects if necessary, updating references.
+The GC stackmap metadata has many entries--one per GC safepoint--and is processed on every GC when walking the stack, thus making its performance critical for reducing pause time.
+Its purpose is to *precisely* locate all references on the stack at a safepoint, allowing the garbage collector to move objects if necessary, updating references.
 
 When the collector walks the stack of a thread, it begins at the topmost frame and loads the program counter (`pc`) from the frame.
 It uses the `pc` as a key into the stackmap table, where it will find an entry that contains a `length-bitmap#32`.
 It then applies the bitmap to the words of the stackframe, treating `1`s in the bitmap as references at the corresponding slot in the frame.
 It then advances to the next frame, repeating the process all the way down the stack to the entrypoint of the thread.
 
-The stackmap table is encoded so that one O(1) indexing operation and one binary search are required to find an entry.
+The stackmap table is encoded so that one indexing operation and one binary search are required to find an entry.
 It consists of two tables:
 
  * `GC_STACKMAP_PAGES` - an array of indexes into the `GC_STACKMAP_TABLE`
@@ -148,14 +148,15 @@ def lookupSafepointStackmap(pc: Pointer) -> LengthBitmap20 {
 
 Thus, we use the first table, the "page" table, to quickly find the two indices that denote the start and end entries for all safepoints on the same page of code memory.
 We then binary-search the entries in the stackmap table for the entry with the matching offset.
-Because all of the entries between these two indices are on the same page, the table doesn't need to store their upper bits.
-Instead, it uses those upper bits to store, in-line, a length-bitmap for the frame.
+Because all of the entries between these two indices are on the same page, their upper bits match; thus the table doesn't need to store their upper bits.
+Instead, it uses those upper bits to store, in-line, a 20-bit length-bitmap for the frame.
+(Though the page size is chosen to be `4096` (12 bits), this is not actually tied to the virtual memory page size; it could be larger or smaller.)
 
 ### Organization of GC roots entries
 
 Similar to the GC stackmap metadata, the roots metadata allows the GC to find all references in the initial heap, including global variables (i.e. component fields) and the objects which have been serialized into the data section.
 It is organized as a list of `offset` + `length-bitmap#32` pairs, where the `offset` is an offset into the `DATA` region.
-It covers only the mutable fields in the data section, since immutable fields by definition have their referents already serialized into the data section.
+It covers only the mutable fields in the data section, since immutable fields by definition have their referents already serialized into the data section and don't need to be scanned nor updated.
 
 ### Organization of the GC types table
 
