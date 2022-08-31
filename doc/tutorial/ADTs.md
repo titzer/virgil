@@ -26,8 +26,8 @@ Calling a method on a value uses the familiar `.method()` syntax.
 
 ```
 type Tree {
-    case Empty            { def height() -> int { return 0; }
-    case Leaf(value: int) { def height() -> int { return 1; }
+    case Empty            { def height() -> int { return 0; } }
+    case Leaf(value: int) { def height() -> int { return 1; } }
     case Node(left: Tree, right: Tree) {
     	 def height() -> int {
 	     var l = left.height(), r = right.height();
