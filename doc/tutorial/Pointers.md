@@ -123,7 +123,7 @@ In these cases, we typically use a Virgil array (often `Array<byte>`) as the und
 To get a pointer directly into the beginning of the contents of an array (i.e. element `0`), we can use `Pointer.atContents`.
 
 ```
-der STDIN = 0;
+def STDIN = 0;
 def SYS_read = 3;
 var buf = Array<byte>.new(128);
 // call Linux kernel to read directly into {buf}

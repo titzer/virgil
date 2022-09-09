@@ -12,7 +12,7 @@ enum Day {
 }
 var celebrationDay: Day = Day.SATURDAY;
 var backToWork: Day = Day.MONDAY;
-var workDays: Day = [Day.MONDAY, Day.TUESDAY, Day.WEDNESDAY, Day.THURSDAY, Day.FRIDAY];
+var workDays: Array<Day> = [Day.MONDAY, Day.TUESDAY, Day.WEDNESDAY, Day.THURSDAY, Day.FRIDAY];
 ```
 
 This defines the familiar set of days of the week and gives us symbolic constants for each of them.
@@ -32,8 +32,8 @@ enum Day {
 }
 def isWorkday(day: Day) -> bool {
     match (day) {
-    	 MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY => return true;
-	 return false;
+    	MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY => return true;
+	 	_ => return false;
     }
 }
 ```
@@ -63,7 +63,7 @@ Since we tend to declare enum values in uppercase by convention, this may not al
 enum Day {
      SUNDAY, MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY
 }
-def sayHello(day: Day) -> bool {
+def sayHello(day: Day) {
     System.puts("Hello, it's a beautiful ");
     System.puts(day.name);
     System.puts("!\n");
@@ -80,13 +80,13 @@ We could write a method to translate a day value to a string, or we could write:
 enum Day(germanName: string, isWorkday: bool) {
      SUNDAY("Sonntag", false),
      MONDAY("Montag", true),
-     TUESDAY("Dienstag, true),
+     TUESDAY("Dienstag", true),
      WEDNESDAY("Mittwoch", true),
      THURSDAY("Donnerstag", true),
      FRIDAY("Freitag", true),
      SATURDAY("Samstag", false)
 }
-def sayHello(day: Day) -> bool {
+def sayHello(day: Day) {
     System.puts("Gruesse an diesem herrlichen ");
     System.puts(day.germanName);
     System.puts("!\n");
