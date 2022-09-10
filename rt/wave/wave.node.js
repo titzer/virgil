@@ -88,4 +88,4 @@ memory = new Uint8Array(memory.buffer);
 var main = instance.exports[".entry"];
 if (main == undefined) main = instance.exports["entry"];
 if (main == undefined) main = instance.exports["main"];
-main(args.length);
+process.exitCode = main(args.length);
