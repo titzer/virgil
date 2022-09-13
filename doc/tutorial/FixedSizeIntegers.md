@@ -37,8 +37,8 @@ To make these programs easier to read and write, and to make Virgil code look an
 
 ```
 var x: byte = 88;
-var y: Array<byte> = [x, 77, 33];
-var z: (int, long) = 33, -9999999999999;
+var y: Array<byte> = [x, 77, 33];            // an array
+var z: (int, long) = (33, -9999999999999);   // a tuple
 ```
 
 ## Two's complement and value ranges
