@@ -6,7 +6,7 @@ def REGS = MachRegSet.new(1, [[1]], ["tos"], [1], [1], 1000, 2000);
 class WasmCodeGen extends SsaMachGen {
 	def wasm: WasmProgram;
 	def rt: MachRuntime;
-	def stackgen = WasmStackInstrGen.new();
+	def stackgen = WasmStackInstrGen.new(wasm);
 	var stackifier: MachStackifier;
 	def matcher = SsaInstrMatcher.new();
 	def spiller = ShadowStackSpiller.new();
@@ -86,10 +86,10 @@ class WasmCodeGen extends SsaMachGen {
 			}
 			Block(t, bi) => {
 				blockEnd = cursor;
-				emit1(WasmOp.BLOCK.opcode, useInt(t));
+				emit1(WasmOp.BLOCK.opcode, useInt(wasm.wasmType(t).toInt()));
 			}
 			Loop(bi) => {
-				emit1(WasmOp.LOOP.opcode, useInt(WasmType.Void));
+				emit1(WasmOp.LOOP.opcode, useInt(WasmType.Void.toInt()));
 				blockEnd = cursor;
 			}
 			Body(bi) => {
@@ -107,7 +107,7 @@ class WasmCodeGen extends SsaMachGen {
 			If(split, val, t, join) => {
 				context.block = split;
 				blockEnd = cursor;
-				emit2(WasmOp.IF.opcode, useInt(t), use(val));
+				emit2(WasmOp.IF.opcode, useInt(wasm.wasmType(t).toInt()), use(val));
 			}
 			Else => {
 				emit0(WasmOp.ELSE.opcode);
@@ -240,7 +240,7 @@ class WasmCodeGen extends SsaMachGen {
 			PtrAdd => emitBinop(i, WasmOp.I32_ADD);
 			PtrSub => emitBinop(i, WasmOp.I32_SUB);
 			ConditionalThrow => {
-				emit2(WasmOp.IF.opcode, useInt(WasmType.Void), use(i.inputs[0].dest));
+				emit2(WasmOp.IF.opcode, useInt(WasmType.Void.toInt()), use(i.inputs[0].dest));
 				emitN(WasmOp.UNREACHABLE.opcode);
 				emitN(WasmOp.END.opcode);
 			}
@@ -467,7 +467,7 @@ class WasmCodeGen extends SsaMachGen {
 	def emitBinop(i: SsaApplyOp, op: WasmOp) {
 		emit3(op.opcode, dfn(i), use(i.input0()), use(i.input1()));
 	}
-	def newTmpVReg(wasmType: byte) -> VReg {
+	def newTmpVReg(wasmType: WasmType) -> VReg {
 		return stackgen.allocSlot(newVReg(null), wasmType);
 	}
 	// Assembling support
@@ -505,7 +505,11 @@ class WasmCodeGen extends SsaMachGen {
 
 			WasmOp.LOOP.opcode,
 			WasmOp.BLOCK.opcode,
-			WasmOp.IF.opcode => w.putb(toInt(a[0]));
+			WasmOp.IF.opcode => {
+				var val = toInt(a[0]); // XXX: introduce a toBlockType() helper?
+				if (val < 0) w.put_sleb32(val);
+				else w.putb(WasmTypeConCode.REF_NULL.code).put_uleb32(u32.view(val));
+			}
 
 			WasmOp.BR.opcode => w.put_uleb32(u32.!(toInt(a[0])));
 			WasmOp.BR_IF.opcode => w.put_uleb32(u32.!(toInt(a[1])));
@@ -614,11 +618,15 @@ class WasmCodeGen extends SsaMachGen {
 		} else {
 			// call main(0...)
 			for (t in main.sig.paramTypes) {
-				match (WasmType.of(t)) {
-					WasmType.I32 => { b(WasmOp.I32_CONST.opcode); b(0); }
-					WasmType.I64 => { b(WasmOp.I64_CONST.opcode); b(0); }
-					WasmType.F32 => { b(WasmOp.F32_CONST.opcode); w.put_b32(0); }
-					WasmType.F64 => { b(WasmOp.F64_CONST.opcode); w.put_b64(0); }
+				match (t) {
+					x: IntType => {
+						if (x.width > 32) { b(WasmOp.I32_CONST.opcode); b(0); }
+						else { b(WasmOp.I64_CONST.opcode); b(0); }
+					}
+					x: FloatType => {
+						if (x.is64) { b(WasmOp.F64_CONST.opcode); w.put_b64(0); }
+						else { b(WasmOp.F32_CONST.opcode); w.put_b32(0); }
+					}
 					_ => context.fail1("unimplemented main parameter type %q", t.render);
 				}
 			}
@@ -651,7 +659,7 @@ class WasmCodeGen extends SsaMachGen {
 		def tNewHeapCur = 1;
 		// A temporary local is needed to use the new heap cur twice
 		b(/*locals_count=*/1);
-		w.put_sleb32(1); w.putb(WasmType.I32);
+		w.put_sleb32(1); w.putb(WasmTypeConCode.I32.code);
 
 		// ============ allocation stub code =========================
 		genLoadRtAddr_i32(CiRuntimeModule.HEAP_CUR_LOC);
@@ -663,7 +671,7 @@ class WasmCodeGen extends SsaMachGen {
 		// if (newHeapCur > heapEnd)
 		genLoadRtAddr_i32(CiRuntimeModule.HEAP_END_LOC);
 		b(WasmOp.I32_GT_S.opcode);
-		b(WasmOp.IF.opcode); b(WasmType.Void);
+		b(WasmOp.IF.opcode); b(WasmTypeConCode.EmptyBlock.code);
 		if (gcmeth != null) {
 			// return gcmeth(size);
 			b(WasmOp.GET_LOCAL.opcode); b(tSize);
@@ -794,9 +802,18 @@ class WasmInstrBuffer extends ArchInstrBuffer {
 			WasmOp.LOOP.opcode => {
 				putIndent(indent);
 				puts(name);
-				puts(": ");
-				var typ = WasmType.name(byte.!(codegen.toInt(a[0])));
-				yellow().puts(typ).end();
+				var val = codegen.toInt(a[0]);
+				yellow();
+				match (val) {
+					WasmTypeConCode.EmptyBlock.val => ; // do nothing
+					WasmTypeConCode.I32.val => puts(": i32");
+					WasmTypeConCode.I64.val => puts(": i64");
+					WasmTypeConCode.F32.val => puts(": f32");
+					WasmTypeConCode.F64.val => puts(": f64");
+					WasmTypeConCode.FUNCREF.val => puts(": funcref");
+					_ => put1(": refnull %d", val);
+				}
+				end();
 				if (a.length > 1) sp().putOperand(a[1]);
 				return indent+1;
 			}
@@ -886,39 +903,45 @@ def isLong(t: Type) -> bool {
 // A stack instruction generator specifically for WASM.
 // Since it may dynamically assign locals for machine variables, it manages this mapping
 // as well.
-class WasmStackInstrGen {
+class WasmStackInstrGen(wasm: WasmProgram) {
 	var context: SsaContext;
 	var params = 0;
 	var i32_count = 0;
 	var i64_count = 0;
 	var f32_count = 0;
 	var f64_count = 0;
+	def other = Vector<WasmType>.new();
+	
 	def reset(m: IrMethod, params: Array<SsaParam>, getVReg: SsaInstr -> VReg) {
 		i32_count = 0;
 		i64_count = 0;
 		f32_count = 0;
 		f64_count = 0;
+		other.resize(0);
 
 		var slot = if(V3.isComponent(m.receiver), 0, 1);
 		for (p in params) {
 			var v = getVReg(p);
 			v.spill = slot++;
-			v.hint = WasmType.of(p.vtype);
+			v.hint = wasm.wasmType(p.vtype).tag;
 		}
 		this.params = slot - 1;
 	}
 	def mapVar(v: VReg) -> VReg {
 		if (v.hint != 0) return v;
-		return allocSlot(v, WasmType.of(v.ssa.getType()));
+		return allocSlot(v, wasm.wasmType(v.ssa.getType()));
 	}
-	def allocSlot(v: VReg, wasmType: byte) -> VReg {
+	def allocSlot(v: VReg, wasmType: WasmType) -> VReg {
 		var index = 0;
-		match (v.hint = wasmType) {
-			WasmType.I32 => index = ++i32_count;
-			WasmType.I64 => index = ++i64_count;
-			WasmType.F32 => index = ++f32_count;
-			WasmType.F64 => index = ++f64_count;
-			_ => return V3.fail1("invalid WasmType for variable @%d", v.ssa.uid);
+		match (v.hint = wasmType.tag) {
+			WasmType.I32.tag => index = ++i32_count;
+			WasmType.I64.tag => index = ++i64_count;
+			WasmType.F32.tag => index = ++f32_count;
+			WasmType.F64.tag => index = ++f64_count;
+			_ => {
+				other.put(wasmType);
+				index = other.length;
+			}
 		}
 		v.spill = params + index;
 		return v;
@@ -927,13 +950,14 @@ class WasmStackInstrGen {
 		var slot = v.spill - 1;
 		if (v.spill < 0) return -1;
 		if (slot < params) return slot;
-		if (v.hint == WasmType.I32) return slot;
+		if (v.hint == WasmType.I32.tag) return slot;
 		slot += i32_count;
-		if (v.hint == WasmType.I64) return slot;
+		if (v.hint == WasmType.I64.tag) return slot;
 		slot += i64_count;
-		if (v.hint == WasmType.F32) return slot;
+		if (v.hint == WasmType.F32.tag) return slot;
 		slot += f32_count;
-		if (v.hint != WasmType.F64) return V3.fail1("invalid WasmType for variable @%d", v.ssa.uid);
+		if (v.hint == WasmType.F64.tag) return slot;
+		slot += f64_count;
 		return slot;
 	}
 	def emitVarDecls(w: MachDataWriter) {
@@ -942,10 +966,14 @@ class WasmStackInstrGen {
 		if (i64_count > 0) count++;
 		if (f32_count > 0) count++;
 		if (f64_count > 0) count++;
+		if (other.length > 0) count++;
 		w.putb(count);
-		if (i32_count > 0) { w.put_sleb32(i32_count); w.putb(WasmType.I32); }
-		if (i64_count > 0) { w.put_sleb32(i64_count); w.putb(WasmType.I64); }
-		if (f32_count > 0) { w.put_sleb32(f32_count); w.putb(WasmType.F32); }
-		if (f64_count > 0) { w.put_sleb32(f64_count); w.putb(WasmType.F64); }
+		if (i32_count > 0) { w.put_sleb32(i32_count); w.putb(WasmTypeConCode.I32.code); }
+		if (i64_count > 0) { w.put_sleb32(i64_count); w.putb(WasmTypeConCode.I64.code); }
+		if (f32_count > 0) { w.put_sleb32(f32_count); w.putb(WasmTypeConCode.F32.code); }
+		if (f64_count > 0) { w.put_sleb32(f64_count); w.putb(WasmTypeConCode.F64.code); }
+		for (i < other.length) {
+			// TODO: encode other type
+		}
 	}
 }
