@@ -236,14 +236,14 @@ class Verifier(compiler: Compiler, prog: Program) {
 		var fields = Vector<VstStructField>.new();
 		for (l = decl.members; l != null; l = l.tail) {
 			match (l.head) {
-				x: VstStructField => if (x.byteOffset >= 0 && x.size >= 0) fields.put(x);
+				x: VstStructField => if (x.byteOffset >= 0 && x.mtref.byteSize >= 0) fields.put(x);
 			}
 		}
 		var length = fields.length;
 		var a = Arrays.sort(fields.extract(), 0, length, compareFieldOffset);
 		for (i < a.length - 1) {
 			var f = a[i], g = a[i + 1];
-			if ((f.byteOffset + f.size) > g.byteOffset) decl.verifier.FieldDeclError(f, Strings.format2("field %q overlaps field %q", f.render, g.render));
+			if ((f.byteOffset + f.mtref.byteSize) > g.byteOffset) decl.verifier.FieldDeclError(f, Strings.format2("field %q overlaps field %q", f.render, g.render));
 		}
 	}
 	def compareFieldOffset(a: VstStructField, b: VstStructField) -> bool {
@@ -552,37 +552,39 @@ class VstCompoundVerifier {
 	def checkStructField(decl: VstStructField) {
 		if (isImport) ImportError(decl, "imported structs cannot contain field declarations");
 
-		var repeat = tryUnboxPositiveInt(decl.mtref.repeat, 1);
-		if (repeat <= 0) FieldDeclError2(decl.mtref.repeat.range(), "expected integer repeat count > 0");
+		var mtref = decl.mtref;
+		mtref.repeatCount = tryUnboxPositiveInt(decl.mtref.repeat, 1);
+		if (mtref.repeatCount <= 0) FieldDeclError2(decl.mtref.repeat.range(), "expected integer repeat count > 0");
 		var map = verifier.prog.structs;
 		var st = if(map != null, map[decl.mtref.tname.name.image]);
-		var size = 1;
+		var scale = 1;
 		if (st != null) {
-			decl.mtref.mtstruct = RefType.!(st.getDeclaredType());
-			size = Int.unbox(st.size.val);
+			mtref.mtstruct = RefType.!(st.getDeclaredType());
+			scale = Int.unbox(st.size.val);
 		} else {
 			var tref = NamedTypeRef.new(null, decl.mtref.tname.name, null);
 			var t = decl.mtref.mttype = resolveType(tref, compound.typeEnv);
 			if (t != null) match (t) {
-				x: IntType => size = x.packedByteSize();
-				x: FloatType => size = x.byteSize();
-				x: EnumType => size = x.packedByteSize();
+				x: IntType => scale = x.packedByteSize();
+				x: FloatType => scale = x.byteSize();
+				x: EnumType => scale = x.packedByteSize();
 				_ => {
 					match (t.typeCon.kind) {
-						V3Kind.BOOL => size = 1;
+						V3Kind.BOOL => scale = 1;
 						_ => FieldDeclError2(decl.mtref.tname.range(), Strings.format1("expected primitive struct field type, found \"%q\"", t.render));
 					}
 				}
 
 			}
 		}
-		var size64 = repeat * long.view(size);
+		mtref.scale = scale;
+		var size64 = mtref.repeatCount * long.view(scale);
 		if (size64 > int.max) FieldDeclError2(decl.mtref.range(), Strings.format2("struct field size of %d exceeds internal limitation of %d", size64, int.max));
-		decl.size = repeat * size;
+		mtref.byteSize = mtref.repeatCount * scale;
 		var offset = decl.byteOffset = tryUnboxPositiveInt(decl.offset, 0);
 		var structSize = VstStruct.!(compound).byteSize;
 		if (offset > structSize) FieldDeclError2(decl.offset.range(), Strings.format2("struct field \"%s\" offset out-of-bounds for struct size %d", decl.name(), structSize));
-		else if ((offset + long.view(decl.size)) > structSize) FieldDeclError2(decl.offset.range(), Strings.format2("struct field \"%s\" reaches out-of-bounds for struct size %d", decl.name(), structSize));
+		else if ((offset + long.view(mtref.byteSize)) > structSize) FieldDeclError2(decl.offset.range(), Strings.format2("struct field \"%s\" reaches out-of-bounds for struct size %d", decl.name(), structSize));
 		// TODO: check overlapping of fields, build IrField?
 		decl.index = compound.numFields++;
 	}
@@ -1246,6 +1248,8 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		match (binding) {
 			None => return if(outer == null, getErrorType(), outer);
 			PtrAtField(t) => methodEnv.verifier.PtrAtFieldError(expr.range());
+//			RefStructRepeatedField,
+//			RefStructRepeatedNested => methodEnv.verifier.error(expr.range(), "RepeatedFieldExpr", "repeated field used as an expression");
 			Type(t) => methodEnv.verifier.TypeExprError(expr.range(), t);
 			_ => ;
 		}
@@ -1472,12 +1476,21 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		} else if (VarExpr.?(expr.expr)) {
 			var left = VarExpr.!(expr.expr);
 			match (left.varbind) {
-				RefStructField(receiver, member) => {
+				RefStructRepeatedNested(receiver, member) => {
 					var mtref = member.mtref;
-					if (mtref.repeat != null) {
-						// TODO: appbinding to RefStructAtRepeatedField or RefStructGetRepeatedField
-						return mtref.getType();
-					}
+					expr.receiver = left.expr;
+					expr.read = AppBinding.Apply(V3Op.newRefStructAtRepeatedField(
+						receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.mtstruct),
+						Facts.NONE);
+					return mtref.getType();
+				}
+				RefStructRepeatedField(receiver, member) => {
+					var mtref = member.mtref;
+					expr.receiver = left.expr;
+					expr.read = AppBinding.Apply(V3Op.newRefStructGetRepeatedField(
+						receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),
+						Facts.NONE);
+					return mtref.getType();
 				}
 				_ => ;
 			}
@@ -1503,12 +1516,13 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		} else if (VarExpr.?(expr.expr)) {
 			var left = VarExpr.!(expr.expr);
 			match (left.varbind) {
-				RefStructField(receiver, member) => {
+				RefStructRepeatedField(receiver, member) => {
 					var mtref = member.mtref;
-					if (mtref.repeat != null && mtref.mttype != null) {
-						// TODO: appbinding to RefStructSetRepeatedField
-						return mtref.mttype;
-					}
+					expr.receiver = left.expr;
+					expr.write = AppBinding.Apply(V3Op.newRefStructSetRepeatedField(
+						receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),
+						Facts.NONE);
+					return mtref.getType();
 				}
 				_ => ;
 			}
