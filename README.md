@@ -1,4 +1,4 @@
-# virgil: A Fast and Lightweight Programming Language
+# virgil: A Fast and Lightweight Systems Programming Language
 
 ```
 def main() {
