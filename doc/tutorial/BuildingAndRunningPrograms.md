@@ -1,7 +1,7 @@
 # Running #
 
 Running Virgil programs is easy with the included interpreter.
-If you've followed the instructions in (GettingStarted)[GettingStarted.md], you should simply be able to run the command:
+If you've followed the instructions in [GettingStarted](GettingStarted.md), you should simply be able to run the command:
 
 > % `v3i <my virgil files>`
 

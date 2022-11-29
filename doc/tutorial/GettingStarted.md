@@ -48,7 +48,7 @@ For convenience, each platform has an associated v3c command that configures the
   * `v3c-x86-linux` - compile for the x86-linux platform and produce an executable
   * `v3c-x86-64-linux` - compile for the x86-64-linux platform and produce an executable
 
-See (BuildingAndRunningPrograms)[BuildingAndRunningPrograms.md] to see more about how to compile and run Virgil programs.
+See [BuildingAndRunningPrograms](BuildingAndRunningPrograms.md) to see more about how to compile and run Virgil programs.
 
 ## Tutorial ##
 
