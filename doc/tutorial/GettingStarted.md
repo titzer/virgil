@@ -23,8 +23,9 @@ Optionally:
 
 The commands in the `bin/` directory will automatically configure themselves when you first run them. You should find:
 
-  * `virgil` - to run, test, and compile most programs
+  * `v3i` - to run and test programs in the interpreter
   * `v3c` - directly invoke the Virgil compiler
+  * `v3c-host` - compile to the host target (i.e. this computer)
 
 Additional `v3c` commands allow you to compile programs for each supported target platform.
 
@@ -32,17 +33,22 @@ Additional `v3c` commands allow you to compile programs for each supported targe
 
 Virgil includes a compiler that can produce binaries for various target platforms:
 
-  * jar - Java Virtual Machine 1.3 or later
-  * x86-darwin - Mac OS X 10.3 or later / 32-bit x86 processor
-  * x86-linux - Linux 2.2 or later / 32-bit x86 processor
+  * `jar` - Java Virtual Machine 1.3 or later
+  * `x86-darwin` - Mac OS X 10.3 to 10.9 / 32-bit x86 processor
+  * `x86-64-darwin` - Mac OS X 10.9 or later / 64-bit x86 processor
+  * `x86-linux` - Linux 2.2 or later / 32-bit x86 processor
+  * `x86-64-linux` - Linux 2.4 or later / 64-bit x86 processor
+  * `wasm` - WebAssembly / 32-bit
 
 For convenience, each platform has an associated v3c command that configures the compiler to generate a binary for that platform:
 
   * `v3c-jar` - compile for the JVM platform and produce .jar file and an executable wrapper script
   * `v3c-x86-darwin` - compile for the x86-darwin platform and produce an executable
+  * `v3c-x86-64-darwin` - compile for the x86-64-darwin platform and produce an executable
   * `v3c-x86-linux` - compile for the x86-linux platform and produce an executable
+  * `v3c-x86-64-linux` - compile for the x86-64-linux platform and produce an executable
 
-See BuildingAndRunningPrograms to see more about how to compile and run Virgil programs.
+See (BuildingAndRunningPrograms)[BuildingAndRunningPrograms.md] to see more about how to compile and run Virgil programs.
 
 ## Tutorial ##
 

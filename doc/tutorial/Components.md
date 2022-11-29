@@ -57,7 +57,7 @@ component ComponentInit {
 The program will print out `"Initializing."` during compilation:
 
 <pre>
-% virgil compile ComponentInit.v3<br>
+% v3c-jar ComponentInit.v3<br>
 Initializing.</pre>
 
 The executable that is produced will print `"Running."`
@@ -69,7 +69,7 @@ Running.</pre>
 And if we use the built-in interpreter for Virgil, it will first print `"Initializing."` and then `"Running."`
 
 <pre>
-% virgil ComponentInit.v3<br>
+% v3i ComponentInit.v3<br>
 Initializing.<br>
 Running.</pre>
 
