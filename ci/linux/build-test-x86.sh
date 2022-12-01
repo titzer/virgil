@@ -6,6 +6,6 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 source "${DIR}/../../test/common.bash"
 
 ${VIRGIL_LOC}/test/configure
+export PATH=$PATH:"${VIRGIL_LOC}/bin:${VIRGIL_LOC}/bin/dev"
 
-TEST_TARGETS="int x86-linux"
-aeneas test
+TEST_TARGETS="int x86-linux" aeneas test
