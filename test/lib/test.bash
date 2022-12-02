@@ -31,7 +31,7 @@ function do_int() {
     fi
 
     if [ "$PROGRESS_PIPE" = 1 ]; then
-	run_v3c "" -run $TESTS $VIRGIL_LOC/lib/util/*.v3 | tee $P | $PROGRESS i
+	run_v3c "" -run $TESTS $VIRGIL_LOC/lib/util/*.v3 | tee $P | $PROGRESS $PROGRESS_ARGS
     else
 	run_v3c "" -run $TESTS $VIRGIL_LOC/lib/util/*.v3 | tee $P
     fi
@@ -50,7 +50,7 @@ function do_compiled() {
 
     print_status Running $target
     if [ -x $CONFIG/run-$target ]; then
-	$OUT/$target/main $TESTS | tee $R | $PROGRESS i
+	$OUT/$target/main $TESTS | tee $R | $PROGRESS $PROGRESS_ARGS
     else
 	printf "${YELLOW}skipped${NORM}\n"
     fi

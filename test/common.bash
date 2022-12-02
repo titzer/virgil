@@ -205,7 +205,7 @@ function run_or_skip_io_tests() {
 	R=$CONFIG/run-
 	tname=${runner/$R/}
 	print_status Running $tname
-	run_io_tests $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS i
+	run_io_tests $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS $PROGRESS_ARGS
     done
 }
 
@@ -233,7 +233,7 @@ function run_v3c_multiple() {
     while [ $i -le $# ]; do
 
 	local args=${@:$i:$SHARDING}
-	
+
 	if [ -z "$target" ]; then
 	    $AENEAS_TEST $V3C_OPTS -multiple $args
 	else
@@ -251,7 +251,7 @@ function execute_int_tests() {
     print_status Interpreting "$2 $V3C_OPTS"
 
     P=$OUT/$1.run.out
-    run_v3c "" -test -expect=failures.txt $2 $TESTS | tee $OUT/run.out | $PROGRESS i
+    run_v3c "" -test -expect=failures.txt $2 $TESTS | tee $OUT/run.out | $PROGRESS $PROGRESS_ARGS
 }
 
 function compile_target_tests() {
@@ -262,7 +262,7 @@ function compile_target_tests() {
     mkdir -p $OUT/$target
     C=$OUT/$target/compile.out
     print_compiling $target
-    V3C_OPTS="$V3C_OPTS $opts -set-exec=false -target=$target-test -output=$OUT/$target" run_v3c_multiple 5000 ""  $TESTS | tee $C | $PROGRESS i
+    V3C_OPTS="$V3C_OPTS $opts -set-exec=false -target=$target-test -output=$OUT/$target" run_v3c_multiple 5000 ""  $TESTS | tee $C | $PROGRESS $PROGRESS_ARGS
 }
 
 function check_cached_target_tests() {
@@ -299,7 +299,7 @@ function execute_target_tests() {
 	if [ "$target" = "wasm-js" ]; then
 	   ext=".wasm"
 	fi
-	check_cached_target_tests $ext | tee $OUT/$target/cached.out | $PROGRESS i
+	check_cached_target_tests $ext | tee $OUT/$target/cached.out | $PROGRESS $PROGRESS_ARGS
 	TORUN=$(cat $OUT/$target/leftover)
     else
 	TORUN="$TESTS"
@@ -309,7 +309,7 @@ function execute_target_tests() {
 	print_status "  running" ""
 
 	if [ -x $CONFIG/test-$target ]; then
-	    $CONFIG/test-$target $OUT/$target $TORUN | tee $OUT/$target/run.out | $PROGRESS i
+	    $CONFIG/test-$target $OUT/$target $TORUN | tee $OUT/$target/run.out | $PROGRESS $PROGRESS_ARGS
 	else
 	    count=$(echo $(echo $TORUN | wc -w))
 	    printf "$count ${YELLOW}skipped${NORM}\n"

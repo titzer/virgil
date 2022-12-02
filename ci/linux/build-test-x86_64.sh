@@ -8,4 +8,4 @@ source "${DIR}/../../test/common.bash"
 ${VIRGIL_LOC}/test/configure
 export PATH=$PATH:"${VIRGIL_LOC}/bin:${VIRGIL_LOC}/bin/dev"
 
-TEST_TARGETS="int x86-64-linux" aeneas test
+PROGRESS_ARGS=l TEST_TARGETS="int x86-64-linux" aeneas test

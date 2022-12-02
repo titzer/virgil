@@ -9,5 +9,5 @@ else
 fi
 
 print_status "Feature detection" ""
-run_v3c "" -test -expect=failures.txt *.v3 | tee $OUT/out | $PROGRESS i
+run_v3c "" -test -expect=failures.txt *.v3 | tee $OUT/out | $PROGRESS $PROGRESS_ARGS
 exit $?

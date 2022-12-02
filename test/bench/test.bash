@@ -49,12 +49,12 @@ for target in $TEST_TARGETS; do
     mkdir -p $T
 
     print_compiling $target
-    compile_benchmarks $BENCHMARKS | tee $T/compile.out | $PROGRESS i
+    compile_benchmarks $BENCHMARKS | tee $T/compile.out | $PROGRESS $PROGRESS_ARGS
 
     print_status Running $target
     if [ ! -x $CONFIG/run-$target ]; then
 	echo "${YELLOW}skipped${NORM}"
     else
-	run_benchmarks $BENCHMARKS | tee $T/run.out | $PROGRESS i
+	run_benchmarks $BENCHMARKS | tee $T/run.out | $PROGRESS $PROGRESS_ARGS
     fi
 done
