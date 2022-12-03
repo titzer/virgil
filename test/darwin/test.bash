@@ -13,7 +13,7 @@ fi
 function do_test() {
     print_compiling "$target"
     mkdir -p $OUT/$target
-    run_v3c "" -multiple -set-exec=false -target=$target-test -output=$OUT/$target $TESTS | tee $OUT/compile.out | $PROGRESS $PROGRESS_ARGS
+    run_v3c "" -multiple -set-exec=false -target=$target-test -output=$OUT/$target $TESTS | tee $OUT/compile.out | $PROGRESS
 
     execute_target_tests $target
 }

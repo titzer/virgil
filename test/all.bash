@@ -69,10 +69,6 @@ else
     BOOTSTRAP=$AENEAS_TEST
 fi
 
-# progress parameters -- by default the inline (`i`) mode is used, while the CI
-# uses line (`l`) mode
-PROGRESS_ARGS=${PROGRESS_ARGS:=i}
-
 #######################################################################
 # Init test framework
 #######################################################################
@@ -116,7 +112,7 @@ for dir in unit lib; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($V3C_STABLE) $dir${NORM}"
-    (cd $td && AENEAS_TEST=$V3C_STABLE PROGRESS_ARGS=$PROGRESS_ARGS $td/test.bash)
+    (cd $td && AENEAS_TEST=$V3C_STABLE $td/test.bash)
 done
 
 #######################################################################
@@ -137,7 +133,7 @@ for dir in $TEST_DIRS; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($AENEAS_TEST) $dir${NORM}"
-    (cd $td && PROGRESS_ARGS=$PROGRESS_ARGS $td/test.bash)
+    (cd $td && $td/test.bash)
 done
 
 if [ "$SKIP_BOOTSTRAP" = 1 ]; then
@@ -166,5 +162,5 @@ for dir in $TEST_DIRS; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($CURRENT) $dir${NORM}"
-    (cd $td && AENEAS_TEST=$CURRENT PROGRESS_ARGS=$PROGRESS_ARGS $td/test.bash)
+    (cd $td && AENEAS_TEST=$CURRENT $td/test.bash)
 done

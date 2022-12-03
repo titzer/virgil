@@ -42,5 +42,5 @@ for target in $TEST_TARGETS; do
     T=$OUT/$target
     mkdir -p $T
     print_status Compiling $target
-    compile_apps $APPS | tee $T/compile.out | $PROGRESS $PROGRESS_ARGS
+    compile_apps $APPS | tee $T/compile.out | $PROGRESS
 done

@@ -31,7 +31,7 @@ function do_test() {
     rm -f $ALL
 
     print_compiling "$target" ""
-    compile_gc_tests $target $TESTS | tee $T/compile.all.out | $PROGRESS $PROGRESS_ARGS
+    compile_gc_tests $target $TESTS | tee $T/compile.all.out | $PROGRESS
 
     execute_target_tests $target
 
@@ -48,7 +48,7 @@ function do_test() {
 
     print_status Testing "$target $HEAP" Aeneas
     if [ -x $CONFIG/run-$target ]; then
-	$T/$target/Aeneas -test -rma $VIRGIL_LOC/test/core/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS $PROGRESS_ARGS
+	$T/$target/Aeneas -test -rma $VIRGIL_LOC/test/core/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS
     else
 	echo "${YELLOW}skipped${NORM}"
     fi

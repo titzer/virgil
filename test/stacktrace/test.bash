@@ -20,7 +20,7 @@ for target in $TEST_TARGETS; do
 
     if [[ ! "$target" =~ ^int ]]; then
         print_status Compiling $target
-        V3C_OPTS="$V3C_OPTS -output=$T" run_v3c_multiple 100 $target $TESTS | tee $T/compile.out | $PROGRESS $PROGRESS_ARGS
+        V3C_OPTS="$V3C_OPTS -output=$T" run_v3c_multiple 100 $target $TESTS | tee $T/compile.out | $PROGRESS
     fi
 
     run_or_skip_io_tests $target $TESTS
