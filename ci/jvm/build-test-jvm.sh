@@ -7,6 +7,5 @@ VIRGIL_LOC="${DIR}/../.."
 TEST_DIR="${VIRGIL_LOC}/test"
 
 "${TEST_DIR}"/configure
-export PATH=$PATH:"${VIRGIL_LOC}/bin:${VIRGIL_LOC}/bin/dev"
 
 PROGRESS_ARGS=l TEST_TARGETS="jvm" "${TEST_DIR}"/all.bash
