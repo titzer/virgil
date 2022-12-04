@@ -19,7 +19,7 @@ function do_test() {
 
     print_compiling "$target" ""
     RT=$(ls $OS_SOURCES $NATIVE_SOURCES $GC_SOURCES)
-    run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k -multiple -rt.files="$RT" $TESTS | tee $T/compile.out | $PROGRESS i
+    run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k -multiple -rt.files="$RT" $TESTS | tee $T/compile.out | $PROGRESS
 
     execute_target_tests $target
 
@@ -36,7 +36,7 @@ function do_test() {
 
     print_status Testing "$target $HEAP" Aeneas
     if [ -x $CONFIG/run-$target ]; then
-	$T/$target/Aeneas -test -rma $VIRGIL_LOC/test/execute/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS i
+	$T/$target/Aeneas -test -rma $VIRGIL_LOC/test/execute/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS
     else
 	echo "${YELLOW}skipped${NORM}"
     fi
