@@ -8,4 +8,4 @@ TEST_DIR="${VIRGIL_LOC}/test"
 
 "${TEST_DIR}"/configure
 
-PROGRESS_ARGS=l TEST_TARGETS="wasm" "${TEST_DIR}"/all.bash
+PROGRESS_ARGS=l TEST_TARGETS="wasm-js" "${TEST_DIR}"/all.bash
