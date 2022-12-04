@@ -8,4 +8,4 @@ TEST_DIR="${VIRGIL_LOC}/test"
 
 "${TEST_DIR}"/configure
 
-PROGRESS_ARGS=l TEST_TARGETS="int x86-64-macos" "${TEST_DIR}"/all.bash
+PROGRESS_ARGS=l TEST_TARGETS="int x86-64-darwin" "${TEST_DIR}"/all.bash
