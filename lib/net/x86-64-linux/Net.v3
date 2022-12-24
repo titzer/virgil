@@ -28,21 +28,63 @@ type InetAddress {
 
 class IntPointer(x: int) { }
 
+def socketToSockAddr(socket: SocketBase, server: bool) -> Array<byte> {
+	match (socket.addr) {
+		Inet4(addrV4) => {
+			// Definition of sockaddr for IPv4:
+			// struct sockaddr_in {
+			//   short int          sin_family;  // Address family, AF_INET
+			//   unsigned short int sin_port;    // Port number
+			//   struct in_addr     sin_addr;    // Internet address
+			//   unsigned char      sin_zero[8]; // Same size as struct sockaddr
+			// };
+			def sockAddrBldr = DataWriter.new();
+			def port = if(server, socket.localPort, socket.port);
+			sockAddrBldr.acquire(LinuxConst.SOCKADDR_V4_SIZE);
+			def addrInt = (int.view(addrV4[0]) << 24) | (int.view(addrV4[1]) << 16)
+						| (int.view(addrV4[2]) << 8) | addrV4[3];
+			// sin_family
+			sockAddrBldr.put_b16(LinuxConst.AF_INET);
+			// sin_port
+			sockAddrBldr.put_b16be(int.view(port));
+			// sin_addr
+			sockAddrBldr.put_b32be(addrInt);
+			// sin_zero
+			sockAddrBldr.zeroN(8);
+			return sockAddrBldr.extract();
+		}
+		Inet6(addrV6) => {
+			System.error("Unimplemented", "IPv6 connections are currently unsupported!");
+			return null;
+		}
+	}
+}
+
 class SocketBase {
 	// IP address of socket
 	def addr: InetAddress;
 	// Associated file descriptor of socket
 	def var fd: int;
+	// Local port the socket is connected to
+	def var localPort: int;
 	// Server port the socket is connected to
-	def port: int;
+	def var port: int;
 
-	new(addr, port) {
-		var family: int;
-		match (addr) {
-			Inet4(addrV4) => family = LinuxConst.AF_INET;
-			Inet6(addrV6) => family = LinuxConst.AF_INET6;
+	new(addr, localPort, port, sockfd: int, createSocket: bool) {
+		if (createSocket) {
+			var family: int;
+			match (addr) {
+				Inet4(addrV4) => family = LinuxConst.AF_INET;
+				Inet6(addrV6) => family = LinuxConst.AF_INET6;
+			}
+			fd = Net.socket(family, LinuxConst.SOCK_STREAM /* type */, 0 /* protocol */);
+		} else {
+			fd = sockfd;
 		}
-		fd = Net.socket(family, LinuxConst.SOCK_STREAM /* type */, 0 /* protocol */);
+	}
+
+	def setLocalPort(local: int) {
+		localPort = local;
 	}
 
 	def read(buf: Array<byte>) -> int {
@@ -59,38 +101,15 @@ class SocketBase {
 }
 
 class ClientSocket extends SocketBase {
-	// Local port the socket is connected to
-	private var localPort: int;
-	// Associated sockaddr_in structure. Is instantiated in connect()
+	// Associated sockaddr structure. Is instantiated in connect()
 	private var sockAddr: Array<byte>;
 
-	new(addr: InetAddress, port: int) super(addr, port) { }
+	new(addr: InetAddress, port: int) super(addr, -1 /* localPort */, port, -1 /* fd */, true) { }
 
 	def connect() -> int {
+		sockAddr = socketToSockAddr(this, false);
 		match (addr) {
 			Inet4(addrV4) => {
-				// Definition of sockaddr for IPv4:
-				// struct sockaddr_in {
-				//   short int          sin_family;  // Address family, AF_INET
-				//   unsigned short int sin_port;    // Port number
-				//   struct in_addr     sin_addr;    // Internet address
-				//   unsigned char      sin_zero[8]; // Same size as struct sockaddr
-				// };
-				def sockAddrBldr = DataWriter.new();
-				sockAddrBldr.acquire(LinuxConst.SOCKADDR_V4_SIZE);
-				def addrInt = (int.view(addrV4[0]) << 24) | (int.view(addrV4[1]) << 16)
-							| (int.view(addrV4[2]) << 8) | addrV4[3];
-				// sin_family
-				sockAddrBldr.put_b16(LinuxConst.AF_INET);
-				// sin_port
-				sockAddrBldr.put_b16be(int.view(port));
-				// sin_addr
-				sockAddrBldr.put_b32be(addrInt);
-				// sin_zero
-				sockAddrBldr.zeroN(8);
-
-				sockAddr = sockAddrBldr.extract();
-
 				// Connect socket
 				def ret = Net.connect(fd, sockAddr);
 				def retSockAddr = Array<byte>.new(LinuxConst.SOCKADDR_V4_SIZE);
@@ -98,7 +117,8 @@ class ClientSocket extends SocketBase {
 				if (ret == -1 || sockNameRet == -1) {
 					return -1;
 				}
-				localPort = (int.view(retSockAddr[2]) << 8) | int.view(retSockAddr[3]);
+				// XXX: Why can't we set `def var` fields from a subclass?
+				setLocalPort((int.view(retSockAddr[2]) << 8) | int.view(retSockAddr[3]));
 				return ret;
 			}
 			Inet6(addrV6) => System.error("Unimplemented", "IPv6 connections are currently unsupported!");
@@ -108,13 +128,55 @@ class ClientSocket extends SocketBase {
 	}
 }
 
-// class ServerSocket extends SocketBase {
-//	// Local port the socket is connected to
-//	private localPort: int;
-//
-// 	new(addr: InetAddr, port: int) super(addr, port) { }
-//
-// }
+class ServerSocket extends SocketBase {
+	// Associated sockaddr structure. Is instantiated in bind()
+	private var sockAddr: Array<byte>;
+
+	new(addr: InetAddress, localPort: int) super(addr, localPort, -1 /* port */, -1 /* fd */, true) { }
+
+	def bind() -> int {
+		sockAddr = socketToSockAddr(this, true);
+		match (addr) {
+			Inet4(addrV4) => {
+				// Bind socket to localPort
+				return Net.bind(fd, sockAddr);
+			}
+			Inet6(addrV6) => System.error("Unimplemented", "IPv6 connections are currently unsupported!");
+		}
+
+		return -1;
+	}
+
+	def listen() -> int {
+		return Net.listen(fd, 10 /* backlog */);
+	}
+
+	def accept() -> SocketBase {
+		var retSockAddr = Array<byte>.new(LinuxConst.SOCKADDR_STORAGE_SIZE);
+		var retSock = Net.accept(fd, retSockAddr);
+		def retSockAddrSize = retSock.1.x;
+		match (retSockAddrSize) {
+			16 => {
+				// XXX: This is all IPv4 specific
+				retSockAddr = Arrays.range(retSockAddr, 0, retSockAddrSize - 1);
+				def retAddr = InetAddress.Inet4(Arrays.range(retSockAddr, 4, 7));
+				def retPort = (int.view(retSockAddr[2]) << 8) | int.view(retSockAddr[3]);
+				return SocketBase.new(retAddr, localPort, retPort, retSock.0, false);
+			}
+			28 => {
+				System.error("Unimplemented", "IPv6 connections are currently unsupported!");
+			}
+			110 => {
+				System.error("Unimplemented", "UNIX connections are currently unsupported!");
+			}
+			_ => {
+				System.error("Error", "Unexpected size for returned sockaddr!");
+			}
+		}
+
+		return null;
+	}
+}
 
 component Net {
 	def ANY_V4 = InetAddress.Inet4([0, 0, 0, 0]);
@@ -132,8 +194,17 @@ component Net {
 		def ret = Linux.syscall(LinuxConst.SYS_connect, (sockfd, Pointer.atContents(sockAddr), sockAddr.length));
 		return if(ret.0 >= 0, int.view(ret.0), -1);
 	}
+	def accept(sockfd: int, sockAddr: Array<byte>) -> (int, IntPointer) {
+		var ptr = IntPointer.new(sockAddr.length);
+		def ret = Linux.syscall(LinuxConst.SYS_accept, (sockfd, Pointer.atContents(sockAddr), Pointer.atField(ptr.x)));
+		return (if(ret.0 >= 0, int.view(ret.0), -1), ptr);
+	}
 	def bind(sockfd: int, sockAddr: Array<byte>) -> int {
 		def ret = Linux.syscall(LinuxConst.SYS_bind, (sockfd, Pointer.atContents(sockAddr), sockAddr.length));
+		return if(ret.0 >= 0, int.view(ret.0), -1);
+	}
+	def listen(sockfd: int, backlog: int) -> int {
+		def ret = Linux.syscall(LinuxConst.SYS_listen, (sockfd, backlog));
 		return if(ret.0 >= 0, int.view(ret.0), -1);
 	}
 	def getsockname(sockfd: int, sockAddr: Array<byte>) -> int {
