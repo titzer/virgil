@@ -4,6 +4,69 @@
 // Implementation of the "Net" component for Linux, using underlying Linux
 // syscalls and methods.
 
+// Descriptive errors that can occur for networking IO.
+enum NetError(desc: string) {
+	NotFound("Entity not found"),
+	PermissionDenied("Permission denied"),
+	ConnectionRefused("Connection refused"),
+	ConnectionReset("Connection reset"),
+	HostUnreachable("Host unreachable"),
+	NetworkUnreachable("Network unreachable"),
+	ConnectionAborted("Connection aborted"),
+	NotConnected("Not connected"),
+	NotListening("Not listening"),
+	AddrInUse("Address in use"),
+	AddrNotAvailable("Address not available"),
+	NetworkDown("Network down"),
+	BrokenPipe("Broken pipe"),
+	AlreadyExists("Entity already exists"),
+	WouldBlock("Operation would block"),
+	InvalidInput("Invalid input parameter"),
+	InvalidProtocol("Using incorrect protocol"),
+	InvalidSockAddr("Invalid sockaddr size"),
+	InvalidRange("Invalid range provided"),
+	TimedOut("Timed out"),
+	ResourceBusy("Resource busy"),
+	Interrupted("Operation interrupted"),
+	Unsupported("Unsupported"),
+	OutOfMemory("Out of memory"),
+	Other("Other error"),
+	Uncategorized("Uncategorized error")
+}
+
+// Convert errno {e} to corresponding NetError.
+def errnoToNetError(e: long) -> NetError {
+	match (e) {
+		LinuxConst.EADDRINUSE => return NetError.AddrInUse;
+		LinuxConst.EEXIST => return NetError.AlreadyExists;
+		LinuxConst.EADDRNOTAVAIL => return NetError.AddrNotAvailable;
+		LinuxConst.EBUSY => return NetError.ResourceBusy;
+		LinuxConst.ECONNABORTED => return NetError.ConnectionAborted;
+		LinuxConst.ECONNREFUSED => return NetError.ConnectionRefused;
+		LinuxConst.ECONNRESET => return NetError.ConnectionReset;
+		LinuxConst.EHOSTUNREACH => return NetError.HostUnreachable;
+		LinuxConst.EINTR => return NetError.Interrupted;
+		LinuxConst.EINVAL => return NetError.InvalidInput;
+		LinuxConst.ENOENT => return NetError.NotFound;
+		LinuxConst.ENOMEM => return NetError.OutOfMemory;
+		LinuxConst.ENOSYS => return NetError.Unsupported;
+		LinuxConst.ENETDOWN => return NetError.NetworkDown;
+		LinuxConst.ENETUNREACH => return NetError.NetworkUnreachable;
+		LinuxConst.ENOTCONN => return NetError.NotConnected;
+		LinuxConst.EPIPE => return NetError.BrokenPipe;
+		LinuxConst.ETIMEDOUT => return NetError.TimedOut;
+		LinuxConst.EAGAIN => return NetError.WouldBlock;
+		LinuxConst.EACCES, LinuxConst.EPERM => return NetError.PermissionDenied;
+		_ => return NetError.Uncategorized;
+	}
+}
+
+// Result type used for error management
+type NetResult<T> {
+	case Result(v: T);
+	case Error(e: NetError);
+}
+
 // Represents an internet address. It can be one of Ipv4 for IPv4 addresses or
 // Ipv6 for IPv6 addresses.
 type InetAddress {
@@ -82,7 +145,7 @@ type InetAddress {
 }
 
 // Pointer to an int used for interfacing with the kernel
-class IntPointer(x: int) { }
+private class IntPointer(x: int) { }
 
 // Convert a Socket {socket} to its C-struct representation. The return value
 // for IPv4 should match the struct sockaddr_in type, while the return value
@@ -90,8 +153,9 @@ class IntPointer(x: int) { }
 // IP address need to written in network-byte order, i.e. in big-endian.
 //
 // Returns the C-struct representation of {socket}.
-def socketToSockAddr(socket: Socket, server: bool) -> Array<byte> {
-	match (socket.addr) {
+def toSockAddr(addr: InetAddress, port: int) -> Array<byte> {
+	def sockAddrBldr = DataWriter.new();
+	match (addr) {
 		Ipv4(o0, o1, o2, o3) => {
 			// Definition of sockaddr for IPv4:
 			// struct sockaddr_in {
@@ -100,8 +164,6 @@ def socketToSockAddr(socket: Socket, server: bool) -> Array<byte> {
 			//   struct in_addr     sin_addr;    // Internet address
 			//   unsigned char      sin_zero[8]; // Same size as struct sockaddr
 			// };
-			def sockAddrBldr = DataWriter.new();
-			def port = if(server, socket.localPort, socket.port);
 			sockAddrBldr.acquire(LinuxConst.SOCKADDR_V4_SIZE);
 			// sin_family
 			sockAddrBldr.put_b16(LinuxConst.AF_INET);
@@ -129,8 +191,6 @@ def socketToSockAddr(socket: Socket, server: bool) -> Array<byte> {
 			// struct in6_addr {
 			//     unsigned char   s6_addr[16];   // IPv6 address
 			// };
-			def sockAddrBldr = DataWriter.new();
-			def port = if(server, socket.localPort, socket.port);
 			sockAddrBldr.acquire(LinuxConst.SOCKADDR_V6_SIZE);
 			// sin6_family
 			sockAddrBldr.put_b16(LinuxConst.AF_INET6);
@@ -150,123 +210,402 @@ def socketToSockAddr(socket: Socket, server: bool) -> Array<byte> {
 	}
 }
 
+// A socket can either use TCP or UDP
+enum SocketType {
+	Tcp,
+	Udp
+}
+
+// A packet representing a UDP peer's IP address and open port. Note that the
+// fields are mutable in order to for users to be able to directly set them and
+// avoid creating unncessary garbage.
+class UdpPacket {
+	// IP address of UDP peer
+	var addr: InetAddress;
+	// Port of UDP peer
+	var port: int;
+
+	new(addr, port) { }
+}
+
 // An abstraction over a network socket that allows for sending and receiving
 // messages.
 class Socket {
-	// IP address of socket
-	def addr: InetAddress;
 	// Associated file descriptor of socket
 	def var fd: int;
-	// Local port the socket is connected to
-	def var localPort: int;
+	// Is the socket an IPv6 socket?
+	def var isV6: bool;
+	// IP address of socket
+	def addr: InetAddress;
 	// Server port the socket is connected to
 	def var port: int;
+	// Local port the socket is connected to
+	def var localPort: int;
+	// Socket type
+	def socketType: SocketType;
+	// Has the socket been opened?
+	def var isOpen = false;
+	// Has the socket been bound?
+	def var isBound = false;
+	// Is the socket listening for connections?
+	def var isListening = false;
+	// Is the sockect connected?
+	def var isConnected = false;
 
-	new(addr, localPort, port, sockfd: int, createSocket: bool) {
-		if (createSocket) {
-			def family = if(InetAddress.Ipv4.?(addr), LinuxConst.AF_INET, LinuxConst.AF_INET6);
-			fd = Net.socket(family, LinuxConst.SOCK_STREAM /* type */, 0 /* protocol */);
-		} else {
-			fd = sockfd;
-		}
+	new(addr, port, localPort, socketType, sockfd: int) {
+		isV6 = InetAddress.Ipv6.?(addr);
+		fd = sockfd;
 	}
+
+	def setOpen(open: bool) {
+		isOpen = open;
+	}
+
+	def setBound(bound: bool) {
+		isBound = bound;
+	}
+
+	def setListening(listening: bool) {
+		isListening = listening;
+	}
+
+	def setConnected(connected: bool) {
+		isConnected = connected;
+	}
+
+	def getLocalAddress() -> InetAddress;
+
+	def getSockAddr() -> Array<byte>;
 
 	def setLocalPort(local: int) {
 		localPort = local;
 	}
 
-	// Read a message into buffer {buf} from the socket. Return how many bytes
-	// were read into the buffer.
-	def read(buf: Array<byte>) -> int {
-		return System.fileReadK(fd, buf, 0, buf.length);
+	def isUdp() -> bool {
+		return socketType == SocketType.Udp;
 	}
 
-	// Write a message {msg} into the socket.
-	def write(msg: string) {
-		System.fileWriteK(fd, msg, 0, msg.length);
+	// Callback that can be overridden by child classes in order to perform more
+	// actions after the `Net.socket()` call.
+	def onSocketOpen() -> NetResult<void> {
+		return NetResult.Result(());
 	}
 
-	// Close the socket.
-	def close() {
-		System.fileClose(fd);
-	}
-}
-
-// A socket that connects to a remote host.
-class ClientSocket extends Socket {
-	// Associated sockaddr structure. Is instantiated in connect()
-	private var sockAddr: Array<byte>;
-
-	new(addr: InetAddress, port: int) super(addr, -1 /* localPort */, port, -1 /* fd */, true) { }
-
-	// Connect socket to a remote host with IP address {addr} on {port}. Returns
-	// -1 if an error has occurred and 0 if everything is correctly functioning.
-	def connect() -> int {
-		sockAddr = socketToSockAddr(this, false);
-		// Connect socket
-		def ret = Net.connect(fd, sockAddr);
-		def size = if(InetAddress.Ipv4.?(addr), LinuxConst.SOCKADDR_V4_SIZE, LinuxConst.SOCKADDR_V6_SIZE);
-		var retSockAddr = Array<byte>.new(size);
-		def sockNameRet = Net.getsockname(fd, retSockAddr);
-		if (ret == -1 || sockNameRet == -1) {
-			return -1;
+	// Opens the socket by calling into the kernel to create a socket.
+	def open() -> NetResult<void> {
+		def family = if(!isV6, LinuxConst.AF_INET, LinuxConst.AF_INET6);
+		def sType = if(!isUdp(), LinuxConst.SOCK_STREAM, LinuxConst.SOCK_DGRAM);
+		match (Net.socket(family, sType, 0 /* protocol */)) {
+			x: NetResult<int>.Result => {
+				// XXX: Have to use unqualified case (i.e. x: {case}) as
+				// case-expression has type parameter
+				fd = x.v;
+				isOpen = true;
+				return onSocketOpen();
+			}
+			x: NetResult<int>.Error => {
+				// XXX: Have to convert from NetResult<int> to NetResult<void> even
+				// though NetResult.Error is the same type
+				return NetResult.Error(x.e);
+			}
 		}
-		// XXX: Why can't we set `def var` fields from a subclass?
-		setLocalPort((int.view(retSockAddr[2]) << 8) | int.view(retSockAddr[3]));
-		return ret;
-	}
-}
-
-// A socket that accepts connections from incoming peers.
-class ServerSocket extends Socket {
-	// Associated sockaddr structure. Is instantiated in bind()
-	private var sockAddr: Array<byte>;
-
-	new(addr: InetAddress, localPort: int) super(addr, localPort, -1 /* port */, -1 /* fd */, true) { }
-
-	// Bind socket to IP address {addr} on {localPort}. Returns -1 if an error
-	// has occurred and 0 if everything is correctly functioning.
-	def bind() -> int {
-		sockAddr = socketToSockAddr(this, true);
-		// Bind socket to localPort
-		return Net.bind(fd, sockAddr);
 	}
 
-	// Start listening on {addr}:{localPort} for incoming connections. Returns -1
-	// if an error has occurred and 0 if everything is correctly functioning.
-	def listen() -> int {
-		return Net.listen(fd, 10 /* backlog */);
+	// Receive a message into buffer {buf} from the socket. Return how many bytes
+	// were read into the buffer. The receive will fail on a standard
+	// connectionless UDP socket or if the socket was not opened.
+	def recv(buf: Array<byte>) -> NetResult<int> {
+		if (isOpen && (!isUdp() || isConnected)) {
+			return NetResult.Result(System.fileReadK(fd, buf, 0, buf.length));
+		} else if (!isOpen) {
+			return NetResult.Error(NetError.NotConnected);
+		} else {
+			// socketType == SocketType.Udp
+			return NetResult.Error(NetError.InvalidProtocol);
+		}
 	}
 
-	// Accept an incoming connection on {addr}:{localPort}. Returns null if an
-	// error has occurred and a {Socket} for the new incoming connection if
-	// everything is correctly functioning.
-	def accept() -> Socket {
+	// Receive a message into buffer {buf} from a remote host. Users can provide
+	// an instance of {packet} which will be overridden with information about
+	// the remote host. If no {packet} is provided, a new one is allocated and
+	// returned. Returns the number of bytes read into {buf} and information
+	// about the remote host for future communication. The receive will fail for
+	// a TCP socket or if the socket was not opened.
+	def recvfrom(buf: Array<byte>, packet: UdpPacket) -> NetResult<(int, UdpPacket)> {
+		if (!isOpen) {
+			return NetResult.Error(NetError.NotConnected);
+		}
+
+		if (!isUdp()) {
+			return NetResult.Error(NetError.InvalidProtocol);
+		}
+
+		if (packet == null) {
+			packet = UdpPacket.new(Net.ANY_V4, -1);
+		}
+
 		var retSockAddr = Array<byte>.new(LinuxConst.SOCKADDR_STORAGE_SIZE);
-		var retSock = Net.accept(fd, retSockAddr);
-		def retSockAddrSize = retSock.1.x;
+		var retSock: (int, int);
+
+		match (Net.recvfrom(fd, buf, retSockAddr)) {
+			x: NetResult<(int, int)>.Result => retSock = x.v;
+			x: NetResult<(int, int)>.Error => return NetResult.Error(x.e);
+		}
+
+		def retSockAddrSize = retSock.1;
 
 		retSockAddr = Arrays.range(retSockAddr, 0, retSockAddrSize);
 		def retPort = (int.view(retSockAddr[2]) << 8) | int.view(retSockAddr[3]);
 
 		match (retSockAddrSize) {
 			LinuxConst.SOCKADDR_V4_SIZE => {
-				def retAddr = Net.rangeToInetAddress(retSockAddr[4 ... 8]);
-				return Socket.new(retAddr, localPort, retPort, retSock.0, false);
+				var retAddr: InetAddress;
+				match (Net.rangeToInetAddress(retSockAddr[4 ... 8])) {
+					x: NetResult<InetAddress>.Result => retAddr = x.v;
+					x: NetResult<InetAddress>.Error => return NetResult.Error(x.e);
+				}
+
+				packet.addr = retAddr;
+				packet.port = retPort;
+				return NetResult.Result((retSock.0, packet));
 			}
 			LinuxConst.SOCKADDR_V6_SIZE => {
-				def retAddr = Net.rangeToInetAddress(retSockAddr[8 ... 24]);
-				return Socket.new(retAddr, localPort, retPort, retSock.0, false);
-			}
-			LinuxConst.SOCKADDR_UNIX_SIZE => {
-				System.error("Unimplemented", "UNIX connections are currently unsupported!");
+				var retAddr: InetAddress;
+				match (Net.rangeToInetAddress(retSockAddr[8 ... 24])) {
+					x: NetResult<InetAddress>.Result => retAddr = x.v;
+					x: NetResult<InetAddress>.Error => return NetResult.Error(x.e);
+				}
+
+				packet.addr = retAddr;
+				packet.port = retPort;
+				return NetResult.Result((retSock.0, packet));
 			}
 			_ => {
-				System.error("Error", "Unexpected size for returned sockaddr!");
+				return NetResult.Error(NetError.InvalidSockAddr);
 			}
 		}
+	}
 
-		return null;
+	// Send a message {msg} into the socket. The send will fail on a standard UDP
+	// connectionless socket or if the socket was not opened.
+	def send(msg: Array<byte>) -> NetResult<void> {
+		if (isOpen && (!isUdp() || isConnected)) {
+			System.fileWriteK(fd, msg, 0, msg.length);
+		} else if (isOpen && isUdp() && ClientSocket.?(this)) {
+			// Directly send to saved sockaddr. Being a bit stingy as we don't want
+			// to create more objects than required
+			return sendtoAddr(msg);
+		} else if (!isOpen) {
+			return NetResult.Error(NetError.NotConnected);
+		} else {
+			// socketType == SocketType.Udp
+			return NetResult.Error(NetError.InvalidProtocol);
+		}
+
+		return NetResult.Result(());
+	}
+
+	// Send a message {msg} to the host specified in {packet}. The send will fail
+	// for a TCP socket or if the socket was not opened.
+	def sendto(msg: Array<byte>, packet: UdpPacket) -> NetResult<void> {
+		if (isOpen && isUdp()) {
+			return Net.sendto(fd, msg, toSockAddr(packet.addr, packet.port));
+		} else if (!isOpen) {
+			return NetResult.Error(NetError.NotConnected);
+		} else {
+			return NetResult.Error(NetError.InvalidProtocol);
+		}
+	}
+
+	private def sendtoAddr(msg: Array<byte>) -> NetResult<void> {
+		return Net.sendto(fd, msg, getSockAddr());
+	}
+
+	// Close the socket.
+	def close() {
+		System.fileClose(fd);
+		isOpen = false;
+		isBound = false;
+		isConnected = false;
+		isListening = false;
+	}
+}
+
+// A connectionless UDP socket. A "Client" socket should provide a {port} of 0.
+class UdpSocket extends Socket {
+	// Associated sockaddr structure. Is instantiated in constructor
+	private var sockAddr: Array<byte>;
+
+	new(port: int, isV6: bool) super(if(isV6, Net.ANY_V6, Net.ANY_V4), port, -1 /* localPort */, SocketType.Udp, -1 /* fd */) {
+		sockAddr = toSockAddr(addr, port);
+	}
+
+	def getLocalAddr() -> InetAddress {
+		return addr;
+	}
+
+	def getSockAddr() -> Array<byte> {
+		return sockAddr;
+	}
+
+	// Bind the socket to an IP address after creation.
+	def onSocketOpen() -> NetResult<void> {
+		return bind();
+	}
+
+	// Bind socket to IP address {addr} on {localPort}.
+	private def bind() -> NetResult<void> {
+		// Bind socket to localPort
+		match (Net.bind(fd, sockAddr)) {
+			x: NetResult<void>.Error => return NetResult.Error(x.e);
+			_ => setBound(true);
+		}
+
+		return NetResult.Result(());
+	}
+}
+
+// A socket that connects to a remote host. It can either be a TCP socket or a
+// connected UDP socket.
+class ClientSocket extends Socket {
+	// Associated sockaddr structure. Is instantiated in constructor
+	private var sockAddr: Array<byte>;
+
+	new(addr: InetAddress, port: int, sType: SocketType) super(addr, port, -1 /* localPort */, sType, -1 /* fd */) {
+		sockAddr = toSockAddr(addr, port);
+	}
+
+	def getLocalAddr() -> InetAddress {
+		return if(isV6, Net.LOCALHOST_V6, Net.LOCALHOST_V4);
+	}
+
+	def getSockAddr() -> Array<byte> {
+		return sockAddr;
+	}
+
+	// Connect socket to a remote host with IP address {addr} on {port}.
+	def connect() -> NetResult<void> {
+		if (!isOpen) {
+			return NetResult.Error(NetError.NotConnected);
+		}
+		// Connect socket
+		match (Net.connect(fd, sockAddr)) {
+			x: NetResult<void>.Error => return x;
+			_ => ;
+		}
+
+		def size = if(InetAddress.Ipv4.?(addr), LinuxConst.SOCKADDR_V4_SIZE, LinuxConst.SOCKADDR_V6_SIZE);
+		var retSockAddr = Array<byte>.new(size);
+
+		match (Net.getsockname(fd, retSockAddr)) {
+			x: NetResult<void>.Error => return x;
+			_ => ;
+		}
+
+		setBound(true);
+		setConnected(true);
+		setLocalPort((int.view(retSockAddr[2]) << 8) | int.view(retSockAddr[3]));
+		return NetResult.Result(());
+	}
+}
+
+// A socket that accepts connections from incoming peers. This can only be used
+// as a TCP socket.
+class ServerSocket extends Socket {
+	// Associated sockaddr structure. Is instantiated in constructor
+	private var sockAddr: Array<byte>;
+
+	new(addr: InetAddress, localPort: int) super(addr, -1 /* port */, localPort, SocketType.Tcp, -1 /* fd */) {
+		sockAddr = toSockAddr(addr, localPort);
+	}
+
+	def getLocalAddr() -> InetAddress {
+		return addr;
+	}
+
+	def getSockAddr() -> Array<byte> {
+		return sockAddr;
+	}
+
+	// Bind the socket and start listening on it after creation.
+	def onSocketOpen() -> NetResult<void> {
+		match (bind()) {
+			x: NetResult<void>.Error => return x;
+			_ => return listen();
+		}
+	}
+
+	// Bind socket to IP address {addr} on {localPort}.
+	private def bind() -> NetResult<void> {
+		// Bind socket to localPort
+		match (Net.bind(fd, sockAddr)) {
+			x: NetResult<void>.Error => return NetResult.Error(x.e);
+			_ => setBound(true);
+		}
+
+		return NetResult.Result(());
+	}
+
+	// Start listening on {addr}:{localPort} for incoming connections.
+	private def listen() -> NetResult<void> {
+		match (Net.listen(fd, 10 /* backlog */)) {
+			x: NetResult<void>.Error => return x;
+			_ => setListening(true);
+		}
+
+		return NetResult.Result(());
+	}
+
+	// Accept an incoming connection on {addr}:{localPort}. Returns a {Socket}
+	// for the new incoming connection.
+	def accept() -> NetResult<Socket> {
+		if (!isListening) {
+			return NetResult.Error(NetError.NotListening);
+		}
+
+		var retSockAddr = Array<byte>.new(LinuxConst.SOCKADDR_STORAGE_SIZE);
+		var retSock: (int, int);
+		match (Net.accept(fd, retSockAddr)) {
+			x: NetResult<(int, int)>.Result => retSock = x.v;
+			x: NetResult<(int, int)>.Error => return NetResult.Error(x.e);
+		}
+
+		def retSockAddrSize = retSock.1;
+
+		retSockAddr = Arrays.range(retSockAddr, 0, retSockAddrSize);
+		def retPort = (int.view(retSockAddr[2]) << 8) | int.view(retSockAddr[3]);
+
+		match (retSockAddrSize) {
+			LinuxConst.SOCKADDR_V4_SIZE => {
+				var retAddr: InetAddress;
+				match (Net.rangeToInetAddress(retSockAddr[4 ... 8])) {
+					x: NetResult<InetAddress>.Result => retAddr = x.v;
+					x: NetResult<InetAddress>.Error => return NetResult.Error(x.e);
+				}
+
+				def ret = Socket.new(retAddr, retPort, localPort, socketType, retSock.0);
+				ret.setOpen(true);
+				ret.setBound(true);
+				ret.setConnected(true);
+				return NetResult.Result(ret);
+			}
+			LinuxConst.SOCKADDR_V6_SIZE => {
+				var retAddr: InetAddress;
+				match (Net.rangeToInetAddress(retSockAddr[8 ... 24])) {
+					x: NetResult<InetAddress>.Result => retAddr = x.v;
+					x: NetResult<InetAddress>.Error => return NetResult.Error(x.e);
+				}
+
+				def ret = Socket.new(retAddr, retPort, localPort, socketType, retSock.0);
+				ret.setOpen(true);
+				ret.setBound(true);
+				ret.setConnected(true);
+				return NetResult.Result(ret);
+			}
+			_ => ;
+		}
+
+		return NetResult.Error(NetError.InvalidSockAddr);
 	}
 }
 
@@ -280,82 +619,116 @@ component Net {
 	// Convert a range of bytes {r} to an equivalent InetAddress. {r} has to be
 	// either 4-bytes long (for IPv4 addresses) or 16-bytes long (for IPv6
 	// addresses). This function will fail if {r}'s length is not one of 4 or 16.
-	def rangeToInetAddress(r: Range<byte>) -> InetAddress {
+	def rangeToInetAddress(r: Range<byte>) -> NetResult<InetAddress> {
 		if (r.length == 4) {
-			return InetAddress.Ipv4(r[0], r[1], r[2], r[3]);
+			return NetResult.Result(InetAddress.Ipv4(r[0], r[1], r[2], r[3]));
 		} else if (r.length == 16) {
-			return InetAddress.Ipv6(
+			return NetResult.Result(InetAddress.Ipv6(
 				(u32.view(r[0]) << 24)  | (u32.view(r[1]) << 16)  | (u32.view(r[2]) << 8)  | r[3],
 				(u32.view(r[4]) << 24)  | (u32.view(r[5]) << 16)  | (u32.view(r[6]) << 8)  | r[7],
 				(u32.view(r[8]) << 24)  | (u32.view(r[9]) << 16)  | (u32.view(r[10]) << 8) | r[11],
 				(u32.view(r[12]) << 24) | (u32.view(r[13]) << 16) | (u32.view(r[14]) << 8) | r[15]
-			);
+			));
 		} else {
-			System.error("Error", "Unexpected length for IP address!");
-			return Net.ANY_V4;
+			return NetResult.Error(NetError.InvalidRange);
 		}
 	}
 
 	// Create a new socket with {family}, {socketType}, {protocol}. Returns
-	// the new fd for the created socket and -1 if an error occurred.
+	// the new fd for the created socket.
 	//
 	// See: man 2 socket
-	def socket(family: int, socketType: int, protocol: int) -> int {
+	def socket(family: int, socketType: int, protocol: int) -> NetResult<int> {
 		// (return value, errno)
 		def ret = Linux.syscall(LinuxConst.SYS_socket, (family, socketType, protocol));
-		return if(ret.0 >= 0, int.view(ret.0), -1);
+		return if(ret.0 >= 0, NetResult.Result(int.view(ret.0)), NetResult.Error(errnoToNetError(ret.0)));
 	}
 
-	// Connect to socket with {sockfd} and {sockAddr} struct. Returns 0 if
-	// the connection succeeds and -1 if an error occurred.
+	// Connect to socket with {sockfd} and {sockAddr} struct.
 	//
 	// See: man 2 connect
-	def connect(sockfd: int, sockAddr: Array<byte>) -> int {
+	def connect(sockfd: int, sockAddr: Array<byte>) -> NetResult<void> {
 		def ret = Linux.syscall(LinuxConst.SYS_connect, (sockfd, Pointer.atContents(sockAddr), sockAddr.length));
-		return if(ret.0 >= 0, int.view(ret.0), -1);
+		return if(ret.0 >= 0, NetResult.Result(()), NetResult.Error(errnoToNetError(ret.0)));
 	}
 
 	// Accept a new connection on socket {sockfd}. Write metadata for the
 	// new connection in the {sockAddr} struct. Returns a tuple of the new
 	// fd for the new socket and the length of the written metadata.
-	// Returns -1 if an error occurred.
 	//
 	// See: man 2 accept
-	def accept(sockfd: int, sockAddr: Array<byte>) -> (int, IntPointer) {
+	def accept(sockfd: int, sockAddr: Array<byte>) -> NetResult<(int, int)> {
 		var ptr = IntPointer.new(sockAddr.length);
 		def ret = Linux.syscall(LinuxConst.SYS_accept, (sockfd, Pointer.atContents(sockAddr), Pointer.atField(ptr.x)));
-		return (if(ret.0 >= 0, int.view(ret.0), -1), ptr);
+		// XXX: The compiler won't optimize the ptr load with a stale value right?
+		return if(ret.0 >= 0, NetResult.Result((int.view(ret.0), ptr.x)), NetResult.Error(errnoToNetError(ret.0)));
+	}
+
+	// Send a message {msg} to the host specified in {sockAddr} via socket
+	// {sockfd}.
+	//
+	// See: man 2 sendto
+	def sendto(sockfd: int, msg: Array<byte>, sockAddr: Array<byte>) -> NetResult<void> {
+		def ret = Linux.syscall(
+			LinuxConst.SYS_sendto, (
+				sockfd,
+				Pointer.atContents(msg),
+				msg.length,
+				0 /* flags */,
+				Pointer.atContents(sockAddr),
+				sockAddr.length
+			)
+		);
+		return if(ret.0 >= 0, NetResult.Result(()), NetResult.Error(errnoToNetError(ret.0)));
+	}
+
+	// Receive a message into the buffer {buf}. Write metadata about the remote
+	// host in {sockAddr}. Returns a tuple of the number of bytes read into {buf}
+	// and the length of the written metadata.
+	//
+	// See: man 2 recvfrom
+	def recvfrom(sockfd: int, buf: Array<byte>, sockAddr: Array<byte>) -> NetResult<(int, int)> {
+		def ptr = IntPointer.new(sockAddr.length);
+		def ret = Linux.syscall(
+			LinuxConst.SYS_recvfrom, (
+				sockfd,
+				Pointer.atContents(buf),
+				buf.length,
+				0 /* flags */,
+				Pointer.atContents(sockAddr),
+				Pointer.atField(ptr.x)
+			)
+		);
+		// XXX: The compiler won't optimize the ptr load with a stale value right?
+		return if(ret.0 >= 0, NetResult.Result((int.view(ret.0), ptr.x)), NetResult.Error(errnoToNetError(ret.0)));
 	}
 
 	// Bind a socket {sockfd} to the IP address and port specified in the
-	// {sockAddr} struct. Returns 0 if the binding succeeds and -1 if an
-	// error occurred.
+	// {sockAddr} struct.
 	//
 	// See: man 2 bind
-	def bind(sockfd: int, sockAddr: Array<byte>) -> int {
+	def bind(sockfd: int, sockAddr: Array<byte>) -> NetResult<void> {
 		def ret = Linux.syscall(LinuxConst.SYS_bind, (sockfd, Pointer.atContents(sockAddr), sockAddr.length));
-		return if(ret.0 >= 0, int.view(ret.0), -1);
+		return if(ret.0 >= 0, NetResult.Result(()), NetResult.Error(errnoToNetError(ret.0)));
 	}
 
 	// Start listening for incoming connection on socket {sockfd}.
-	// {backlog} specifies the length of the message queue. Returns 0 if
-	// the binding succeeds and -1 if an error occurred.
+	// {backlog} specifies the length of the message queue.
 	//
 	// See: man 2 listen
-	def listen(sockfd: int, backlog: int) -> int {
+	def listen(sockfd: int, backlog: int) -> NetResult<void> {
 		def ret = Linux.syscall(LinuxConst.SYS_listen, (sockfd, backlog));
-		return if(ret.0 >= 0, int.view(ret.0), -1);
+		return if(ret.0 >= 0, NetResult.Result(()), NetResult.Error(errnoToNetError(ret.0)));
 	}
 
 	// Write the address and port to the {sockAddr} struct the socket
 	// {sockfd} is currently bound to. This is used to query the
-	// {localPort} for ClientSockets. Returns 0 if the query succeeds and
-	// -1 if an error occurred.
+	// {localPort} for ClientSockets.
 	//
 	// See: man 2 getsockname
-	def getsockname(sockfd: int, sockAddr: Array<byte>) -> int {
+	def getsockname(sockfd: int, sockAddr: Array<byte>) -> NetResult<void> {
 		var ptr = IntPointer.new(sockAddr.length);
 		def ret = Linux.syscall(LinuxConst.SYS_getsockname, (sockfd, Pointer.atContents(sockAddr), Pointer.atField(ptr.x)));
-		return if(ret.0 >= 0, int.view(ret.0), -1);
+		return if(ret.0 >= 0, NetResult.Result(()), NetResult.Error(errnoToNetError(ret.0)));
 	}
 }
