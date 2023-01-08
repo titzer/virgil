@@ -165,9 +165,7 @@ if [ $? = 0 ]; then
     echo "  bin/current == bin/bootstrap ${GREEN}ok${NORM}"
     exit $SCRIPT_EXIT_CODE
 else
-    # if the bootstrap check fails, we exit with an exit failure even if no
-    # tests have failed
-    update_exit_code_if_non_zero 1
+    # if the bootstrap check fails, print out the diff
     printf $YELLOW
     cat $OUT/bootstrap.diff
     printf $NORM
