@@ -143,3 +143,20 @@ The overall execution order of initialization is therefore:
   * Constructor body
 
 This is somewhat backwards to Java initialization order, which always executes a super constructor before the subclass constructor. Virgil chooses this order so that the implicitly and explicitly initialized fields are _always_ initialized before _any_ constructor body is executed. This ensures that no partially-constructed object can escape, and that all virtual calls (even those in a constructor body) always occur on an initialized object.
+
+## Visibility of `private` members ##
+
+In Virgil, type definitions like classes can have `private` members, e.g. to hide some of their implementation details.
+Private members are not accessible outside of their definition, and in the case of classes, that also means that they are *not* accessible in subclasses.
+
+```
+class C {
+    def m() -> int { return p(); }
+    private def p() -> int { return 33; } // not accessible outside of C
+}
+var c: C = C.new();
+var x = c.p(); // ERROR: {C.p} not accessible here
+class D extends C {
+    def foo() -> int { return p(); } // ERROR {this.p} not accessible here.
+}
+```
