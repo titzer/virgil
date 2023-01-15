@@ -11,4 +11,4 @@ sudo apt -y install nasm
 
 "${TEST_DIR}"/configure
 
-PROGRESS_ARGS=l TEST_TARGETS="int x86-linux" "${TEST_DIR}"/all.bash
+PROGRESS_ARGS=c TEST_TARGETS="int x86-linux" "${TEST_DIR}"/all.bash

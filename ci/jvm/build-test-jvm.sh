@@ -8,4 +8,4 @@ TEST_DIR="${VIRGIL_LOC}/test"
 
 "${TEST_DIR}"/configure
 
-PROGRESS_ARGS=l TEST_TARGETS="jvm" "${TEST_DIR}"/all.bash
+PROGRESS_ARGS=c TEST_TARGETS="jvm" "${TEST_DIR}"/all.bash
