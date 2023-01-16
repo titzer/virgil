@@ -11,9 +11,11 @@
 #include <unistd.h>
 #include <errno.h>
 #include <math.h>
+#include <string.h>
 
 #define MAX_RUNS 1000
 
+int lines = 0;
 char **global_envp;
 double times[MAX_RUNS];
 
@@ -39,7 +41,6 @@ int run(int run, int numruns, int nstdout, int nstderr, char *argv[]) {
   struct timeval end;
   struct timeval elapsed;
   int pid, status = 0, i = 0, rc = 0;
-  char tmpfname[1024];
 
   // get start time
   gettimeofday(&start, NULL);
@@ -63,7 +64,7 @@ int run(int run, int numruns, int nstdout, int nstderr, char *argv[]) {
   if (rc < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
     // program returned nonzero exit code, or terminated with signal
     if (numruns > 1) {
-	printf(" %12s", "--");
+      if (!lines) printf(" %12s", "--");
     } else if (rc == pid) {
       if (WIFEXITED(status)) {
         printf("process exited with rc = %d\n", WEXITSTATUS(status));
@@ -83,15 +84,18 @@ int run(int run, int numruns, int nstdout, int nstderr, char *argv[]) {
 
   times[run] = ((double) elapsed.tv_sec) + ((double) elapsed.tv_usec) / 1000000.0;
 
-  if (numruns > 1) {
+  if (lines) {
+    // print the sample on one line
+    printf("%ld.%06d\n", elapsed.tv_sec, (int)elapsed.tv_usec);
+  } else if (numruns > 1) {
     // print each time on the same row
     printf(" %5ld.%06d", elapsed.tv_sec, (int)elapsed.tv_usec);
-    fflush(stdout);
   } else {
     // print one row with multiple times
     print_time(NULL, NULL);
     print_time(&elapsed, &usage);
   }
+  fflush(stdout);
   return 0;
 }
 
@@ -119,13 +123,30 @@ int do_fail_run(char* argv[]) {
 }
 
 int main(int argc, char *argv[], char *envp[]) {
-  int i;
-  char *tmp = "/dev/null";
+  int i = 1, runs = 1;
+  const char *tmp = "/dev/null";
   global_envp = envp;
+  // Check for enough arguments
   if (argc < 2) {
-    printf("usage: btime [runs] <command>\n");
+    printf("usage: btime [-l] [runs] <command>\n");
     exit(1);
   }
+
+  // Process options and flags.
+  for (i = 1; i < argc - 1; i++) {
+    char *arg = argv[i];
+    if (strcmp(arg, "-l") == 0) {
+      lines = 1;
+      continue;
+    }
+    if (arg[0] >= '0' && arg[0] <= '9') {
+      runs = atoi(arg);
+      if (runs > MAX_RUNS) runs = MAX_RUNS;
+      continue;
+    }
+    break;
+  }
+
   // open /dev/null as the default output.
   int devnull = open("/dev/null", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (devnull <= 0) {
@@ -133,28 +154,25 @@ int main(int argc, char *argv[], char *envp[]) {
     return 1;
   }
 
-  if (argc > 2) {
-    // Check to see if the number of runs was specified.
-    char *num = argv[1];
-    if (num[0] >= '0' && num[0] <= '9') {
-      int runs = atoi(num);
-      if (runs > MAX_RUNS) runs = MAX_RUNS;
-      if (runs > 1) {
-	int i = 0, failed = 0;
-        for(i = 0; i < runs; i++) {
-  	  if (run(i, runs, devnull, devnull, &argv[2]) != 0) {
-		return do_fail_run(&argv[2]);
-	  }
-        }
-        print_stats(runs);
-        printf("\n");
-        return 0;
+  char** nargv = &argv[i];
+  // Multiple runs?
+  if (runs > 1) {
+    int i = 0, failed = 0;
+    for(i = 0; i < runs; i++) {
+      if (run(i, runs, devnull, devnull, nargv) != 0) {
+	return do_fail_run(nargv);
       }
     }
+    if (!lines) {
+      print_stats(runs);
+      printf("\n");
+    }
+    return 0;
   }
+  
   // Just do a single run.
-  if (run(0, 1, devnull, devnull, &argv[1]) != 0) {
-    return do_fail_run(&argv[1]);
+  if (run(0, 1, devnull, devnull, nargv) != 0) {
+    return do_fail_run(nargv);
   }
   return 0;
 }
