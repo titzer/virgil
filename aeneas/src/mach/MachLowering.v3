@@ -511,7 +511,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			ComponentSetField(field) => 	return genComponentSetField(oi, field);
 			TupleGetElem(index) => 		return genTupleGetElem(oi, index);
 			NullCheck =>			ni = genNullCheck(oi);
-			BoundsCheck => 			ni = genBoundsCheck(oi, true);
+			BoundsCheck => 			ni = genBoundsCheck(oi, Facts.NONE).0;
 			CallMethod(method) => 		return genCallMethod(oi, method);
 			CallClassMethod(selector) => 	return genCallClassMethod(oi, selector);
 			CallClassSelector(selector) => 	return genCallClassSelector(oi, selector);
@@ -541,7 +541,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				ni = normRef1(oi.inputs[0]);
 			}
 			PtrAtElement => {
-				genBoundsCheck(oi, false);
+				genBoundsCheck(oi, Fact.O_NO_NULL_CHECK); // XXX: propagate nullity
 				var narr = normRef1(oi.inputs[0]), arrayType = oi.op.typeArgs[0];
 				var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
 				var index = normRef1(oi.inputs[1]);
@@ -1362,7 +1362,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		for (i = 0; i < inputs.length; (i = i + stride, offset = offset + scale)) {
 			// generate unchecked pointer stores to initialize the array
 			// XXX: cache type normalization across calls to this method
-			genNormTypedStores(oi, false, true, machType, narr, offset, inputs, i);
+			genNormTypedStores(oi, Fact.O_NO_NULL_CHECK, true, machType, narr, offset, inputs, i);
 		}
 		return narr;
 	}
@@ -1377,33 +1377,35 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var inputs = normRefN(val);
 				var offset = arrayRep.headerSize + arrayRep.offsets[j] + i * arrayRep.elemScale;
 				// XXX: cache type normalization across calls to this method
-				genNormTypedStores(oi, false, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
+				genNormTypedStores(oi, Fact.O_NO_NULL_CHECK, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
 			}
 		}
 		return narr;
 	}
 	def genArrayGetElem(oi: SsaApplyOp, elem: int) {
 		if (config.ObjectSystem) return void(normId(oi));
-		genBoundsCheck(oi, false);
-		var narr = normRef1(oi.inputs[0]), arrayType = oi.op.typeArgs[0];
+		var inputs = normRefs(oi.inputs);
+		var narr = inputs[0], nindex = inputs[1], arrayType = oi.op.typeArgs[0];
+		var nullity = context.compiler.nullity(oi, narr);
+		nullity = genBoundsCheck(oi, nullity).1;
 		var arrayRep = mach.arrayRep(arrayType);
-		var index = normRef1(oi.inputs[1]);
-		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, index);
+		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
 		// XXX: fold null check into pointer access if no bounds check
 		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
-		var loads = genNormTypedLoads(oi.source, false, machType, ptrAdd(narr, offset), 0);
+		var loads = genNormTypedLoads(oi.source, nullity, machType, ptrAdd(narr, offset), 0);
 		mapN(oi, loads);
 	}
 	def genArraySetElem(oi: SsaApplyOp, elem: int) {
 		if (config.ObjectSystem) return void(normId(oi));
-		genBoundsCheck(oi, false);
 		var inputs = normRefs(oi.inputs);
-		var narr = inputs[0], arrayType = oi.op.typeArgs[0];
+		var narr = inputs[0], nindex = inputs[1], arrayType = oi.op.typeArgs[0];
+		var nullity = context.compiler.nullity(oi, narr);
+		nullity = genBoundsCheck(oi, nullity).1;
 		var arrayRep = mach.arrayRep(arrayType);
-		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, inputs[1]);
+		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
 		// XXX: fold null check into pointer access if no bounds check
 		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
-		genNormTypedStores(oi, false, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
+		genNormTypedStores(oi, nullity, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
 		oi.kill();
 		oi.remove();
 	}
@@ -1421,7 +1423,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	def genArrayGetLength(oi: SsaApplyOp) -> SsaInstr {
 		if (config.ObjectSystem) return normId(oi);
 		var oarr = oi.inputs[0], narr = normRef1(oarr);
-		return refLoad(Int.TYPE, oi, oarr, narr, mach.getArrayLengthOffset(oi.op.typeArgs[0]));
+		var nullity = context.compiler.nullity(oi, null);
+		return refLoad(nullity, Int.TYPE, oi, oarr, narr, mach.getArrayLengthOffset(oi.op.typeArgs[0]));
 	}
 	def genClassAlloc(oi: SsaApplyOp, method: IrMethod) {
 		if (config.ObjectSystem) return void(normId(oi));
@@ -1448,11 +1451,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var oobj = oi.inputs[0], nobj = normRef1(oobj);
 		var machType = mach.machType(fieldRef.getFieldType());
 		var offset = mach.classFieldOffset(fieldRef);
-		var nullCheck = V3Op.needsNullCheck(oi, oobj.dest);
+		var nullity = context.compiler.nullity(oi, oobj.dest);
 		if (isVariant) {
 			var tblock: SsaBuilder, fblock: SsaBuilder, merge: SsaBuilder;
 			var sub: Array<Type>;
-			if (nullCheck) {
+			if (!nullity.O_NO_NULL_CHECK) {
 				var t = addIfNull(nobj);
 				tblock = t.0;
 				fblock = t.1;
@@ -1461,8 +1464,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var tn = normIntType(machType);
 				sub = if(tn == null, [machType], tn.sub);
 			}
-			var loads = genNormTypedLoads(oi.source, false, machType, nobj, offset);
-			if (nullCheck) {
+			var loads = genNormTypedLoads(oi.source, Fact.O_NO_NULL_CHECK, machType, nobj, offset);
+			if (!nullity.O_NO_NULL_CHECK) {
 				fblock.addGoto(merge.block);
 				tblock.addGoto(merge.block);
 				curBlock = merge;
@@ -1473,7 +1476,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			}
 			mapN(oi, loads);
 		} else {
-			var loads = genNormTypedLoads(oi.source, nullCheck, machType, nobj, offset);
+			var loads = genNormTypedLoads(oi.source, nullity, machType, nobj, offset);
 			mapN(oi, loads);
 		}
 	}
@@ -1483,7 +1486,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var fieldRef = V3Op.extractIrSpec(oi.op, field), nobj = inputs[0];
 		var offset = mach.classFieldOffset(fieldRef);
 		var machType = mach.machType(fieldRef.getFieldType());
-		genNormTypedStores(oi, V3Op.needsNullCheck(oi, nobj), init, machType, nobj, offset, inputs, 1);
+		var nullity = compiler.nullity(oi, nobj);
+		genNormTypedStores(oi, nullity, init, machType, nobj, offset, inputs, 1);
 		oi.kill();
 		oi.remove();
 	}
@@ -1517,7 +1521,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def genMtableLookup(oi: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, funcRep: Mach_FuncRep, methodRef: IrSpec) -> SsaInstr {
 		// use method-table based dispatch
-		var tid = refLoad(mach.tagType, oi, oobj, nobj, 0);
+		var nullity = context.compiler.nullity(oi, oobj.dest);
+		var tid = refLoad(nullity, mach.tagType, oi, oobj, nobj, 0);
 		var mtbl = context.graph.valConst(mach.data.ptrType, mach.methodTable(methodRef));
 		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
 	}
@@ -1540,7 +1545,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var fieldRef = V3Op.extractIrSpec(oi.op, field);
 		var fieldType = mach.machType(fieldRef.getFieldType());
 		var ptr = componentFieldPtr(fieldRef);
-		var loads = genNormTypedLoads(oi.source, false, fieldType, ptr, 0);
+		var loads = genNormTypedLoads(oi.source, Fact.O_NO_NULL_CHECK, fieldType, ptr, 0);
 		mapN(oi, loads);
 	}
 	def genComponentSetField(oi: SsaApplyOp, field: IrField) {
@@ -1550,7 +1555,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var machType = mach.machType(fieldRef.getFieldType());
 		var ptr = componentFieldPtr(fieldRef);
 		// generate remaining stores for normalized fields.
-		genNormTypedStores(oi, false, false, machType, ptr, 0, inputs, 1);
+		genNormTypedStores(oi, Fact.O_NO_NULL_CHECK, false, machType, ptr, 0, inputs, 1);
 		oi.kill();
 		oi.remove();
 	}
@@ -1561,33 +1566,35 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	def genNullCheck(oi: SsaApplyOp) -> SsaInstr {
 		var oobj = oi.inputs[0], nobj = normRef1(oobj);
 		oi.facts = Facts.NONE;
-		if (context.compiler.DisableNullChecks) return nobj;
-		if (V3Op.needsNullCheck(oi, oobj.dest)) {
-			if (SsaConst.?(nobj)) {
-				var oval = SsaConst.!(nobj).val;
-				if (oval == null) addThrow(oi.source, V3Exception.NullCheck);
-				return nobj; // constant is non-null
-			}
-			if (config.ObjectSystem) return normId(oi);
-			ptrLoadT(oi.source, Void.TYPE, nobj, 0);
-		}
+		var nullity = context.compiler.nullity(oi, oobj.dest);
+		if (!nullity.O_NO_NULL_CHECK) genNullCheck0(oi.source, nobj);
 		return nobj;
 	}
-	def genBoundsCheck(oi: SsaApplyOp, nullCheck: bool) -> SsaInstr {
+	def genNullCheck0(source: Source, nobj: SsaInstr) {
+		if (SsaConst.?(nobj)) {
+			var oval = SsaConst.!(nobj).val;
+			if (oval == null) addThrow(source, V3Exception.NullCheck);
+			return; // constant is non-null
+		}
+//TODO		if (config.ObjectSystem) return normId(oi);
+		ptrLoadT(source, Void.TYPE, nobj, 0);
+	}
+	def genBoundsCheck(oi: SsaApplyOp, nullity: Fact.set) -> (SsaInstr, Fact.set) {
 		var oarr = oi.inputs[0], narr = normRef1(oarr);
 		if (context.compiler.DisableBoundsChecks || oi.facts.O_NO_BOUNDS_CHECK) {
-			return if(nullCheck, genNullCheck(oi), context.graph.nullConst(Void.TYPE));
+			if (!nullity.O_NO_NULL_CHECK) genNullCheck0(oi.source, narr);
+			return (context.graph.nullConst(Void.TYPE), nullity | Fact.O_NO_NULL_CHECK);
 		}
-		if (config.ObjectSystem) return normId(oi);
+		if (config.ObjectSystem) return (normId(oi), nullity);
 		// load length
 		// XXX: CSE the array length if possible
-		var len = refLoad(Int.TYPE, oi, oarr, narr, mach.getArrayLengthOffset(oi.op.typeArgs[0]));
+		var len = refLoad(nullity, Int.TYPE, oi, oarr, narr, mach.getArrayLengthOffset(oi.op.typeArgs[0]));
 		var index = normRef1(oi.inputs[1]);
 		var throwOp = V3Op.newConditionalThrow(V3Exception.BoundsCheck);
 		// throw BoundsCheckException if ugteq(index, length)
 		var op = Int.getType(false, 32).opLtEq();
 		apply(oi.source, throwOp, [apply(oi.source, op, [len, index])]);
-		return index;
+		return (index, nullity | Fact.O_NO_NULL_CHECK);
 	}
 	def genCallMethod(oi: SsaApplyOp, method: IrMethod) {
 		if (config.ObjectSystem) return void(normId(oi));
@@ -1760,9 +1767,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		maybeDeadCodeLater(v);
 		return i;
 	}
-	def refLoad(vt: Type, oi: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, offset: int) -> SsaInstr {
-		if (V3Op.needsNullCheck(oi, oobj.dest)) return ptrLoadT(oi.source, vt, nobj, offset);
-		return ptrLoad(vt, nobj, offset);
+	def refLoad(nullity: Fact.set, vt: Type, oi: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, offset: int) -> SsaInstr {
+		return if(nullity.O_NO_NULL_CHECK, ptrLoad(vt, nobj, offset), ptrLoadT(oi.source, vt, nobj, offset));
 	}
 	def componentFieldPtr(f: IrSpec) -> SsaInstr {
 		return context.graph.valConst(mach.data.ptrType, mach.componentFieldPtr(f));
@@ -1798,16 +1804,16 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return SsaBuilder.new(context, context.graph, SsaBlock.new());
 	}
 	// Support for normalizing loads and stores.
-	def genNormTypedLoads(source: Source, nullCheck: bool, machType: Type, base: SsaInstr, offset: int) -> Array<SsaInstr> {
+	def genNormTypedLoads(source: Source, nullity: Fact.set, machType: Type, base: SsaInstr, offset: int) -> Array<SsaInstr> {
 		var tn = normIntType(machType);
 		// check for simple case first.
 		if (tn == null) {
-			var result = if(nullCheck, ptrLoadT(source, machType, base, offset), ptrLoad(machType, base, offset));
+			var result = if(!nullity.O_NO_NULL_CHECK, ptrLoadT(source, machType, base, offset), ptrLoad(machType, base, offset));
 			return [result];
 		}
 		// generate multiple loads for normalized fields and array elements.
 		var loads = Array<SsaInstr>.new(tn.size);
-		var check = if(nullCheck, 0, -1);
+		var check = if(nullity.O_NO_NULL_CHECK, -1);
 		for (i < loads.length) {
 			var et = tn.sub[i];
 			loads[i] = if(i == check, ptrLoadT(source, et, base, offset), ptrLoad(et, base, offset));
@@ -1815,8 +1821,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return loads;
 	}
-	def genNormTypedStores(oi: SsaApplyOp, nullCheck: bool, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
-		var tn = normIntType(machType);
+	def genNormTypedStores(oi: SsaApplyOp, nullity: Fact.set, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
+		var tn = normIntType(machType), nullCheck = !nullity.O_NO_NULL_CHECK;
 		// check for simple case first.
 		if (tn == null) {
 			var val = vals[start];
