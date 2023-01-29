@@ -1,0 +1,364 @@
+// Copyright 2023 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def INITIAL_VALUES = 128;
+def INITIAL_FRAMES = 16;
+
+// Implements an interpreter capable of executing all SSA instructions, calls, etc
+// for initialization and testing.
+class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
+	var values = Array<Val>.new(INITIAL_VALUES);
+	var stack = Array<SsaIntFrame>.new(INITIAL_FRAMES);
+	var frame: SsaIntFrame;
+	def args = SsaIntArguments.new(prog);
+	var sp: int;
+	var retVal: Val;
+	var exception: Exception;
+	var printer: SsaPrinter;
+	var tailCalled: bool;
+	var phiMoves = Vector<(SsaPhi, Val)>.new();
+	var source: Source;
+
+	new() {
+		args.interpreter = this;
+	}
+
+	def invoke(del: Closure, args: Array<Val>) -> Result {
+		frame = null;
+		exception = null;
+		retVal = null;
+		tailCalled = false;
+		sp = 0;
+
+		pushFrame(del.memberRef, del.val, args);
+
+		// Main execution loop
+		while (true) {
+			var n = step(frame.ip);
+			if (frame == null) break;
+			frame.ip = n;
+		}
+		phiMoves.clear();
+		return if (exception == null, retVal, exception);
+	}
+	def setTrace(on: bool) {
+		if (on) printer = SsaPrinter.new();
+		else printer = null;
+	}
+	def step(i: SsaInstr) -> SsaInstr {
+		if (printer != null) {
+			for (j < sp) printer.buf.puts("  ");
+			printer.printInstr(i, false, false, false);
+			printer.flush();
+		}
+		match (i) {
+			x: SsaParam => {
+				if (printer != null) putEqVal(getVal(x), x.getType());
+				return nextInstr(i);
+			}
+			x: SsaApplyOp => {
+				source = null;
+				if (printer != null) putInputs(x.inputs);
+				return doOp(x);
+			}
+			x: SsaPhi => {
+				if (printer != null) putEqVal(getVal(x), x.getType());
+				return nextInstr(i);
+			}
+			x: SsaGoto => {
+				if (printer != null) printer.outln();
+				return doGoto(x.succs[0]);
+			}
+			x: SsaIf =>  {
+				if (printer != null) putInputs(x.inputs).outln();
+				var cond = getVal(x.inputs[0].dest), taken = Bool.unbox(cond);
+				var which = if(taken, 0, 1);
+				return doGoto(x.succs[which]);
+			}
+			x: SsaSwitch => {
+				if (printer != null) putInputs(x.inputs).outln();
+				var key = getVal(x.inputs[0].dest);
+				var which = Int.unbox(key);
+				if (u32.view(which) >= u32.view(x.succs.length)) which = x.succs.length - 1;
+				return doGoto(x.succs[which]);
+			}
+			x: SsaReturn => {
+				if (printer != null) {
+					putInputs(x.inputs).outln();
+					var b = printer.buf;
+					for (j < sp) b.puts("  ");
+					b.puts("<=");
+					printer.outln();
+				}
+				var r = if(x.inputs.length > 0, getVal(x.inputs[0].dest));
+				if (--sp < 1) {
+					frame = null;
+					retVal = r;
+					return null;
+				} else {
+					frame = stack[sp - 1];
+					setVal(frame.ip, r);
+					return nextInstr(frame.ip);
+				}
+			}
+			x: SsaThrow => {
+				source = x.source;
+				args.throw(x.exception, null);
+				if (printer != null) printer.outln();
+			}
+		}
+		return fail("unexpected SsaInstr type");
+	}
+	private def putEqVal(v: Val, t: Type) {
+		printer.buf.puts(" = ");
+		printer.buf.puthashv(v, t).ln();
+		printer.flush();
+	}
+	private def putInputs(inputs: Array<SsaDfEdge>) -> SsaPrinter {
+		var b = printer.buf;
+		b.puts("(");
+		for (i < inputs.length) {
+			if (i > 0) b.csp();
+			var v = inputs[i];
+			printer.printRef(v);
+			if (!SsaConst.?(v.dest)) {
+				b.putc('=').puthashv(getVal(v.dest), null).end();
+			}
+		}
+		b.puts(") ");
+		printer.flush();
+		return printer;
+	}
+	private def getVal(i: SsaInstr) -> Val {
+		if (SsaConst.?(i)) return SsaConst.!(i).val;
+		if (i.valueNum < 0) allocValueNum(i);
+		var index = frame.fp + i.valueNum;
+		return values[index];
+	}
+	private def setVal(i: SsaInstr, v: Val) {
+		if (i.valueNum < 0) allocValueNum(i);
+		var index = frame.fp + i.valueNum;
+		if (index >= values.length) values = Arrays.grow(values, frame.meth.ssa.numValues + values.length * 2);
+		values[index] = v;
+		// TODO: if (Debug.paranoid) do a type check
+	}
+	private def allocValueNum(i: SsaInstr) {
+		var g = frame.meth.ssa;
+		i.valueNum = g.numValues++;
+		if (frame.fp + g.numValues >= values.length) values = Arrays.grow(values, INITIAL_VALUES + values.length * 2);
+	}
+	private def doGoto(target: SsaCfEdge) -> SsaInstr {
+		var block = frame.block = target.dest;
+		var next: SsaInstr;
+		for (i = block.next; i != block; i = i.next) {
+			match (i) {
+				x: SsaPhi => phiMoves.put(x, getVal(x.inputs[target.desti].dest));
+				x: SsaInstr => { next = x; break; }
+				_ => return fail("no SsaInstr successor");
+			}
+		}
+		// apply deferred phi moves
+		for (i < phiMoves.length) setVal(phiMoves[i]);
+		phiMoves.resize(0);
+		return if(next != null, next, fail("fell off the end of the block"));
+	}
+	private def doOp(i: SsaApplyOp) -> SsaInstr {
+		var n = nextInstr(i);
+		// Set up arguments to Eval.doOp
+		args.frame = frame;
+		args.args = Arrays.grow(args.args, i.inputs.length);
+		args.typeArgs = i.op.typeArgs;
+		for (j < i.inputs.length) args.args[j] = getVal(i.inputs[j].dest);
+		args.nargs = i.inputs.length;
+		// Evaluate the operator
+		var r = Eval.doOp(i.op, args);
+		if (tailCalled) {
+			tailCalled = false;
+			return frame.ip; // pushed a frame, {frame.ip} is already correct
+		}
+		if (frame == null) return null; // evaluation threw an exception
+		match (r) {
+			x: Exception => {
+				this.exception = x;
+				if (printer != null) { printer.buf.put1("= !%s", x.error).ln(); printer.flush(); }
+			}
+			x: Val => {
+				setVal(i, x);
+				if (printer != null && !tailCalled) putEqVal(x, i.op.sig.returnType());
+			}
+			null => {
+				setVal(i, null);
+				if (printer != null && !tailCalled) putEqVal(null, i.op.sig.returnType());
+			}
+		}
+		return n;
+	}
+	private def nextInstr(i: SsaLink) -> SsaInstr {
+		match (i.next) {
+			x: SsaInstr => return x;
+			null => return fail("no instruction successor");
+			_ => return fail("successor is not an SsaInstr");
+		}
+	}
+	private def fail<T>(msg: string) -> T {
+		var d: T;
+		if (exception == null) {
+			var buf = StringBuilder.new().puts(msg);
+			if (frame != null) {
+				if (frame.ip != null) buf.put1(", near @%d", frame.ip.uid);
+				if (frame.block != null) buf.put1(", in block #%d", frame.block.uid);
+				frame = null;
+			}
+			exception = Exception.new("SsaEvalInternalError", buf.toString(), getStackTrace());
+			if (CLOptions.FATAL.val) System.error(exception.error, exception.msg);
+		}
+		return d;
+	}
+	def getStackTrace() -> List<Source> {
+		var trace = if(source != null, List.new(source, null));
+		for (i = sp - 1; i >= 0; i--) {
+			var f = stack[i];
+			var source: Source;
+			if (SsaApplyOp.?(f.ip)) source = SsaApplyOp.!(f.ip).source;
+			trace = List.new(source, trace);
+		}
+		return Lists.reverse(trace);
+	}
+	def pushFrame(spec: IrSpec, recvr: Val, args: Range<Val>) {
+		if (printer != null) {
+			var b = printer.buf;
+			for (j < sp) b.puts("  ");
+			b.puts("=>");
+			b.red().put1("#%d", spec.member.uid).end().sp();
+			b.green().put1("%q", spec.render).end();
+			b.putc('(');
+		}
+		var prev = frame;
+		if (sp >= stack.length) stack = Arrays.grow(stack, stack.length * 4);
+		frame = stack[sp];
+		if (frame == null) frame = stack[sp] = SsaIntFrame.new();
+		sp++;
+		frame.meth = spec.asMethod();
+		frame.spec = spec;
+		var ssa = frame.meth.ssa;
+		if (ssa == null) ssa = genSsa(spec, 0);
+		frame.block = ssa.startBlock;
+		frame.ip = nextInstr(ssa.startBlock);
+		if (prev != null) frame.fp = prev.fp + prev.meth.ssa.numValues;
+		else frame.fp = 0;
+		setVal(ssa.params[0], recvr);
+		if (printer != null) {
+			var param = ssa.params[0];
+			printer.buf.putref(param);
+			printer.buf.puts("=");
+			printer.buf.putv(recvr, param.getType());
+		}
+		setArgs(ssa.params[1 ...], args);
+		if (printer != null) {
+			printer.buf.puts(")");
+			printer.outln();
+		}
+	}
+	private def setArgs(params: Range<SsaParam>, args: Range<Val>) {
+		if (params.length == 0) return; // no parameters, nothing to do
+		if (params.length == args.length) return setArgs0(params, args); // no adjustment necessary
+		if (args.length == 0) {
+			// pass all BOTTOMs
+			for (p in params) setVal(p, Values.BOTTOM);
+			return;
+		}
+		if (params.length == 1) {
+			// collapse into tuple
+			var vals = Array<Val>.new(args.length);
+			for (i < vals.length) vals[i] = args[i]; // XXX: manual array copy
+			setVal(params[0], TupleVal.new(vals));
+			return;
+		}
+		// Deal with fewer arguments than parameters by expanding the last tuple.
+		var last = args.length - 1;
+		setArgs0(params[0 ... last], args[0 ... last]);
+		match (args[last]) {
+			x: TupleVal => {
+				// expand tuple
+				for (j = last; j < params.length; j++) {
+					setVal(params[j], x.values[j - last]);
+				}
+			}
+			_ => {
+				// pass all BOTTOMS
+				while (last < params.length) setVal(params[last++], Values.BOTTOM);
+			}
+		}
+	}
+	private def setArgs0(params: Range<SsaParam>, args: Range<Val>) {
+		for (i < params.length) {
+			var param = params[i], arg = args[i];
+			setVal(param, arg);
+			if (printer != null) {
+				printer.buf.csp();
+				printer.buf.putref(param);
+				printer.buf.puts("=");
+				printer.buf.putv(arg, param.getType());
+			}
+		}
+	}
+	def popFrame() -> SsaIntFrame {
+		sp--;
+		if (sp < 1) return frame = null;
+		return frame = stack[sp - 1];
+	}
+	def unwind() {
+		frame = null;
+		sp = 0;
+	}
+}
+class SsaIntArguments(prog: Program) extends Arguments {
+	var frame: SsaIntFrame;
+	var args: Array<Val> = Array.new(INITIAL_VALUES);
+	var nargs: int;
+	var typeArgs: Array<Type>;
+	var interpreter: SsaInterpreter;
+
+	def numArgs() -> int {
+		return nargs;
+	}
+	def getArg(i: int) -> Val {
+		return args[i];
+	}
+	def getType(i: int) -> Type {
+		var t = typeArgs[i];
+		if (t.open()) t = frame.spec.instantiateType(t);
+		return t;
+	}
+	def getTypes() -> Array<Type> {
+		return frame.spec.instantiateTypes(typeArgs);
+	}
+	def getProgram() -> Program {
+		return prog;
+	}
+	def tailCall(spec: IrSpec, recvr: Val, startArg: int, endArg: int) -> Result {
+		if (interpreter.printer != null) {
+			interpreter.printer.buf.put1("tail-call(%q)", spec.render);
+			interpreter.printer.outln();
+		}
+		if (spec == null) {
+			return interpreter.exception = Exception.new(V3Exception.NullCheck, "null function", interpreter.getStackTrace());
+		} else {
+			interpreter.tailCalled = true;
+			interpreter.pushFrame(spec, recvr, args[startArg ... endArg]);
+			return null;
+		}
+	}
+	def throw(ex: string, msg: string) -> Exception {
+		var e = interpreter.exception = Exception.new(ex, msg, interpreter.getStackTrace());
+		interpreter.unwind();
+		return e;
+	}
+}
+class SsaIntFrame {
+	var spec: IrSpec;
+	var meth: IrMethod;
+	var block: SsaBlock;
+	var ip: SsaInstr;
+	var fp: int;
+}
