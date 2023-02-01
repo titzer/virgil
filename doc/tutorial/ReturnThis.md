@@ -41,7 +41,7 @@ class B extends A {
 
 var b = B.new();
 // all subexpressions are of type {B}, even though {add} is declared in {A}
-var x = a.add(3).mul(4).add(5);
+var x = b.add(3).mul(4).add(5);
 ```
 
 ## Used in standard libraries ##

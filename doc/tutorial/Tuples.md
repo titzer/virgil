@@ -23,7 +23,7 @@ var a = (11, false);
 var b = a.0;		// == 11
 var c = a.1;		// == false
 var d = (1, (12, 13));
-var e = d.1.0;		// == 13
+var e = d.1.0;		// == 12
 ```
 
 Tuples also have a special member `last` that always refers to the last element in the tuple.

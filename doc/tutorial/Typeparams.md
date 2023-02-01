@@ -1,6 +1,6 @@
 # Type Parameters for Methods #
 
-Type parameters are a powerful abstraction mechanism that allows you write methods that are independent of the actual type of data they manipulate, leading to more reusable code.
+Type parameters are a powerful abstraction mechanism that allows you to write methods that are independent of the actual type of data they manipulate, leading to more reusable code.
 
 ```
 // search an array for a given element and return its index

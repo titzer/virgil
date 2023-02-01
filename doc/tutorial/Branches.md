@@ -32,7 +32,7 @@ var f: bool = (x >= y);	// greater than or equal
 
 ## If Statements ##
 
-Syntax and semantics for statements in Virgil are like those in Java. An `if` statement executes the associated statement or block if its condition evaluates to the boolean value `true`. If statements require a condition expression of type `bool`. An `if` statement also optionally have an `else` clause the specifies the statement to execute if the condition is false. In either case, control resumes from the end of the `if` statement after the block is executed.
+Syntax and semantics for statements in Virgil are like those in Java. An `if` statement executes the associated statement or block if its condition evaluates to the boolean value `true`. If statements require a condition expression of type `bool`. An `if` statement also can optionally have an `else` clause that specifies the statement to execute if the condition is false. In either case, control resumes from the end of the `if` statement after the block is executed.
 
 ```
 var b: bool;

@@ -17,7 +17,7 @@ var x = Foo.!(a); // casts to Foo type
 var y = Foo.?(a); // queries if a is a Foo
 ```
 
-The operators are accessible as if they were type members. To cast an expression `e` _to_ a type `T`, write `T.!(e)` and to test an whether a value  `e` is of type `T`, write `T.?(e)`. The above example uses a class for the cast type, but the same applies to primitives and array casts.
+The operators are accessible as if they were type members. To cast an expression `e` _to_ a type `T`, write `T.!(e)` and to test whether the value `e` is of type `T`, write `T.?(e)`. The above example uses a class for the cast type, but the same applies to primitives and array casts.
 
 ## Primitives ##
 
@@ -97,7 +97,7 @@ Objects, arrays, and function references can be `null`. At runtime a type cast o
 
 ## Tuples ##
 
-Type casts and type queries on tuples are _inductive_. The result of a typecasting a tuple value to another type is the result of individually casting each element value to the corresponding element type and creating a tuple from those values. If the element counts do not match, the cast fails. The result of a type query of a tuple value is `true` if and only if the result of querying every element value against its corresponding element type is `true`. Again, the compiler tries to reject invalid casts whenever possible at compile time.
+Type casts and type queries on tuples are _inductive_. The result of typecasting a tuple value to another type is the result of individually casting each element value to the corresponding element type and creating a tuple from those values. If the element counts do not match, the cast fails. The result of a type query of a tuple value is `true` if and only if the result of querying every element value against its corresponding element type is `true`. Again, the compiler tries to reject invalid casts whenever possible at compile time.
 
 ## Cast and query operators are functions ##
 
