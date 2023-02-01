@@ -45,7 +45,7 @@ def main(args: Array<string>) {
         System.puti(i);
         System.puts("\n");
     }
-    // equivalent three-far for:
+    // equivalent three-part for:
     for (i = 0; i < 5; i++) {
         System.puti(i);
         System.puts("\n");
@@ -58,7 +58,7 @@ A `for`-less-than loop always introduces a new loop iteration variable that cann
 ## `for`-in on arrays ##
 
 Virgil supports a simplified version of the `for` loop that allows iteration over the elements of an array.
-The keyword `in` to differentiates between the a three-part `for` and `for`-in.
+The keyword `in` differentiates between the a three-part `for` and `for`-in.
 
 ```
 def main(args: Array<string>) {
@@ -86,7 +86,7 @@ def main(args: Array<string>) {
 }
 ```
 
-Like the other short forms, `for`-in over an enum always a new loop variable that cannot be assigned in the body.
+Like the other short forms, `for`-in over an enum always introduces a new loop variable that cannot be assigned in the body.
 
 ## `break` and `continue` ##
 
