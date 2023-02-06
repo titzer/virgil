@@ -1,0 +1,1 @@
+declare module 'tree-sitter-virgil/bindings/node/index.js'
