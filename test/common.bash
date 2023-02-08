@@ -302,6 +302,9 @@ function execute_target_tests() {
 	if [ "$target" = "wasm-js" ]; then
 	   ext=".wasm"
 	fi
+	if [ "$target" = "wasm-spec" ]; then
+	   ext=".wasm"
+	fi
 	check_cached_target_tests $ext | tee $OUT/$target/cached.out | $PROGRESS
 	TORUN=$(cat $OUT/$target/leftover)
     else
@@ -309,13 +312,23 @@ function execute_target_tests() {
     fi
 
     if [ "$TORUN" != "" ]; then
-	print_status "  running" ""
 
-	if [ -x $CONFIG/test-$target ]; then
-	    $CONFIG/test-$target $OUT/$target $TORUN | tee $OUT/$target/run.out | $PROGRESS
-	else
+	RUNNERS=$(cd $CONFIG && echo test-$target*)
+
+	RAN=0
+	for r in $RUNNERS; do
+	    runner=$CONFIG/$r
+	    if [ -x $runner ]; then
+		print_status "  running" "${r/test-$target/}"
+		$runner $OUT/$target $TORUN | tee $OUT/$target/run.out | $PROGRESS
+		RAN=1
+	    fi
+	done
+
+	if [ "RAN" = 0 ]; then
+	    print_status "  skipped" ""
 	    count=$(echo $(echo $TORUN | wc -w))
-	    printf "$count ${YELLOW}skipped${NORM}\n"
+	    printf "$count ${YELLOW}no runners found${NORM}\n"
 	fi
     fi
 }
@@ -381,6 +394,8 @@ function convert_to_io_target() {
     if [ "$target" = "jvm" ]; then
 	target=jar
     elif [ "$target" = "wasm-js" ]; then
+	target=wave
+    elif [ "$target" = "wasm-spec" ]; then
 	target=wave
     fi
     echo $target
