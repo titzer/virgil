@@ -59,6 +59,7 @@ module.exports = grammar({
         variant_decl: $ => seq(
             "type", field('name', $.ident_param),
             optional(seq("(", optional(field('decls', $.param_decls)), ")")),
+            optional($.boxing_mode),
             "{", field('members', repeat($.variant_member)), "}"
         ),
         enum_decl: $ => seq(
@@ -94,6 +95,7 @@ module.exports = grammar({
         variant_case: $ => seq(
             "case", field('name', $.identifier),
             optional(seq("(", optional(field('decls', $.param_decls)), ")")),
+            optional($.boxing_mode),
             choice(";", seq("{", field('method', repeat($.def_method)), "}"))
         ),
         enum_case: $ => seq(
@@ -264,6 +266,7 @@ module.exports = grammar({
             ...infix_ops.map(op => op[0])
         ),
 
+        boxing_mode: $ => choice("#unboxed", "#boxed", "#packed"),
         identifier: $ => /[a-zA-Z]\w*/,
         char: $ => seq("'", choice($.hex_char, $.printable, $.escape), "'"),
         integer: $ => /0|-?([1-9][0-9]*|0x[a-fA-F0-9]+)[uU]?[lL]?/,
