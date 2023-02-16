@@ -4,13 +4,13 @@ UTILS=bin/utils/vctags bin/utils/progress bin/utils/nu
 
 all: bootstrap utils
 
-bin/utils/vctags: apps/vctags/* $(LIB_UTIL)
+bin/utils/vctags: bootstrap apps/vctags/* $(LIB_UTIL)
 	(cd apps/vctags && v3c-host -output=../../bin/utils/ *.v3 `cat DEPS`)
 
-bin/utils/progress: apps/Progress/* $(LIB_UTIL)
+bin/utils/progress: bootstrap apps/Progress/* $(LIB_UTIL)
 	(cd apps/Progress && v3c-host -program-name=progress -output=../../bin/utils/ *.v3 `cat DEPS`)
 
-bin/utils/nu: apps/NumUtil/* $(LIB_UTIL)
+bin/utils/nu: bootstrap apps/NumUtil/* $(LIB_UTIL)
 	(cd apps/NumUtil && v3c-host -program-name=nu -output=../../bin/utils/ *.v3 `cat DEPS`)
 
 utils: $(UTILS)
