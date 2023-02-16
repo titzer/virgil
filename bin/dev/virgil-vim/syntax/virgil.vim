@@ -25,6 +25,7 @@ syn keyword virgilType false
 syn keyword virgilType int
 syn keyword virgilType long
 syn keyword virgilType null
+syn keyword virgilType Range range
 syn keyword virgilType string
 syn keyword virgilType this true
 syn keyword virgilType void
