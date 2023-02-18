@@ -10,12 +10,6 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 EXIT_SUCCESS=0
 
-function exit_if_non_zero() {
-    if [[ $1 != 0 ]]; then
-        exit $1
-    fi
-}
-
 #######################################################################
 # Sense stable compiler and host platform, or use environment variables
 #######################################################################
@@ -120,7 +114,7 @@ for dir in unit lib; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($V3C_STABLE) $dir${NORM}"
-    (cd $td && AENEAS_TEST=$V3C_STABLE $td/test.bash) || exit_if_non_zero $?
+    (cd $td && AENEAS_TEST=$V3C_STABLE $td/test.bash) || exit $?
 done
 
 #######################################################################
@@ -141,7 +135,7 @@ for dir in $TEST_DIRS; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($AENEAS_TEST) $dir${NORM}"
-    (cd $td && $td/test.bash) || exit_if_non_zero $?
+    (cd $td && $td/test.bash) || exit $?
 done
 
 if [ "$SKIP_BOOTSTRAP" = 1 ]; then
@@ -172,7 +166,7 @@ for dir in $TEST_DIRS; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($CURRENT) $dir${NORM}"
-    (cd $td && AENEAS_TEST=$CURRENT $td/test.bash) || exit_if_non_zero $?
+    (cd $td && AENEAS_TEST=$CURRENT $td/test.bash) || exit $?
 done
 
 exit $EXIT_SUCCESS
