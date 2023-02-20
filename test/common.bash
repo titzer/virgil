@@ -31,7 +31,7 @@ GC_SOURCES="${GC_LOC}/*.v3"
 V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
-# it to line (l) mode
+# it to character (c) mode
 PROGRESS_ARGS=${PROGRESS_ARGS:=i}
 PROGRESS="${VIRGIL_LOC}/test/config/progress $PROGRESS_ARGS"
 

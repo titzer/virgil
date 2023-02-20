@@ -8,15 +8,7 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-SCRIPT_EXIT_CODE=0
-
-function update_exit_code_if_non_zero() {
-    if [[ $1 != 0 ]]; then
-        if [[ $SCRIPT_EXIT_CODE == 0 ]]; then
-            SCRIPT_EXIT_CODE=$1
-        fi
-    fi
-}
+EXIT_SUCCESS=0
 
 #######################################################################
 # Sense stable compiler and host platform, or use environment variables
@@ -122,9 +114,7 @@ for dir in unit lib; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($V3C_STABLE) $dir${NORM}"
-    (cd $td && AENEAS_TEST=$V3C_STABLE $td/test.bash)
-    X=$?
-    update_exit_code_if_non_zero $X
+    (cd $td && AENEAS_TEST=$V3C_STABLE $td/test.bash) || exit $?
 done
 
 #######################################################################
@@ -145,13 +135,11 @@ for dir in $TEST_DIRS; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($AENEAS_TEST) $dir${NORM}"
-    (cd $td && $td/test.bash)
-    X=$?
-    update_exit_code_if_non_zero $X
+    (cd $td && $td/test.bash) || exit $?
 done
 
 if [ "$SKIP_BOOTSTRAP" = 1 ]; then
-    exit $SCRIPT_EXIT_CODE
+    exit $EXIT_SUCCESS
 fi
 
 
@@ -163,7 +151,7 @@ diff -rq $VIRGIL_TEST_OUT/aeneas/bootstrap/ $VIRGIL_TEST_OUT/aeneas/current/ > $
 if [ $? = 0 ]; then
     # binaries match exactly. no need to test again
     echo "  bin/current == bin/bootstrap ${GREEN}ok${NORM}"
-    exit $SCRIPT_EXIT_CODE
+    exit $EXIT_SUCCESS
 else
     # if the bootstrap check fails, print out the diff
     printf $YELLOW
@@ -178,9 +166,7 @@ for dir in $TEST_DIRS; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($CURRENT) $dir${NORM}"
-    (cd $td && AENEAS_TEST=$CURRENT $td/test.bash)
-    X=$?
-    update_exit_code_if_non_zero $X
+    (cd $td && AENEAS_TEST=$CURRENT $td/test.bash) || exit $?
 done
 
-exit $SCRIPT_EXIT_CODE
+exit $EXIT_SUCCESS
