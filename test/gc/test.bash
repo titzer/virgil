@@ -5,7 +5,7 @@
 if [ $# -gt 0 ]; then
   TESTS="$*"
 else
-  TESTS=$(cat core.gc variants.gc large.gc)
+  TESTS=$(cat core.gc cast.gc variants.gc large.gc)
 fi
 
 function compile_gc_tests() {
@@ -36,9 +36,9 @@ function do_test() {
     execute_target_tests $target
 
     if [[ "$target" =~ "x86-64" ]]; then
-        HEAP='-heap-size=48m' # 64-bit needs more heap
+        HEAP='-heap-size=64m' # 64-bit needs more heap
     else
-        HEAP='-heap-size=24m'
+        HEAP='-heap-size=32m'
     fi
     BEFORE=$V3C_OPTS
     V3C_OPTS="$V3C_OPTS $HEAP"
@@ -48,7 +48,7 @@ function do_test() {
 
     print_status Testing "$target $HEAP" Aeneas
     if [ -x $CONFIG/run-$target ]; then
-	$T/$target/Aeneas -test -rma $VIRGIL_LOC/test/core/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS
+	$T/$target/Aeneas -test -ra $VIRGIL_LOC/test/core/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS
     else
 	echo "${YELLOW}skipped${NORM}"
     fi
