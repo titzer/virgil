@@ -1222,7 +1222,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	}
 	def visitAutoExpr(expr: AutoExpr, outer: Type) -> Type {
 		var t = checkWrite(expr.expr);
-		if (IndexExpr.?(expr.expr)) t = visitIndexedRead(IndexExpr.!(expr.expr), outer);
+		if (IndexExpr.?(expr.expr)) t = checkIndexedRead(IndexExpr.!(expr.expr), outer);
 		var op = expr.op;
 		if (op == null) op = methodEnv.lookupInfix(expr.infix, t, t);
 		if (op == null) {
@@ -1259,11 +1259,11 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	}
 	def visitVar(expr: VarExpr, outer: Type) -> Type {
 		var binding = lookupBinding(expr, outer);
-		match (binding) {
+		match (binding) { // some bindings are not allowed as standalone expressions
 			None => return if(outer == null, getErrorType(), outer);
 			PtrAtField(t) => methodEnv.verifier.PtrAtFieldError(expr.range());
-//			RefStructRepeatedField,
-//			RefStructRepeatedNested => methodEnv.verifier.error(expr.range(), "ExprError", "repeated field used as an expression");
+			RefStructRepeatedField,
+			RefStructRepeatedNested => methodEnv.verifier.error(expr.range(), "ExprError", "repeated field used as an expression");
 			Type(t) => methodEnv.verifier.TypeExprError(expr.range(), t);
 			_ => ;
 		}
@@ -1452,7 +1452,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return getErrorType();
 	}
 	def visitIndex(expr: IndexExpr, outer: Type) -> Type {
-		return visitIndexedRead(expr, outer);
+		return checkIndexedRead(expr, outer);
 	}
 	def visitRange(expr: RangeExpr, outer: Type) -> Type {
 		if (V3.isArray(outer)) outer = V3Range.newType(V3Array.elementType(outer));
@@ -1479,75 +1479,95 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		if (typeArgs != null) funcType = funcType.substitute(typeArgs);
 		return funcType;
 	}
-	def visitIndexedRead(expr: IndexExpr, outer: Type) -> Type {
+	def checkIndexedRead(expr: IndexExpr, outer: Type) -> Type {
 		var arrayType = if(outer != null, V3Array.newType(outer)); // try using array type for outer
-		var exprType = inferType(expr.expr, arrayType);
-		if (V3.isArray(exprType) || V3.isRange(exprType)) {
-			return visitArrayIndex(expr, exprType);
-		} else if (ClassType.?(exprType)) {
-			var varExpr = VarExpr.new(expr, null, VstIdent<TypeRef>.new(null, 0, null));
-			var member = methodEnv.resolveClassMember(varExpr, ClassType.!(exprType), "[]");
-			if (member != null) {
-				var funcType = member.memberType;
-				expr.read = AppBinding.CallObjectMethod(member.receiver, member.getMethod(), null);
-				typeCheckArgs("indexing", expr.exprs, funcType, outer);
-				return Function.getReturnType(funcType);
+		var exprType: Type;
+		match (expr.expr) {
+			x: VarExpr => {
+				var binding = lookupBinding(x, arrayType);
+				match (binding) {
+					RefStructRepeatedNested(receiver, member) => {
+						var mtref = member.mtref;
+						expr.receiver = x.expr;
+						expr.read = AppBinding.Apply(V3Op.newRefStructAtRepeatedField(
+							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.mtstruct),
+							Facts.NONE);
+						visitRepeatedIndex(expr.exprs);
+						return mtref.getType();
+					}
+					RefStructRepeatedField(receiver, member) => {
+						var mtref = member.mtref;
+						expr.receiver = x.expr;
+						expr.read = AppBinding.Apply(V3Op.newRefStructGetRepeatedField(
+							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),
+							Facts.NONE);
+						visitRepeatedIndex(expr.exprs);
+						return mtref.getType();
+					}
+					_ => ;
+				}
+				if (arrayType != null) TypeSystem.unifyWiden(x.exactType, arrayType);
+				exprType = x.exactType;
 			}
-		} else if (VarExpr.?(expr.expr)) {
-			var left = VarExpr.!(expr.expr);
-			match (left.varbind) {
-				RefStructRepeatedNested(receiver, member) => {
-					var mtref = member.mtref;
-					expr.receiver = left.expr;
-					expr.read = AppBinding.Apply(V3Op.newRefStructAtRepeatedField(
-						receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.mtstruct),
-						Facts.NONE);
-					visitRepeatedIndex(expr.exprs);
-					return mtref.getType();
+			_ => {
+				exprType = inferType(expr.expr, arrayType);
+			}
+		}
+		match (exprType) {
+			x: ArrayType => return visitArrayIndex(expr, exprType);
+			x: RangeType => return visitArrayIndex(expr, exprType);
+			x: ClassType => {
+				var varExpr = VarExpr.new(expr, null, VstIdent<TypeRef>.new(null, 0, null));
+				var member = methodEnv.resolveClassMember(varExpr, x, "[]");
+				if (member != null) {
+					var funcType = member.memberType;
+					expr.read = AppBinding.CallObjectMethod(member.receiver, member.getMethod(), null);
+					typeCheckArgs("indexing", expr.exprs, funcType, outer);
+					return Function.getReturnType(funcType);
 				}
-				RefStructRepeatedField(receiver, member) => {
-					var mtref = member.mtref;
-					expr.receiver = left.expr;
-					expr.read = AppBinding.Apply(V3Op.newRefStructGetRepeatedField(
-						receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),
-						Facts.NONE);
-					visitRepeatedIndex(expr.exprs);
-					return mtref.getType();
-				}
-				_ => ;
 			}
 		}
 		error(expr.exprs.range(), "TypeError", Strings.format1("type %s has no [] operator", TYPE(exprType)));
 		return getErrorType();
 	}
-	def visitIndexedWrite(expr: IndexExpr, outer: Type) -> Type {
+	def checkIndexedWrite(expr: IndexExpr, outer: Type) -> Type {
 		var arrayType = if(outer != null, V3Array.newType(outer)); // try using array type for outer
-		var exprType = inferType(expr.expr, arrayType);
-		if (V3.isArray(exprType) || V3.isRange(exprType)) {
-			return visitArrayIndex(expr, exprType);
-		} else if (ClassType.?(exprType)) {
-			var varExpr = VarExpr.new(expr, null, VstIdent<TypeRef>.new(null, 0, null));
-			var member = methodEnv.resolveClassMember(varExpr, ClassType.!(exprType), "[]=");
-			if (member != null) {
-				var method = member.getMethod();
-				var funcType = getIndexedWriteType(member.receiver, method);
-				expr.write = AppBinding.CallObjectMethod(member.receiver, method, null);
-				typeCheckArgs("indexing", expr.exprs, funcType, outer);
-				return Function.getReturnType(funcType);
-			}
-		} else if (VarExpr.?(expr.expr)) {
-			var left = VarExpr.!(expr.expr);
-			match (left.varbind) {
-				RefStructRepeatedField(receiver, member) => {
-					var mtref = member.mtref;
-					expr.receiver = left.expr;
-					expr.write = AppBinding.Apply(V3Op.newRefStructSetRepeatedField(
-						receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),
-						Facts.NONE);
-					visitRepeatedIndex(expr.exprs);
-					return mtref.getType();
+		var exprType: Type;
+		match (expr.expr) {
+			x: VarExpr => {
+				var binding = lookupBinding(x, arrayType);
+				match (binding) {
+					RefStructRepeatedField(receiver, member) => {
+						var mtref = member.mtref;
+						expr.receiver = x.expr;
+						expr.write = AppBinding.Apply(V3Op.newRefStructSetRepeatedField(
+							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),	
+							Facts.NONE);
+						visitRepeatedIndex(expr.exprs);
+						return mtref.getType();
+					}
+					_ => ;
 				}
-				_ => ;
+				if (arrayType != null) TypeSystem.unifyWiden(x.exactType, arrayType);
+				exprType = x.exactType;
+			}
+			_ => {
+				exprType = inferType(expr.expr, arrayType);
+			}
+		}
+		match (exprType) {
+			x: ArrayType => return visitArrayIndex(expr, x);
+			x: RangeType => return visitArrayIndex(expr, x);
+			x: ClassType => {
+				var varExpr = VarExpr.new(expr, null, VstIdent<TypeRef>.new(null, 0, null));
+				var member = methodEnv.resolveClassMember(varExpr, x, "[]=");
+				if (member != null) {
+					var method = member.getMethod();
+					var funcType = getIndexedWriteType(member.receiver, method);
+					expr.write = AppBinding.CallObjectMethod(member.receiver, method, null);
+					typeCheckArgs("indexing", expr.exprs, funcType, outer);
+					return Function.getReturnType(funcType);
+				}
 			}
 		}
 		error(expr.exprs.range(), "AssignError", Strings.format1("type %s has no [] assignment operator", TYPE(exprType)));
@@ -1653,19 +1673,28 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return t;
 	}
 	def checkWrite(left: Expr) -> Type {
-		if (IndexExpr.?(left)) {
-			var t = visitIndexedWrite(IndexExpr.!(left), null);
-			left.exactType = t;
-			return t;
-		}
-		var result = inferClosedType(left);
-		var expr: VarExpr;
-		if (VarExpr.?(left) && (expr = VarExpr.!(left)).isAssignable(methodEnv.compound)) {
-			match (expr.varbind) {
-				Local(decl) => setAssigned(decl.ssa);
-				_ => ;
+		var result: Type;
+		match (left) {
+			x: VarExpr => {
+				result = inferClosedType(x);
+				if (x.isAssignable(methodEnv.compound)) {
+					match (x.varbind) {
+						Local(decl) => setAssigned(decl.ssa);
+						_ => ;
+					}
+					return result;
+				} else {
+					// TODO: improve error message for assign error depending on binding
+				}
 			}
-			return result;
+			x: IndexExpr => {
+				result = checkIndexedWrite(x, null);
+				left.exactType = result;
+				return result;
+			}
+			_ => {
+				result = inferClosedType(left);
+			}
 		}
 		AssignError(left.range());
 		return result;
@@ -1675,7 +1704,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var ltype = checkWrite(left);
 		var infix = expr.infix;
 		if (infix != null) {
-			if (IndexExpr.?(left)) ltype = visitIndexedRead(IndexExpr.!(left), outer);
+			if (IndexExpr.?(left)) ltype = checkIndexedRead(IndexExpr.!(left), outer);
 			if (infix.op == null) infix.op = methodEnv.lookupInfix(infix.infix, ltype, null);
 			if (infix.op == null) {
 				UnresolvedOp(infix.token, ltype, null);
