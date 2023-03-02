@@ -17,6 +17,7 @@ That way, you can jump right into a topic.
 * [Arithmetic](Arith.md) on numbers in Virgil is a lot more general than other programming languages.
 * [Fixed-sized Integers](FixedSizeIntegers.md) allow intuitive systems programming and save memory.
 * [Arrays](Arrays.md) are key for storing large amounts of data.
+* [Ranges](Ranges.md) are a generalization of arrays.
 * [Strings](Strings.md) are key for dealing with files, text, etc.
 * [Tuples](Tuples.md) allow using multiple values where one value is expected.
 * [Tuples and Methods](TuplesAndMethods.md) go together particularly well in Virgil.
