@@ -25,23 +25,30 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	var coloring: Array<byte>;
 	var blockWeight: Array<int>;
 	var liveoutRow: int;
+	var maskRow: int;
 
-	// 1. Construct the interference graph.
-	// 2. Color the graph with simplify, spill and select phases. The spilled node
-	//    is not assigned a register in this process.
-	// 3. Allocate register in the instructions. If there is constraint, move variable
+	// 1. Insert move instruction before each use whose constraint is stack.
+	// 2. Construct the interference graph.
+	// 3. Color the graph with simplify, spill and select phases. Iterate until the graph is colorable.
+	// 4. Allocate register in the instructions. If there is constraint, move variable
 	//    to match the constraint and move it back to its color (register assigned
 	//    in previous step).
 	def allocate() {
 		clear();
+		insertLoadToStack();
 		liveness = codegen.liveness;
 		liveoutRow = liveness.numrows;
-		liveness.grow(liveoutRow + 1);
+		maskRow = liveness.numrows + 1;
+		liveness.grow(maskRow + 1);
+		liveness.setRow(maskRow);
 		buildGraph();
 		var result = colorGraph(availableColor);
-		if (!result.0) {
-			backupAllocate();
-			return;
+		while (!result.0) { // insert actual spill and iterate again
+			visitedCnt = 0;
+			coloring = result.1;
+			insertSpill();
+			buildGraph();
+			result = colorGraph(availableColor);
 		}
 		coloring = result.1;
 		if (colorVerbose) printColor();
@@ -54,6 +61,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			// union the succesor's live-in set into this.
 			liveness.or(liveoutRow, succ.mark);
 		}
+		liveness.and(liveoutRow, maskRow);
 	}
 	def allocateAfterColoring() {
 		cur = codegen.last;
@@ -101,6 +109,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			movesPrev.clear();
 			for (i < operands.length) match (operands[i]) {
 				Def(vreg, constraint) => {
+					// ignore `Def` introduced by previous spill or `insertLoadToStack`
+					if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use && vreg.spill <= 0)) continue;
 					var loc = allocDefReg(vreg, constraint);
 					operands[i] = Operand.Def(vreg, loc);
 				}
@@ -115,6 +125,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 					operands[i] = Operand.Overwrite(vreg, use, loc);
 				}
 				Use(vreg, constraint) => {
+					if (vreg == null || regSet.isStack(constraint)) continue;
 					var loc = allocUseReg(vreg, constraint);
 					operands[i] = Operand.Use(vreg, loc);
 				}
@@ -134,6 +145,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 					}
 				}
 				Use(vreg, assignment) => {
+					if (vreg == null) continue;
 					if (!regSet.isStack(assignment) || !vreg.isConst()) {
 						updateRegState(vreg);
 					}
@@ -162,7 +174,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			if (regSet.isReg(gReg)) moves.addRegMove(vreg, loc, gReg);
 			if (loc < regSet.physRegs) spillReg(byte.!(loc));
 		}
-		if (vreg.spill != 0) moves.saves.put(vreg, loc, vreg.spill);
+		if (vreg.spill > 0) moves.saves.put(vreg, loc, vreg.spill);
 		return loc;
 	}
 	def allocUseReg(vreg: VReg, constraint: int) -> int {
@@ -287,7 +299,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def chooseSpill() -> int {
 		var mincost: float = 100000000f, node: int;
 		for (i < graph.nodes.length) {
-			if (!graph.nodes[i].removed) {
+			if (!graph.nodes[i].removed && !vars[i].notSpill) {
 				var cost: float = float.roundi(graph.nodes[i].spillCost) / float.roundi(graph.nodes[i].interfereCnt);
 				if (cost < mincost) {
 					node = i;
@@ -299,7 +311,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	}
 	// Recursively color the graph by removing the nodes from graph and add them back
 	// in a LIFO order. Pick node with degree smaller than k or mark as spill if no
-	// available node.
+	// available node. If there is an actual spill in the select phase, return false. 
 	def colorGraph(k: int) -> (bool, Array<byte>) {
 		if (visitedCnt == graph.nodes.length) {
 			return (true, Array<byte>.new(visitedCnt));
@@ -321,7 +333,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		visitedCnt ++;
 
 		var result = colorGraph(k);
-		if (!result.0) return (false, null);
 
 		graph.addNodeBack(node);
 		var allocatedColor: Array<bool> = Array.new(regSet.physRegs);
@@ -332,7 +343,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 		var vreg = vars[node];
-		if (vreg != null) {
+		if (vreg != null && vreg.spill <= 0) {
 			if (vreg.hint != 0 && !allocatedColor[vreg.hint]) {
 				result.1[node] = vreg.hint;
 				return result;
@@ -347,11 +358,70 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 			if (graph.nodes[node].spill) {
 				allocSpill(vreg);
-				return result;
+				return (false, result.1);
 			}
-			return (false, null);
 		}
 		return result;
+	}
+	def insertRestore(vreg: VReg, constraint: int, next: ArchInstr) -> VReg {
+		var newVreg = codegen.dupVReg(vreg);
+		newVreg.notSpill = true;
+		if (vreg.spill > 0) {
+			codegen.insertMoveUnallocLocLoc((null, vreg.spill), (newVreg, constraint), newVreg.regClass, next);
+		} else { // is const
+			codegen.insertMoveUnallocValLoc(newVreg, (newVreg, constraint), newVreg.regClass, next);
+		}
+		if (constraint < regSet.physRegs) newVreg.hint = byte.view(constraint);
+		return newVreg;
+	}
+	def insertSpill() {
+		for (i < vars.length) {
+			if (coloring[i] == 0) {
+				liveness[maskRow, i] = false;
+			}
+		}
+		var i = codegen.first;
+		while (i != null) {
+			var next = i.next;
+			var operands = i.operands;
+			for (j = operands.length - 1; j >= 0; j--) {
+				match (operands[j]) {
+					Use(vreg, constraint) => {
+						if (vreg != null && !regSet.isStack(constraint) && coloring[vreg.varNum] == 0) {
+							var newVreg = insertRestore(vreg, constraint, i);
+							operands[j] = Operand.Use(newVreg, constraint);
+						}
+					}
+					Overwrite(vreg, use, constraint) => {
+						if (!regSet.isStack(constraint) && coloring[use.varNum] == 0) {
+							var newVreg = insertRestore(use, constraint, i);
+							operands[j] = Operand.Overwrite(vreg, newVreg, constraint);
+						}
+					}
+					_ => ;
+				}
+			}
+			i = next;
+		}
+	}
+	def insertLoadToStack() {
+		var i = codegen.first;
+		while (i != null) {
+			var next = i.next;
+			var operands = i.operands;
+			for (j = operands.length - 1; j >= 0; j--) {
+				match (operands[j]) {
+					Use(vreg, constraint) => {
+						if (regSet.isStack(constraint)) {
+							if (vreg.isConst()) codegen.insertMoveValLoc(vreg, (vreg, constraint), vreg.regClass, i);
+							else codegen.insertMoveLocLoc((vreg, 0), (null, constraint), vreg.regClass, i);
+						}
+					}
+					_ => ;
+				}
+			}
+			i = next;
+		}
 	}
 	def printColor() {
 		buf.reset();
@@ -407,8 +477,12 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			var operands = cur.operands;
 			for (i < operands.length) match (operands[i]) {
 				Def(vreg, constraint) => {
-					liveness[liveoutRow, vreg.varNum] = true;
-					addInterfere(vreg);
+					// ignore `Def` introduced by previous spill or `insertLoadToStack`
+					if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
+					if (vreg.spill <= 0) { // only consider varaible which are not spilled
+						liveness[liveoutRow, vreg.varNum] = true;
+						addInterfere(vreg);
+					}
 				}
 				Overwrite(vreg, use, constraint)    => {
 					liveness[liveoutRow, vreg.varNum] = true;
@@ -418,8 +492,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 			for (i < operands.length) match (operands[i]) {
 				Def(vreg, constraint) => {
-					liveness[liveoutRow, vreg.varNum] = false;
-					graph.nodes[vreg.varNum].spillCost += curWeight;
+					if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
+					if (vreg.spill <= 0) {
+						liveness[liveoutRow, vreg.varNum] = false;
+						graph.nodes[vreg.varNum].spillCost += curWeight;
+					}
 				}
 				Overwrite(vreg, use, constraint)    => {
 					liveness[liveoutRow, vreg.varNum] = false;
@@ -427,11 +504,14 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 					addInterfere(use);
 					graph.nodes[vreg.varNum].spillCost += curWeight;
 					graph.nodes[use.varNum].spillCost += curWeight;
+					graph.nodes[use.varNum].use = true;
 				}
 				Use(vreg, constraint) => {
+					if (vreg == null || regSet.isStack(constraint)) continue;
 					liveness[liveoutRow, vreg.varNum] = true;
 					addInterfere(vreg);
 					graph.nodes[vreg.varNum].spillCost += curWeight;
+					graph.nodes[vreg.varNum].use = true;
 				}
 				_ => ;
 			}
@@ -475,12 +555,13 @@ class Graph(varsCnt: int) {
 	}
 }
 
-class Node() {
+class Node {
 	def interfere = Vector<int>.new();
 	var interfereCnt: int = 0;
 	var removed: bool = false;
 	var spillCost = 0;
 	var spill: bool = false;
+	var use: bool = false;
 
 	def addInterfere(n: int) {
 		for (i < interfere.length) {
