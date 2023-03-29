@@ -337,8 +337,8 @@ function execute_tests() {
     for target in $TEST_TARGETS; do
 	if [ "$target" = "int" ]; then
 	    execute_int_tests "int" ""
-	    execute_int_tests "int-ra" "-ra"
-	    execute_int_tests "int-ra-ma" "-ra -ma"
+	    execute_int_tests "int-ra" "-ra -ma=false"
+	    execute_int_tests "int-ra-ma" "-ra -ma=true"
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             compile_target_tests jvm -jvm.script=false
             execute_target_tests jvm
