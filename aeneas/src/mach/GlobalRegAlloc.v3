@@ -81,7 +81,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				cur = prev;
 				continue;
 			}
-			
+			moves.clear();
+			movesPrev.clear();
 			var operands = cur.operands;
 			if (opcode == ArchInstrs.ARCH_PARMOVE) { // perform parallel move
 				parmoveDests.resize(0);
@@ -105,8 +106,17 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				cur = prev;
 				continue;
 			}
-			moves.clear();
-			movesPrev.clear();
+			if (opcode == ArchInstrs.ARCH_RELOAD) {
+				var dst = Operand.Def.!(cur.operands[0]).vreg;
+				moves.reloads.put(dst, coloring[dst.varNum]);
+				moves.emit(codegen, cur.next);
+				regState.freeReg(coloring[dst.varNum], true);
+				cur.remove();
+				if (verbose) regState.dumpState("");
+				cur = prev;
+				continue;
+			}
+			
 			for (i < operands.length) match (operands[i]) {
 				Def(vreg, constraint) => {
 					// ignore `Def` introduced by previous spill or `insertLoadToStack`
@@ -366,7 +376,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		return result;
 	}
-	def insertRestore(vreg: VReg, constraint: int, next: ArchInstr) -> VReg {
+	def insertReload(vreg: VReg, constraint: int, next: ArchInstr) -> VReg {
 		var newVreg = codegen.dupVReg(vreg);
 		newVreg.notSpillable = true;
 		if (vreg.spill > 0) {
@@ -377,34 +387,99 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (constraint < regSet.physRegs) newVreg.hint = byte.view(constraint);
 		return newVreg;
 	}
-	def insertSpill() {
-		for (i < vars.length) {
-			if (coloring[i] == 0) {
-				liveness[maskRow, i] = false;
+	def isOkDominator(node: Node, newCommonDominator: SsaBlock) -> bool {
+		if (newCommonDominator == node.defBlock) return false;
+		for (e in newCommonDominator.succs()) {
+			var succ = e.dest;
+			var found = false;
+			for (i < node.useBlock.length) {
+				if (succ.mark == node.useBlock[i].mark) {
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				return false;
 			}
 		}
+		return true;
+	}
+	def processSpill(vreg: VReg, block: SsaBlock) {
+		var node = graph.nodes[vreg.varNum];
+		if (node.commonDominator == null) {
+			node.newVreg = codegen.dupVReg(vreg);
+			node.newVreg.spill = vreg.spill;
+			node.useBlock.put(block);
+			node.commonDominator = block;
+		} else {
+			var order = codegen.order;
+			var newCommonDominator = codegen.blocks.commonDominator(order[node.commonDominator.mark], order[block.mark]);
+			if (newCommonDominator == null || !isOkDominator(node, newCommonDominator.block)) {
+				codegen.insertReloadSpill(vreg, node.newVreg, codegen.instrs[node.commonDominator.mark].next);
+				node.newVreg = codegen.dupVReg(vreg);
+				node.newVreg.spill = vreg.spill;
+				node.useBlock.resize(1);
+				node.useBlock[0] = block;
+				node.commonDominator = block;
+			} else {
+				node.useBlock.put(block);
+				node.commonDominator = newCommonDominator.block;
+			}
+		}
+	}
+	def insertSpill() {
 		var i = codegen.first;
+		var block: SsaBlock = codegen.order[0].block;
 		while (i != null) {
 			var next = i.next;
+			var opcode = i.opcode();
+			if (opcode == ArchInstrs.ARCH_BLOCK) {
+				block = Operand.Label.!(i.operands[0]).block;
+			}
 			var operands = i.operands;
 			for (j = operands.length - 1; j >= 0; j--) {
 				match (operands[j]) {
 					Use(vreg, constraint) => {
 						if (vreg != null && !regSet.isStack(constraint) && coloring[vreg.varNum] == 0) {
-							var newVreg = insertRestore(vreg, constraint, i);
-							operands[j] = Operand.Use(newVreg, constraint);
+							var node = graph.nodes[vreg.varNum];
+							if (node.defBlock == block) node.newVreg = insertReload(vreg, constraint, i);
+							else processSpill(vreg, block);
+							operands[j] = Operand.Use(node.newVreg, constraint);
 						}
 					}
 					Overwrite(vreg, use, constraint) => {
 						if (!regSet.isStack(constraint) && coloring[use.varNum] == 0) {
-							var newVreg = insertRestore(use, constraint, i);
-							operands[j] = Operand.Overwrite(vreg, newVreg, constraint);
+							var node = graph.nodes[use.varNum];
+							if (node.defBlock == block) node.newVreg = insertReload(use, constraint, i);
+							else processSpill(use, block);
+							operands[j] = Operand.Overwrite(vreg, node.newVreg, constraint);
+						}
+						if (vreg != null && coloring[vreg.varNum] == 0) {
+							graph.nodes[vreg.varNum].defBlock = block;
+						}
+					}
+					Def(vreg, constraint) => {
+						if (vreg != null && coloring[vreg.varNum] == 0) {
+							graph.nodes[vreg.varNum].defBlock = block;
+							if (opcode == ArchInstrs.ARCH_RELOAD) {
+								i.remove();
+								break;
+							}
 						}
 					}
 					_ => ;
 				}
 			}
 			i = next;
+		}
+		for (i < coloring.length) {
+			if (coloring[i] == 0) {
+				liveness[maskRow, i] = false;
+				var node = graph.nodes[i];
+				if (node.commonDominator != null) {
+					codegen.insertReloadSpill(vars[i], node.newVreg, codegen.instrs[node.commonDominator.mark].next);
+				}
+ 			}
 		}
 	}
 	def insertLoadToStack() {
@@ -497,6 +572,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 					if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
 					liveness[liveoutRow, vreg.varNum] = false;
 					graph.nodes[vreg.varNum].spillCost += curWeight;
+					if (opcode == ArchInstrs.ARCH_RELOAD) break;
 				}
 				Overwrite(vreg, use, constraint)    => {
 					liveness[liveoutRow, vreg.varNum] = false;
@@ -563,6 +639,10 @@ class Node {
 	var spill: bool = false;
 	var use: bool = false;
 	var color: bool = false; // whether a node requires a color even without use
+	var newVreg: VReg;
+	def useBlock = Vector<SsaBlock>.new();
+	var commonDominator: SsaBlock;
+	var defBlock: SsaBlock;
 
 	def addInterfere(n: int) {
 		for (i < interfere.length) {
