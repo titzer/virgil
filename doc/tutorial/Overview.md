@@ -22,16 +22,16 @@ That way, you can jump right into a topic.
 * [Tuples](Tuples.md) allow using multiple values where one value is expected.
 * [Tuples and Methods](TuplesAndMethods.md) go together particularly well in Virgil.
 * Logic is done with familiar control constructs.
-  * [Branches](Branches.md)
-  * [Loops](Loops.md)
+  * [Branches](Branches.md) for simple conditional logic.
+  * [Loops](Loops.md) for induction and iteration over arrays and ranges.
 * [Algebraic data types](ADTs.md) allow building structured data.
 * [Enums](Enums.md) allow expressing fixed sets of values and even tables.
-* Virgil has switches and [pattern matching](Matches.md)
+* Virgil has switches and [pattern matching](Matches.md).
 * [Ternary Expressions](Ternary.md) expressions have a slightly different syntax in Virgil.
-* [Logical](Logical.md) operations are like arithmetic on booleans.
+* [Logical](Logical.md) operations can be used to combine boolean expressions.
 * First-class functions and partial application support a somewhat functional programming style.
   * [Functions](Functions.md) are first-class values in Virgil.
-  * [Partial Application](PartialApp.md)
+  * [Partial Application](PartialApp.md) allows programming with higher-order functions.
   * Methods from objects or classes can be used for [functional programming](ClassesAndFunctions.md).
 * Methods can have [type parameters](Typeparams.md) and be generic in their type.
 * [Classes](Classes.md) are part of Virgil's support for object-oriented programming.
