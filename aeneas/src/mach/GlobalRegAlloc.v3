@@ -16,7 +16,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def vars = codegen.vars;
 	var liveness: BitMatrix;
 	var buf = ArchInstrBuffer.new(codegen, codegen.mach.prog, regSet);
-	var liveout: BitMatrix;
 	var prev: ArchInstr;
 	var cur: ArchInstr;
 	var next: ArchInstr;
@@ -24,6 +23,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	var visitedCnt = 0;
 	var coloring: Array<byte>;
 	var blockWeight: Array<int>;
+	var curWeight: int;
 	var liveoutRow: int;
 	var maskRow: int;
 
@@ -34,25 +34,30 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	//    to match the constraint and move it back to its color (register assigned
 	//    in previous step).
 	def allocate() {
-		clear();
-		insertLoadToStack();
+		reset();
 		liveness = codegen.liveness;
 		liveoutRow = liveness.numrows;
 		maskRow = liveness.numrows + 1;
 		liveness.grow(maskRow + 1);
 		liveness.setRow(maskRow);
-		buildGraph();
+		codegen.iterateInstructionsForward(insertMovesToStack);
+		blockWeight = Array<int>.new(codegen.order.length);
+		computeBlockWeight(1, 0, codegen.order.length);
+		initGraph();
+		codegen.iterateInstructionsBackward(buildGraph);
 		var result = colorGraph(availableColor);
 		while (!result.0) { // insert actual spill and iterate again
 			visitedCnt = 0;
 			coloring = result.1;
-			insertSpill();
-			buildGraph();
+			codegen.iterateInstructionsForward(insertSpill);
+			insertSpillCleanup();
+			initGraph();
+			codegen.iterateInstructionsBackward(buildGraph);
 			result = colorGraph(availableColor);
 		}
 		coloring = result.1;
 		if (colorVerbose) printColor();
-		allocateAfterColoring();
+		codegen.iterateInstructionsBackward(allocateAfterColoring);
 	}
 	def computeLiveoutForBlock(block: SsaBlock) {
 		liveness.clearRow(liveoutRow);
@@ -63,117 +68,112 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		liveness.and(liveoutRow, maskRow);
 	}
-	def allocateAfterColoring() {
-		cur = codegen.last;
-		while (cur != null) {
-			if (verbose) Terminal.put(buf.putInstrV(cur).toString());
-			regState.pos++;
-			prev = cur.prev;
-			next = cur.next;
-			var opcode = cur.opcode();
-			if (opcode == ArchInstrs.ARCH_BLOCK_END) {
-				regState.release();
-				var block = Operand.Label.!(cur.operands[0]).block;
-				computeLiveoutForBlock(block);
-				for (i < vars.length) {
-					if (liveness[liveoutRow, i]) updateRegState(vars[i]);
-				}
-				cur = prev;
-				continue;
+	def allocateAfterColoring(block: SsaBlock, cur: ArchInstr) {
+		cur = cur;
+		prev = cur.prev;
+		next = cur.next;
+		if (verbose) Terminal.put(buf.putInstrV(cur).toString());
+		regState.pos++;
+		var opcode = cur.opcode();
+		var operands = cur.operands;
+
+		if (opcode == ArchInstrs.ARCH_BLOCK_END) {
+			regState.release();
+			computeLiveoutForBlock(block);
+			for (i < vars.length) {
+				if (liveness[liveoutRow, i]) updateRegState(vars[i]);
 			}
-			moves.clear();
-			movesPrev.clear();
-			var operands = cur.operands;
-			if (opcode == ArchInstrs.ARCH_PARMOVE) { // perform parallel move
-				parmoveDests.resize(0);
-				codegen.gatherParallelMoveDests(cur, parmoveDests);
-				for (j < parmoveDests.length) recursivelyEmitMoves(j, next);
-				for (i < operands.length) match (operands[i]) {
-					Def(vreg, constraint) => {
-						var gReg = coloring[vreg.varNum];
-						regState.freeReg(gReg, true);
-						if (regSet.isReg(gReg)) codegen.insertRestoreLocal(vreg, gReg, next);
-					}
-					Use(vreg, assignment) => {
-						if (!regSet.isStack(assignment)) {
-							updateRegState(vreg);
-						}
-					}
-					_ => ;
-				}
-				cur.remove();
-				if (verbose) regState.dumpState("");
-				cur = prev;
-				continue;
-			}
-			if (opcode == ArchInstrs.ARCH_RELOAD) {
-				var dst = Operand.Def.!(cur.operands[0]).vreg;
-				moves.reloads.put(dst, coloring[dst.varNum]);
-				moves.emit(codegen, cur.next);
-				regState.freeReg(coloring[dst.varNum], true);
-				cur.remove();
-				if (verbose) regState.dumpState("");
-				cur = prev;
-				continue;
-			}
-			
+			return;
+		}
+		moves.clear();
+		movesPrev.clear();
+		
+		if (opcode == ArchInstrs.ARCH_PARMOVE) { // perform parallel move
+			parmoveDests.resize(0);
+			codegen.gatherParallelMoveDests(cur, parmoveDests);
+			for (j < parmoveDests.length) recursivelyEmitMoves(j, next);
 			for (i < operands.length) match (operands[i]) {
 				Def(vreg, constraint) => {
-					// ignore `Def` introduced by previous spill or `insertLoadToStack`
-					if (vreg == null || (regSet.isCallerStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
-					var loc = allocDefReg(vreg, constraint);
-					operands[i] = Operand.Def(vreg, loc);
-				}
-				Overwrite(vreg, use, constraint)    => {
-					var loc = allocDefReg(vreg, constraint), newReg = byte.!(loc);
-					var gReg = coloring[use.varNum];
-					if (use.reloadFrom != null) movesPrev.reloads.put(use.reloadFrom, newReg);
-					else if (newReg != gReg) {
-						if (regSet.isReg(gReg)) movesPrev.addRegMove(use, gReg, newReg);
-						else movesPrev.reloads.put(use, newReg);
-					}
-					regUsage[loc] = regState.pos;
-					operands[i] = Operand.Overwrite(vreg, use, loc);
-				}
-				Use(vreg, constraint) => {
-					if (vreg == null || regSet.isStack(constraint)) continue;
-					var loc = allocUseReg(vreg, constraint);
-					operands[i] = Operand.Use(vreg, loc);
-				}
-				Kill(constraint) => {
-					if (constraint < regSet.regSets.length) {
-						for (reg in regSet.regSets[constraint]) {
-							spillReg(reg);
-							regState.freeReg(reg, true);
-						}
-					}
-				}
-				_ => ;
-			}
-			for (i < operands.length) match (operands[i]) {
-				Overwrite(vreg, use, assignment)    => {
-					if (!regSet.isStack(assignment) || !use.isConst()) {
-						updateRegState(use);
-					}
+					var gReg = coloring[vreg.varNum];
+					regState.freeReg(gReg, true);
+					if (regSet.isReg(gReg)) codegen.insertRestoreLocal(vreg, gReg, next);
 				}
 				Use(vreg, assignment) => {
-					if (vreg == null || regSet.isStack(assignment)) continue;
-					updateRegState(vreg);
+					if (!regSet.isStack(assignment)) {
+						updateRegState(vreg);
+					}
 				}
 				_ => ;
 			}
+			cur.remove();
 			if (verbose) regState.dumpState("");
+			return;
+		}
+		if (opcode == ArchInstrs.ARCH_RELOAD) {
+			var dst = Operand.Def.!(cur.operands[0]).vreg;
+			moves.reloads.put(dst, coloring[dst.varNum]);
 			moves.emit(codegen, cur.next);
-			movesPrev.emit(codegen, cur);
-			if (opcode == ArchInstrs.ARCH_ENTRY) {
-				for (j < regState.cursor) {
-					var vreg = regState.allocated[j].0;
-					if (vreg.isConst()) {
-						codegen.insertMoveValLoc(vreg, (vreg, vreg.reg), vreg.regClass, next);
+			regState.freeReg(coloring[dst.varNum], true);
+			cur.remove();
+			if (verbose) regState.dumpState("");
+			return;
+		}
+			
+		for (i < operands.length) match (operands[i]) {
+			Def(vreg, constraint) => {
+				// ignore `Def` introduced by previous spill or `insertLoadToStack`
+				if (vreg == null || (regSet.isCallerStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
+				var loc = allocDefReg(vreg, constraint);
+				operands[i] = Operand.Def(vreg, loc);
+			}
+			Overwrite(vreg, use, constraint)    => {
+				var loc = allocDefReg(vreg, constraint), newReg = byte.!(loc);
+				var gReg = coloring[use.varNum];
+				if (use.reloadFrom != null) movesPrev.reloads.put(use.reloadFrom, newReg);
+				else if (newReg != gReg) {
+					if (regSet.isReg(gReg)) movesPrev.addRegMove(use, gReg, newReg);
+					else movesPrev.reloads.put(use, newReg);
+				}
+				regUsage[loc] = regState.pos;
+				operands[i] = Operand.Overwrite(vreg, use, loc);
+			}
+			Use(vreg, constraint) => {
+				if (vreg == null || regSet.isStack(constraint)) continue;
+				var loc = allocUseReg(vreg, constraint);
+				operands[i] = Operand.Use(vreg, loc);
+			}
+			Kill(constraint) => {
+				if (constraint < regSet.regSets.length) {
+					for (reg in regSet.regSets[constraint]) {
+						spillReg(reg);
+						regState.freeReg(reg, true);
 					}
 				}
 			}
-			cur = prev;
+			_ => ;
+		}
+		for (i < operands.length) match (operands[i]) {
+			Overwrite(vreg, use, assignment)    => {
+				if (!regSet.isStack(assignment) || !use.isConst()) {
+					updateRegState(use);
+				}
+			}
+			Use(vreg, assignment) => {
+				if (vreg == null || regSet.isStack(assignment)) continue;
+				updateRegState(vreg);
+			}
+			_ => ;
+		}
+		if (verbose) regState.dumpState("");
+		moves.emit(codegen, cur.next);
+		movesPrev.emit(codegen, cur);
+		if (opcode == ArchInstrs.ARCH_ENTRY) {
+			for (j < regState.cursor) {
+				var vreg = regState.allocated[j].0;
+				if (vreg.isConst()) {
+					codegen.insertMoveValLoc(vreg, (vreg, vreg.reg), vreg.regClass, next);
+				}
+			}
 		}
 	}
 	def allocDefReg(vreg: VReg, constraint: int) -> int {
@@ -249,7 +249,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		regState.reassignReg(vreg, reg);
 		vreg.reg = reg;
 	}
-	def clear() {
+	def reset() {
 		visitedCnt = 0;
 		for (i < regUsage.length) regUsage[i] = 0;
 		regState.clear();
@@ -364,7 +364,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		return result;
 	}
-	def dupVReg(vreg: VReg, constraint: int) -> VReg {
+	def processSpillOnInstr(vreg: VReg, constraint: int) -> VReg {
 		var newVreg = codegen.dupVReg(vreg);
 		newVreg.notSpillable = true;
 		newVreg.reloadFrom = vreg;
@@ -415,60 +415,55 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
-	def insertSpill() {
-		var i = codegen.first;
-		var block: SsaBlock = codegen.order[0].block;
-		while (i != null) {
-			var next = i.next;
-			var opcode = i.opcode();
-			if (opcode == ArchInstrs.ARCH_BLOCK) {
-				block = Operand.Label.!(i.operands[0]).block;
-			}
-			var operands = i.operands;
-			for (j = operands.length - 1; j >= 0; j--) {
-				match (operands[j]) {
-					Use(vreg, constraint) => {
-						if (opcode == ArchInstrs.ARCH_RELOAD) continue;
-						if (vreg != null && !regSet.isStack(constraint) && coloring[vreg.varNum] == 0) {
-							var node = graph.nodes[vreg.varNum];
-							if (opcode == ArchInstrs.ARCH_PARMOVE) {
-								operands[j] = Operand.Use(vreg, regSet.spillStart); // Set the constraint to stack
-								continue;
-							}
-							if (node.defBlock == block) node.newVreg = dupVReg(vreg, constraint);
-							else processSpillOnBlock(vreg, block);
-							operands[j] = Operand.Use(node.newVreg, constraint);
+	def processSpill(vreg: VReg, constraint: int, block: SsaBlock) {
+		var node = graph.nodes[vreg.varNum];
+		if (node.defBlock == block) node.newVreg = processSpillOnInstr(vreg, constraint);
+		else processSpillOnBlock(vreg, block);
+	}
+	def insertSpill(block: SsaBlock, i: ArchInstr) {
+		var opcode = i.opcode();
+		var operands = i.operands;
+		for (j = operands.length - 1; j >= 0; j--) {
+			match (operands[j]) {
+				Use(vreg, constraint) => {
+					if (opcode == ArchInstrs.ARCH_RELOAD) continue;
+					if (vreg != null && !regSet.isStack(constraint) && coloring[vreg.varNum] == 0) {
+						var node = graph.nodes[vreg.varNum];
+						if (opcode == ArchInstrs.ARCH_PARMOVE) {
+							operands[j] = Operand.Use(vreg, regSet.spillStart); // Set the constraint to stack
+							continue;
 						}
+						processSpill(vreg, constraint, block);
+						operands[j] = Operand.Use(node.newVreg, constraint);
 					}
-					Overwrite(vreg, use, constraint) => {
-						if (!regSet.isStack(constraint) && coloring[use.varNum] == 0) {
-							var node = graph.nodes[use.varNum];
-							if (node.defBlock == block) node.newVreg = dupVReg(use, constraint);
-							else processSpillOnBlock(use, block);
-							operands[j] = Operand.Overwrite(vreg, node.newVreg, constraint);
-						}
-						if (vreg != null && coloring[vreg.varNum] == 0) {
-							graph.nodes[vreg.varNum].defBlock = block;
-						}
-					}
-					Def(vreg, constraint) => {
-						if (vreg != null && coloring[vreg.varNum] == 0) {
-							graph.nodes[vreg.varNum].defBlock = block;
-							if (opcode == ArchInstrs.ARCH_RELOAD) {
-								// vreg is spilled again, remove this reload
-								i.remove();
-								break;
-							}
-							if (opcode == ArchInstrs.ARCH_PARMOVE) {
-								operands[j] = Operand.Def(vreg, vreg.spill);
-							}
-						}
-					}
-					_ => ;
 				}
+				Overwrite(vreg, use, constraint) => {
+					if (!regSet.isStack(constraint) && coloring[use.varNum] == 0) {
+						processSpill(use, constraint, block);
+						operands[j] = Operand.Overwrite(vreg, graph.nodes[use.varNum].newVreg, constraint);
+					} 
+					if (vreg != null && coloring[vreg.varNum] == 0) {
+						graph.nodes[vreg.varNum].defBlock = block;
+					}
+				}
+				Def(vreg, constraint) => {
+					if (vreg != null && coloring[vreg.varNum] == 0) {
+						graph.nodes[vreg.varNum].defBlock = block;
+						if (opcode == ArchInstrs.ARCH_RELOAD) {
+							// vreg is spilled again, remove this reload
+							i.remove();
+							return;
+						}
+						if (opcode == ArchInstrs.ARCH_PARMOVE) {
+							operands[j] = Operand.Def(vreg, vreg.spill);
+						}
+					}
+				}
+				_ => ;
 			}
-			i = next;
 		}
+	}
+	def insertSpillCleanup() {
 		for (i < coloring.length) {
 			if (coloring[i] == 0) {
 				liveness[maskRow, i] = false; // spill vreg are not live accross blocks
@@ -480,23 +475,18 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
  			}
 		}
 	}
-	def insertLoadToStack() {
-		var i = codegen.first;
-		while (i != null) {
-			var next = i.next;
-			var operands = i.operands;
-			for (j = operands.length - 1; j >= 0; j--) {
-				match (operands[j]) {
-					Use(vreg, constraint) => {
-						if (regSet.isStack(constraint)) {
-							if (vreg.isConst()) codegen.insertMoveValLoc(vreg, (vreg, constraint), vreg.regClass, i);
-							else codegen.insertMoveLocLoc((vreg, 0), (null, constraint), vreg.regClass, i);
-						}
+	def insertMovesToStack(block: SsaBlock, cur: ArchInstr) {
+		var operands = cur.operands;
+		for (j = operands.length - 1; j >= 0; j--) {
+			match (operands[j]) {
+				Use(vreg, constraint) => {
+					if (regSet.isStack(constraint)) {
+						if (vreg.isConst()) codegen.insertMoveValLoc(vreg, (vreg, constraint), vreg.regClass, cur);
+						else codegen.insertMoveLocLoc((vreg, 0), (null, constraint), vreg.regClass, cur);
 					}
-					_ => ;
 				}
+				_ => ;
 			}
-			i = next;
 		}
 	}
 	def printColor() {
@@ -543,91 +533,83 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
-	// Build interference graph via liveness analysis passing instructions backward.
-	def buildGraph() {
+	def initGraph() {
 		graph = Graph.new(vars.length);
 		for (i < vars.length) {
 			graph.nodes[i] = Node.new();
 		}
 		blockWeight = Array<int>.new(codegen.order.length);
 		computeBlockWeight(1, 0, codegen.order.length);
-
-		var curWeight = 0;
-		cur = codegen.last;
-		while (cur != null) {
-			prev = cur.prev;
-			next = cur.next;
-			var opcode = cur.opcode();
-			if (opcode == ArchInstrs.ARCH_BLOCK_END) {
-				var block = Operand.Label.!(cur.operands[0]).block;
-				computeLiveoutForBlock(block);
-				// Variables may be interfered with uses in different succ of the block.
-				for (i < vars.length) if (liveness[liveoutRow, i]) addInterferences(vars[i]);
-				curWeight = blockWeight[block.mark];
-				cur = prev;
-				continue;
-			}
-			if (opcode == ArchInstrs.ARCH_BLOCK) {
-				var block = Operand.Label.!(cur.operands[0]).block;
-				liveness.copy(block.mark, liveoutRow);
-			}
-
-			var operands = cur.operands;
-			for (i < operands.length) match (operands[i]) {
-				Def(vreg, constraint) => {
-					// ignore `Def` introduced by previous spill or `insertLoadToStack`
-					if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
-					liveness[liveoutRow, vreg.varNum] = true;
-					addInterferences(vreg);
-					graph.nodes[vreg.varNum].color = true;
-				}
-				Overwrite(vreg, use, constraint)    => {
-					liveness[liveoutRow, vreg.varNum] = true;
-					addInterferences(vreg);
-				}
-				_ => ;
-			}
-			for (i < operands.length) match (operands[i]) {
-				Def(vreg, constraint) => {
-					if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
-					liveness[liveoutRow, vreg.varNum] = false;
-					graph.nodes[vreg.varNum].spillCost += curWeight;
-					if (opcode == ArchInstrs.ARCH_RELOAD) break;
-				}
-				Kill(constraint) => {
-					if (regSet.names[constraint] == "all") {
-						liveness.clearRow(liveoutRow);
-					}
-				}
-				Overwrite(vreg, use, constraint)    => {
-					liveness[liveoutRow, vreg.varNum] = false;
-					liveness[liveoutRow, use.varNum] = true;
-					addInterferences(use);
-					graph.nodes[vreg.varNum].spillCost += curWeight;
-					graph.nodes[use.varNum].spillCost += curWeight;
-					graph.nodes[use.varNum].use = true;
-				}
-				Use(vreg, constraint) => {
-					if (vreg == null || regSet.isStack(constraint)) continue;
-					liveness[liveoutRow, vreg.varNum] = true;
-					addInterferences(vreg);
-					graph.nodes[vreg.varNum].spillCost += curWeight;
-					graph.nodes[vreg.varNum].use = true;
-				}
-				_ => ;
-			}
-			for (i < operands.length) match (operands[i]) {
-				Overwrite(vreg, use, constraint) => {
-					if (use.reloadFrom != null) liveness[liveoutRow, use.varNum] = false;
-				}
-				Use(vreg, constraint) => {
-					if (vreg != null && vreg.reloadFrom != null) liveness[liveoutRow, vreg.varNum] = false;
-				}
-				_ => ;
-			}
-			cur = prev;
+		curWeight = 0;
+		visitedCnt = 0;
+	}
+	// Build interference graph via liveness analysis passing instructions backward.
+	def buildGraph(block: SsaBlock, cur: ArchInstr) {
+		var opcode = cur.opcode();
+		if (opcode == ArchInstrs.ARCH_BLOCK_END) {
+			computeLiveoutForBlock(block);
+			// Variables may be interfered with uses in different succ of the block.
+			for (i < vars.length) if (liveness[liveoutRow, i]) addInterferences(vars[i]);
+			curWeight = blockWeight[block.mark];
+			return;
 		}
-		graph.print();
+		if (opcode == ArchInstrs.ARCH_BLOCK) {
+			liveness.copy(block.mark, liveoutRow);
+		}
+
+		var operands = cur.operands;
+		for (i < operands.length) match (operands[i]) {
+			Def(vreg, constraint) => {
+				// ignore `Def` introduced by previous spill or `insertLoadToStack`
+				if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
+				liveness[liveoutRow, vreg.varNum] = true;
+				addInterferences(vreg);
+				graph.nodes[vreg.varNum].color = true;
+			}
+			Overwrite(vreg, use, constraint)    => {
+				liveness[liveoutRow, vreg.varNum] = true;
+				addInterferences(vreg);
+			}
+			_ => ;
+		}
+		for (i < operands.length) match (operands[i]) {
+			Def(vreg, constraint) => {
+				if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
+				liveness[liveoutRow, vreg.varNum] = false;
+				graph.nodes[vreg.varNum].spillCost += curWeight;
+				if (opcode == ArchInstrs.ARCH_RELOAD) break;
+			}
+			Kill(constraint) => {
+				if (regSet.names[constraint] == "all") {
+					liveness.clearRow(liveoutRow);
+				}
+			}
+			Overwrite(vreg, use, constraint)    => {
+				liveness[liveoutRow, vreg.varNum] = false;
+				liveness[liveoutRow, use.varNum] = true;
+				addInterferences(use);
+				graph.nodes[vreg.varNum].spillCost += curWeight;
+				graph.nodes[use.varNum].spillCost += curWeight;
+				graph.nodes[use.varNum].use = true;
+			}
+			Use(vreg, constraint) => {
+				if (vreg == null || regSet.isStack(constraint)) continue;
+				liveness[liveoutRow, vreg.varNum] = true;
+				addInterferences(vreg);
+				graph.nodes[vreg.varNum].spillCost += curWeight;
+				graph.nodes[vreg.varNum].use = true;
+			}
+			_ => ;
+		}
+		for (i < operands.length) match (operands[i]) {
+			Overwrite(vreg, use, constraint) => {
+				if (use.reloadFrom != null) liveness[liveoutRow, use.varNum] = false;
+			}
+			Use(vreg, constraint) => {
+				if (vreg != null && vreg.reloadFrom != null) liveness[liveoutRow, vreg.varNum] = false;
+			}
+			_ => ;
+		}
 	}
 }
 
