@@ -46,6 +46,8 @@ class VReg {
 	var next: VReg;			// next link for list management
 	var spill: int;			// assigned spill slot (< 0 indicates a constant)
 	var endPos: int;		// last live position
+	var notSpillable: bool;		// true if this var cannot be spill anymore
+	var reloadFrom: VReg;			// var that this var is spilled from
 	// -- state for stackifier -----------------------------
 	var usage = Usage.NONE;
 	var parmoveState: int;
@@ -241,6 +243,7 @@ component ArchInstrs {
 	def NUM_FLAGS: u5 = 4;
 
 	// block and SSA resolution instructions
+	def ARCH_RELOAD = -8;
 	def ARCH_BLOCK_END = -7;
 	def ARCH_NOP	 = -6;
 	def ARCH_BLOCK	 = -5;
@@ -272,6 +275,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 	var lowestMark: int;
 	var blocks: SsaBlockOrder;
 	var order: Vector<SsaBlockInfo>;
+	def instrs = Vector<ArchInstr>.new();
 	var liveness: BitMatrix;
 	var numLivepoints = 0;
 	def livepoints = Vector<(SsaBlock, ArchInstr, Operand.RefMap)>.new();
@@ -293,6 +297,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 		this.lowestMark = graph.markGen++;
 		this.blocks = blocks;
 		this.order = if(blocks != null, blocks.order);
+		this.instrs.resize(if(order != null, order.length, 0));
 		this.liveness = BitMatrix.new(if(order != null, order.length, 1), 32); // XXX: reuse?
 		this.numLivepoints = 0;
 		this.livepoints.length = 0;
@@ -334,6 +339,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 			gatherLivenessForBlock(block);
 			selectInstructionsForBlock(block);
 			if (info.loop != null) finishLoopLiveness(info);
+			instrs[i] = cursor;
 		}
 		// emit the entry instruction.
 		visitEntry(context.graph.params);
@@ -349,7 +355,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 			if (block.mark >= end) break;  // rely on backwards codegen order
 			liveness.or(order.length + t.2.livepoint, info.block.mark);
 		}
-    // Propagate the liveness to the blocks in this loop.
+		// Propagate the liveness to the blocks in this loop.
 		for (i = info.block.mark + 1; i < end; i++) {
 			liveness.or(i, info.block.mark);
 		}
@@ -458,6 +464,19 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 		vars.length = length;
 		var n = VReg.new(i, id, width, SsaConst.?(i));
 		n.regClass = rcl;
+		vars[id] = n;
+		return n;
+	}
+	def dupVReg(vreg: VReg) -> VReg {
+		var next = context.graph.markGen++;
+		var width = vreg.varSize;
+		var id = next - lowestMark;
+		var length = id + width + 1;
+		liveness.widen(length);
+		vars.grow(length);
+		vars.length = length;
+		var n = VReg.new(vreg.ssa, id, width, vreg.isConst());
+		n.regClass = vreg.regClass;
 		vars[id] = n;
 		return n;
 	}
@@ -584,6 +603,32 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 		}
 		return builder.finishRefMap();
 	}
+	def iterateInstructionsForward(func: (SsaBlock, ArchInstr) -> void) {
+		var i = first;
+		var block: SsaBlock = order[0].block;
+		while (i != null) {
+			var next = i.next;
+			var opcode = i.opcode();
+			if (opcode == ArchInstrs.ARCH_BLOCK) {
+				block = Operand.Label.!(i.operands[0]).block;
+			}
+			func(block, i);  // call user callback
+			i = next;
+		}
+	}
+	def iterateInstructionsBackward(func: (SsaBlock, ArchInstr) -> void) {
+		var i = last;
+		var block: SsaBlock = order[order.length - 1].block;
+		while (i != null) {
+			var prev = i.prev;
+			var opcode = i.opcode();
+			if (opcode == ArchInstrs.ARCH_BLOCK_END) {
+				block = Operand.Label.!(i.operands[0]).block;
+			}
+			func(block, i);  // call user callback
+			i = prev;
+		}
+	}
 	//======================================================================
 	// MachStackifier uses these codegen methods to insert loads, stores,
 	// etc. Only relevant targets implement the gen*() methods.
@@ -643,11 +688,18 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 	def insertMoveValLoc(src: VReg, dst: (VReg, int), regClass: RegClass, next: ArchInstr) {
 		runInsertion(genMoveValLoc, (src, dst, regClass), next);
 	}
+
 	def genSaveLocal(reg: int, v: VReg);
 	def genRestoreLocal(v: VReg, reg: int);
 	def genMoveLocLoc(src: (VReg, int), dst: (VReg, int), regClass: RegClass);
 	def genMoveValLoc(vreg: VReg, dst: (VReg, int), regClass: RegClass);
 
+	def insertReloadSpill(src: VReg, dst: (VReg, int), next: ArchInstr) {
+		runInsertion(genReloadSpill, (src, dst), next);
+	}
+	def genReloadSpill(src: VReg, dst: (VReg, int)) {
+		emit2(ArchInstrs.ARCH_RELOAD, op(Operand.Def(dst)), op(Operand.Use(src, 0)));
+	}
 
 	//======================================================================
 	// Helper routines for emitting instructions.
@@ -1025,6 +1077,11 @@ class ArchInstrBuffer(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) ex
 			ArchInstrs.ARCH_END => {
 				putIndent(indent);
 				puts("end");
+			}
+			ArchInstrs.ARCH_RELOAD => {
+				putIndent(indent + 1);
+				puts("reload ");
+				putOperands(a);
 			}
 			_ => {
 				indent = putArchInstr(indent + 1, i) - 1;
