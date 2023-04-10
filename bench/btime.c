@@ -16,6 +16,8 @@
 #define MAX_RUNS 1000
 
 int lines = 0;
+int interactive = 0;
+int printed = 0;
 char **global_envp;
 double times[MAX_RUNS];
 
@@ -84,7 +86,16 @@ int run(int run, int numruns, int nstdout, int nstderr, char *argv[]) {
 
   times[run] = ((double) elapsed.tv_sec) + ((double) elapsed.tv_usec) / 1000000.0;
 
-  if (lines) {
+  if (interactive) {
+    for (int i = 0; i < printed; i++) {
+      printf("\x08 \x08");
+    }
+    double sum = 0;
+    for (int i = 0; i < run + 1; i++) {
+      sum += times[i];
+    }
+    printed = printf("%.6lf", sum / (run + 1));
+  } else if (lines) {
     // print the sample on one line
     printf("%ld.%06d\n", elapsed.tv_sec, (int)elapsed.tv_usec);
   } else if (numruns > 1) {
@@ -139,6 +150,10 @@ int main(int argc, char *argv[], char *envp[]) {
       lines = 1;
       continue;
     }
+    if (strcmp(arg, "-i") == 0) {
+      interactive = 1;
+      continue;
+    }
     if (arg[0] >= '0' && arg[0] <= '9') {
       runs = atoi(arg);
       if (runs > MAX_RUNS) runs = MAX_RUNS;
@@ -158,12 +173,14 @@ int main(int argc, char *argv[], char *envp[]) {
   // Multiple runs?
   if (runs > 1) {
     int i = 0, failed = 0;
-    for(i = 0; i < runs; i++) {
+    for (i = 0; i < runs; i++) {
       if (run(i, runs, devnull, devnull, nargv) != 0) {
 	return do_fail_run(nargv);
       }
     }
-    if (!lines) {
+    if (interactive) {
+      printf("\n");
+    } else if (!lines) {
       print_stats(runs);
       printf("\n");
     }
@@ -173,6 +190,9 @@ int main(int argc, char *argv[], char *envp[]) {
   // Just do a single run.
   if (run(0, 1, devnull, devnull, nargv) != 0) {
     return do_fail_run(nargv);
+  }
+  if (interactive) {
+    printf("\n");
   }
   return 0;
 }
