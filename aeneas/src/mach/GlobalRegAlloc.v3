@@ -14,14 +14,17 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def backupAllocate = LocalRegAlloc.new(regSet, codegen).allocate;
 	def availableColor = regSet.regSets[regSet.regClasses[RegClass.REF.tag]].length - 2;
 	def vars = codegen.vars;
+	def simplifyWorklist = Vector<int>.new();
+	def spillWorklist = Vector<int>.new();
+	def selectStack = Vector<int>.new();
 	var liveness: BitMatrix;
 	var buf = ArchInstrBuffer.new(codegen, codegen.mach.prog, regSet);
 	var prev: ArchInstr;
 	var cur: ArchInstr;
 	var next: ArchInstr;
 	var graph: Graph;
-	var visitedCnt = 0;
 	var coloring: Array<byte>;
+	var actualSpill: bool;
 	var blockWeight: Array<int>;
 	var curWeight: int;
 	var liveoutRow: int;
@@ -45,17 +48,14 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		computeBlockWeight(1, 0, codegen.order.length);
 		initGraph();
 		codegen.iterateInstructionsBackward(buildGraph);
-		var result = colorGraph(availableColor);
-		while (!result.0) { // insert actual spill and iterate again
-			visitedCnt = 0;
-			coloring = result.1;
+		colorGraph();
+		while (actualSpill) {
 			codegen.iterateInstructionsForward(insertSpill);
 			insertSpillCleanup();
 			initGraph();
 			codegen.iterateInstructionsBackward(buildGraph);
-			result = colorGraph(availableColor);
+			colorGraph();
 		}
-		coloring = result.1;
 		if (colorVerbose) printColor();
 		codegen.iterateInstructionsBackward(allocateAfterColoring);
 	}
@@ -250,7 +250,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		vreg.reg = reg;
 	}
 	def reset() {
-		visitedCnt = 0;
 		for (i < regUsage.length) regUsage[i] = 0;
 		regState.clear();
 	}
@@ -294,75 +293,94 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		var loc = regSet.regSets[set][regSet.regSets[set].length - which - 1];
 		return loc;
 	}
-	def chooseSpill() -> int {
-		var mincost: float = 1000000000000f, node: int = -1;
-		for (i = 1; i < graph.nodes.length; i++) {
-			if (!graph.nodes[i].removed && !vars[i].notSpillable) {
-				var cost: float = float.roundi(graph.nodes[i].spillCost) / float.roundi(graph.nodes[i].interfereCnt);
+	def mkWorklist() {
+		simplifyWorklist.clear();
+		spillWorklist.clear();
+		for (i = vars.length - 1; i > 0; i--) {
+			if (vars[i] == null || !graph.nodes[i].use) continue;
+			if (graph.nodes[i].interfereCnt >= availableColor) spillWorklist.put(i);
+			else simplifyWorklist.put(i);
+		} 
+	}
+	def simplify() {
+		var node = simplifyWorklist[--simplifyWorklist.length];
+		graph.nodes[node].removed = true;
+		selectStack.put(node);
+		for (i < graph.nodes[node].interfere.length) {
+			var n = graph.nodes[node].interfere[i];
+			// When a degree transit from availableColor, move the node to simplifyWorklist.
+			if (!graph.nodes[n].removed && graph.nodes[n].interfereCnt == availableColor) {
+				for (j < spillWorklist.length) {
+					if (spillWorklist[j] == n) {
+						var a = spillWorklist[--spillWorklist.length];
+						if (spillWorklist.length > 0) spillWorklist[j] = a;
+						simplifyWorklist.put(n);
+						break;
+					}
+				}
+			}
+			graph.nodes[n].interfereCnt --;
+		}
+	}
+	def selectSpill() {
+		var mincost: float = 1000000000000f, idx: int = -1;
+		for (i < spillWorklist.length) {
+			var node = graph.nodes[spillWorklist[i]];
+			if (!node.removed && !vars[spillWorklist[i]].notSpillable) {
+				var cost: float = float.roundi(node.spillCost) / float.roundi(node.interfereCnt);
 				if (cost < mincost) {
-					node = i;
+					idx = i;
 					mincost = cost;
 				}
 			}
 		}
-		if (node == -1) codegen.context.fail("no registers available to spill");
-		return node;
+		if (idx == -1) return V3.fail("no registers available to spill");
+		graph.nodes[spillWorklist[idx]].spill = true;
+		simplifyWorklist.put(spillWorklist[idx]);
+		var a = spillWorklist[--spillWorklist.length];
+		if (spillWorklist.length > 0) spillWorklist[idx] = a;
 	}
-	// Recursively color the graph by removing the nodes from graph and add them back
-	// in a LIFO order. Pick node with degree smaller than k or mark as spill if no
-	// available node. If there is an actual spill in the select phase, return false. 
-	def colorGraph(k: int) -> (bool, Array<byte>) {
-		if (visitedCnt == graph.nodes.length) {
-			return (true, Array<byte>.new(visitedCnt));
+	// Color the graph by removing the nodes from graph and add them back in a
+	// LIFO order. Select node with degree smaller than k or mark as spill if no
+	// available node. Set `actualSpill` to true if require actual spill.
+	def colorGraph() {
+		mkWorklist();
+		while (simplifyWorklist.length > 0 || spillWorklist.length > 0) {
+			if (simplifyWorklist.length > 0) simplify();
+			else selectSpill();
 		}
-
-		var node: int = -1;
-		for (i < graph.nodes.length) {
-			if (!graph.nodes[i].removed && graph.nodes[i].interfereCnt < k) {
-				node = i;
-				break;
-			}
-		}
-		if (node == -1) {
-			node = chooseSpill();
-			graph.nodes[node].spill = true;
-		}
-
-		graph.removeNode(node);
-		visitedCnt ++;
-
-		var result = colorGraph(k);
-
-		graph.addNodeBack(node);
+		coloring = Array<byte>.new(vars.length);
+		actualSpill = false;
 		var allocatedColor: Array<bool> = Array.new(regSet.physRegs);
-		for (i < graph.nodes[node].interfere.length) {
-			var neighbor = graph.nodes[node].interfere[i];
-			if (!graph.nodes[neighbor].removed) {
-				allocatedColor[result.1[neighbor]] = true;
+		while (selectStack.length > 0) {
+			var node = selectStack[--selectStack.length];
+			graph.nodes[node].removed = false;
+			for (i < regSet.physRegs) allocatedColor[i] = false;
+			for (i < graph.nodes[node].interfere.length) {
+				var neighbor = graph.nodes[node].interfere[i];
+				if (!graph.nodes[neighbor].removed) {
+					allocatedColor[coloring[neighbor]] = true;
+				}
 			}
-		}
-		var vreg = vars[node];
-		
-		if (vreg != null) {
-			if (!graph.nodes[vreg.varNum].color && !graph.nodes[vreg.varNum].use) return result;
+			var vreg = vars[node];
 			if (vreg.hint != 0 && !allocatedColor[vreg.hint]) {
-				result.1[node] = vreg.hint;
-				return result;
+				coloring[node] = vreg.hint;
+				continue;
 			}
 			var set = regSet.regClasses[vreg.regClass.tag];
 			for (i < regSet.regSets[set].length - 2) {
 				var reg = regSet.regSets[set][i];
 				if (!allocatedColor[reg]) {
-					result.1[node] = reg;
-					return result;
+					coloring[node] = reg;
+					break;
 				}
 			}
+			if (coloring[node] > 0) continue;
 			if (!graph.nodes[node].spill) return V3.fail("no colors available");
 			vreg.notSpillable = true;
 			allocSpill(vreg);
-			return (false, result.1);
+			actualSpill = true;
 		}
-		return result;
 	}
 	def processSpillOnInstr(vreg: VReg, constraint: int) -> VReg {
 		var newVreg = codegen.dupVReg(vreg);
@@ -541,7 +559,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		blockWeight = Array<int>.new(codegen.order.length);
 		computeBlockWeight(1, 0, codegen.order.length);
 		curWeight = 0;
-		visitedCnt = 0;
 	}
 	// Build interference graph via liveness analysis passing instructions backward.
 	def buildGraph(block: SsaBlock, cur: ArchInstr) {
@@ -621,18 +638,6 @@ def DEAD: i8 = -3;
 class Graph(varsCnt: int) {
 	def nodes = Array<Node>.new(varsCnt);
 
-	def removeNode(n: int) {
-		for (i < nodes[n].interfere.length) {
-			nodes[nodes[n].interfere[i]].interfereCnt --;
-		}
-		nodes[n].removed = true;
-	}
-	def addNodeBack(n: int) {
-		for (i < nodes[n].interfere.length) {
-			nodes[nodes[n].interfere[i]].interfereCnt ++;
-		}
-		nodes[n].removed = false;
-	}
 	def print() {
 		for (i < nodes.length) {
 			Terminal.put1("v%d:", i);
