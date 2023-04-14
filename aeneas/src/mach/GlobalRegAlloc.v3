@@ -14,6 +14,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def backupAllocate = LocalRegAlloc.new(regSet, codegen).allocate;
 	def availableColor = regSet.regSets[regSet.regClasses[RegClass.REF.tag]].length - 2;
 	def vars = codegen.vars;
+	def loops = Vector<SsaLoopInfo>.new();
 	def simplifyWorklist = Vector<int>.new();
 	def freezeWorklist = Vector<int>.new();
 	def spillWorklist = Vector<int>.new();
@@ -31,6 +32,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	var curWeight: int;
 	var liveoutRow: int;
 	var maskRow: int;
+	var originVarsCnt: int;
+	var blockReloads: Array<Vector<VReg>>;
 
 	// 1. Insert move instruction before each use whose constraint is stack.
 	// 2. Construct the interference graph.
@@ -45,6 +48,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		maskRow = liveness.numrows + 1;
 		liveness.grow(maskRow + 1);
 		liveness.setRow(maskRow);
+		blockReloads = Array<Vector<VReg>>.new(codegen.order.length);
+		for (i < codegen.order.length) {
+			blockReloads[i] = Vector<VReg>.new();
+		}
+		codegen.blocks.computeDominators();
 		codegen.iterateInstructionsForward(insertMovesToStack);
 		blockWeight = Array<int>.new(codegen.order.length);
 		computeBlockWeight(1, 0, codegen.order.length);
@@ -52,6 +60,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		codegen.iterateInstructionsBackward(buildGraph);
 		colorGraph();
 		while (actualSpill) {
+			insertSpillInit();
 			codegen.iterateInstructionsForward(insertSpill);
 			insertSpillCleanup();
 			initGraph();
@@ -487,20 +496,35 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (constraint < regSet.physRegs) newVreg.hint = byte.view(constraint);
 		return newVreg;
 	}
-	def findDominatorOutOfLoop(block: SsaBlock, defBlock: SsaBlock) -> SsaBlock {
-		var block = codegen.order[block.mark];
-		for (p = block; p != null; p = p.dom_parent) {
-			if (p.loop != null && p.dom_parent != null && p.dom_parent.block != defBlock) {
-				block = p.dom_parent;
+	def findDominatorOutOfLoop(node: Node) -> SsaBlock {
+		var vreg = node.newVreg;
+		var blockinfo = codegen.order[node.commonDominator.mark];
+		var defBlockinfo = codegen.order[node.defBlock.mark];
+		for (p = blockinfo; p != null; p = p.dom_parent) {
+			if (p.loop != null && p.dom_parent != null && !codegen.blocks.isDominator(defBlockinfo, p.dom_parent)) break;
+			if (p.loop != null && p.dom_parent != null && p.dom_parent != defBlockinfo && p.loop.contains(blockinfo)) {
+				blockinfo = p.dom_parent;
+				liveness[p.block.mark, vreg.varNum] = true;
 			}
 		}
-		return block.block;
+		return blockinfo.block;
+	}
+	def insertReload(vreg: VReg, node: Node) {
+		node.commonDominator = findDominatorOutOfLoop(node);
+		codegen.insertReloadSpill(vreg, (node.newVreg, 0), codegen.instrs[node.commonDominator.mark].next);
+		blockReloads[node.commonDominator.mark].put(node.newVreg);
 	}
 	def findCommonDominator(vreg: VReg, block: SsaBlock) -> SsaBlock {
 		var node = graph.nodes[vreg.varNum];
 		var order = codegen.order;
 		var blockAInfo = codegen.blocks.commonDominator(order[node.commonDominator.mark], order[block.mark]);
 		if (blockAInfo == null) return null;
+		for (i < loops.length) {
+			if (loops[i].contains(blockAInfo) && 
+				(!loops[i].contains(order[node.commonDominator.mark]) || !loops[i].contains(order[block.mark]))) {
+				return null;
+			}
+		}
 		var blockA = blockAInfo.block;
 		if (blockA == node.commonDominator) return blockA;
 		if (blockA == node.defBlock) return null;
@@ -521,8 +545,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			var newCommonDominator = findCommonDominator(vreg, block);
 			if (newCommonDominator == null) {
 				// Insert reload for the past uses at the start of the common dominator.
-				node.commonDominator = findDominatorOutOfLoop(node.commonDominator, node.defBlock);
-				codegen.insertReloadSpill(vreg, (node.newVreg, 0), codegen.instrs[node.commonDominator.mark].next);
+				insertReload(vreg, node);
 				node.newVreg = codegen.dupVReg(vreg);
 				node.newVreg.spill = vreg.spill;
 				node.commonDominator = block;
@@ -530,6 +553,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				node.commonDominator = newCommonDominator;
 			}
 		}
+		liveness[block.mark, node.newVreg.varNum] = true;
 	}
 	def processSpill(vreg: VReg, constraint: int, block: SsaBlock) {
 		var node = graph.nodes[vreg.varNum];
@@ -538,6 +562,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	}
 	def insertSpill(block: SsaBlock, i: ArchInstr) {
 		var opcode = i.opcode();
+		if (opcode == ArchInstrs.ARCH_BLOCK) {
+			if (codegen.order[block.mark].loop != null) {
+				loops.put(codegen.order[block.mark].loop);
+			}
+		}
 		var operands = i.operands;
 		for (j = operands.length - 1; j >= 0; j--) {
 			match (operands[j]) {
@@ -564,6 +593,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				}
 				Def(vreg, constraint) => {
 					if (vreg != null && coloring[vreg.varNum] == 0) {
+						var node = graph.nodes[vreg.varNum];
+						if (node.commonDominator != null) {
+							insertReload(vreg, node);
+							node.commonDominator = null;
+						}
 						graph.nodes[vreg.varNum].defBlock = block;
 						if (opcode == ArchInstrs.ARCH_RELOAD) {
 							// vreg is spilled again, remove this reload
@@ -579,16 +613,42 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
+	def insertSpillInit() {
+		originVarsCnt = vars.length;
+		for (i = vars.length - 1; i > 0; i--) {
+			if (vars[i] == null) originVarsCnt --;
+			else break;
+		}
+		for (i < codegen.order.length) {
+			blockReloads[i].resize(0);
+		}
+		loops.resize(0);
+	}
 	def insertSpillCleanup() {
-		for (i < coloring.length) {
+		for (i = originVarsCnt; i < vars.length; i++) {
+			liveness[maskRow, i] = true;
+		}
+		for (i < originVarsCnt) {
 			if (coloring[i] == 0) {
 				liveness[maskRow, i] = false; // spill vreg are not live accross blocks
 				var node = graph.nodes[i];
 				if (node.commonDominator != null) {
-					node.commonDominator = findDominatorOutOfLoop(node.commonDominator, node.defBlock);
-					codegen.insertReloadSpill(vars[i], (node.newVreg, 0), codegen.instrs[node.commonDominator.mark].next);
+					insertReload(vars[i], node);
 				}
  			}
+		}
+		for (i = codegen.order.length - 1; i >= 0; i--) {
+			var info = codegen.order[i], block = info.block;
+			for (e in block.succs()) {
+				var succ = e.dest;
+				for (j = originVarsCnt; j < vars.length; j++) {
+					if (liveness[succ.mark, j]) liveness[block.mark, j] = true;
+				}
+			}
+			for (j < blockReloads[i].length) {
+				liveness[i, blockReloads[i][j].varNum] = false;
+			}
+			if (info.loop != null) codegen.finishLoopLiveness(info);
 		}
 	}
 	def insertMovesToStack(block: SsaBlock, cur: ArchInstr) {
@@ -654,7 +714,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def initGraph() {
 		graph = Graph.new(vars.length);
 		for (i < vars.length) {
-			graph.nodes[i] = Node.new(i);
+			graph.nodes[i] = Node.new(i, codegen.order[0].block);
 		}
 		blockWeight = Array<int>.new(codegen.order.length);
 		computeBlockWeight(1, 0, codegen.order.length);
@@ -820,7 +880,7 @@ class Graph(varsCnt: int) {
 	}
 }
 
-class Node(var alias: int) {
+class Node(var alias: int, var defBlock: SsaBlock) {
 	var interfere = Vector<int>.new();
 	var interfereCnt: int = 0;
 	var moves = Vector<int>.new();
@@ -833,7 +893,6 @@ class Node(var alias: int) {
 	//  -- state for inserting spill ---------------------------
 	var newVreg: VReg;
 	var commonDominator: SsaBlock;
-	var defBlock: SsaBlock;
 
 	def addInterfere(n: int) -> bool {
 		var stop = interfere.length;
