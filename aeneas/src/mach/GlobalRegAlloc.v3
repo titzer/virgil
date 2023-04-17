@@ -37,10 +37,10 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 
 	// 1. Insert move instruction before each use whose constraint is stack.
 	// 2. Construct the interference graph.
-	// 3. Color the graph with simplify, spill and select phases. Iterate until the graph is colorable.
+	// 3. Color the graph with simplify, coalesce, freeze, spill and select phases.
+	//    Iterate until the graph is colorable.
 	// 4. Allocate register in the instructions. If there is constraint, move variable
-	//    to match the constraint and move it back to its color (register assigned
-	//    in previous step).
+	//    to match the constraint.
 	def allocate() {
 		reset();
 		liveness = codegen.liveness;
@@ -172,12 +172,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		for (i < operands.length) match (operands[i]) {
 			Overwrite(vreg, use, assignment)    => {
-				if (!regSet.isStack(assignment) || !use.isConst()) {
-					updateRegState(use);
-				}
+				if (use.reloadFrom != null) continue;
+				updateRegState(use);
 			}
 			Use(vreg, assignment) => {
-				if (vreg == null || regSet.isStack(assignment)) continue;
+				if (vreg == null || regSet.isStack(assignment) || vreg.reloadFrom != null) continue;
 				updateRegState(vreg);
 			}
 			_ => ;
@@ -201,7 +200,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (!isOk(loc, constraint)) {
 			loc = findBestLocUnderConstraint(vreg.regClass, loc, constraint);
 			if (regSet.isReg(gReg) && prevVreg == vreg) moves.addRegMove(vreg, loc, gReg);
-			if (loc < regSet.physRegs) spillReg(byte.!(loc));
 		}
 		if (vreg.spill > 0) moves.saves.put(vreg, loc, vreg.spill);
 		return loc;
@@ -212,7 +210,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		var newReg = byte.!(loc);
 		if (vreg.reloadFrom != null) movesPrev.reloads.put(vreg.reloadFrom, newReg);
 		else if (newReg != gReg) {
-			spillReg(newReg);
 			if (regSet.isReg(gReg)) movesPrev.addRegMove(vreg, gReg, newReg);
 			else movesPrev.reloads.put(vreg, newReg);
 		}
@@ -333,6 +330,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		} 
 	}
 	def decrementDegree(n: int) {
+		if (n < 0) return;
 		// When a degree transit from availableColor, move the node to simplifyWorklist.
 		if (!graph.nodes[n].removed && graph.nodes[n].interfereCnt == availableColor) {
 			removeFromWorklist(spillWorklist, n);
@@ -350,7 +348,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 	}
 	def getAlias(n: int) -> int {
-		while (graph.nodes[n].alias != n) {
+		while (n > 0 && graph.nodes[n].alias != n) {
 			n = graph.nodes[n].alias;
 		}
 		return n;
@@ -361,7 +359,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		while (movesWorklist.length > 0) {
 			var m = movesWorklist[--movesWorklist.length];
 			var x = m.0, y = m.1;
-			if (graph.isInterfere(x, y) || graph.nodes[x].removed || graph.nodes[y].removed) continue;
+			if (graph.isInterfere(x, y) || (x > 0 && graph.nodes[x].removed) || graph.nodes[y].removed) continue;
 			if (!tryCoalesce(x, y)) {
 				tmpMovesWorklist.put(m);
 			} else {
@@ -371,47 +369,69 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		movesWorklist = tmpMovesWorklist;
 		return flag;
 	}
-	def tryCoalesce(x_: int, y_: int) -> bool {
-		var x = graph.nodes[x_], y = graph.nodes[y_];
-		var combine = graph.combineInterfere(x_, y_);
-		var cnt = 0, tmpInterfereCnt = 0;
-		for (i < combine.length) {
-			if (graph.nodes[combine[i]].interfereCnt >= availableColor) cnt ++;
-			if (!graph.nodes[combine[i]].removed) tmpInterfereCnt ++;
+	def precoloredCoalesceCheck(precolored: int, y: Node) -> bool{
+		for (i < y.interfere.length) {
+			if (y.interfere[i] < 0) continue;
+			var t = y.interfere[i], tnode = graph.nodes[t];
+			if (tnode.removed || tnode.interfereCnt < availableColor || graph.isInterfere(t, precolored)) continue;
+			return false;
 		}
-		if (cnt < availableColor) { // Briggs conservative coalescing heuristic
+		return true;
+	}
+	def tryCoalesce(x_: int, y_: int) -> bool {
+		var coalesce = false;
+		var y = graph.nodes[y_];
+		if (x_ < 0) {
+			if (precoloredCoalesceCheck(-x_, graph.nodes[y_])) {
+				coalesce = true;
+			}
+		} else {
+			var x = graph.nodes[x_];
+			var combine = graph.combineInterfere(x_, y_);
+			var cnt = 0, tmpInterfereCnt = 0;
+			for (i < combine.length) {
+				if (combine[i] < 0) {cnt++; tmpInterfereCnt ++; continue;}
+				if (graph.nodes[combine[i]].interfereCnt >= availableColor) cnt ++;
+				if (!graph.nodes[combine[i]].removed) tmpInterfereCnt ++;
+			}
+			if (cnt < availableColor) { // Briggs conservative coalescing heuristic
+				coalesce = true;
+				if (tmpInterfereCnt >= availableColor && x.interfereCnt < availableColor) {
+					removeFromWorklist(freezeWorklist, x_);
+					spillWorklist.put(x_);
+				} else if (tmpInterfereCnt < availableColor && x.movesCnt == 0) {
+					removeFromWorklist(freezeWorklist, x_);
+					simplifyWorklist.put(x_);
+				}
+				x.interfere = combine;
+				x.interfereCnt = tmpInterfereCnt;
+			}
+		}
+		if (coalesce) {
 			y.removed = true;
 			if (y.interfereCnt < availableColor) removeFromWorklist(freezeWorklist, y_);
 			else removeFromWorklist(spillWorklist, y_);
 			for (i < y.interfere.length) {
+				if (y.interfere[i] < 0) continue;
 				if (graph.nodes[y.interfere[i]].addInterfere(x_)) graph.nodes[y.interfere[i]].interfereCnt --;
 				else decrementDegree(y.interfere[i]);
 			}
 			graph.nodes[y_].alias = x_;
 			graph.mergeMoves(x_, y_);
-			if (tmpInterfereCnt >= availableColor && x.interfereCnt < availableColor) {
-				removeFromWorklist(freezeWorklist, x_);
-				spillWorklist.put(x_);
-			} else if (tmpInterfereCnt < availableColor && x.movesCnt == 0) {
-				removeFromWorklist(freezeWorklist, x_);
-				simplifyWorklist.put(x_);
-			}
-			x.interfere = combine;
-			x.interfereCnt = tmpInterfereCnt;
-			return true;
-		} else {
-			return false;
 		}
+		return coalesce;
 	}
 	def freeze() {
 		var node = freezeWorklist[--freezeWorklist.length];
 		simplifyWorklist.put(node);
 		for (i < graph.nodes[node].moves.length) {
 			var v = graph.nodes[node].moves[i];
-			graph.nodes[v].movesCnt --;
-			if (!graph.nodes[v].removed && graph.nodes[v].movesCnt == 0 && graph.nodes[v].interfereCnt < availableColor) {
-				simplifyWorklist.put(v);
-				removeFromWorklist(freezeWorklist, v);
+			if (v > 0) {
+				graph.nodes[v].movesCnt --;
+				if (!graph.nodes[v].removed && graph.nodes[v].movesCnt == 0 && graph.nodes[v].interfereCnt < availableColor) {
+					simplifyWorklist.put(v);
+					removeFromWorklist(freezeWorklist, v);
+				}
 			}
 			for (j < movesWorklist.length) {
 				if (movesWorklist[j] == (node, v) || movesWorklist[j] == (v, node)) {
@@ -461,8 +481,12 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			for (i < regSet.physRegs) allocatedColor[i] = false;
 			for (i < graph.nodes[node].interfere.length) {
 				var neighbor = graph.nodes[node].interfere[i];
-				if (!graph.nodes[neighbor].removed) {
-					allocatedColor[coloring[neighbor]] = true;
+				if (neighbor < 0) {
+					allocatedColor[-neighbor] = true;
+				} else {
+					if (!graph.nodes[neighbor].removed) {
+						allocatedColor[coloring[neighbor]] = true;
+					}
 				}
 			}
 			var vreg = vars[node];
@@ -485,8 +509,9 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			actualSpill = true;
 		}
 		for (i = vars.length - 1; i > 0; i--) {
-			if (vars[i] == null || !graph.nodes[i].use || coloring[i] > 0) continue;
-			coloring[i] = coloring[getAlias(i)];
+			if (vars[i] == null || (!graph.nodes[i].use && !graph.nodes[i].color) || coloring[i] > 0) continue;
+			var a = getAlias(i);
+			coloring[i] = if(a > 0, coloring[a], byte.!(-a));
 		}
 	}
 	def processSpillOnInstr(vreg: VReg, constraint: int) -> VReg {
@@ -692,6 +717,10 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		var node = graph.nodes[vreg.varNum], old = node.interfere;
 		node.interfere = Vector<int>.new();
 		var i = 0, j = 0;
+		while (i < old.length && old[i] < 0) {
+			node.interfere.put(old[i]);
+			i ++;
+		}
 		while (i < old.length && j < vars.length) {
 			if (old[i] == j) {
 				node.interfere.put(old[i]);
@@ -711,8 +740,29 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
+	def addInterfereRegfilter(reg: int, filter: VReg) {
+		for (i < vars.length) {
+			if (i != filter.varNum && liveness[liveoutRow, i]) graph.nodes[i].addInterfere(-reg);
+		}
+	}
+	def processConstraint(vreg: VReg, constraint: int) {
+		if (vreg == null || constraint == 0 || regSet.isStack(constraint)) return;
+		if (regSet.isReg(constraint)) {
+			addInterfereRegfilter(constraint, vreg);
+			if (graph.addMove(vreg.varNum, -constraint)) movesWorklist.put((-constraint, vreg.varNum));
+		} else {
+			var constraintSet = regSet.regSets[constraint], j = 0;
+			constraintSet = Arrays.sort(constraintSet, 0, constraintSet.length, byte.<);
+			var set = regSet.regClasses[vreg.regClass.tag];
+			for (i < regSet.regSets[set].length - 2) {
+				var reg = regSet.regSets[set][i];
+				if (j < constraintSet.length && reg == constraintSet[j]) j ++;
+				else graph.nodes[vreg.varNum].addInterfere(-reg);
+			}
+		}
+	}
 	def initGraph() {
-		graph = Graph.new(vars.length);
+		graph = Graph.new(vars.length, regSet);
 		for (i < vars.length) {
 			graph.nodes[i] = Node.new(i, codegen.order[0].block);
 		}
@@ -755,6 +805,19 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				liveness[liveoutRow, vreg.varNum] = true;
 				addInterferences(vreg);
 				graph.nodes[vreg.varNum].color = true;
+			}
+			_ => ;
+		}
+		// constraint
+		for (i < operands.length) match (operands[i]) {
+			Def(vreg, constraint) => {
+				processConstraint(vreg, constraint);
+			}
+			Overwrite(vreg, use, constraint) => {
+				processConstraint(vreg, constraint);
+			}
+			Use(vreg, constraint) => {
+				processConstraint(vreg, constraint);
 			}
 			_ => ;
 		}
@@ -804,7 +867,7 @@ def ON_STACK: i8 = -1;
 def IN_CYCLE: i8 = -2;
 def DEAD: i8 = -3;
 
-class Graph(varsCnt: int) {
+class Graph(varsCnt: int, regSet: MachRegSet) {
 	def nodes = Array<Node>.new(varsCnt);
 
 	def addMove(x: int, y: int) -> bool {
@@ -812,12 +875,15 @@ class Graph(varsCnt: int) {
 			if (nodes[x].moves[i] == y) return false;
 		}
 		nodes[x].moves.put(y);
-		nodes[y].moves.put(x);
 		nodes[x].movesCnt ++;
-		nodes[y].movesCnt ++;
+		if (y > 0) {
+			nodes[y].moves.put(x);	
+			nodes[y].movesCnt ++;
+		}
 		return true;
 	}
 	def mergeMoves(dst: int, src: int) {
+		if (dst < 0) return;
 		for (i < nodes[src].moves.length) {
 			var flag = false;
 			for (j < nodes[dst].moves.length) {
@@ -833,12 +899,14 @@ class Graph(varsCnt: int) {
 		}
 	}
 	def isInterfere(x: int, y: int) -> bool {
-		var interfere = nodes[x].interfere;
+		var u = x, v = y;
+		if (x < 0) {u = y; v = x;}
+		var interfere = nodes[u].interfere;
 		var low = 0, high = interfere.length - 1;
 		while (low <= high) {
 			var mid = low + (high - low) / 2;
-			if (interfere[mid] == y) return true;
-			if (interfere[mid] < y) low = mid + 1;
+			if (interfere[mid] == v) return true;
+			if (interfere[mid] < v) low = mid + 1;
 			else high = mid - 1;
 		}
 		return false;
@@ -873,7 +941,8 @@ class Graph(varsCnt: int) {
 		for (i < nodes.length) {
 			Terminal.put1("v%d:", i);
 			for (j < nodes[i].interfere.length) {
-				Terminal.put1(" v%d", nodes[i].interfere[j]);
+				if (nodes[i].interfere[j] < 0) Terminal.put1(" %s", regSet.identify(-nodes[i].interfere[j]));
+				else Terminal.put1(" v%d", nodes[i].interfere[j]);
 			}
 			Terminal.put("\n");
 		}
