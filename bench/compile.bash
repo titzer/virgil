@@ -17,8 +17,18 @@ VIRGIL_LOC=${VIRGIL_LOC:=$(cd $DIR/.. && pwd)}
 
 cd $DIR
 
+BTIME="./btime-$(../bin/dev/sense_host | cut -d' ' -f1)"
+
 TMP=/tmp/$USER/virgil-bench/
 mkdir -p $TMP
+
+if [ -x $1 ]; then
+	binary=$1
+	shift
+	TMP=$TMP/$1
+	mkdir -p $TMP
+	shift
+fi
 
 target="$1"
 shift
@@ -47,7 +57,14 @@ function do_compile() {
 	opts="$opts $(cat $p/v3c-opts-$target)"
     fi
 
-    if [ "$target" = "v3i" ]; then
+		if [ ! -z $binary ]; then
+			# compile with provided binary
+			RT=$VIRGIL_LOC/rt
+			RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
+			CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
+			$BTIME -i 1 $binary $CONFIG"$RT_FILES" -output=$TMP -program-name=$PROG "${opts[@]}" $files
+			return $?
+    elif [ "$target" = "v3i" ]; then
 	# v3i is a special target that runs the V3C interpreter
 	echo "#!/bin/bash" > $EXE
 	echo "exec v3i $files \"$@\"" >> $EXE
@@ -67,8 +84,11 @@ function do_compile() {
 }
 
 for p in $benchmarks; do
-	printf "##+compiling (%s) %s\n" $target $p
-
+	if [ -z $binary ]; then
+		printf "##+compiling (%s) %s\n" $target $p
+	else
+		printf "##+compiling %s (%s) %s\n" $binary $target $p
+	fi
 	do_compile $p
 
 	if [ $? != 0 ]; then
