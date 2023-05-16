@@ -10,6 +10,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def statistic = RegAllocStatistic.new();
 	def regState = RegState.new(regSet, codegen);
 	def regUsage = Array<int>.new(regSet.physRegs);
+	def regindex = Array<(int,VReg)>.new(regSet.physRegs);
 	def moves = GlobalMoveSet.new(regSet);
 	def movesPrev = GlobalMoveSet.new(regSet);
 	def parmoveDests = Vector<(VReg, List<Operand.Def>)>.new();
@@ -56,6 +57,17 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		codegen.blocks.computeDominators();
 		codegen.iterateInstructionsBackward(insertMovesToStack);
+		
+		liveness.clearRow(liveoutRow);
+		for (i < codegen.livepoints.length) {
+		var t = codegen.livepoints[i];
+			liveness.or(liveoutRow, codegen.order.length + t.2.livepoint);
+		}
+		for (i < vars.length) if (liveness[liveoutRow, i]) allocSpill(vars[i]);
+		var spiller = ShadowStackSpiller.new();
+		spiller.reset(codegen, codegen.blocks);
+		spiller.restore();
+
 		blockWeight = Array<int>.new(codegen.order.length);
 		computeBlockWeight(1, 0, codegen.order.length);
 		initGraph();
@@ -107,6 +119,18 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (opcode == ArchInstrs.ARCH_PARMOVE) { // perform parallel move
 			parmoveDests.resize(0);
 			codegen.gatherParallelMoveDests(cur, parmoveDests);
+			for (i < regindex.length) regindex[i] = (DEAD,null);
+			for (i < operands.length) match (operands[i]) {
+				Use(vreg, assignment) => {
+					if (!regSet.isStack(assignment)) {
+						var gReg = coloring[vreg.varNum];
+						if (regSet.isReg(gReg)) {
+							regindex[gReg] = (vreg.parmoveState - 1, vreg);
+						}
+					}
+				}
+				_ => ;
+			}
 			for (j < parmoveDests.length) recursivelyEmitMoves(j, next);
 			for (i < operands.length) match (operands[i]) {
 				Def(vreg, constraint) => {
@@ -119,14 +143,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 					}
 				}
 				_ => ;
-			}
-			var half = operands.length / 2;
-			for (i < half) {
-				var dst = Operand.Def.!(operands[i]), src = Operand.Use.!(operands[i + half]);
-				var dstReg = coloring[dst.vreg.varNum];
-				if (regSet.isReg(dstReg) && regState.getVreg(dstReg) != src.vreg) {
-					codegen.insertRestoreLocal(dst.vreg, dstReg, next);
-				}
 			}
 			cur.remove();
 			if (verbose) regState.dumpState("");
@@ -172,7 +188,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			Kill(constraint) => {
 				if (constraint < regSet.regSets.length) {
 					for (reg in regSet.regSets[constraint]) {
-						spillReg(reg);
 						regState.freeReg(reg, true);
 					}
 				}
@@ -286,40 +301,58 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	}
 	def recursivelyEmitMoves(j: int, next: ArchInstr) {
 		var t = parmoveDests[j], vreg = t.0, dest = t.1;
+		var srcreg = coloring[vreg.varNum];
+		if (regSet.isReg(srcreg) && regindex[srcreg].1 != vreg) srcreg = 0;
 		if (vreg.parmoveState <= 0) return; // already done on or stack
 		vreg.parmoveState = ON_STACK;
+		if (regSet.isReg(srcreg) && regindex[srcreg].0 != DEAD) regindex[srcreg] = (ON_STACK,regindex[srcreg].1);
 		for (l = dest; l != null; l = l.tail) {
 			var o = l.head, dreg = o.vreg, index = dreg.parmoveState;
-			allocSpill(dreg);
-			if (index == ON_STACK) {
+			var dstreg = coloring[dreg.varNum], index2 = if(regSet.isReg(dstreg),regindex[dstreg],(DEAD,null));
+			if (dstreg == srcreg) continue;
+			if (index2.0 == ON_STACK) {
+				// destination reg (another var) is already on stack; cycle; load to temp
+				index2.1.parmoveState = IN_CYCLE;
+				codegen.insertMoveLocLoc((index2.1, dstreg), (null, getParallelMoveReg(index2.1.regClass, 1)), index2.1.regClass, next);
+			} else if (index == ON_STACK) {
 				// destination is already on stack; cycle; load to temp
 				dreg.parmoveState = IN_CYCLE;
-				codegen.insertRestoreLocal(dreg, getParallelMoveReg(dreg.regClass, 1), next);
+				if (!regSet.isReg(dstreg)) codegen.insertRestoreLocal(dreg, getParallelMoveReg(dreg.regClass, 1), next);
+				else codegen.insertMoveLocLoc((dreg, dstreg), (null, getParallelMoveReg(dreg.regClass, 1)), dreg.regClass, next);
 			}
 			if (index > 0) recursivelyEmitMoves(index - 1, next);
+			else if (index2.0 >= 0) recursivelyEmitMoves(index2.0, next);
 		}
 		var loc: int;
 		if (vreg.parmoveState == IN_CYCLE) {
 			loc = getParallelMoveReg(vreg.regClass, 1);
 		} else if (vreg.spill <= 0) {
-			loc = coloring[vreg.varNum];
+			loc = srcreg;
 		} else {
-			allocSpill(vreg);
 			loc = getParallelMoveReg(vreg.regClass, 0);
 			codegen.insertRestoreLocal(vreg, loc, next);
 		}
 		if (regSet.isReg(loc)) {
 			for (l = dest; l != null; l = l.tail) {
-				statistic.store++;
-				codegen.insertSaveLocal(loc, l.head.vreg, next);
+				var dreg = l.head.vreg, dstreg = coloring[dreg.varNum];
+				if (dstreg != loc && regSet.isReg(dstreg)) codegen.insertMoveLocLoc((vreg, loc), (dreg, dstreg), dreg.regClass, next);
+				if (dreg.spill > 0) {
+					statistic.store ++;
+					codegen.insertSaveLocal(loc, dreg, next);
+				}
 			}
 		} else { // not spill and no global register assigned -> const
 			for (l = dest; l != null; l = l.tail) {
-				statistic.store++;
-				codegen.insertMoveValLoc(vreg, (l.head.vreg, l.head.vreg.spill), vreg.regClass, next);
+				var dreg = l.head.vreg, dstreg = coloring[dreg.varNum];
+				if (dstreg != loc && regSet.isReg(dstreg)) codegen.insertMoveValLoc(vreg, (dreg, dstreg), dreg.regClass, next);
+				if (dreg.spill > 0) {
+					statistic.store ++;
+					codegen.insertMoveValLoc(vreg, (dreg, dreg.spill), dreg.regClass, next);
+				}
 			}
 		}
 		vreg.parmoveState = 0;
+		if (regSet.isReg(srcreg)) regindex[srcreg] = (DEAD,null);
 	}
 	def getParallelMoveReg(rcl: RegClass, which: int) -> int {
 		var set = regSet.regClasses[rcl.tag];
@@ -679,11 +712,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 	}
 	def insertSpillInit() {
-		originVarsCnt = vars.length;
-		for (i = vars.length - 1; i > 0; i--) {
-			if (vars[i] == null) originVarsCnt --;
-			else break;
-		}
+		originVarsCnt = codegen.nextId();
 		for (i < codegen.order.length) {
 			blockReloads[i].resize(0);
 		}
@@ -721,14 +750,17 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
+	def defineConst(next: ArchInstr) {
+		for (i < vars.length) if (liveness[liveoutRow, i]) {
+			codegen.insertReload(vars[i], (vars[i], 0), next);
+			liveness[maskRow, i] = false;
+		}
+		liveness.clearRow(liveoutRow);
+	}
 	def insertMovesToStack(block: SsaBlock, cur: ArchInstr) {
 		var opcode = cur.opcode();
 		if (opcode == ArchInstrs.ARCH_BLOCK) {
-			for (i < vars.length) if (liveness[liveoutRow, i]) {
-				codegen.insertReload(vars[i], (vars[i], 0), cur.next);
-				liveness[maskRow, i] = false;
-			}
-			liveness.clearRow(liveoutRow);
+			defineConst(cur.next);
 		}
 		var operands = cur.operands;
 		for (j < operands.length) {
@@ -744,11 +776,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 					if (use.isConst()) liveness[liveoutRow, use.varNum] = true;
 				}
 				Kill(constraint) => {
-					for (i < vars.length) if (liveness[liveoutRow, i]) {
-						codegen.insertReload(vars[i], (vars[i], 0), cur.next);
-						liveness[maskRow, i] = false;
-					}
-					liveness.clearRow(liveoutRow);
+					defineConst(cur.next);
 				}
 				_ => ;
 			}
@@ -805,15 +833,15 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
-	def addInterfereRegfilter(reg: int, filter: VReg) {
+	def addInterferencesReg(reg: int, filter: VReg) {
 		for (i < vars.length) {
-			if (i != filter.varNum && liveness[liveoutRow, i]) graph.nodes[i].addInterfere(-reg);
+			if ((filter == null || i != filter.varNum) && liveness[liveoutRow, i]) graph.nodes[i].addInterfere(-reg);
 		}
 	}
 	def processConstraint(vreg: VReg, constraint: int, weight: int) {
 		if (vreg == null || constraint == 0 || regSet.isStack(constraint)) return;
 		if (regSet.isReg(constraint)) {
-			addInterfereRegfilter(constraint, vreg);
+			addInterferencesReg(constraint, vreg);
 			if (graph.addMove(vreg.varNum, -constraint)) movesWorklist.put((-constraint, vreg.varNum, weight));
 		} else {
 			var constraintSet = regSet.regSets[constraint], j = 0;
@@ -895,8 +923,12 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				if (opcode == ArchInstrs.ARCH_RELOAD) break;
 			}
 			Kill(constraint) => {
-				if (regSet.names[constraint] == "all") {
+				if (i+1 < operands.length && Operand.RefMap.?(operands[i+1])) {
 					liveness.clearRow(liveoutRow);
+				} else {
+					for (reg in regSet.regSets[constraint]) {
+						addInterferencesReg(reg, null);
+					}
 				}
 			}
 			Overwrite(vreg, use, constraint)    => {

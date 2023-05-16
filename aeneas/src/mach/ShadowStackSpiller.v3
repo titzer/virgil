@@ -1,6 +1,8 @@
 // Copyright 2019 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+def EVERYUSE = false;
+
 // Responsible for transforming Arch code containing livepoints (i.e. kills
 // of VRegs across potential GC points) to use a shadow stack. To do this,
 // it computes good locations for the allocation and deallocation of the stack frame,
@@ -13,6 +15,11 @@
 class ShadowStackSpiller() {
 	var codegen: SsaMachGen;
 	var order: SsaBlockOrder;
+	var matrix: BitMatrix;
+	var maskRow: int;
+	var lpPassStart: int;
+	var reloadStart: int;
+	var tmpRow: int;
 	def shadowVarMap = Vector<int>.new();
 	def lastLivepoint = Vector<ArchInstr>.new();
 	def deallocate = Vector<bool>.new();
@@ -138,6 +145,178 @@ class ShadowStackSpiller() {
 					}
 					bits = bits >>> 1;
 					varNum++;
+				}
+			}
+		}
+	}
+	def restore() {
+		if (codegen.livepoints.length == 0) return;
+		matrix = codegen.liveness;
+		maskRow = matrix.numrows - 1;
+		lpPassStart = matrix.numrows;
+		reloadStart = matrix.numrows + codegen.order.length;
+		matrix.grow(matrix.numrows + codegen.order.length * 2 + 1);
+		tmpRow = matrix.numrows - 1;
+		codegen.iterateInstructionsForward(markRestore);
+		pushRestoreUp();
+	}
+	def iterateloop(loop: SsaLoopInfo, endinstr: ArchInstr) {
+		var cur = codegen.instrs[loop.start];
+		var block: SsaBlock;
+		while (cur != endinstr) {
+			var next = cur.next;
+			var opcode = cur.opcode();
+			if (opcode == ArchInstrs.ARCH_BLOCK) {
+				block = Operand.Label.!(cur.operands[0]).block;
+				matrix.clearRow(lpPassStart + block.mark);
+				for (e in block.preds) {
+					var pred = e.src.block();
+					matrix.or(lpPassStart + block.mark, lpPassStart + pred.mark);
+				}
+				matrix.and(lpPassStart + block.mark, maskRow);
+			}
+			var operands = cur.operands;
+			for (j = operands.length-1; j >= 0; j--) {
+				match (operands[j]) {
+					Def(vreg, constraint) => {
+						if (vreg != null) matrix[lpPassStart + block.mark, vreg.varNum] = false;
+					}
+					Use(vreg, constraint) => {
+						if (matrix[lpPassStart + block.mark, vreg.varNum]) {
+							if (EVERYUSE) codegen.insertReload(vreg, (vreg, 0), cur);
+							else matrix[reloadStart + block.mark, vreg.varNum] = true;
+							matrix[lpPassStart + block.mark, vreg.varNum] = false;
+						}
+					}
+					Overwrite(vreg, use, constraint) => {
+						if (matrix[lpPassStart + block.mark, use.varNum]) {
+							if (EVERYUSE) codegen.insertReload(use, (use, 0), cur);
+							else matrix[reloadStart + block.mark, use.varNum] = true;
+							matrix[lpPassStart + block.mark, use.varNum] = false;
+						}
+					}
+					RefMap(livepoint, outgoing) => {
+						matrix.or(lpPassStart + block.mark, codegen.order.length + livepoint);
+						matrix.and(lpPassStart + block.mark, maskRow);
+					}
+					_ => ;
+				}
+			}
+			cur = next;
+		}
+	}
+	def markRestoreVreg(block: SsaBlock, cur: ArchInstr, vreg: VReg) {
+		if (matrix[lpPassStart + block.mark, vreg.varNum]) { // kills in this block
+			codegen.insertReload(vreg, (vreg, 0), cur);
+			matrix[tmpRow, vreg.varNum] = false;
+			matrix[lpPassStart + block.mark, vreg.varNum] = false;
+		} else if (matrix[tmpRow, vreg.varNum]) { // kills from predecessor
+			if (EVERYUSE) codegen.insertReload(vreg, (vreg, 0), cur);
+			else matrix[reloadStart + block.mark, vreg.varNum] = true;
+			matrix[tmpRow, vreg.varNum] = false;
+		}
+	}
+	def markRestore(block: SsaBlock, cur: ArchInstr) {
+		var opcode = cur.opcode();
+		if (opcode == ArchInstrs.ARCH_BLOCK) {
+			matrix.clearRow(tmpRow);
+			for (e in block.preds) {
+				var pred = e.src.block();
+				matrix.or(tmpRow, lpPassStart + pred.mark); // kills from predecessor
+			}
+			matrix.and(tmpRow, maskRow);
+		} else if (opcode == ArchInstrs.ARCH_BLOCK_END) {
+			matrix.or(lpPassStart + block.mark, tmpRow);
+			if (order.loops != null) for (i < order.loops.length) {
+				if (block.mark == order.loops[i].end-1) {
+					iterateloop(order.loops[i], cur);
+					break;
+				}
+			}
+		}
+		var operands = cur.operands;
+		for (j = operands.length-1; j >= 0; j--) {
+			match (operands[j]) {
+				Use(vreg, constraint) => {
+					if (vreg != null) markRestoreVreg(block, cur, vreg);
+				}
+				Overwrite(vreg, use, constraint) => {
+					markRestoreVreg(block, cur, use);
+				}
+				RefMap(livepoint, outgoing) => { // kills in this block
+					matrix.or(lpPassStart + block.mark, codegen.order.length + livepoint);
+					matrix.and(lpPassStart + block.mark, maskRow);
+				}
+				_ => ;
+			}
+		}
+	}
+	def isSucc(block: SsaBlock, succs: Array<SsaCfEdge>) -> bool {
+		for (e in succs) {
+			if (e.dest == block) return true;
+		}
+		return false;
+	}
+	def succsHasKill(succs: Array<SsaCfEdge>) -> bool {
+		for (e in succs) {
+			if (hasKill(e.dest)) return true;
+		}
+		return false;
+	}
+	def hasKill(block: SsaBlock) -> bool {
+		var livepoints = codegen.livepoints;
+		for (i < livepoints.length) {
+			if (livepoints[i].0 == block) return true;
+		}
+		return false;
+	}
+	def insertReload(col: int, t: (ArchInstr, SsaBlock)) {
+		codegen.insertReload(codegen.vars[col], (codegen.vars[col], 0), t.0);
+		matrix[t.1.mark, col] = false;
+	}
+	def pushRestoreUp() {
+		if (EVERYUSE) return;
+		for (i = codegen.order.length - 1; i >= 0; i--) {
+			var info = codegen.order[i], block = info.block;
+			var succs = block.succs();
+			var child = info.dom_child;
+			if (child != null) {
+				if (child.dom_sibling == null || hasKill(block) || succsHasKill(succs)) {
+					while (child != null) {
+						var next = codegen.instrs[child.block.mark].next;
+						matrix.apply(reloadStart + child.block.mark, insertReload, (next, child.block));
+						child = child.dom_sibling;
+					}
+				} else {
+					matrix.setRow(tmpRow);
+					// Mark reload if all successors require reload
+					for (e in succs) {
+						matrix.and(tmpRow, reloadStart + e.dest.mark);
+					}
+					matrix.or(reloadStart + block.mark, tmpRow);
+					// Mark reload if some succs and dom_child that is not a successor require reload
+					matrix.clearRow(tmpRow);
+					for (e in succs) {
+						matrix.or(tmpRow, reloadStart + e.dest.mark);
+					}
+					while (child != null) {
+						if (!isSucc(child.block, succs)) {
+							matrix.and(tmpRow, reloadStart + child.block.mark);
+							matrix.or(reloadStart + block.mark, tmpRow);
+							break;
+						}
+						child = child.dom_sibling;
+					}
+					child = info.dom_child;
+					while (child != null) {
+						// Reload at child if child requires reload but current block doesn't.
+						var next = codegen.instrs[child.block.mark].next;
+						matrix.copy(tmpRow, reloadStart + block.mark);
+						matrix.flipRow(tmpRow);
+						matrix.and(tmpRow, reloadStart + child.block.mark);
+						matrix.apply(tmpRow, insertReload, (next, child.block));
+						child = child.dom_sibling;
+					}
 				}
 			}
 		}
