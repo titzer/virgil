@@ -2,7 +2,7 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def EVERYUSE = false;
-def EVERYKILL = false;
+def EVERYKILL = false; // only for useShadowStack
 
 // Responsible for transforming Arch code containing livepoints (i.e. kills
 // of VRegs across potential GC points) to use a shadow stack. To do this,
@@ -164,6 +164,8 @@ class ShadowStackSpiller() {
 			tmpRow.apply(insertSaveVarNum, (before, after));
 		}
 	}
+	// Mark blocks which contain reachable use from kill and try to push the mark up.
+	// Insert restore instruction when the mark isn't pushed upward.
 	def restore() {
 		if (lps.length == 0) return;
 		matrix = codegen.liveness;
@@ -171,7 +173,15 @@ class ShadowStackSpiller() {
 		reloadStart = matrix.numrows + codegen.order.length;
 		matrix.grow(matrix.numrows + codegen.order.length * 2);
 		codegen.iterateInstructionsForward(markRestore);
-		pushRestoreUp();
+		if (!EVERYUSE) codegen.blocks.iterateBlocksBackward(pushRestoreUp);
+	}
+	def killsFromPred(storeRow: BitMatrixRow, block: SsaBlock) {
+		storeRow.clear();
+		for (e in block.preds) {
+			var pred = e.src.block();
+			storeRow.ori(lpPassStart + pred.mark);
+		}
+		storeRow.and(allLive);
 	}
 	def iterateloop(loop: SsaLoopInfo, endinstr: ArchInstr) {
 		var cur = codegen.instrs[loop.start];
@@ -182,12 +192,7 @@ class ShadowStackSpiller() {
 			if (opcode == ArchInstrs.ARCH_BLOCK) {
 				block = Operand.Label.!(cur.operands[0]).block;
 				curRow = BitMatrixRow(matrix, lpPassStart + block.mark);
-				curRow.clear();
-				for (e in block.preds) {
-					var pred = e.src.block();
-					curRow.ori(lpPassStart + pred.mark);
-				}
-				curRow.and(allLive);
+				killsFromPred(curRow, block);
 			}
 			var operands = cur.operands;
 			for (j = operands.length-1; j >= 0; j--) {
@@ -196,18 +201,10 @@ class ShadowStackSpiller() {
 						if (vreg != null) curRow[vreg.varNum] = false;
 					}
 					Use(vreg, constraint) => {
-						if (vreg != null && curRow[vreg.varNum]) {
-							if (EVERYUSE) insertRestore(vreg, cur);
-							else matrix[reloadStart + block.mark, vreg.varNum] = true;
-							curRow[vreg.varNum] = false;
-						}
+						if (vreg != null ) markRestoreVregLoop(block, cur, vreg);
 					}
 					Overwrite(vreg, use, constraint) => {
-						if (curRow[use.varNum]) {
-							if (EVERYUSE) insertRestore(vreg, cur);
-							else matrix[reloadStart + block.mark, use.varNum] = true;
-							curRow[use.varNum] = false;
-						}
+						markRestoreVregLoop(block, cur, use);
 					}
 					RefMap(livepoint, outgoing) => {
 						curRow.ori(codegen.order.length + livepoint);
@@ -223,6 +220,13 @@ class ShadowStackSpiller() {
 		if (!useShadowStack) codegen.insertRestore((vreg, 0), vreg.spill, next);
 		else codegen.insertShadowStackRestore(shadow_sp, vreg, shadowVarMap[vreg.varNum], next);
 	}
+	def markRestoreVregLoop(block: SsaBlock, cur: ArchInstr, vreg: VReg) {
+		if (curRow[vreg.varNum]) {
+			if (EVERYUSE) insertRestore(vreg, cur);
+			else matrix[reloadStart + block.mark, vreg.varNum] = true;
+			curRow[vreg.varNum] = false;
+		}
+	}
 	def markRestoreVreg(block: SsaBlock, cur: ArchInstr, vreg: VReg) {
 		if (curRow[vreg.varNum]) { // kills in this block
 			insertRestore(vreg, cur);
@@ -237,12 +241,7 @@ class ShadowStackSpiller() {
 	def markRestore(block: SsaBlock, cur: ArchInstr) {
 		var opcode = cur.opcode();
 		if (opcode == ArchInstrs.ARCH_BLOCK) {
-			tmpRow.clear();
-			for (e in block.preds) {
-				var pred = e.src.block();
-				tmpRow.ori(lpPassStart + pred.mark); // kills from predecessor
-			}
-			tmpRow.and(allLive);
+			killsFromPred(tmpRow, block);
 			curRow = BitMatrixRow(matrix, lpPassStart + block.mark);
 		} else if (opcode == ArchInstrs.ARCH_BLOCK_END) {
 			curRow.or(tmpRow);
@@ -293,50 +292,47 @@ class ShadowStackSpiller() {
 		insertRestore(codegen.vars[varNum], t.0);
 		matrix[t.1.mark, varNum] = false;
 	}
-	def pushRestoreUp() {
-		if (EVERYUSE) return;
-		for (i = codegen.order.length - 1; i >= 0; i--) {
-			var info = codegen.order[i], block = info.block;
-			curRow = BitMatrixRow(matrix, reloadStart + block.mark);
-			var succs = block.succs();
-			var child = info.dom_child;
-			if (child != null) {
-				if (child.dom_sibling == null || hasKill(block) || succsHasKill(succs)) {
-					while (child != null) {
-						var next = codegen.instrs[child.block.mark].next;
-						matrix.apply(reloadStart + child.block.mark, insertRestoreVarNum, (next, child.block));
-						child = child.dom_sibling;
-					}
-				} else {
-					tmpRow.set();
-					// Mark reload if all successors require reload
-					for (e in succs) {
-						tmpRow.andi(reloadStart + e.dest.mark);
-					}
-					curRow.or(tmpRow);
-					// Mark reload if some succs and dom_child that is not a successor require reload
-					tmpRow.clear();
-					for (e in succs) {
-						tmpRow.ori(reloadStart + e.dest.mark);
-					}
-					while (child != null) {
-						if (!isSucc(child.block, succs)) {
-							tmpRow.andi(reloadStart + child.block.mark);
-							curRow.or(tmpRow);
-							break;
-						}
-						child = child.dom_sibling;
-					}
-					child = info.dom_child;
-					while (child != null) {
-						// Reload at child if child requires reload but current block doesn't.
-						var next = codegen.instrs[child.block.mark].next;
-						tmpRow.copy(curRow);
-						tmpRow.flip();
+	def pushRestoreUp(info: SsaBlockInfo) {
+		var block = info.block;
+		curRow = BitMatrixRow(matrix, reloadStart + block.mark);
+		var succs = block.succs();
+		var child = info.dom_child;
+		if (child != null) {
+			if (child.dom_sibling == null || hasKill(block) || succsHasKill(succs)) {
+				while (child != null) {
+					var next = codegen.instrs[child.block.mark].next;
+					matrix.apply(reloadStart + child.block.mark, insertRestoreVarNum, (next, child.block));
+					child = child.dom_sibling;
+				}
+			} else {
+				tmpRow.set();
+				// Mark reload if all successors require reload
+				for (e in succs) {
+					tmpRow.andi(reloadStart + e.dest.mark);
+				}
+				curRow.or(tmpRow);
+				// Mark reload if some succs and dom_child that is not a successor require reload
+				tmpRow.clear();
+				for (e in succs) {
+					tmpRow.ori(reloadStart + e.dest.mark);
+				}
+				while (child != null) {
+					if (!isSucc(child.block, succs)) {
 						tmpRow.andi(reloadStart + child.block.mark);
-						tmpRow.apply(insertRestoreVarNum, (next, child.block));
-						child = child.dom_sibling;
+						curRow.or(tmpRow);
+						break;
 					}
+					child = child.dom_sibling;
+				}
+				child = info.dom_child;
+				while (child != null) {
+					// Reload at child if child requires reload but current block doesn't.
+					var next = codegen.instrs[child.block.mark].next;
+					tmpRow.copy(curRow);
+					tmpRow.flip();
+					tmpRow.andi(reloadStart + child.block.mark);
+					tmpRow.apply(insertRestoreVarNum, (next, child.block));
+					child = child.dom_sibling;
 				}
 			}
 		}
