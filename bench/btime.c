@@ -18,6 +18,7 @@
 int lines = 0;
 int interactive = 0;
 int printed = 0;
+int ignore_failure = 0;
 char **global_envp;
 double times[MAX_RUNS];
 
@@ -63,7 +64,7 @@ int run(int run, int numruns, int nstdout, int nstderr, char *argv[]) {
 
   // in parent, wait for child
   rc = wait4(pid, &status, 0, &usage);
-  if (rc < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+  if (!ignore_failure && (rc < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
     // program returned nonzero exit code, or terminated with signal
     if (numruns > 1) {
       if (!lines) printf(" %12s", "--");
@@ -139,7 +140,7 @@ int main(int argc, char *argv[], char *envp[]) {
   global_envp = envp;
   // Check for enough arguments
   if (argc < 2) {
-    printf("usage: btime [-l] [runs] <command>\n");
+    printf("usage: btime [-l|-f] [runs] <command>\n");
     exit(1);
   }
 
@@ -148,6 +149,10 @@ int main(int argc, char *argv[], char *envp[]) {
     char *arg = argv[i];
     if (strcmp(arg, "-l") == 0) {
       lines = 1;
+      continue;
+    }
+    if (strcmp(arg, "-f") == 0) {
+      ignore_failure = 1;
       continue;
     }
     if (strcmp(arg, "-i") == 0) {
