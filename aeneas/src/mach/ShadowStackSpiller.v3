@@ -2,6 +2,7 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def EVERYUSE = false;
+def EVERYLPS = false; // only available if useShadowStack
 
 // Responsible for transforming Arch code containing livepoints (i.e. kills
 // of VRegs across potential GC points) to use a shadow stack. To do this,
@@ -16,10 +17,17 @@ class ShadowStackSpiller() {
 	var codegen: SsaMachGen;
 	var order: SsaBlockOrder;
 	var matrix: BitMatrix;
-	var maskRow: int;
 	var lpPassStart: int;
 	var reloadStart: int;
-	var tmpRow: int;
+	var allLive: BitMatrixRow;
+	var tmpRow: BitMatrixRow;
+	var curRow: BitMatrixRow;
+	var saveRow: BitMatrixRow;
+	var shadowStackAllocNext: ArchInstr;
+	var lps: Vector<(SsaBlock, ArchInstr, Operand.RefMap)>;
+	var useShadowStack: bool;
+	var inShadowStack: bool;
+	var shadow_sp: VReg;
 	def shadowVarMap = Vector<int>.new();
 	def lastLivepoint = Vector<ArchInstr>.new();
 	def deallocate = Vector<bool>.new();
@@ -27,12 +35,67 @@ class ShadowStackSpiller() {
 	def reset(codegen: SsaMachGen, order: SsaBlockOrder) {
 		this.codegen = codegen;
 		this.order = order;
+		useShadowStack = if(WasmCodeGen.?(codegen), WasmCodeGen.!(codegen).useShadowStack, false);
+		inShadowStack = false;
 	}
 	// Run the algorithm, inserting save and restore code.
 	def run() {
-		var lps = codegen.livepoints;
+		lps = codegen.livepoints;
 		if (lps.length == 0) return;  // nothing to do
-
+		matrix = codegen.liveness;
+		matrix.grow(matrix.numrows + 3);
+		saveRow = matrix.row(matrix.numrows - 3);
+		allLive = matrix.row(matrix.numrows - 2);
+		tmpRow = matrix.row(matrix.numrows - 1);
+		allLive.clear();
+		for (i < lps.length) {
+			var t = lps[i], lp = order.order.length + t.2.livepoint;
+			allLive.ori(lp); // union all livepoint sets
+		}
+		var numSlots = allocSpillSlot();
+		if (numSlots == 0) return; // no live references at any livepoint
+		if (useShadowStack) {
+			allocateShadowStack(numSlots);
+		}
+		if (useShadowStack && EVERYLPS) saveRestoreLps();
+		else {
+			restore();
+			if (useShadowStack) {
+				saveRow.apply(insertSSVarNum, (shadowStackAllocNext, null));
+			}
+		}
+	}
+	def allocSpillSlot() -> int {
+		var numVars = codegen.vars.length;
+		var numSlots = 0;
+		if (useShadowStack) {
+			// Allocate a temporary for a shadow stack pointer.
+			shadow_sp = codegen.newShadowSpTmp();
+			// Initialize the shadow variable map, which maps (reference) variables to shadow
+			// spill slots.
+			shadowVarMap.grow(numVars);
+			shadowVarMap.length = numVars;
+		}
+		for (i < numVars) {
+			if (allLive[i]) {
+				var vreg = codegen.vars[i];
+				if (!vreg.isConst() && (!useShadowStack || codegen.isRef(vreg))) {
+					if (useShadowStack) shadowVarMap[i] = numSlots;
+					else allocSpill(codegen.vars[i]);
+					numSlots++;
+					continue;
+				}
+			}
+			if (useShadowStack) shadowVarMap[i] = -1;
+			allLive[i] = false; // filter out non-ref vars and consts
+		}
+		saveRow.copy(allLive);
+		return numSlots;
+	}
+	def allocSpill(vreg: VReg) {
+		if (vreg.spill == 0) vreg.spill = codegen.frame.allocSpill(vreg.regClass);
+	}
+	def allocateShadowStack(numShadowSlots: int) {
 		// Make a first pass over all livepoints.
 		lastLivepoint.resize(codegen.order.length);
 		deallocate.resize(codegen.order.length);
@@ -42,17 +105,10 @@ class ShadowStackSpiller() {
 		}
 
 		// Compute the allocation block A, where the shadow stack pointer will be adjusted.
-		// Find the common dominator A of all blocks that contain livepoints. Along the way,
-		// compute the union of all variables used in all livepoints.
-		var matrix = codegen.liveness;
-		matrix.grow(matrix.numrows + 2);
-		var allLive = matrix.numrows - 2;
-		var tmpLive = matrix.numrows - 1;
+		// Find the common dominator A of all blocks that contain livepoints.
 		var blockA_i = lps[0].0.mark, blockA = order.order[blockA_i];
-		matrix.copy(allLive, blockA_i);
 		for (i < lps.length) {
-			var t = lps[i], bm = t.0.mark, info = order.order[bm], lp = order.order.length + t.2.livepoint;
-			matrix.or(allLive, lp); // union all livepoint sets
+			var t = lps[i], bm = t.0.mark, info = order.order[bm];
 			if (lastLivepoint[bm] == null) lastLivepoint[bm] = t.1;
 			if (info == blockA) continue;
 			blockA = order.commonDominator(blockA, info);
@@ -86,27 +142,6 @@ class ShadowStackSpiller() {
 				}
 			}
 		}
-		// Allocate a temporary for a shadow stack pointer.
-		var shadow_sp = codegen.newShadowSpTmp();
-
-		// Initialize the shadow variable map, which maps (reference) variables to shadow
-		// spill slots. XXX: improve shadow spill slot allocation with graph coloring.
-		var numVars = codegen.vars.length;
-		shadowVarMap.grow(numVars);
-		shadowVarMap.length = numVars;
-		var numShadowSlots = 0;
-		for (i < numVars) {
-			if (matrix[allLive, i]) {
-				var vreg = codegen.vars[i];
-				if (!vreg.isConst() && codegen.isRef(vreg)) {
-					shadowVarMap[i] = numShadowSlots++;
-					continue;
-				}
-			}
-			shadowVarMap[i] = -1;
-			matrix[allLive, i] = false; // filter out non-ref vars and consts
-		}
-		if (numShadowSlots == 0) return;  // no live references at any livepoint
 
 		// Insert shadow stack allocation and deallocations. Iterate instructions from top
 		// to bottom because blocks don't know their first instruction.
@@ -116,6 +151,7 @@ class ShadowStackSpiller() {
 			if (label.block == blockA.block) { // allocation block
 				var startOfBlock = i.next;
 				codegen.insertShadowStackAlloc(shadow_sp, numShadowSlots, startOfBlock);
+				shadowStackAllocNext = startOfBlock;
 			}
 			if (deallocate[label.block.mark]) { // deallocation block
 				var point = lastLivepoint[label.block.mark]; // insert after last livepoint
@@ -123,42 +159,35 @@ class ShadowStackSpiller() {
 				codegen.insertShadowStackFree(shadow_sp, numShadowSlots, point.next);
 			}
 		}
-
+	}
+	def saveRestoreLps() {
 		// For every livepoint, for every live variable, add a save before and a restore after.
-		// XXX: improve spilling to the shadow stack with better splitting heuristics.
-		var start = tmpLive * matrix.width, end = start + matrix.width;
 		for (j < lps.length) {
 			var t = lps[j], i = t.1, lp = order.order.length + t.2.livepoint;
-			matrix.copy(tmpLive, lp);
-			matrix.and(tmpLive, allLive);  // filter non-refs and constants
+			tmpRow.copyi(lp);
+			tmpRow.and(allLive);  // filter non-refs and constants
 			var before = i, after = i.next;
-
-			for (j = start; j < end; j++) {
-				var bits = matrix.bits[j];
-				var varNum = (j - start) * 32;
-				while (bits != 0) {
-					if ((bits & 1) == 1) {
-						// spill and restore varNum
-						var vreg = codegen.vars[varNum], slot = shadowVarMap[varNum];
-						codegen.insertShadowStackSave(shadow_sp, vreg, slot, before);
-						codegen.insertShadowStackRestore(shadow_sp, vreg, slot, after);
-					}
-					bits = bits >>> 1;
-					varNum++;
-				}
-			}
+			tmpRow.apply(insertSSVarNum, (before, after));
 		}
 	}
+	// Mark blocks which contain reachable use from kill and try to push the mark up.
+	// Insert restore instruction when the mark isn't pushed upward.
 	def restore() {
-		if (codegen.livepoints.length == 0) return;
+		if (lps.length == 0) return;
 		matrix = codegen.liveness;
-		maskRow = matrix.numrows - 1;
 		lpPassStart = matrix.numrows;
 		reloadStart = matrix.numrows + codegen.order.length;
-		matrix.grow(matrix.numrows + codegen.order.length * 2 + 1);
-		tmpRow = matrix.numrows - 1;
+		matrix.grow(matrix.numrows + codegen.order.length * 2);
 		codegen.iterateInstructionsForward(markRestore);
-		pushRestoreUp();
+		if (!EVERYUSE) codegen.blocks.iterateBlocksBackward(pushRestoreUp);
+	}
+	def killsFromPred(storeRow: BitMatrixRow, block: SsaBlock) {
+		storeRow.clear();
+		for (e in block.preds) {
+			var pred = e.src.block();
+			storeRow.ori(lpPassStart + pred.mark);
+		}
+		storeRow.and(allLive);
 	}
 	def iterateloop(loop: SsaLoopInfo, endinstr: ArchInstr) {
 		var cur = codegen.instrs[loop.start];
@@ -168,36 +197,26 @@ class ShadowStackSpiller() {
 			var opcode = cur.opcode();
 			if (opcode == ArchInstrs.ARCH_BLOCK) {
 				block = Operand.Label.!(cur.operands[0]).block;
-				matrix.clearRow(lpPassStart + block.mark);
-				for (e in block.preds) {
-					var pred = e.src.block();
-					matrix.or(lpPassStart + block.mark, lpPassStart + pred.mark);
-				}
-				matrix.and(lpPassStart + block.mark, maskRow);
+				curRow = BitMatrixRow(matrix, lpPassStart + block.mark);
+				killsFromPred(curRow, block);
+			} else if (opcode == ArchInstrs.ARCH_SETSHADOWSTACKPTR) {
+				curRow.clear();
 			}
 			var operands = cur.operands;
 			for (j = operands.length-1; j >= 0; j--) {
 				match (operands[j]) {
 					Def(vreg, constraint) => {
-						if (vreg != null) matrix[lpPassStart + block.mark, vreg.varNum] = false;
+						if (vreg != null) curRow[vreg.varNum] = false;
 					}
 					Use(vreg, constraint) => {
-						if (matrix[lpPassStart + block.mark, vreg.varNum]) {
-							if (EVERYUSE) codegen.insertReload(vreg, (vreg, 0), cur);
-							else matrix[reloadStart + block.mark, vreg.varNum] = true;
-							matrix[lpPassStart + block.mark, vreg.varNum] = false;
-						}
+						if (vreg != null ) markRestoreVregLoop(block, cur, vreg);
 					}
 					Overwrite(vreg, use, constraint) => {
-						if (matrix[lpPassStart + block.mark, use.varNum]) {
-							if (EVERYUSE) codegen.insertReload(use, (use, 0), cur);
-							else matrix[reloadStart + block.mark, use.varNum] = true;
-							matrix[lpPassStart + block.mark, use.varNum] = false;
-						}
+						markRestoreVregLoop(block, cur, use);
 					}
 					RefMap(livepoint, outgoing) => {
-						matrix.or(lpPassStart + block.mark, codegen.order.length + livepoint);
-						matrix.and(lpPassStart + block.mark, maskRow);
+						curRow.ori(codegen.order.length + livepoint);
+						curRow.and(allLive);
 					}
 					_ => ;
 				}
@@ -205,34 +224,28 @@ class ShadowStackSpiller() {
 			cur = next;
 		}
 	}
-	def markRestoreVreg(block: SsaBlock, cur: ArchInstr, vreg: VReg) {
-		if (matrix[lpPassStart + block.mark, vreg.varNum]) { // kills in this block
-			codegen.insertReload(vreg, (vreg, 0), cur);
-			matrix[tmpRow, vreg.varNum] = false;
-			matrix[lpPassStart + block.mark, vreg.varNum] = false;
-		} else if (matrix[tmpRow, vreg.varNum]) { // kills from predecessor
-			if (EVERYUSE) codegen.insertReload(vreg, (vreg, 0), cur);
-			else matrix[reloadStart + block.mark, vreg.varNum] = true;
-			matrix[tmpRow, vreg.varNum] = false;
-		}
-	}
 	def markRestore(block: SsaBlock, cur: ArchInstr) {
 		var opcode = cur.opcode();
 		if (opcode == ArchInstrs.ARCH_BLOCK) {
-			matrix.clearRow(tmpRow);
-			for (e in block.preds) {
-				var pred = e.src.block();
-				matrix.or(tmpRow, lpPassStart + pred.mark); // kills from predecessor
-			}
-			matrix.and(tmpRow, maskRow);
-		} else if (opcode == ArchInstrs.ARCH_BLOCK_END) {
-			matrix.or(lpPassStart + block.mark, tmpRow);
+			codegen.instrs[block.mark] = cur;
+			killsFromPred(tmpRow, block);
+			curRow = BitMatrixRow(matrix, lpPassStart + block.mark);
+		}
+		if (useShadowStack) {
+			if (cur == shadowStackAllocNext) inShadowStack = true;
+			else if (!inShadowStack) return;
+		}
+		if (opcode == ArchInstrs.ARCH_BLOCK_END) {
+			curRow.or(tmpRow);
 			if (order.loops != null) for (i < order.loops.length) {
 				if (block.mark == order.loops[i].end-1) {
 					iterateloop(order.loops[i], cur);
 					break;
 				}
 			}
+		} else if (opcode == ArchInstrs.ARCH_SETSHADOWSTACKPTR) {
+			curRow.clear();
+			tmpRow.clear();
 		}
 		var operands = cur.operands;
 		for (j = operands.length-1; j >= 0; j--) {
@@ -244,11 +257,36 @@ class ShadowStackSpiller() {
 					markRestoreVreg(block, cur, use);
 				}
 				RefMap(livepoint, outgoing) => { // kills in this block
-					matrix.or(lpPassStart + block.mark, codegen.order.length + livepoint);
-					matrix.and(lpPassStart + block.mark, maskRow);
+					curRow.ori(codegen.order.length + livepoint);
+					curRow.and(allLive);
+				}
+				Def(vreg, constraint) => {
+					if (useShadowStack && allLive[vreg.varNum]) {
+						var slot = shadowVarMap[vreg.varNum];
+						codegen.insertShadowStackSave(shadow_sp, vreg, slot, cur.next);
+						saveRow[vreg.varNum] = false;
+					}
 				}
 				_ => ;
 			}
+		}
+	}
+	def markRestoreVregLoop(block: SsaBlock, cur: ArchInstr, vreg: VReg) {
+		if (curRow[vreg.varNum]) {
+			if (EVERYUSE) insertRestore(vreg, cur);
+			else matrix[reloadStart + block.mark, vreg.varNum] = true;
+			curRow[vreg.varNum] = false;
+		}
+	}
+	def markRestoreVreg(block: SsaBlock, cur: ArchInstr, vreg: VReg) {
+		if (curRow[vreg.varNum]) { // kills in this block
+			insertRestore(vreg, cur);
+			tmpRow[vreg.varNum] = false;
+			curRow[vreg.varNum] = false;
+		} else if (tmpRow[vreg.varNum]) { // kills from predecessor
+			if (EVERYUSE) insertRestore(vreg, cur);
+			else matrix[reloadStart + block.mark, vreg.varNum] = true;
+			tmpRow[vreg.varNum] = false;
 		}
 	}
 	def isSucc(block: SsaBlock, succs: Array<SsaCfEdge>) -> bool {
@@ -270,56 +308,65 @@ class ShadowStackSpiller() {
 		}
 		return false;
 	}
-	def insertReload(col: int, t: (ArchInstr, SsaBlock)) {
-		codegen.insertReload(codegen.vars[col], (codegen.vars[col], 0), t.0);
-		matrix[t.1.mark, col] = false;
-	}
-	def pushRestoreUp() {
-		if (EVERYUSE) return;
-		for (i = codegen.order.length - 1; i >= 0; i--) {
-			var info = codegen.order[i], block = info.block;
-			var succs = block.succs();
-			var child = info.dom_child;
-			if (child != null) {
-				if (child.dom_sibling == null || hasKill(block) || succsHasKill(succs)) {
-					while (child != null) {
-						var next = codegen.instrs[child.block.mark].next;
-						matrix.apply(reloadStart + child.block.mark, insertReload, (next, child.block));
-						child = child.dom_sibling;
+	def pushRestoreUp(info: SsaBlockInfo) {
+		var block = info.block;
+		curRow = BitMatrixRow(matrix, reloadStart + block.mark);
+		var succs = block.succs();
+		var child = info.dom_child;
+		if (child != null) {
+			if (child.dom_sibling == null || hasKill(block) || succsHasKill(succs)) {
+				while (child != null) {
+					var next = codegen.instrs[child.block.mark].next;
+					matrix.apply(reloadStart + child.block.mark, insertRestoreVarNum, (next, child.block));
+					child = child.dom_sibling;
+				}
+			} else {
+				tmpRow.set();
+				// Mark reload if all successors require reload
+				for (e in succs) {
+					tmpRow.andi(reloadStart + e.dest.mark);
+				}
+				curRow.or(tmpRow);
+				// Mark reload if some succs and dom_child that is not a successor require reload
+				tmpRow.clear();
+				for (e in succs) {
+					tmpRow.ori(reloadStart + e.dest.mark);
+				}
+				while (child != null) {
+					if (!isSucc(child.block, succs)) {
+						tmpRow.andi(reloadStart + child.block.mark);
+						curRow.or(tmpRow);
+						break;
 					}
-				} else {
-					matrix.setRow(tmpRow);
-					// Mark reload if all successors require reload
-					for (e in succs) {
-						matrix.and(tmpRow, reloadStart + e.dest.mark);
-					}
-					matrix.or(reloadStart + block.mark, tmpRow);
-					// Mark reload if some succs and dom_child that is not a successor require reload
-					matrix.clearRow(tmpRow);
-					for (e in succs) {
-						matrix.or(tmpRow, reloadStart + e.dest.mark);
-					}
-					while (child != null) {
-						if (!isSucc(child.block, succs)) {
-							matrix.and(tmpRow, reloadStart + child.block.mark);
-							matrix.or(reloadStart + block.mark, tmpRow);
-							break;
-						}
-						child = child.dom_sibling;
-					}
-					child = info.dom_child;
-					while (child != null) {
-						// Reload at child if child requires reload but current block doesn't.
-						var next = codegen.instrs[child.block.mark].next;
-						matrix.copy(tmpRow, reloadStart + block.mark);
-						matrix.flipRow(tmpRow);
-						matrix.and(tmpRow, reloadStart + child.block.mark);
-						matrix.apply(tmpRow, insertReload, (next, child.block));
-						child = child.dom_sibling;
-					}
+					child = child.dom_sibling;
+				}
+				child = info.dom_child;
+				while (child != null) {
+					// Reload at child if child requires reload but current block doesn't.
+					var next = codegen.instrs[child.block.mark].next;
+					tmpRow.copy(curRow);
+					tmpRow.flip();
+					tmpRow.andi(reloadStart + child.block.mark);
+					tmpRow.apply(insertRestoreVarNum, (next, child.block));
+					child = child.dom_sibling;
 				}
 			}
 		}
+	}
+	def insertRestoreVarNum(varNum: int, t: (ArchInstr, SsaBlock)) {
+		insertRestore(codegen.vars[varNum], t.0);
+		matrix[t.1.mark, varNum] = false;
+	}
+	// Insert a ShadowStack save and/or restore. The save instruction is inserted before {t.0},
+	// ans the restore instruction is inserted before {t.1}.
+	def insertSSVarNum(varNum: int, t: (ArchInstr, ArchInstr)) {
+		var vreg = codegen.vars[varNum], slot = shadowVarMap[varNum];
+		if (t.0 != null) codegen.insertShadowStackSave(shadow_sp, vreg, slot, t.0);
+		if (t.1 != null) codegen.insertShadowStackRestore(shadow_sp, vreg, slot, t.1);
+	}
+	def insertRestore(vreg: VReg, next: ArchInstr) {
+		if (!useShadowStack) codegen.insertRestore((vreg, 0), vreg.spill, next);
+		else codegen.insertShadowStackRestore(shadow_sp, vreg, shadowVarMap[vreg.varNum], next);
 	}
 	def print() {
 		var out = codegen.getOutput(), indent = 1;
