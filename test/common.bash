@@ -36,7 +36,7 @@ PROGRESS_ARGS=${PROGRESS_ARGS:=i}
 PROGRESS="${VIRGIL_LOC}/test/config/progress $PROGRESS_ARGS"
 
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
-TEST_TARGETS=${TEST_TARGETS:="int jvm wasm-js x86-linux x86-64-linux x86-darwin x86-64-darwin"}
+TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm-js x86-linux x86-64-linux x86-darwin x86-64-darwin"}
 
 if [[ ! -x "$AENEAS_TEST" && "$AENEAS_TEST" != auto ]]; then
     echo $AENEAS_TEST: not found or not executable
@@ -335,10 +335,10 @@ function execute_target_tests() {
 
 function execute_tests() {
     for target in $TEST_TARGETS; do
-	if [ "$target" = "int" ]; then
-	    execute_v3i_tests "int" ""
-	    execute_v3i_tests "int-ra" "-ra -ma=false"
-	    execute_v3i_tests "int-ra-ma" "-ra -ma=true"
+	if [ "$target" = "v3i" ]; then
+	    execute_v3i_tests "v3i" ""
+	    execute_v3i_tests "v3i-ra" "-ra -ma=false"
+	    execute_v3i_tests "v3i-ra-ma" "-ra -ma=true"
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             compile_target_tests jvm -jvm.script=false
             execute_target_tests jvm

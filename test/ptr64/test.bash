@@ -12,7 +12,7 @@ ALL_TEST_TARGETS=$TEST_TARGETS
 TEST_TARGETS=""
 
 for target in $ALL_TEST_TARGETS; do
-    if [ "$target" = int ]; then
+    if [ "$target" = v3i ]; then
 	continue # skip because not native target
     elif [[ "$target" = jvm || "$target" = jar ]]; then
 	continue # skip because not native

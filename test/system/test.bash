@@ -14,7 +14,7 @@ for target in $TEST_TARGETS; do
     T=$OUT/$target
     mkdir -p $T
 
-    if [ "$target" != "int" ]; then
+    if [ "$target" != "v3i" ]; then
 	print_compiling "$target" ""
 	V3C_OPTS="$V3C_OPTS -heap-size=32k -output=$T" run_v3c_multiple 100 $target $TESTS | tee $T/compile.out | $PROGRESS
     fi

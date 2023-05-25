@@ -34,7 +34,7 @@ function compile_apps() {
 }
 
 for target in $TEST_TARGETS; do
-    if [ "$target" = int ]; then
+    if [ "$target" = v3i ]; then
 	continue
     fi
     target=$(convert_to_io_target $target)

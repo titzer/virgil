@@ -57,7 +57,7 @@ function do_compiled() {
 }
 
 for target in $TEST_TARGETS; do
-    if [ "$target" = int ]; then
+    if [ "$target" = v3i ]; then
 	do_v3i
     else
 	target=$(convert_to_io_target $target)

@@ -40,7 +40,7 @@ function run_benchmarks() {
 }
 
 for target in $TEST_TARGETS; do
-    if [ "$target" = int ]; then
+    if [ "$target" = v3i ]; then
 	continue # TODO: too slow
     fi
     target=$(convert_to_io_target $target)

@@ -7,7 +7,7 @@ V3C_LINK=$VIRGIL_LOC/bin/v3c
 TEST_HOST=jar
 
 for target in $TEST_TARGETS; do
-    if [ "$target" = "int" ]; then
+    if [ "$target" = "v3i" ]; then
 	continue # skip
     elif [ "$target" = "wasm-js" ]; then
 	continue # TODO: wasm-js bootstrap

@@ -15,8 +15,8 @@ for target in $TEST_TARGETS; do
     target=$(convert_to_io_target $target)
     if [ "$target" = "wave" ]; then
 	ALL_TARGETS="$ALL_TARGETS wave wave-nogc"
-    elif [ "$target" = "int" ]; then
-	ALL_TARGETS="$ALL_TARGETS int int-ra"
+    elif [ "$target" = "v3i" ]; then
+	ALL_TARGETS="$ALL_TARGETS v3i v3i-ra"
     elif [[ "$target" =~ ^x86 ]]; then
 	ALL_TARGETS="$ALL_TARGETS $target $target-nogc $target-nort"
     else
@@ -28,7 +28,7 @@ for target in $ALL_TARGETS; do
     T=$OUT/$target
     mkdir -p $T
 
-    if [[ ! "$target" =~ ^int ]]; then
+    if [[ ! "$target" =~ ^v3i ]]; then
         print_status Compiling $target
         V3C_OPTS="$V3C_OPTS -output=$T" run_v3c_multiple 100 $target $TESTS | tee $T/compile.out | $PROGRESS
     fi

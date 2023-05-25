@@ -14,7 +14,7 @@ function do_seman_tests() {
     cd ..
 }
 
-. ../common.bash struct
+. ../common.bash layout
 if [ $# -gt 0 ]; then
 	TESTS="$@"
 else
