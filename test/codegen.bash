@@ -23,7 +23,7 @@ if [ "$#" -gt 0 ]; then
 else
     # TODO: ptr32 and ptr64
     # TODO: skip parse and seman tests for these directories
-    DIRS="execute fsi32 fsi64 float legacy_intcast future_intcast variants enums large"
+    DIRS="execute fsi32 fsi64 cast float variants enums large"
 fi
 
 export SKIP_BOOTSTRAP=1

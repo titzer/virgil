@@ -21,7 +21,7 @@ else
   TESTS=*.v3
 fi
 
-function do_int() {
+function do_v3i() {
     print_status Interpreting
     P=$OUT/run.out
     run_v3c "" $TESTS $VIRGIL_LOC/lib/util/*.v3
@@ -58,7 +58,7 @@ function do_compiled() {
 
 for target in $TEST_TARGETS; do
     if [ "$target" = int ]; then
-	do_int
+	do_v3i
     else
 	target=$(convert_to_io_target $target)
 	do_compiled

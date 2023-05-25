@@ -250,7 +250,7 @@ function run_v3c_multiple() {
     done
 }
 
-function execute_int_tests() {
+function execute_v3i_tests() {
     print_status Interpreting "$2 $V3C_OPTS"
 
     P=$OUT/$1.run.out
@@ -336,9 +336,9 @@ function execute_target_tests() {
 function execute_tests() {
     for target in $TEST_TARGETS; do
 	if [ "$target" = "int" ]; then
-	    execute_int_tests "int" ""
-	    execute_int_tests "int-ra" "-ra -ma=false"
-	    execute_int_tests "int-ra-ma" "-ra -ma=true"
+	    execute_v3i_tests "int" ""
+	    execute_v3i_tests "int-ra" "-ra -ma=false"
+	    execute_v3i_tests "int-ra-ma" "-ra -ma=true"
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             compile_target_tests jvm -jvm.script=false
             execute_target_tests jvm
