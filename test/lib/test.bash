@@ -22,7 +22,7 @@ else
 fi
 
 function do_v3i() {
-    print_status Interpreting
+    print_status Running v3i
     P=$OUT/run.out
     run_v3c "" $TESTS $VIRGIL_LOC/lib/util/*.v3
     if [ "$?" != 0 ]; then

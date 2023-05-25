@@ -251,7 +251,7 @@ function run_v3c_multiple() {
 }
 
 function execute_v3i_tests() {
-    print_status Interpreting "$2 $V3C_OPTS"
+    print_status Running "v3i $2 $V3C_OPTS"
 
     P=$OUT/$1.run.out
     run_v3c "" -test -expect=failures.txt $2 $TESTS | tee $OUT/run.out | $PROGRESS
