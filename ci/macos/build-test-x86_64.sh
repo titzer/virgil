@@ -8,4 +8,4 @@ TEST_DIR="${VIRGIL_LOC}/test"
 
 "${TEST_DIR}"/configure
 
-PROGRESS_ARGS=c TEST_TARGETS="int x86-64-darwin" "${TEST_DIR}"/all.bash
+PROGRESS_ARGS=c TEST_TARGETS="v3i x86-64-darwin" "${TEST_DIR}"/all.bash
