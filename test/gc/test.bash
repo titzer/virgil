@@ -28,9 +28,21 @@ function do_int_test() {
     ALL=$T/compile.all.out
     rm -f $ALL
 
+    if [[ "$target" =~ "x86-64" ]]; then
+        HEAP='-heap-size=64m' # 64-bit needs more heap
+    else
+        HEAP='-heap-size=32m'
+    fi
+
+    BEFORE=$V3C_OPTS
+    V3C_OPTS="$V3C_OPTS $HEAP"
+    QUIET_COMPILE=1
+    compile_aeneas $AENEAS_TEST $OUT $target
+    V3C_OPTS="$BEFORE"
+
     print_status Testing "$target $HEAP" Aeneas
     if [ -x $CONFIG/run-$target ]; then
-	$T/$target/Aeneas -test -ra $VIRGIL_LOC/test/core/*.v3 | tee $T/$target/Aeneas-gc.test.out | $PROGRESS
+	$T/Aeneas -test -ra $VIRGIL_LOC/test/core/*.v3 | tee $T/Aeneas-gc.test.out | $PROGRESS
     else
 	echo "${YELLOW}skipped${NORM}"
     fi
