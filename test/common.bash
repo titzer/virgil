@@ -147,8 +147,7 @@ function run_io_test() {
 	return 0
     fi
 
-    local P=$T/$test
-
+    local P=$T/$(basename $test)
 
     if [ -f $test.in ]; then
 	V3C=$AENEAS_TEST $runner $T $test $args < $test.in > $P.out 2> $P.err
@@ -399,4 +398,17 @@ function convert_to_io_target() {
 	target=wave
     fi
     echo $target
+}
+
+function is_gc_target() {
+    if [ "$target" = "x86-darwin" ]; then
+	return 0
+    elif [ "$target" = "x86-64-darwin" ]; then
+	return 0
+    elif [ "$target" = "x86-linux" ]; then
+	return 0
+    elif [ "$target" = "x86-64-linux" ]; then
+	return 0
+    fi
+    return 1
 }
