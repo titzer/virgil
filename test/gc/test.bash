@@ -63,9 +63,15 @@ function do_exe_test() {
 }
 
 for target in $TEST_TARGETS; do
-    is_gc_target $target && do_exe_test
+    is_gc_target $target
+    if [ $? = 0 ]; then
+	do_exe_test
+    fi
 done
 
 for target in $TEST_TARGETS; do
-    is_gc_target $target && do_int_test
+    is_gc_target $target
+    if [ $? = 0 ]; then
+	do_int_test
+    fi
 done
