@@ -359,6 +359,8 @@ function set_os_sources() {
 	export OS_SOURCES="$RT_LOC/x86-linux/*.v3"
     elif [ "$target" = "x86-64-linux" ]; then
 	export OS_SOURCES="$RT_LOC/x86-64-linux/*.v3"
+    elif [ "$target" = "wave" ]; then
+	export OS_SOURCES="$RT_LOC/wave/*.v3"
     fi
 }
 
@@ -408,6 +410,8 @@ function is_gc_target() {
     elif [ "$target" = "x86-linux" ]; then
 	return 0
     elif [ "$target" = "x86-64-linux" ]; then
+	return 0
+    elif [ "$target" = "wave" ]; then
 	return 0
     fi
     return 1
