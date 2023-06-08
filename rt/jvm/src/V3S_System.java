@@ -58,6 +58,21 @@ public class V3S_System {
         return 0;
     }
 
+    public static int write(int fd, byte[] b, int offset, int length) throws IOException {
+	OutputStream out = getFileOutput(fd);
+        if (out != null) {
+	    out.write(b, offset, length);
+	    return length;
+	}
+        return 0;
+    }
+
+    public static int read(int fd, byte[] b, int offset, int length) throws IOException {
+	InputStream in = getFileInput(fd);
+        if (in != null) return in.read(b, offset, length);
+        return 0;
+    }
+
     public static int fileOpen(byte[] name, boolean input) {
         for (int i = 0; i < fileInput.length; i++) {
             if (fileInput[i] == null && fileOutput[i] == null) {
