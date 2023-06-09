@@ -1,0 +1,272 @@
+// Copyright 2023 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+enum DbgCommand(cmdName: string, alias: string) {
+	Run("run", "r"),           // Begin program
+	Continue("continue", "c"), // Continue program
+	Step("step", "s"),         // Step program until it reaches a different source line
+	Stepi("stepi", "si"),      // Step one instruction exactly
+	Next("next", "n"),         // Step program, jumping over calls
+	Nexti("nexti", "ni"),      // Step one instruction, jumping over calls
+	Info("info", "info"),         // Show breakpoints or locals
+	Breakpoint("breakpoint", "b"), // Making program stop at certain line: "<fileName> <line>"
+	DisableBreakpoint("disable", "disable"), // Enable breakpoint by index
+	EnableBreakpoint("enable", "enable"),    // Disable breakpoint by index
+	Backtrace("backtrace", "bt"),       // Print a backtrace
+	Trace("trace", "t"),       // Switch "on"/"off" of tracing execution
+	Quit("quit", "q"),         // Quit the debugger
+	Unknown("unknown", "unknown"),
+}
+enum Info(cmdName: string, alias: string) {
+	Breakpoints("breakpoints", "b"),
+	Locals("locals", "l"),
+	Invalid("invalid", "invalid")
+}
+
+// Implement a GDB-like interface debugger based on SsaInterpreter
+class SsaDebugger(prog: Program, interp: SsaInterpreter) {
+	def parser = DebuggerParser.new();
+	def bps = Vector<Breakpoint>.new();
+	def printer = SsaPrinter.new();
+	var startDel: Closure;
+	var startArgs: Array<Val>;
+	var running: bool;
+
+	def invoke(del: Closure, args: Array<Val>) -> Result {
+		startDel = del;
+		startArgs = args;
+		var readCommand = true;
+		while (readCommand) {
+			var result = parser.parseCommand(parser.getCommand());
+			readCommand = handleCommand(result);
+		}
+		return null;
+	}
+	def handleCommand(command: DbgCommand, args: string) -> bool {
+		match (command) {
+			Run => {
+				start();
+				execute(true, false, false);
+			}
+			Continue => execute(true, false, false);
+			Step => execute(false, true, false);
+			Stepi => execute(false, false, false);
+			Next => execute(false, true, true);
+			Nexti => execute(false, false, true);
+			Info => {
+				var info = parser.parseInfo(args);
+				match (info) {
+					Breakpoints => {
+						for (i < bps.length) Terminal.put2("%d: %q\n", i, bps[i].render);
+					}
+					Locals => Terminal.put("Not implemented yet\n");
+					Invalid => Terminal.put1("Invalid info args: %s\n", args);
+				}
+			}
+			Breakpoint => {
+				var breakpoint = parser.parseBreakpoint(args);
+				match (breakpoint) {
+					x: LineBreakpoint => {
+						for (i < prog.files.length) {
+							if (Strings.equal(prog.files[i], x.fileName)) {
+								bps.put(x);
+								return true;
+							}
+						}
+					}
+					_ => ;
+				}
+				Terminal.put1("Invalid breakpoint args: %s\n", args);
+			}
+			DisableBreakpoint => {
+				handleBreakpoint(args, false);
+			}
+			EnableBreakpoint => {
+				handleBreakpoint(args, true);
+			}
+			Backtrace => {
+				if (running) {
+					var source: Source;
+					if (SsaCheckpoint.?(interp.frame.ip)) source = SsaCheckpoint.!(interp.frame.ip).source;
+					var trace = interp.getStackTrace(source);
+					for (list = trace; list != null; list = list.tail) {
+						for (s = list.head; s != null; s = s.tail) {
+							Terminal.put1("\t%q\n", s.render);
+						}
+					}
+				}
+			}
+			Trace => {
+				var on = parser.parseTrace(args);
+				interp.setTrace(on);
+			}
+			Unknown => {
+				Terminal.put("Unknown command\n");
+			}
+			Quit => {
+				return false;
+			}
+		}
+		return true;
+	}
+	def start() {
+		interp.reset();
+		Terminal.put1("Starting program: %s\n", interp.prog.name());
+		interp.pushFrame(startDel.memberRef, startDel.val, startArgs);
+		running = true;
+	}
+	def execute(untilBreak: bool, nextLine: bool, jump: bool) {
+		if (!running) start(); // ???: start or return?
+		var targetSp = interp.sp;
+		var n = interp.step(interp.frame.ip);
+		if (interp.frame == null) {
+			running = false;
+			printExecuteResult();
+			return;
+		}
+		interp.frame.ip = n;
+		while (!stopExecute(n, untilBreak, nextLine, jump, targetSp)) {
+			n = interp.step(interp.frame.ip);
+			if (interp.frame == null) {
+				running = false;
+				break;
+			}
+			interp.frame.ip = n;
+		}
+		printExecuteResult();
+	}
+	def stopExecute(instr: SsaInstr, untilBreak: bool, nextLine: bool, jump: bool, targetSp: int) -> bool {
+		if (isBreakpoint(instr)) return true;
+		if (untilBreak) return false;
+		if (!nextLine && !jump) return true;
+		if (jump && interp.sp > targetSp) return false;
+		if (!nextLine || (nextLine && SsaCheckpoint.?(instr))) return true;
+		return false;
+	}
+	def isBreakpoint(instr: SsaInstr) -> bool {
+		if (!SsaCheckpoint.?(instr)) return false;
+		var checkpoint = SsaCheckpoint.!(instr);
+		if (checkpoint.breakpoint) return true;
+		for (i < bps.length) {
+			if (LineBreakpoint.?(bps[i])) {
+				var x = LineBreakpoint.!(bps[i]), s = checkpoint.source;
+				if (x.on && Strings.equal(x.fileName, s.mdecl.token.fileName) && x.line == s.line) {
+					checkpoint.breakpoint = true;
+					bps[i] = SsaCPBreakpoint.new(checkpoint);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+	def printExecuteResult() {
+		if (interp.frame != null) {
+			for (j < interp.sp-1) printer.buf.puts("  ");
+			printer.buf.blue().puts("=>").end();
+			printer.printInstr(interp.frame.ip, false, false, false, false);
+			printer.outln();
+		} else {
+			var result = if (interp.exception == null, interp.retVal, interp.exception);
+			var rettype = interp.prog.getMain().getReturnType();
+			printer.buf.puts("Program exited: ");
+			V3.renderResult(result, rettype, printer.buf);
+			printer.outln();
+		}
+	}
+	def handleBreakpoint(args: string, on: bool) {
+		var result = Ints.parseDecimal(args, 0);
+		if (result.0 != args.length) Terminal.put1("Invalid breakpoint: %s\n", args);
+		else {
+			var index = result.1;
+			if (index < bps.length) {
+				if (on) bps[index].enable();
+				else bps[index].disable();
+			} else Terminal.put1("Invalid breakpoint: %d\n", index);
+		}
+	}
+}
+
+class DebuggerParser {
+	def STDIN = 0;
+
+	def getCommand() -> string {
+		var sb = StringBuilder.new();
+		System.puts("(debug) ");
+		var ch = byte.!(System.fileRead(STDIN));
+		while (ch != '\n') {
+			sb.putc(ch);
+			ch = byte.!(System.fileRead(STDIN));
+		}
+		return sb.extract();
+	}
+	def parseCommand(command: string) -> (DbgCommand, /*args*/ string) {
+		var name: string;
+		var args: string;
+		for (i < command.length) {
+			if (command[i] == ' ') {
+				name = Arrays.range(command, 0, i);
+				args = Arrays.range(command, i + 1, command.length);
+				break;
+			}
+			if (i == command.length - 1) name = command;
+		}
+		if (name == null) return (DbgCommand.Unknown, command);
+		for (cmd in DbgCommand) {
+			if (Strings.equal(name, cmd.cmdName) || Strings.equal(name, cmd.alias)) {
+				return (cmd, args);
+			}
+		}
+		return (DbgCommand.Unknown, command);
+	}
+	def parseInfo(args: string) -> Info {
+		if (args == null) return Info.Invalid;
+		for (e in Info) {
+			if (Strings.equal(args, e.alias) || Strings.equal(args, e.cmdName)) return e;
+		}
+		return Info.Invalid;
+	}
+	def parseBreakpoint(args: string) -> Breakpoint {
+		if (args == null) return InvalidBreakpoint.new();
+		for (i < args.length) {
+			if (args[i] == ' ') {
+				var fileName = Arrays.range(args, 0, i);
+				if (!Strings.endsWith(fileName, ".v3")) {
+					fileName = Strings.format1("%s.v3", fileName);
+				}
+				var result = Ints.parseDecimal(args, i+1);
+				if (result.0 + i + 1 == args.length) {
+					return LineBreakpoint.new(fileName, result.1, true);
+				} else InvalidBreakpoint.new();
+			}
+		}
+		return InvalidBreakpoint.new();
+	}
+	def parseTrace(args: string) -> bool {
+		if (args == null || Strings.equal(args, "on")) return true;
+		else return false;
+	}
+}
+class Breakpoint {
+	def render(out: StringBuilder) -> StringBuilder;
+	def disable();
+	def enable();
+}
+class LineBreakpoint(fileName: string, line: int, var on: bool) extends Breakpoint {
+	def render(out: StringBuilder) -> StringBuilder {
+		return out.put3("[%s @ %d] (%z)", fileName, line, on);
+	}
+	def disable() { on = false; }
+	def enable() { on = true; }
+}
+class SsaCPBreakpoint(ssa: SsaCheckpoint) extends Breakpoint {
+	def render(out: StringBuilder) -> StringBuilder { 
+		return out.put2("%q (%z)", ssa.source.render, ssa.breakpoint);
+	}
+	def disable() { ssa.breakpoint = false; }
+	def enable() { ssa.breakpoint = true; }
+}
+class InvalidBreakpoint extends Breakpoint {
+	def render(out: StringBuilder) -> StringBuilder { return out; }
+	def disable() {}
+	def enable() {}
+}
