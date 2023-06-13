@@ -8,35 +8,34 @@ def COALESCE = false;
 // graph from liveness analysis.
 class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def statistic = RegAllocStatistic.new();
-	def regState = RegState.new(regSet, codegen);
-	def regUsage = Array<int>.new(regSet.physRegs);
-	def regindex = Array<(int,VReg)>.new(regSet.physRegs);
-	def moves = GlobalMoveSet.new(regSet);
-	def movesPrev = GlobalMoveSet.new(regSet);
-	def parmoveDests = Vector<(VReg, List<Operand.Def>)>.new();
-	def backupAllocate = LocalRegAlloc.new(regSet, codegen).allocate;
-	def availableColor = regSet.regSets[regSet.regClasses[RegClass.REF.tag]].length - 2;
 	def vars = codegen.vars;
-	def loops = Vector<SsaLoopInfo>.new();
+	var liveness: BitMatrix;
+	var liveoutRow: int;
+	var maskRow: int;
+	var buf = ArchInstrBuffer.new(codegen, codegen.mach.prog, regSet);
+	var graph: Graph;
+	var coloring: Array<byte>;
+	// --- graph coloring ------------------
+	def availableColor = regSet.regSets[regSet.regClasses[RegClass.REF.tag]].length - 2;
 	def simplifyWorklist = Vector<int>.new();
 	def freezeWorklist = Vector<int>.new();
 	def spillWorklist = Vector<int>.new();
 	def selectStack = Vector<int>.new();
 	var movesWorklist = Vector<(int,int,int)>.new(); // var, var, weight
-	var liveness: BitMatrix;
-	var buf = ArchInstrBuffer.new(codegen, codegen.mach.prog, regSet);
-	var prev: ArchInstr;
-	var cur: ArchInstr;
-	var next: ArchInstr;
-	var graph: Graph;
-	var coloring: Array<byte>;
 	var actualSpill: bool;
+	// --- insert split -------------------
+	def loops = Vector<SsaLoopInfo>.new();
 	var blockWeight: Array<int>;
 	var curWeight: int;
-	var liveoutRow: int;
-	var maskRow: int;
 	var originVarsCnt: int;
 	var blockReloads: Array<Vector<VReg>>;
+	// --- allocate after coloring ----------
+	def regState = RegState.new(regSet, codegen);
+	def regUsage = Array<int>.new(regSet.physRegs);
+	def regindex = Array<(int,VReg)>.new(regSet.physRegs);
+	def movesNext = GlobalMoveSet.new(regSet);
+	def movesPrev = GlobalMoveSet.new(regSet);
+	def parmoveDests = Vector<(VReg, List<Operand.Def>)>.new();
 
 	// 1. Insert move instruction before each use whose constraint is stack.
 	// 2. Construct the interference graph.
@@ -51,12 +50,9 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		maskRow = liveness.numrows + 1;
 		liveness.grow(maskRow + 1);
 		liveness.setRow(maskRow);
-		blockReloads = Array<Vector<VReg>>.new(codegen.order.length);
-		for (i < codegen.order.length) {
-			blockReloads[i] = Vector<VReg>.new();
-		}
+		
 		codegen.blocks.computeDominators();
-		codegen.iterateInstructionsBackward(insertMovesToStack);
+		codegen.iterateInstructionsBackward(preprocess);
 		
 		var spiller = ShadowStackSpiller.new();
 		spiller.reset(codegen, codegen.blocks);
@@ -82,10 +78,14 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (CLOptions.PRINT_REGALLOC.get()) statistic.print();
 	}
 	def reset() {
-		for (i < regUsage.length) regUsage[i] = 0;
-		regState.clear();
 		statistic.reset(vars.length);
 		loops.resize(0);
+		blockReloads = Array<Vector<VReg>>.new(codegen.order.length);
+		for (i < codegen.order.length) {
+			blockReloads[i] = Vector<VReg>.new();
+		}
+		regState.clear();
+		for (i < regUsage.length) regUsage[i] = 0;
 	}
 	def computeBlockWeight(weight: int, start: int, end: int) -> int {
 		var order = codegen.order;
@@ -104,7 +104,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	// =====================
 	// Preprocess on constants and uses with constraint is stack
 	// =====================
-	def insertMovesToStack(block: SsaBlock, cur: ArchInstr) {
+	def preprocess(block: SsaBlock, cur: ArchInstr) {
 		var opcode = cur.opcode();
 		if (opcode == ArchInstrs.ARCH_BLOCK) {
 			defineConst(cur.next);
@@ -708,9 +708,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	// Allocate registers by iterating instructions in backward order
 	// =====================
 	def allocateAfterColoring(block: SsaBlock, cur: ArchInstr) {
-		cur = cur;
-		prev = cur.prev;
-		next = cur.next;
+		var prev = cur.prev;
+		var next = cur.next;
 		if (verbose) Terminal.put(buf.putInstrV(cur).toString());
 		regState.pos++;
 		var opcode = cur.opcode();
@@ -724,7 +723,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 			return;
 		}
-		moves.clear();
+		movesNext.clear();
 		movesPrev.clear();
 		
 		if (opcode == ArchInstrs.ARCH_PARMOVE) { // perform parallel move
@@ -762,8 +761,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (opcode == ArchInstrs.ARCH_RELOAD) {
 			var dst = Operand.Def.!(cur.operands[0]).vreg;
 			if (Operand.Use.!(cur.operands[1]).vreg != dst) statistic.reload ++;
-			moves.reloads.put(dst, coloring[dst.varNum]);
-			moves.emit(codegen, cur.next);
+			movesNext.reloads.put(dst, coloring[dst.varNum]);
+			movesNext.emit(codegen, cur.next);
 			regState.freeReg(coloring[dst.varNum], true);
 			cur.remove();
 			if (verbose) regState.dumpState("");
@@ -772,7 +771,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			
 		for (i < operands.length) match (operands[i]) {
 			Def(vreg, constraint) => {
-				// ignore `Def` introduced by previous spill or `insertLoadToStack`
+				// ignore `Def` introduced by previous spill or `preprocess`
 				if (vreg == null || (regSet.isCallerStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
 				var loc = allocDefReg(vreg, constraint, opcode != ArchInstrs.ARCH_RESTORE);
 				operands[i] = Operand.Def(vreg, loc);
@@ -817,16 +816,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			_ => ;
 		}
 		if (verbose) regState.dumpState("");
-		moves.emit(codegen, cur.next);
+		movesNext.emit(codegen, cur.next);
 		movesPrev.emit(codegen, cur);
-		if (opcode == ArchInstrs.ARCH_ENTRY) {
-			for (j < regState.cursor) {
-				var vreg = regState.allocated[j].0;
-				if (vreg.isConst()) {
-					codegen.insertMoveValLoc(vreg, (vreg, vreg.reg), vreg.regClass, next);
-				}
-			}
-		}
 	}
 	def allocDefReg(vreg: VReg, constraint: int, genSave: bool) -> int {
 		var gReg = coloring[vreg.varNum], loc: int = gReg;
@@ -834,11 +825,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		regState.freeReg(loc, true);
 		if (!isOk(loc, constraint)) {
 			loc = findBestLocUnderConstraint(vreg.regClass, loc, constraint);
-			if (regSet.isReg(gReg) && prevVreg == vreg) moves.addRegMove(vreg, loc, gReg);
+			if (regSet.isReg(gReg) && prevVreg == vreg) movesNext.addRegMove(vreg, loc, gReg);
 		}
 		if (genSave && vreg.spill > 0) {
 			statistic.store++;
-			moves.saves.put(vreg, loc, vreg.spill);
+			movesNext.saves.put(vreg, loc, vreg.spill);
 		}
 		return loc;
 	}
