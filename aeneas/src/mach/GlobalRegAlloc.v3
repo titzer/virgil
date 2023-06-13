@@ -24,7 +24,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	var movesWorklist = Vector<(int,int,int)>.new(); // var, var, weight
 	var actualSpill: bool;
 	// --- insert split -------------------
-	def loops = Vector<SsaLoopInfo>.new();
 	var blockWeight: Array<int>;
 	var curWeight: int;
 	var originVarsCnt: int;
@@ -37,7 +36,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def movesPrev = GlobalMoveSet.new(regSet);
 	def parmoveDests = Vector<(VReg, List<Operand.Def>)>.new();
 
-	// 1. Insert move instruction before each use whose constraint is stack.
+	// 1. Preprocess on constants and use whose constraint is stack.
 	// 2. Construct the interference graph.
 	// 3. Color the graph with simplify, coalesce, freeze, spill and select phases.
 	//    Iterate until the graph is colorable.
@@ -79,7 +78,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	}
 	def reset() {
 		statistic.reset(vars.length);
-		loops.resize(0);
 		blockReloads = Array<Vector<VReg>>.new(codegen.order.length);
 		for (i < codegen.order.length) {
 			blockReloads[i] = Vector<VReg>.new();
@@ -87,13 +85,13 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		regState.clear();
 		for (i < regUsage.length) regUsage[i] = 0;
 	}
+	// Compute block weight by giving more weight in loops: weight = 10^depth 
 	def computeBlockWeight(weight: int, start: int, end: int) -> int {
 		var order = codegen.order;
 		for (i = start; i < end; i++) {
 			var info = order[i], block = info.block;
 			if (info.loop != null) {
 				blockWeight[i] = weight * 10;
-				loops.put(info.loop);
 				i = computeBlockWeight(weight * 10, i + 1, info.loop.end);
 			} else {
 				blockWeight[i] = weight;
@@ -102,7 +100,9 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		return end - 1;
 	}
 	// =====================
-	// Preprocess on constants and uses with constraint is stack
+	// Preprocess on constants and uses with constraint is stack. Define constants
+	// at the begining of blocks and insert move before instructions whose constraint
+	// of use is stack.
 	// =====================
 	def preprocess(block: SsaBlock, cur: ArchInstr) {
 		var opcode = cur.opcode();
@@ -173,7 +173,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		// first pass to mark defs live
 		for (i < operands.length) match (operands[i]) {
 			Def(vreg, constraint) => {
-				// ignore `Def` introduced by previous spill or `insertLoadToStack`
+				// Ignore Def introduced by previous spill or preprocess
 				if (vreg == null || (regSet.isStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
 				buildGraphDefLive(vreg);
 			}
@@ -274,12 +274,16 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
+	// Add interference between live vars and {reg}, except {filter} var.
 	def addInterferencesReg(reg: int, filter: VReg) {
 		for (i < vars.length) {
 			if ((filter == null || i != filter.varNum) && liveness[liveoutRow, i])
-				graph.nodes[i].addInterfere(-reg);
+				graph.nodes[i].addInterfere(-reg); // register is represented by negative value
 		}
 	}
+	// Process constraint in two cases:
+	// 1. If constraint is a single register, add a move for this constraint. 
+	// 2. If constraint is a set of registers, add interference with registers not in the set.
 	def processConstraint(vreg: VReg, constraint: int, weight: int) {
 		if (vreg == null || constraint == 0 || regSet.isStack(constraint)) return;
 		if (regSet.isReg(constraint)) {
@@ -328,6 +332,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			for (i < regSet.physRegs) allocatedColor[i] = false;
 			for (i < graph.nodes[node].interfere.length) {
 				var neighbor = graph.nodes[node].interfere[i];
+				// Mark neighbors' color as allocated
 				if (neighbor < 0) {
 					allocatedColor[-neighbor] = true;
 				} else {
@@ -337,10 +342,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				}
 			}
 			var vreg = vars[node];
-			if (vreg.hint != 0 && !allocatedColor[vreg.hint]) {
+			if (vreg.hint != 0 && !allocatedColor[vreg.hint]) { // try hint first
 				coloring[node] = vreg.hint;
 				continue;
 			}
+			// Find a free one and assign register depends on regClass
 			var set = regSet.regClasses[vreg.regClass.tag];
 			for (i < regSet.regSets[set].length - 2) {
 				var reg = regSet.regSets[set][i];
@@ -377,6 +383,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		movesWorklist.array = Arrays.sort(movesWorklist.array, 0, movesWorklist.length, movesWorklistCmp);
 		statistic.move = movesWorklist.length;
 	}
+	// Sort movesWorklist against the weight in descending order
 	def movesWorklistCmp(x: (int, int, int), y: (int, int, int)) -> bool {
 		return x.2 > y.2;
 	}
@@ -390,6 +397,22 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		return false;
 	}
+	def getAlias(n: int) -> int {
+		while (n > 0 && graph.nodes[n].alias != n) {
+			n = graph.nodes[n].alias;
+		}
+		return n;
+	}
+	// Simplify the last node in the worklist.
+	def simplify() {
+		var node = simplifyWorklist[--simplifyWorklist.length];
+		graph.nodes[node].removed = true;
+		selectStack.put(node);
+		for (i < graph.nodes[node].interfere.length) {
+			decrementDegree(graph.nodes[node].interfere[i]);
+		}
+	}
+	// Decrements the degree of node {n}, and moves the node to the right worklist.
 	def decrementDegree(n: int) {
 		if (n < 0) return;
 		// When a degree transit from availableColor, move the node to simplifyWorklist.
@@ -400,22 +423,9 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		graph.nodes[n].interfereCnt --;
 	}
-	def simplify() {
-		var node = simplifyWorklist[--simplifyWorklist.length];
-		graph.nodes[node].removed = true;
-		selectStack.put(node);
-		for (i < graph.nodes[node].interfere.length) {
-			decrementDegree(graph.nodes[node].interfere[i]);
-		}
-	}
-	def getAlias(n: int) -> int {
-		while (n > 0 && graph.nodes[n].alias != n) {
-			n = graph.nodes[n].alias;
-		}
-		return n;
-	}
+	// Coalesces all possible moves in the movelist.
 	def coalesce() -> bool {
-		var flag = false;
+		var flag = false; // if there is any coalesce
 		var tmpMovesWorklist = Vector<(int,int,int)>.new();
 		while (movesWorklist.length > 0) {
 			var m = movesWorklist[--movesWorklist.length];
@@ -428,7 +438,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				addWorklist(x);
 			} else if (!graph.isInterfere(x, y) && tryCoalesce(x, y)) {
 				flag = true;
-			} else {
+			} else { // cannot coalesces
 				tmpMovesWorklist.put(m);
 			}
 		}
@@ -441,6 +451,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			simplifyWorklist.put(n);
 		}
 	}
+	// Try to coalesce and if success, merge node y into node x
 	def tryCoalesce(x_: int, y_: int) -> bool {
 		var coalesce = false;
 		var y = graph.nodes[y_];
@@ -459,6 +470,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 			if (cnt < availableColor) { // Briggs conservative coalescing heuristic
 				coalesce = true;
+				// Update x
 				x.movesCnt --;
 				graph.mergeMoves(x_, y_);
 				if (tmpInterfereCnt >= availableColor && x.interfereCnt < availableColor) {
@@ -474,6 +486,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		if (coalesce) {
 			statistic.coalesce++;
+			// Remove y and updates its neighbor
 			y.removed = true;
 			if (y.interfereCnt < availableColor) removeFromWorklist(freezeWorklist, y_);
 			else removeFromWorklist(spillWorklist, y_);
@@ -486,6 +499,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		return coalesce;
 	}
+	// Heuristic used for coalescing a precolored register: 
+	// For any t in y's neighbor, t is precolored || degree[t] < K || (t, r) is interfered
 	def precoloredCoalesceCheck(precolored: int, y: Node) -> bool{
 		for (i < y.interfere.length) {
 			if (y.interfere[i] < 0) continue;
@@ -495,6 +510,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 		return true;
 	}
+	// Freeze the last node in the worklist.
 	def freeze() {
 		var node = freezeWorklist[--freezeWorklist.length];
 		simplifyWorklist.put(node);
@@ -505,11 +521,13 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			var v = getAlias(graph.nodes[node].moves[i]);
 			if (v > 0 && v != node) {
 				graph.nodes[v].movesCnt --;
-				if (!graph.nodes[v].removed && graph.nodes[v].movesCnt == 0 && graph.nodes[v].interfereCnt < availableColor) {
+				if (!graph.nodes[v].removed && graph.nodes[v].movesCnt == 0
+					&& graph.nodes[v].interfereCnt < availableColor) {
 					simplifyWorklist.put(v);
 					removeFromWorklist(freezeWorklist, v);
 				}
 			}
+			// Remove from movesWorklist
 			for (j < movesWorklist.length) {
 				var x = getAlias(movesWorklist[j].0), y = getAlias(movesWorklist[j].1);
 				if ((x == node && y == v) || (x == v && y == node)) {
@@ -520,6 +538,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
+	// Select a node in spillWorklist with minimum cost and push it to simplifyWorklist.
 	def selectSpill() {
 		var mincost: float = 1000000000000f, idx: int = -1;
 		for (i < spillWorklist.length) {
@@ -552,6 +571,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			blockReloads[i].resize(0);
 		}
 	}
+	// Iterate instruction forward and process spilled vars
 	def insertSpill(block: SsaBlock, i: ArchInstr) {
 		var opcode = i.opcode();
 		var operands = i.operands;
@@ -600,6 +620,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 	}
+	// Decide to insert reload right before this use or on block level.
 	def processSpill(vreg: VReg, constraint: int, block: SsaBlock) {
 		var node = graph.nodes[vreg.varNum];
 		if (node.defBlock == block) node.newVreg = processSpillOnInstr(vreg, constraint);
@@ -634,25 +655,29 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		liveness[block.mark, node.newVreg.varNum] = true;
 	}
 	def findCommonDominator(vreg: VReg, block: SsaBlock) -> SsaBlock {
-		var node = graph.nodes[vreg.varNum];
+		var node = graph.nodes[vreg.varNum], commonDominator = node.commonDominator;
 		var order = codegen.order;
-		var blockAInfo = codegen.blocks.commonDominator(order[node.commonDominator.mark], order[block.mark]);
+		var blockInfo = order[block.mark], commonDominatorInfo = order[commonDominator.mark];
+		var blockAInfo = codegen.blocks.commonDominator(commonDominatorInfo, blockInfo);
 		if (blockAInfo == null) return null;
-		for (i < loops.length) {
+		var loops = codegen.blocks.loops;
+		if (loops != null) for (i < loops.length) {
 			if (loops[i].contains(blockAInfo) && 
-				(!loops[i].contains(order[node.commonDominator.mark]) || !loops[i].contains(order[block.mark]))) {
-				return null;
+				(!loops[i].contains(commonDominatorInfo) || !loops[i].contains(blockInfo))) {
+				return null; // Avoid a common dominator which is in a loop but the {block} is not
 			}
 		}
 		var blockA = blockAInfo.block;
-		if (blockA == node.commonDominator) return blockA;
-		if (blockA == node.defBlock) return null;
+		if (blockA == commonDominator) return blockA;
+		if (blockA == node.defBlock) return null; // Avoid to insert reload at the var been defined
 		for (e in blockA.succs()) {
+			// Check if every successor requires this reload
 			var succ = e.dest;
 			if (!liveness[succ.mark, vreg.varNum]) return null;
 		}
 		return blockA;
 	}
+	// Insert reload at the start of the commonDominator block
 	def insertReload(vreg: VReg, node: Node) {
 		node.commonDominator = findDominatorOutOfLoop(node);
 		codegen.insertReload(vreg, (node.newVreg, 0), codegen.instrs[node.commonDominator.mark].next);
@@ -684,6 +709,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				}
  			}
 		}
+		// Gather liveness for new variables.
 		for (i = codegen.order.length - 1; i >= 0; i--) {
 			var info = codegen.order[i], block = info.block;
 			for (e in block.succs()) {
@@ -771,7 +797,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			
 		for (i < operands.length) match (operands[i]) {
 			Def(vreg, constraint) => {
-				// ignore `Def` introduced by previous spill or `preprocess`
+				// Ignore Def introduced by previous spill or preprocess
 				if (vreg == null || (regSet.isCallerStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
 				var loc = allocDefReg(vreg, constraint, opcode != ArchInstrs.ARCH_RESTORE);
 				operands[i] = Operand.Def(vreg, loc);
