@@ -11,4 +11,4 @@ sudo apt -y install nasm
 
 "${TEST_DIR}"/configure
 
-PROGRESS_ARGS=c TEST_TARGETS="v3i x86-linux" "${TEST_DIR}"/all.bash
+V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="v3i x86-linux" "${TEST_DIR}"/all.bash
