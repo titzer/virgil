@@ -11,4 +11,4 @@ sudo apt -y install nasm
 
 "${TEST_DIR}"/configure
 
-V3C_OPTS=-global-regalloc PROGRESS_ARGS=c TEST_HOST=x86-64-linux TEST_TARGETS="v3i x86-64-linux" "${TEST_DIR}"/all.bash
+V3C_OPTS=-O1 PROGRESS_ARGS=c TEST_HOST=x86-64-linux TEST_TARGETS="v3i x86-64-linux" "${TEST_DIR}"/all.bash
