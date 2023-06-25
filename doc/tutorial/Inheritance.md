@@ -147,7 +147,7 @@ This is somewhat backwards to Java initialization order, which always executes a
 ## Visibility of `private` members ##
 
 In Virgil, type definitions like classes can have `private` members, e.g. to hide some of their implementation details.
-Private members are not accessible outside of their definition, and in the case of classes, that also means that they are *not* accessible in subclasses.
+Private members are not accessible outside of their declared file, and in the case of classes, that also means that they are *not* accessible in subclasses, unless those subclasses are declared in the same file.
 
 ```
 class C {
@@ -155,8 +155,18 @@ class C {
     private def p() -> int { return 33; } // not accessible outside of C
 }
 var c: C = C.new();
-var x = c.p(); // ERROR: {C.p} not accessible here
+var x = c.p(); // OK: {C.p} is accessible in same file.
 class D extends C {
-    def foo() -> int { return p(); } // ERROR {this.p} not accessible here.
+    def foo() -> int { return p(); } // OK {this.p} is accessible in same file.
+}
+```
+
+While in another file:
+
+```
+var c: C = C.new();
+var x = c.p(); // ERROR: {C.p} is not accessible except in same file.
+class E extends C {
+    def foo() -> int { return p(); } // ERROR {this.p} is not accessible in subclasses.
 }
 ```

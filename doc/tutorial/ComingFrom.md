@@ -71,7 +71,7 @@ There are *many* features of JavaScript that Virgil lacks.
  * growable arrays
  * stack- and queue-like arrays
 
-Of these, Virgil is planning on adding lambdas in the future, using a syntax similar to JavaScript arrow functions.
+Of these, Virgil is planning on adding lambdas in the future.
 Also, many years of tuple wrangling has suggested the need for destructuring assignments.
 
 Virgil does have some things that JavaScript programmers might like:

@@ -178,7 +178,7 @@ class Searcher {
 
 ## Visibility ##
 
-The `private` keyword limits the scope of class members to the enclosing class. Members that are declared `private` are not visible from outside the class.
+The `private` keyword limits the scope of class members to the enclosing file. Members that are declared `private` are not visible from outside the file.
 
 ```
 class Example8 {
