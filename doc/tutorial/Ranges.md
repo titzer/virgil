@@ -165,15 +165,14 @@ Virgil ranges, like Virgil arrays, are _not_ co-variantly typed. See the section
 
 Ranges in Virgil are effectively tuples of three values: an underlying array, a start index, and a length.
 Like other tuples in Virgil, these three values will be unboxed (i.e. flattened or _normalized_).
-Unlike a Go (slice)[https://go.dev/tour/moretypes/7], a range is not an object on the heap with a (mutable) length and a capacity.
+Unlike a Go [slice](https://go.dev/tour/moretypes/7), a range is not an object on the heap with a (mutable) length and a capacity.
 
-- Evaluating a range expression does not need to allocate storage on the garbage-collected heap.
+- **Evaluating a range expression does not need to allocate storage on the garbage-collected heap.**
   (That makes them suitable for high-performance, allocation-free algorithms that do not create GC pressure.)
-- Accessing range elements is constant-time, like arrays.
+- **Accessing range elements is constant-time, like arrays.**
   (The index is bounds-checked against the length, and then the start index is added. This is just one more
    machine instruction versus a raw array.)
-- Accessing the length is constant-time.
+- **Accessing the length is constant-time.**
   (This is simply a projection of the three-tuple.)
-- Evaluating a range expression is constant-time.
+- **Evaluating a range expression is constant-time.**
   (The start and end indices are bounds checked, then a three-value tuple is the result).
-  
