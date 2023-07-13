@@ -4,6 +4,7 @@
 enum DbgCommand(cmdName: string, alias: string, help: string) {
 	Help("help", "h", "Print help text"),
 	Run("run", "r", "Begin program"),
+	Start("start", "start", "Set a temporary breakpoint on main() and begin program")
 	Continue("continue", "c", "Continue program"),
 	Step("step", "s", "Step program until it reaches a different source line"),
 	Stepi("stepi", "si", "Step one instruction exactly"),
@@ -25,6 +26,7 @@ enum DbgInfo(cmdName: string, alias: string, help: string) {
 	Breakpoints("breakpoints", "b", "Print information about breakpoints"),
 	Locals("locals", "l", "Print information about nonSsa-locals when next instr is a Checkpoint"),
 	Inputs("inputs", "i", "Print information about inputs of next instruction"),
+	Variable("variable", "v", "Print detail information about a variable"),
 	Invalid("invalid", "invalid", "")
 }
 enum DbgDisplay(cmdName: string, alias: string, help: string) {
@@ -45,6 +47,12 @@ enum DbgExecuteOpt(untilBreak: bool, nextLine: bool, jump: bool, fin: bool) {
 	Finish(false, false, false, true),
 }
 
+enum DbgStopReason {
+	stopOnBreakpoint,
+	stopOnStep,
+	end,
+}
+
 // Implement a GDB-like interface debugger based on SsaInterpreter
 class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaInterpreter) {
 	def parser = DebuggerParser.new();
@@ -55,11 +63,12 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 	var startDel: Closure;
 	var startArgs: Array<Val>;
 	var running: bool;
+	var stopReason: DbgStopReason;
 
 	def invoke(del: Closure, args: Array<Val>) -> Result {
 		startDel = del;
 		startArgs = args;
-		Terminal.put("For help, type \"help\".\n");
+		if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put("For help, type \"help\".\n");
 		var readCommand = true;
 		while (readCommand) {
 			var result = parser.parseCommand(parser.getCommand());
@@ -74,6 +83,10 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 				start();
 				execute(DbgExecuteOpt.Continue);
 			}
+			Start => {
+				start();
+				execute(DbgExecuteOpt.Step);
+			}
 			Continue => execute(DbgExecuteOpt.Continue);
 			Step => execute(DbgExecuteOpt.Step);
 			Stepi => execute(DbgExecuteOpt.Stepi);
@@ -82,12 +95,16 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 			Finish => execute(DbgExecuteOpt.Finish);
 			Info => {
 				var info = parser.parseInfo(args);
-				match (info) {
+				match (info.0) {
 					Breakpoints => {
 						for (i < bps.length) Terminal.put2("%d: %q\n", i, bps[i].render);
 					}
 					Locals => infoLocals();
 					Inputs => infoInputs();
+					Variable => {
+						if (running) infoVal(interp.frame.ip.inputs, info.1);
+						Terminal.put("variableDone\n");
+					}
 					Invalid => Terminal.put1("Invalid info args: %s\n", args);
 				}
 			}
@@ -95,8 +112,12 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 				var result = parser.parseBreakpoint(args);
 				if (result.0.length > 0 && insertBreakpoint(result)) {
 					var idx = bps.length-1, ssa = bps[idx].ssa;
-					Terminal.put2("Breakpoint %d %q\n", idx, ssa.source.render);
-				} else Terminal.put1("Invalid breakpoint args: %s\n", args);
+					if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put2("Breakpoint %d %q\n", idx, ssa.source.render);
+					else Terminal.put2("breakpoint|%s|%d\n", args, idx);
+				} else {
+					if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put1("Invalid breakpoint args: %s\n", args);
+					else  Terminal.put1("breakpoint|%s|-1\n", args);
+				}
 			}
 			DisableBreakpoint => {
 				handleBreakpoint(args, false);
@@ -111,7 +132,8 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 					var trace = interp.getStackTrace(source);
 					for (list = trace; list != null; list = list.tail) {
 						for (s = list.head; s != null; s = s.tail) {
-							Terminal.put1("\t%q\n", s.render);
+							if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put1("\t%q\n", s.render);
+							else Terminal.put3("bt|%q|%s|%d\n", s.mdecl.renderLong, s.mdecl.token.fileName, s.line);
 						}
 					}
 				}
@@ -152,18 +174,24 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 	def start() {
 		interp.reset();
 		srcPrinter.reset();
-		Terminal.put2("Starting program: %s with method %q\n", interp.prog.name(), startDel.memberRef.render);
-		if (startArgs != null) for (i < startArgs.length) Terminal.put2("args %d: %s\n", i, V3.renderVal(startArgs[i]));
+		if (!CLOptions.DEBUG_EXTENSION.get()) {
+			Terminal.put2("Starting program: %s with method %q\n", interp.prog.name(), startDel.memberRef.render);
+			if (startArgs != null) {
+				for (i < startArgs.length) Terminal.put2("args %d: %s\n", i, V3.renderVal(startArgs[i]));
+			}
+		}
 		interp.pushFrame(startDel.memberRef, startDel.val, startArgs);
 		running = true;
 	}
 	// Step debugged program and stop depending on condition
 	def execute(opt: DbgExecuteOpt) {
 		if (!running) start(); // ???: start or return?
+		stopReason = DbgStopReason.stopOnStep;
 		var targetSp = interp.sp;
 		var prev = interp.frame.ip;
 		var n = interp.step(interp.frame.ip);
 		if (interp.frame == null) {
+			stopReason = DbgStopReason.end;
 			running = false;
 			printExecuteResult();
 			return;
@@ -174,6 +202,7 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 			prev = interp.frame.ip;
 			n = interp.step(interp.frame.ip);
 			if (interp.frame == null) {
+				stopReason = DbgStopReason.end;
 				running = false;
 				break;
 			}
@@ -185,7 +214,10 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 	}
 	// Decide whether to stop execution or not
 	def stopExecute(instr: SsaInstr, opt: DbgExecuteOpt, targetSp: int) -> bool {
-		if (isBreakpoint(instr)) return true;
+		if (isBreakpoint(instr)) {
+			stopReason = DbgStopReason.stopOnBreakpoint;
+			return true;
+		}
 		if (opt.untilBreak) return false;
 		if (opt.fin) {
 			if (interp.sp < targetSp) return true;
@@ -204,6 +236,10 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 	}
 	// Print next instruction or the final result of the debugger program
 	def printExecuteResult() {
+		if (CLOptions.DEBUG_EXTENSION.get()) {
+			Terminal.putln(stopReason.name);
+			return;
+		}
 		if (interp.frame != null) {
 			for (j < interp.sp-1) printer.buf.puts("  ");
 			printer.buf.blue().puts("=>").end();
@@ -224,12 +260,22 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		for (i < nonSsaVars.length) {
 			var instr = inputs[i].dest;
 			if (instr != null) {
-				printer.buf.put2("%d. \"%s\": ", i, nonSsaVars[i].name());
-				printer.buf.putref(instr).putc('=');
-				putVal(interp.getVal(instr), nonSsaVars[i].vtype);
+				if (CLOptions.DEBUG_EXTENSION.get()) {
+					Terminal.put2("variable|%d|%s|", i, nonSsaVars[i].name());
+					var val = interp.getVal(instr);
+					V3.renderResult(val, nonSsaVars[i].vtype, printer.buf);
+					printer.buf.putc('|');
+					nonSsaVars[i].vtype.render(printer.buf);
+					printer.buf.put1("|%z", (Record.?(val)));
+					printer.outln();
+				} else {
+					printer.buf.put2("%d. \"%s\": ", i, nonSsaVars[i].name());
+					printer.buf.putref(instr).putc('=');
+					putVal(interp.getVal(instr), nonSsaVars[i].vtype);
+				}
 			}
 		}
-		infoVal(inputs);
+		// infoVal(inputs);
 	}
 	def infoInputs() {
 		var inputs = interp.frame.ip.inputs;
@@ -242,19 +288,34 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 				putVal(interp.getVal(instr), if(vtypes!=null, vtypes[i]));
 			}
 		}
-		infoVal(inputs);
+		infoVal(inputs, null);
 	}
-	def infoVal(inputs: Array<SsaDfEdge>) {
+	def infoVal(inputs: Array<SsaDfEdge>, infoIdx: Vector<int>) {
 		if (inputs.length == 0) return;
-		Terminal.put("More info? (index): ");
-		var result = parser.getInt();
-		if (result.0 && result.1 < inputs.length) {
-			var instr = inputs[result.1].dest;
+		var idx: int;
+		if (infoIdx != null) {
+			idx = infoIdx[0];
+		} else {
+			Terminal.put("More info? (index): ");
+			var result = parser.getInt();
+			if (result.0) idx = result.1;
+		}
+		if (idx < inputs.length) {
+			var instr = inputs[idx].dest;
 			if (instr == null) {
 				Terminal.put("Nothing to show\n");
 				return;
 			}
 			var val = interp.getVal(instr);
+			if (infoIdx != null) {
+				for (j = 1; j < infoIdx.length; j++) {
+					if (Record.?(val) && infoIdx[j] < Record.!(val).values.length) val = Record.!(val).values[infoIdx[j]];
+					else {
+						Terminal.put("variable,-1");
+						return;
+					}
+				}
+			}
 			if (Record.?(val)) {
 				var r = Record.!(val), line = r.values.length;
 				if (line > PRINT_LIMIT) {
@@ -264,15 +325,33 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 				if (V3.isClass(r.rtype)) {
 					var irclass = prog.ir.getIrClass(r.rtype);
 					for (i < r.values.length) {
-						var field = irclass.fields[i];
-						printer.buf.put1(".%q=", field.render);
-						putVal(r.values[i], irclass.fields[i].fieldType);
+						if (CLOptions.DEBUG_EXTENSION.get()) {
+							Terminal.put2("variable|%d|%q|", i, irclass.fields[i].render);
+							var v = r.values[i];
+							V3.renderResult(v, irclass.fields[i].fieldType, printer.buf);
+							printer.buf.putc('|');
+							irclass.fields[i].fieldType.render(printer.buf);
+							printer.buf.put1("|%z", (Record.?(v)));
+							printer.outln();
+						} else {
+							var field = irclass.fields[i];
+							printer.buf.put1(".%q=", field.render);
+							putVal(r.values[i], irclass.fields[i].fieldType);
+						}
 					}
 					return;
 				} else if (V3.isArray(r.rtype)) {
 					for (i < r.values.length) {
-						printer.buf.put1("[%d]=", i);
-						putVal(r.values[i], null);
+						if (CLOptions.DEBUG_EXTENSION.get()) {
+							Terminal.put2("variable|%d|%d|", i, i);
+							var v = r.values[i];
+							V3.renderResult(v, null, printer.buf);
+							printer.buf.put1("||%z", (Record.?(v)));
+							printer.outln();
+						} else {
+							printer.buf.put1("[%d]=", i);
+							putVal(r.values[i], null);
+						}
 					}
 					return;
 				}
@@ -394,7 +473,7 @@ class DebuggerParser {
 
 	def getCommand() -> string {
 		var sb = StringBuilder.new();
-		System.puts("(debug) ");
+		if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put("(debug) ");
 		var ch = byte.!(System.fileRead(STDIN));
 		while (ch != '\n') {
 			sb.putc(ch);
@@ -421,12 +500,29 @@ class DebuggerParser {
 		}
 		return (DbgCommand.Unknown, command);
 	}
-	def parseInfo(args: string) -> DbgInfo {
-		if (args.length == 0) return DbgInfo.Invalid;
-		for (e in DbgInfo) {
-			if (Strings.equal(args, e.alias) || Strings.equal(args, e.cmdName)) return e;
+	def parseInfo(args: string) -> (DbgInfo, Vector<int>) {
+		if (args.length == 0) return (DbgInfo.Invalid, null);
+		var infoType = "";
+		var infoIdx = Vector<int>.new();
+		for (i < args.length) {
+			if (args[i] == ' ') {
+				if (infoType.length == 0) {
+					infoType = Arrays.range(args, 0, i);
+					var sepIdx = i + 1;
+					while (sepIdx < args.length) {
+						var result = Ints.parseDecimal(args, sepIdx);
+						if (result.0 > 0) infoIdx.put(result.1);
+						sepIdx += result.0 + 1;
+					}
+					break;
+				}
+			}
 		}
-		return DbgInfo.Invalid;
+		if (infoType.length == 0) infoType = args;
+		for (e in DbgInfo) {
+			if (Strings.equal(infoType, e.alias) || Strings.equal(infoType, e.cmdName)) return (e, infoIdx);
+		}
+		return (DbgInfo.Invalid, null);
 	}
 	def parseBreakpoint(args: string) -> (/*fileName*/string, /*line*/int) {
 		if (args.length == 0) return ("", 0);
