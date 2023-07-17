@@ -8,4 +8,9 @@ else
   TESTS="$(ls *.v3)"
 fi
 
-run_or_skip_io_tests debug $TESTS
+target=debug
+
+T=$OUT/$target
+mkdir -p $T
+
+run_or_skip_io_tests $target $TESTS
