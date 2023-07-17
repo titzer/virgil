@@ -205,6 +205,7 @@ export class DbgAdapter extends LoggingDebugSession {
 	}
 
 	private convertRuntime(v: IRuntimeVariable): DebugProtocol.Variable {
+		if (v.type == 'float') v.value = this.HexToFloat32(v.value.split(':')[1]).toString();
 		let dapVariable: DebugProtocol.Variable = {
 			name: v.name,
 			value: v.value,
@@ -215,5 +216,20 @@ export class DbgAdapter extends LoggingDebugSession {
 			dapVariable.variablesReference = this._variableHandles.create(v);
 		}
 		return dapVariable;
+	}
+
+	private HexToFloat32(s: string): number {
+		var int = parseInt(s, 16);
+		if (int > 0 || int < 0) {
+			var sign = int >>> 31 ? -1 : 1;
+			var exp = ((int >>> 23) & 0xff) - 127;
+			var mantissa = ((int & 0x7fffff) + 0x800000);
+			var float32 = 0;
+			for (let mask = 0x800000; mask > 0; mask >>= 1) {
+				float32 += mantissa & mask ? Math.pow(2, exp) : 0;
+				exp--;
+			}
+			return float32 * sign;
+		} else return 0;
 	}
 }
