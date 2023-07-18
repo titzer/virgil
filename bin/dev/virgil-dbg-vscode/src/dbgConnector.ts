@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { spawn } from 'child_process';
 import { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { debug } from 'vscode';
 
 interface IRuntimeStackFrame {
 	index: number;
@@ -60,13 +61,10 @@ export class DbgConnector extends EventEmitter {
 			}
 		});
 		this.debugger.stderr.on('data', data => {
-			console.log(`stderr:${data}`);
+			debug.activeDebugConsole.appendLine(data);
 		});
 		this.debugger.on('error', (error) => {
-			console.error(`error: ${error.message}`);
-		});
-		this.debugger.on('close', (code) => {
-			console.log(`child process exited with code ${code}`);
+			debug.activeDebugConsole.appendLine(error.name + ': ' + error.message);
 		});
 	}
 
@@ -192,7 +190,6 @@ export class DbgConnector extends EventEmitter {
 	}
 
 	private parseStdout(data: string) {
-		console.log(`stdout:${data}`);
 		if (this.stepEvent) {
 			if (data == 'end' || data == 'stopOnBreakpoint') this.sendEvent(data);
 			else this.sendEvent(this.stepEvent);
@@ -200,16 +197,19 @@ export class DbgConnector extends EventEmitter {
 			return;
 		}
 		const par = data.split('|');
-		if (par[0] == 'bt') {
+		switch(par[0]) {
+		case 'bt':
 			this._stacktrace.push({
 				index: 0,
 				name: par[1],
 				file: par[2],
 				line: parseInt(par[3]),
 			});
-		} else if (par[0] == 'breakpoint') {
+			break;
+		case 'breakpoint':
 			this.sendEvent('setBreakDone' + par[1], parseInt(par[2]));
-		} else if (par[0] == 'variable') {
+			break;
+		case 'variable':
 			let item: IRuntimeVariable = {
 				idx: this._variableIdx.concat(parseInt(par[1])),
 				name: par[2],
@@ -218,9 +218,14 @@ export class DbgConnector extends EventEmitter {
 				reference: (par[5] == 'true')? true : false,
 			}
 			this._localVariables.push(item);
-		} else if (par[0] == 'variableDone') {
+			break;
+		case 'variableDone':
 			this.sendEvent('getVariableDone', 0);
-		}
+			break;
+		case 'result':
+			debug.activeDebugConsole.appendLine('Program exited with result: ' + par[1]);
+			break;
+		} 
 	}
 
 	private sendEvent(event: string, ... args: any[]): void {
