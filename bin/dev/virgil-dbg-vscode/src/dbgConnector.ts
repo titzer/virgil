@@ -29,32 +29,29 @@ export interface IRuntimeVariable {
 
 export class DbgConnector extends EventEmitter {
 	private debugger!: ChildProcessWithoutNullStreams;
+	private stopOnEntry = false;
+
 	private stepEvent: string = '';
-	private _stacktrace: IRuntimeStackFrame[] = [];
-	private _localVariables: IRuntimeVariable[] = [];
-	private _variableIdx: number[] = [];
-
-	private _sourceFile: string[] = [];
-	public get sourceFile() {
-		return this._sourceFile;
-	}
-
+	private stacktrace: IRuntimeStackFrame[] = [];
+	private variables: IRuntimeVariable[] = [];
+	private variableIdx: number[] = [];
 	private breakPoints = new Map<string, Map<number,IRuntimeBreakpoint>>();
 	private breakpointTs = 0;
-	private stopOnEntry = false;
+	
+	private output = "";
 
 	/**
 	 * Start executing the given program.
 	 */
 	public start(command: string, program: string[], stopOnEntry: boolean): void {
 		console.log('dbgConnector start')
-		this._sourceFile = program;
 		this.stopOnEntry = stopOnEntry;
 		const debuggerArgs = ['-debug', '-debug-extension'].concat(program);
 
 		this.debugger = spawn(command, debuggerArgs);
 
 		this.debugger.stdout.on('data', data => {
+			this.output += data;
 			let lines = data.toString().split('\n');
 			for (let line of lines) {
 				if (line) this.parseStdout(line);
@@ -65,6 +62,14 @@ export class DbgConnector extends EventEmitter {
 		});
 		this.debugger.on('error', (error) => {
 			debug.activeDebugConsole.appendLine(error.name + ': ' + error.message);
+			console.log(error.name + ': ' + error.message);
+		});
+		this.debugger.on('close', (code) => {
+			if (code != 0) {
+				debug.activeDebugConsole.appendLine(this.output);
+				debug.activeDebugConsole.appendLine('exit');
+				this.sendEvent('end');
+			}
 		});
 	}
 
@@ -94,8 +99,8 @@ export class DbgConnector extends EventEmitter {
 
 	public stack(startFrame: number, endFrame: number): IRuntimeStackFrame[] {
 		const frames: IRuntimeStackFrame[] = [];
-		for (let i = 0; i < this._stacktrace.length; i ++) {
-			let entry = this._stacktrace[i];
+		for (let i = 0; i < this.stacktrace.length; i ++) {
+			let entry = this.stacktrace[i];
 			frames.push({
 				index: entry.index,
 				name:  entry.name,
@@ -103,37 +108,29 @@ export class DbgConnector extends EventEmitter {
 				line:  entry.line
 			});
 		}
-		if (frames.length === 0) {
-			frames.push({
-				index: 0,
-				name: "BOTTOM",
-				file: this._sourceFile[0],
-				line: -1,
-			});
-		}
 		return frames;
 	}
 
 	public getLocalVariables() {
-		return this._localVariables;
+		return this.variables;
 	}
 
 	public async getLocalVariable(idx: number[]) {
-		this._localVariables = [];
-		this._variableIdx = idx;
+		this.variables = [];
+		this.variableIdx = idx;
 		this.debugger.stdin.write(`info variable ${idx.join(' ')}\n`);
 		await this.getPromiseFromEvent('getVariableDone');
-		return this._localVariables;
+		return this.variables;
 	}
 
 	private requestStackTrace() {
-		this._stacktrace = [];
+		this.stacktrace = [];
 		this.debugger.stdin.write('bt\n');
 	}
 
 	private requestVariables() {
-		this._localVariables = [];
-		this._variableIdx = [];
+		this.variables = [];
+		this.variableIdx = [];
 		this.debugger.stdin.write('info l\n');
 	}
 
@@ -199,7 +196,7 @@ export class DbgConnector extends EventEmitter {
 		const par = data.split('|');
 		switch(par[0]) {
 		case 'bt':
-			this._stacktrace.push({
+			this.stacktrace.push({
 				index: 0,
 				name: par[1],
 				file: par[2],
@@ -211,13 +208,13 @@ export class DbgConnector extends EventEmitter {
 			break;
 		case 'variable':
 			let item: IRuntimeVariable = {
-				idx: this._variableIdx.concat(parseInt(par[1])),
+				idx: this.variableIdx.concat(parseInt(par[1])),
 				name: par[2],
 				value: par[3],
 				type: par[4],
 				reference: (par[5] == 'true')? true : false,
 			}
-			this._localVariables.push(item);
+			this.variables.push(item);
 			break;
 		case 'variableDone':
 			this.sendEvent('getVariableDone', 0);
