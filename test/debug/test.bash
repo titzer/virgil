@@ -5,7 +5,7 @@
 if [ $# -gt 0 ]; then
   TESTS="$*"
 else
-  TESTS="$(ls *.v3)"
+  TESTS="$(ls *.v3) $(cat core.debug)"
 fi
 
 target=debug
