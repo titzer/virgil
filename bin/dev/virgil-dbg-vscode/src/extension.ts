@@ -6,7 +6,7 @@ import { DbgAdapter } from './dbgAdaptor';
 export function activate(context: vscode.ExtensionContext) {
 	console.log("Starting extension...");
 
-	context.subscriptions.push(vscode.commands.registerCommand('extension.virgil-debug.getProgramName', config => {
+	context.subscriptions.push(vscode.commands.registerCommand('extension.virgil-debug.getProgramName', _ => {
 		return vscode.window.showInputBox({
 			placeHolder: "Please enter the program name in the workspace folder",
 			value: "mytest.v3"

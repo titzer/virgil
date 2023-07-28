@@ -31,7 +31,6 @@ export class DbgConnector extends EventEmitter {
 	private debugger!: ChildProcessWithoutNullStreams;
 	private stopOnEntry = false;
 
-	private stepEvent: string = '';
 	private stacktrace: IRuntimeStackFrame[] = [];
 	private variables: IRuntimeVariable[] = [];
 	private variableIdx: number[] = [];
@@ -49,6 +48,7 @@ export class DbgConnector extends EventEmitter {
 		const debuggerArgs = ['-debug', '-debug-extension'].concat(program);
 
 		this.debugger = spawn(command, debuggerArgs);
+		console.log(debuggerArgs);
 
 		this.debugger.stdout.on('data', data => {
 			this.output += data;
@@ -75,11 +75,10 @@ export class DbgConnector extends EventEmitter {
 
 	public startDebugee() {
 		if (this.stopOnEntry) {
-			this.stepEvent = 'stopOnEntry';
 			this.debugger.stdin.write("start\n");
 			this.requestStackTrace();
+			this.requestVariables();
 		} else {
-			this.stepEvent = 'stopOnStep';
 			this.debugger.stdin.write("run\n");
 			this.requestStackTrace();
 			this.requestVariables();
@@ -91,10 +90,20 @@ export class DbgConnector extends EventEmitter {
 	}
 
 	public step(cmd: string) {
-		this.stepEvent = 'stopOnStep';
 		this.debugger.stdin.write(cmd + '\n');
 		this.requestStackTrace();
 		this.requestVariables();
+	}
+
+	private requestStackTrace() {
+		this.stacktrace = [];
+		this.debugger.stdin.write('bt\n');
+	}
+
+	private requestVariables() {
+		this.variables = [];
+		this.variableIdx = [];
+		this.debugger.stdin.write('info l\n');
 	}
 
 	public stack(startFrame: number, endFrame: number): IRuntimeStackFrame[] {
@@ -115,23 +124,13 @@ export class DbgConnector extends EventEmitter {
 		return this.variables;
 	}
 
+	// Get more info about a variable with indexes
 	public async getLocalVariable(idx: number[]) {
 		this.variables = [];
 		this.variableIdx = idx;
 		this.debugger.stdin.write(`info variable ${idx.join(' ')}\n`);
 		await this.getPromiseFromEvent('getVariableDone');
 		return this.variables;
-	}
-
-	private requestStackTrace() {
-		this.stacktrace = [];
-		this.debugger.stdin.write('bt\n');
-	}
-
-	private requestVariables() {
-		this.variables = [];
-		this.variableIdx = [];
-		this.debugger.stdin.write('info l\n');
 	}
 
 	public async updateBreakPoint(path: string, lines: number[]): Promise<IRuntimeBreakpoint[]> {
@@ -187,14 +186,12 @@ export class DbgConnector extends EventEmitter {
 	}
 
 	private parseStdout(data: string) {
-		if (this.stepEvent) {
-			if (data == 'end' || data == 'stopOnBreakpoint') this.sendEvent(data);
-			else this.sendEvent(this.stepEvent);
-			this.stepEvent = '';
-			return;
-		}
+		console.log(data);
 		const par = data.split('|');
 		switch(par[0]) {
+		case 'stop':
+			this.sendEvent(par[1]);
+			break;
 		case 'bt':
 			this.stacktrace.push({
 				index: 0,

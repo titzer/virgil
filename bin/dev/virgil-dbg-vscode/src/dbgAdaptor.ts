@@ -12,7 +12,7 @@ import {
 } from '@vscode/debugadapter';
 import { Subject } from 'await-notify';
 import { DebugProtocol } from '@vscode/debugprotocol';
-import { basename } from 'path-browserify';
+import { basename } from 'path';
 import { DbgConnector, IRuntimeVariable } from './dbgConnector';
 
 /**
@@ -97,7 +97,7 @@ export class DbgAdapter extends LoggingDebugSession {
 
 	protected async launchRequest(response: DebugProtocol.LaunchResponse, args: ILaunchRequestArguments) {
 		// make sure to 'Stop' the buffered logging if 'trace' is not set
-		logger.setup(args.trace ? Logger.LogLevel.Verbose : Logger.LogLevel.Stop, false);
+		logger.setup(args.trace? Logger.LogLevel.Verbose : Logger.LogLevel.Stop, false);
 		
 		this._runtime.start(args.debugger, args.program, !!args.stopOnEntry);
 		await this._configurationDone.wait();
@@ -141,12 +141,7 @@ export class DbgAdapter extends LoggingDebugSession {
 		this.sendResponse(response);
 	}
 
-	protected setFunctionBreakPointsRequest(response: DebugProtocol.SetFunctionBreakpointsResponse, args: DebugProtocol.SetFunctionBreakpointsArguments, request?: DebugProtocol.Request): void {
-		this.sendResponse(response);
-	}
-
 	protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
-
 		// runtime supports no threads so just return a default thread.
 		response.body = {
 			threads: [
@@ -157,7 +152,6 @@ export class DbgAdapter extends LoggingDebugSession {
 	}
 
 	protected stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): void {
-
 		const startFrame = typeof args.startFrame === 'number' ? args.startFrame : 0;
 		const maxLevels = typeof args.levels === 'number' ? args.levels : 1000;
 		const endFrame = startFrame + maxLevels;
@@ -174,11 +168,10 @@ export class DbgAdapter extends LoggingDebugSession {
 	}
 
 	private createSource(filePath: string): Source {
-		return new Source(basename(filePath), this.convertDebuggerPathToClient(filePath), undefined, undefined, 'mock-adapter-data');
+		return new Source(basename(filePath), this.convertDebuggerPathToClient(filePath));
 	}
 
 	protected scopesRequest(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): void {
-
 		response.body = {
 			scopes: [
 				new Scope("Locals", this._variableHandles.create('locals'), false),
@@ -187,8 +180,7 @@ export class DbgAdapter extends LoggingDebugSession {
 		this.sendResponse(response);
 	}
 
-	protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments, request?: DebugProtocol.Request): Promise<void> {
-
+	protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): Promise<void> {
 		let vs: IRuntimeVariable[] = [];
 
 		const v = this._variableHandles.get(args.variablesReference);
