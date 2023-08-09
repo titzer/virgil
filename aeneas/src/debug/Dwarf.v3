@@ -1,0 +1,354 @@
+// Copyright 2023 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def DWARF_VERSION = 5;
+def MIN_INSTR_LEN = 1;
+def MAX_OP_PER_INSTR = 1;
+
+def CODE_POINTER_SIZE32: u8 = 4;
+def CODE_POINTER_SIZE64: u8 = 8;
+
+def DWARFLineBase: i8 = -5;
+def DWARFLineRange: u8 = 14;
+def DWARFLineOpcodeBase: u8 = 13;
+
+def DWARF_DEFAULT_IS_STMT = 1;
+def DWARF_FLAG_IS_STMT = 1;
+def DWARF_FLAG_BASIC_BLOCK = (1 << 1);
+def DWARF_FLAG_PROLOGUE_END = (1 << 2);
+def DWARF_FLAG_EPILOGUE_BEGIN = (1 << 3);
+
+def DW_LNCT_path: u32 = 1;
+def DW_LNCT_directory_index: u32 = 2;
+def DW_FORM_udata: u32 = 0xf;
+def DW_FORM_line_strp: u32 = 0x1f;
+
+class DwarfDir {
+	def directory: string;
+	def index: u32;
+	var offset: int;
+	new(directory, index) { }
+}
+class DwarfFile {
+	def filename: string;
+	def index: u32;
+	var offset: int;
+	def dirIdx: u32;
+	new(filename, index, dirIdx) { }
+}
+
+class Dwarf {
+	def elf: ElfHeader;
+	def sections: ElfSections;
+	def prog: Program;
+	def line = DwarfLineSection.new(elf, prog);
+	new(elf, sections, prog) { }
+	def emitLine(w: DataWriter) {
+		line.w = w;
+		var lineStrStart = w.pos;
+		sections.lineStr.sh_offset = lineStrStart;
+		line.emitLineStr();
+		sections.lineStr.sh_size = w.pos - lineStrStart;
+		
+		var lineStart = w.pos;
+		sections.line.sh_offset = lineStart;
+		line.codeStart = sections.text.sh_addr;
+		line.codeSize = sections.text.sh_size;
+		line.emit();
+		sections.line.sh_size = w.pos - lineStart;
+	}
+}
+
+class DwarfLineSection {
+	def compilationDir = DwarfDir.new(".", 0u); // todo, commandline
+	var rootFile: DwarfFile;
+	var dirCount: u32 = 1u;
+	var fileCount: u32;
+	def dwarfDirs = HashMap<string, DwarfDir>.new(Strings.hash, Strings.equal);
+	def dwarfFiles = HashMap<string, DwarfFile>.new(Strings.hash, Strings.equal);
+	def lineEntries = Vector<DwarfLineEntry>.new();
+	var w: DataWriter;
+	var codeStart: long;
+	var codeSize: long;
+	var lineStrStart: int;
+	var codePointerSize: u8;
+	def maxSpecialAddrDelta: u32 = (255u - DWARFLineOpcodeBase) / DWARFLineRange;
+
+	new(elf: ElfHeader, prog: Program) {
+		rootFile = toDwarfFile(prog.files[0]); // todo
+		for (i < prog.files.length) {
+			var tmp = toDwarfFile(prog.files[i]);
+			dwarfFiles[tmp.filename] = tmp;
+		}
+		codePointerSize = if(elf.is64(), CODE_POINTER_SIZE64, CODE_POINTER_SIZE32);
+	}
+	def toDwarfFile(filepath: string) -> DwarfFile {
+		var r = basename(filepath), dir = r.0, file = r.1;
+		if (!dwarfDirs.has(dir)) dwarfDirs[dir] = DwarfDir.new(dir, dirCount++);
+		return DwarfFile.new(file, fileCount++, dwarfDirs[dir].index);
+	}
+	def addLineEntry(src: Source, label: Label) {
+		var fileNum = dwarfFiles[src.mdecl.token.fileName].index;
+		var lineEntry = DwarfLineEntry.new(fileNum, src.line, u32.!(src.column), label);
+		lineEntries.put(lineEntry);
+	}
+	def emitLineStr() {
+		lineStrStart = w.pos;
+		w.puta(compilationDir.directory);
+		w.puta("\x00");
+		dwarfDirs.apply(putLineStrDir);
+		rootFile.offset = w.pos - lineStrStart;
+		w.puta(rootFile.filename);
+		w.puta("\x00");
+		dwarfFiles.apply(putLineStrFile);
+	}
+	def putLineStrDir(name: string, info: DwarfDir) {
+		info.offset = w.pos - lineStrStart;
+		w.puta(name);
+		w.puta("\x00");
+	}
+	def putLineStrFile(name: string, info: DwarfFile) {
+		info.offset = w.pos - lineStrStart;
+		w.puta(name);
+		w.puta("\x00");
+	}
+	def emit() {
+		var unitLengthStart = emitHeader();
+		emitLines();
+		// update unit_length, bytes after this field
+		var unit_length = w.pos - unitLengthStart - 4;
+		w.at(unitLengthStart);
+		w.put_b32(unit_length);
+		w.atEnd();
+	}
+	def emitHeader() -> int {
+		var standardOpcodeLengths: Array<byte> = [
+      0, // length of DW_LNS_copy
+      1, // length of DW_LNS_advance_pc
+      1, // length of DW_LNS_advance_line
+      1, // length of DW_LNS_set_file
+      1, // length of DW_LNS_set_column
+      0, // length of DW_LNS_negate_stmt
+      0, // length of DW_LNS_set_basic_block
+      0, // length of DW_LNS_const_add_pc
+      1, // length of DW_LNS_fixed_advance_pc
+      0, // length of DW_LNS_set_prologue_end
+      0, // length of DW_LNS_set_epilogue_begin
+      1  // length of DW_LNS_set_isa
+		];
+		var unitLengthStart = w.pos;
+		w.skipN(4);									// unit_length
+		w.put_b16(DWARF_VERSION);		// version
+		w.putb(codePointerSize);	// address_size
+		w.putb(0);									// segment_selector_size
+		var headerLengthStart = w.pos;
+		w.skipN(4);									// header_length
+		w.putb(MIN_INSTR_LEN);			// minimum_instruction_length
+		w.putb(MAX_OP_PER_INSTR);		// maximum_operations_per_instruction
+		w.putb(DWARF_DEFAULT_IS_STMT); // default_is_stmt
+		w.putb(DWARFLineBase);			// line_base
+		w.putb(DWARFLineRange);			// line_range
+		w.putb(DWARFLineOpcodeBase); // opcode_base 
+		for (len in standardOpcodeLengths) w.putb(len); // standard_opcode_lengths
+		// directory table
+		w.putb(1);									// directory_entry_format_count
+		w.put_uleb32(DW_LNCT_path);	// directory_entry_format - content type code
+		w.put_uleb32(DW_FORM_line_strp); // directory_entry_format - form code
+		w.put_uleb32(dirCount);			// directories_count
+		w.put_b32(compilationDir.offset);
+		dwarfDirs.apply(putDirRef);
+		// filename table
+		w.putb(2);									// file_name_entry_format_count
+		w.put_uleb32(DW_LNCT_path);	// file_name_entry_format - content type code
+		w.put_uleb32(DW_FORM_line_strp); // file_name_entry_format - form code
+		w.put_uleb32(DW_LNCT_directory_index); // file_name_entry_format - content type code
+		w.put_uleb32(DW_FORM_udata); // file_name_entry_format - form code
+		w.put_uleb32(fileCount);		// file_names_count
+		w.put_b32(rootFile.offset);
+		w.put_uleb32(rootFile.dirIdx);
+		dwarfFiles.apply(putFileRef);
+		// update header_length, bytes after this field
+		var header_length = w.pos - headerLengthStart - 4;
+		w.at(headerLengthStart);
+		w.put_b32(header_length);
+		w.atEnd();
+		return unitLengthStart;
+	}
+	def putDirRef(directory: string, info: DwarfDir) {
+		w.put_b32(info.offset); // ref to debug_line_str
+	}
+	def putFileRef(filename: string, info: DwarfFile) {
+			w.put_b32(info.offset); // ref to debug_line_str
+			w.put_uleb32(info.dirIdx); // directory index
+	}
+	def emitLines() {
+		// init register
+		var fileNum: u32 = 1, lastLine = 1, column: u32 = 0, flags = DWARF_DEFAULT_IS_STMT;
+		var isa: u32 = 0, discriminator: u32 = 0;
+		var lastLabel: Label;
+		var endEntryEmitted = false;
+		for (i < lineEntries.length) {
+			var lineEntry = lineEntries[i], label = lineEntry.label;
+			if (lineEntry.isEndEntry) {
+				endEntryEmitted = true;
+				emitLine(Int.MAX_VALUE, lastLabel, label);
+				continue;
+			}
+			var lineDelta = lineEntry.line - lastLine;
+			if (fileNum != lineEntry.fileNum) {
+				fileNum = lineEntry.fileNum;
+				w.putb(DW_LNS_set_file);
+				w.put_uleb32(fileNum);
+			}
+			if (column != lineEntry.column) {
+				column = lineEntry.column;
+				w.putb(DW_LNS_set_column);
+				w.put_uleb32(column);
+			}
+			if (discriminator != lineEntry.discriminator) {
+				discriminator = lineEntry.discriminator;
+				var size = getULEB128Size(discriminator);
+				w.putb(DW_LNS_extended_op);
+				w.put_uleb32(size + 1);
+				w.putb(DW_LNE_set_discriminator);
+				w.put_uleb32(discriminator);
+			}
+			if (isa != lineEntry.isa) {
+				isa = lineEntry.isa;
+				w.putb(DW_LNS_set_isa);
+				w.put_uleb32(isa);
+			}
+			// flags
+			emitLine(lineDelta, lastLabel, label);
+			lastLine = lineEntry.line;
+			lastLabel = lineEntry.label;
+		}
+		if (!endEntryEmitted) {
+			var endLabel = Label.new();
+			endLabel.pos = int.!(codeSize);
+			emitLine(Int.MAX_VALUE, lastLabel, endLabel);
+		}
+	}
+	def emitLine(lineDelta: int, lastLabel: Label, label: Label) {
+		if (lastLabel == null) {
+			emitSetLineAddr(lineDelta, label);
+			return;
+		}
+		var addrDelta = u32.!(label.pos - lastLabel.pos);
+		emitLineAddr(lineDelta, addrDelta);
+	}
+	def emitSetLineAddr(lineDelta: int, label: Label) {
+		// emit the sequence to set the address
+		w.putb(DW_LNS_extended_op);
+		w.put_uleb32(u32.!(codePointerSize + 1));
+		w.putb(DW_LNE_set_address);
+		if (codePointerSize == CODE_POINTER_SIZE64) w.put_b64(label.pos + codeStart);
+		else w.put_b32(int.!(label.pos + codeStart));
+		// emit the sequence for the LineDelta and a zero address delta
+		emitLineAddr(lineDelta, 0u);
+	}
+	def emitLineAddr(lineDelta: int, addrDelta: u32) {
+		var needCopy = false;
+		if (lineDelta == Int.MAX_VALUE) {
+			if (addrDelta == maxSpecialAddrDelta) {
+				w.putb(DW_LNS_const_add_pc);
+			} else if (addrDelta > 0) {
+				w.putb(DW_LNS_advance_pc);
+				w.put_uleb32(addrDelta);
+			}
+			w.putb(DW_LNS_extended_op);
+			w.putb(1);
+			w.putb(DW_LNE_end_sequence);
+			return;
+		}
+		var tmp = lineDelta - DWARFLineBase;
+		// If the line increment is out of range of a special opcode, we must encode
+  	// it with DW_LNS_advance_line.
+		if (tmp >= DWARFLineRange || tmp + DWARFLineOpcodeBase > 255) {
+			w.putb(DW_LNS_advance_line);
+			w.put_sleb32(lineDelta);
+
+			lineDelta = 0;
+			tmp = 0 - DWARFLineBase;
+			needCopy = true;
+		}
+		// Use DW_LNS_copy instead of a "line +0, addr +0" special opcode.
+		if (lineDelta == 0 && addrDelta == 0) {
+			w.putb(DW_LNS_copy);
+			return;
+		}
+		// Bias the opcode by the special opcode base.
+  	tmp += DWARFLineOpcodeBase;
+		// Avoid overflow
+		if (addrDelta < 256u + maxSpecialAddrDelta) {
+			// Try using a special opcode.
+			var opcode = tmp + i32.!(addrDelta) * DWARFLineRange;
+			if (opcode <= 255) {
+				w.putb(opcode);
+				return;
+			}
+
+			// Try using DW_LNS_const_add_pc followed by special op.
+			opcode = tmp + (i32.!(addrDelta) - i32.!(maxSpecialAddrDelta)) * DWARFLineRange;
+			if (opcode <= 255) {
+				w.putb(DW_LNS_const_add_pc);
+				w.putb(opcode);
+				return;
+			}
+		}
+		// Otherwise use DW_LNS_advance_pc.
+		w.putb(DW_LNS_advance_pc);
+		w.put_uleb32(addrDelta);
+
+		if (needCopy)
+			w.putb(DW_LNS_copy);
+		else {
+			w.putb(tmp);
+		}
+	}
+	def getULEB128Size(x: u32) -> u32 {
+		return 1;
+	}
+	def basename(filepath: string) -> (string, string) {
+		var path = ".", basename = filepath; 
+		for (i = filepath.length - 1; i >= 0; i--) {
+			if (filepath[i] == '/') {
+				path = Arrays.range(filepath, 0, i);
+				basename = Arrays.range(filepath, i + 1, filepath.length);
+				break;
+			}
+		}
+		return (path, basename);
+	}
+}
+
+class DwarfLineEntry {
+	def fileNum: u32;
+	def line: int;
+	def column: u32;
+	def flags = DWARF_DEFAULT_IS_STMT;
+	def isa: u32;
+	def discriminator: u32;
+	def label: Label;
+	def isEndEntry: bool;
+	new(fileNum, line, column, label) { }
+}
+
+def DW_LNS_extended_op = 0;
+def DW_LNS_copy = 1;
+def DW_LNS_advance_pc = 2;
+def DW_LNS_advance_line = 3;
+def DW_LNS_set_file = 4;
+def DW_LNS_set_column = 5;
+def DW_LNS_negate_stmt = 6;
+def DW_LNS_set_basic_block = 7;
+def DW_LNS_const_add_pc = 8;
+def DW_LNS_fixed_advance_pc = 9;
+def DW_LNS_set_prologue_end = 10;
+def DW_LNS_set_epilogue_begin = 11;
+def DW_LNS_set_isa = 12;
+
+def DW_LNE_end_sequence = 1;
+def DW_LNE_set_address = 2;
+def DW_LNE_define_file = 3;
+def DW_LNE_set_discriminator = 4;
