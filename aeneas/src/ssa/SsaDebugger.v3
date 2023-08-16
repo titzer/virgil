@@ -1,9 +1,11 @@
 // Copyright 2023 Virgil Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// Supported commands
 enum DbgCommand(cmdName: string, alias: string, help: string) {
 	Help("help", "h", "Print help text"),
 	Run("run", "r", "Begin program"),
+	Start("start", "start", "Set a temporary breakpoint on main() and begin program")
 	Continue("continue", "c", "Continue program"),
 	Step("step", "s", "Step program until it reaches a different source line"),
 	Stepi("stepi", "si", "Step one instruction exactly"),
@@ -25,6 +27,7 @@ enum DbgInfo(cmdName: string, alias: string, help: string) {
 	Breakpoints("breakpoints", "b", "Print information about breakpoints"),
 	Locals("locals", "l", "Print information about nonSsa-locals when next instr is a Checkpoint"),
 	Inputs("inputs", "i", "Print information about inputs of next instruction"),
+	Variable("variable", "v", "Print detail information about a variable <index>(es) separated by space"),
 	Invalid("invalid", "invalid", "")
 }
 enum DbgDisplay(cmdName: string, alias: string, help: string) {
@@ -36,14 +39,52 @@ enum DbgDisplay(cmdName: string, alias: string, help: string) {
 
 def PRINT_LIMIT = 30;
 
-enum DbgExecuteOpt(untilBreak: bool, nextLine: bool, jump: bool, fin: bool) {
-	Continue(true, false, false, false),
-	Step(false, true, false, false),
-	Stepi(false, false, false, false),
-	Next(false, true, true, false),
-	Nexti(false, false, true, false),
-	Finish(false, false, false, true),
+enum DbgExecuteOpt(stopFunc: (SsaInstr, int, int) -> bool) {
+	Continue(stopExecuteUntilBreak),
+	Step(stopExecuteStep),
+	Stepi(stopExecuteStepi),
+	Next(stopExecuteNext),
+	Nexti(stopExecuteNexti),
+	Finish(stopExecuteUntilFin),
 }
+def stopExecuteUntilBreak(instr: SsaInstr, interpSp: int, targetSp: int) -> bool {
+	// Breakpoint is processed already, so don't stop here
+	return false;
+}
+def stopExecuteUntilFin(instr: SsaInstr, interpSp: int, targetSp: int) -> bool {
+	if (interpSp < targetSp) return true;
+	else return false;
+}
+def stopExecuteStepi(instr: SsaInstr, interpSp: int, targetSp: int) -> bool {
+	return true;
+}
+def stopExecuteStep(instr: SsaInstr, interpSp: int, targetSp: int) -> bool {
+	if (SsaCheckpoint.?(instr)) return true;
+	else return false;
+}
+def stopExecuteNexti(instr: SsaInstr, interpSp: int, targetSp: int) -> bool {
+	if (interpSp > targetSp) return false;
+	else return true;
+}
+def stopExecuteNext(instr: SsaInstr, interpSp: int, targetSp: int) -> bool {
+	if (interpSp > targetSp) return false;
+	else if (SsaCheckpoint.?(instr)) return true;
+	else return false;
+}
+// Type of reasons of the program stop executing
+enum DbgStopReason {
+	stopOnBreakpoint,
+	stopOnStep,
+	stopOnEntry,
+	end,
+}
+
+class DbgFrame {
+	def localVars = Vector<DbgFrameEntry>.new();
+}
+type DbgFrameEntry(name: string, t: Type, index: int, instr: SsaInstr) #unboxed { }
+
+def INITIAL_FRAMES = 16;
 
 // Implement a GDB-like interface debugger based on SsaInterpreter
 class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaInterpreter) {
@@ -51,15 +92,18 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 	def bps = Vector<Breakpoint>.new();
 	def printer = SsaPrinter.new();
 	def srcPrinter = SrcPrinter.new(prog.vst.files, interp);
-	var fileMethods: Array<Vector<VstMethod>>;
 	var startDel: Closure;
 	var startArgs: Array<Val>;
 	var running: bool;
+	var stopReason: DbgStopReason;
+	var stack = Array<DbgFrame>.new(INITIAL_FRAMES);
+	var frame: DbgFrame;
+	var ip: SsaInstr;
 
 	def invoke(del: Closure, args: Array<Val>) -> Result {
 		startDel = del;
 		startArgs = args;
-		Terminal.put("For help, type \"help\".\n");
+		if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put("For help, type \"help\".\n");
 		var readCommand = true;
 		while (readCommand) {
 			var result = parser.parseCommand(parser.getCommand());
@@ -71,8 +115,11 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		match (command) {
 			Help => printHelp(args);
 			Run => {
-				start();
+				start(false);
 				execute(DbgExecuteOpt.Continue);
+			}
+			Start => {
+				start(true);
 			}
 			Continue => execute(DbgExecuteOpt.Continue);
 			Step => execute(DbgExecuteOpt.Step);
@@ -82,21 +129,30 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 			Finish => execute(DbgExecuteOpt.Finish);
 			Info => {
 				var info = parser.parseInfo(args);
-				match (info) {
+				match (info.0) {
 					Breakpoints => {
 						for (i < bps.length) Terminal.put2("%d: %q\n", i, bps[i].render);
 					}
 					Locals => infoLocals();
 					Inputs => infoInputs();
+					Variable => {
+						if (running) {
+							var res = infoVal(info.1);
+							if (!res && !CLOptions.DEBUG_EXTENSION.get()) Terminal.put("Nothing to show\n");
+						}
+						if (CLOptions.DEBUG_EXTENSION.get()) Terminal.put("variableDone\n");
+					}
 					Invalid => Terminal.put1("Invalid info args: %s\n", args);
 				}
 			}
 			Breakpoint => {
 				var result = parser.parseBreakpoint(args);
+				var idx = -1, source: Source;
 				if (result.0.length > 0 && insertBreakpoint(result)) {
-					var idx = bps.length-1, ssa = bps[idx].ssa;
-					Terminal.put2("Breakpoint %d %q\n", idx, ssa.source.render);
-				} else Terminal.put1("Invalid breakpoint args: %s\n", args);
+					idx = bps.length-1;
+					source = bps[idx].ssa.source;
+				}
+				putBreakpoint(args, idx, source);
 			}
 			DisableBreakpoint => {
 				handleBreakpoint(args, false);
@@ -107,11 +163,11 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 			Backtrace => {
 				if (running) {
 					var source: Source;
-					if (SsaCheckpoint.?(interp.frame.ip)) source = SsaCheckpoint.!(interp.frame.ip).source;
+					if (SsaCheckpoint.?(ip)) source = SsaCheckpoint.!(ip).source;
 					var trace = interp.getStackTrace(source);
 					for (list = trace; list != null; list = list.tail) {
 						for (s = list.head; s != null; s = s.tail) {
-							Terminal.put1("\t%q\n", s.render);
+							putBacktrace(s);
 						}
 					}
 				}
@@ -149,52 +205,62 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		return true;
 	}
 	// Start the program to be debugged in the interpreter
-	def start() {
+	def start(stopOnEntry: bool) {
 		interp.reset();
 		srcPrinter.reset();
-		Terminal.put2("Starting program: %s with method %q\n", interp.prog.name(), startDel.memberRef.render);
-		if (startArgs != null) for (i < startArgs.length) Terminal.put2("args %d: %s\n", i, V3.renderVal(startArgs[i]));
+		if (!CLOptions.DEBUG_EXTENSION.get()) {
+			Terminal.put2("Starting program: %s with method %q\n", interp.prog.name(), startDel.memberRef.render);
+			if (startArgs != null) {
+				for (i < startArgs.length) Terminal.put2("args %d: %s\n", i, V3.renderVal(startArgs[i]));
+			}
+		}
 		interp.pushFrame(startDel.memberRef, startDel.val, startArgs);
+		pushFrame(); // push the first frame
+		ip = interp.frame.ip;
 		running = true;
+		if (stopOnEntry) {
+			stopReason = DbgStopReason.stopOnEntry;
+			var targetSp = interp.sp;
+			while (!stopExecute(ip, DbgExecuteOpt.Step, targetSp)) {
+				step(targetSp);
+				if (!running) break;
+			}
+			printExecuteResult();
+		}
 	}
 	// Step debugged program and stop depending on condition
 	def execute(opt: DbgExecuteOpt) {
-		if (!running) start(); // ???: start or return?
+		if (!running) return;
+		stopReason = DbgStopReason.stopOnStep;
 		var targetSp = interp.sp;
-		var prev = interp.frame.ip;
-		var n = interp.step(interp.frame.ip);
-		if (interp.frame == null) {
-			running = false;
-			printExecuteResult();
-			return;
-		}
-		srcPrinter.putData(prev, targetSp);
-		interp.frame.ip = n;
-		while (!stopExecute(n, opt, targetSp)) {
-			prev = interp.frame.ip;
-			n = interp.step(interp.frame.ip);
-			if (interp.frame == null) {
-				running = false;
-				break;
-			}
-			srcPrinter.putData(prev, targetSp);
-			interp.frame.ip = n;
+		step(targetSp);
+		while (running && !stopExecute(ip, opt, targetSp)) {
+			step(targetSp);
 		}
 		if (srcPrinter.on) srcPrinter.out();
 		printExecuteResult();
 	}
+	def step(targetSp: int) {
+		var prevSp = interp.sp, prev = ip;
+		var n = interp.step(prev);
+		if (interp.frame == null) {
+			stopReason = DbgStopReason.end;
+			running = false;
+			return;
+		}
+		srcPrinter.putData(prev, targetSp);
+		interp.frame.ip = n;
+		updateLocals(prevSp);
+		ip = interp.frame.ip;
+	}
 	// Decide whether to stop execution or not
 	def stopExecute(instr: SsaInstr, opt: DbgExecuteOpt, targetSp: int) -> bool {
-		if (isBreakpoint(instr)) return true;
-		if (opt.untilBreak) return false;
-		if (opt.fin) {
-			if (interp.sp < targetSp) return true;
-			else return false;
-		} 
-		if (!opt.nextLine && !opt.jump) return true; // stepi
-		if (opt.jump && interp.sp > targetSp) return false; // next(i), jump over function
-		if (!opt.nextLine || (opt.nextLine && SsaCheckpoint.?(instr))) return true;
-		return false;
+		if (SsaNewVar.?(instr) || SsaDeleteVar.?(instr)) return false;
+		if (isBreakpoint(instr)) {
+			stopReason = DbgStopReason.stopOnBreakpoint;
+			return true;
+		}
+		return opt.stopFunc(instr, interp.sp, targetSp);
 	}
 	def isBreakpoint(instr: SsaInstr) -> bool {
 		if (!SsaCheckpoint.?(instr)) return false;
@@ -202,112 +268,154 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		if (checkpoint.breakpoint) return true;
 		else return false;
 	}
+	// Add a new frame on stack
+	def pushFrame() {
+		var sp = interp.sp;
+		if (sp >= stack.length) stack = Arrays.grow(stack, stack.length * 4);
+		frame = stack[sp];
+		if (frame == null) frame = stack[sp] = DbgFrame.new();
+		frame.localVars.resize(0);
+	}
+	// Update local variables information
+	def updateLocals(prevSp: int) {
+		var sp = interp.sp;
+		// Compare prev stack pointer to add or remove frame
+		if (sp > prevSp) {
+			pushFrame();
+		} else if (sp < prevSp) {
+			frame = stack[sp];
+		}
+		if (SsaNewVar.?(ip)) {
+			var ip = SsaNewVar.!(ip);
+			var instr: SsaInstr = if (ip.index == -1, ip.inputs[0].dest); // Store instr if is SsaVar
+			frame.localVars.put(DbgFrameEntry(ip.name, ip.vtype, ip.index, instr));
+		} else if (SsaDeleteVar.?(ip)) {
+			var resizeTo = frame.localVars.length - SsaDeleteVar.!(ip).n;
+			frame.localVars.resize(resizeTo);
+		}
+	}
 	// Print next instruction or the final result of the debugger program
 	def printExecuteResult() {
+		if (CLOptions.DEBUG_EXTENSION.get()) {
+			Terminal.put1("stop|%s\n", stopReason.name);
+			if (interp.frame == null) printProgramResult();
+			return;
+		}
 		if (interp.frame != null) {
 			for (j < interp.sp-1) printer.buf.puts("  ");
 			printer.buf.blue().puts("=>").end();
-			printer.printInstr(interp.frame.ip, false, true, false, false);
+			printer.printInstr(ip, false, true, false, false);
 			printer.outln();
 		} else {
-			var result = if (interp.exception == null, interp.retVal, interp.exception);
-			var rettype = interp.prog.getMain().getReturnType();
-			printer.buf.puts("Program exited: ");
-			V3.renderResult(result, rettype, printer.buf);
-			printer.outln();
+			printProgramResult();
 		}
+	}
+	def printProgramResult() {
+		var result = if (interp.exception == null, interp.retVal, interp.exception);
+		var rettype = interp.prog.getMain().getReturnType();
+		if (CLOptions.DEBUG_EXTENSION.get()) printer.buf.puts("result|");
+		else printer.buf.puts("Program exited: ");
+		V3.renderResult(result, rettype, printer.buf);
+		printer.outln();
 	}
 	def infoLocals() {
-		if (!running || !SsaCheckpoint.?(interp.frame.ip)) return;
-		var nonSsaVars = interp.frame.meth.source.nonSsaVars;
-		var inputs = interp.frame.ip.inputs;
-		for (i < nonSsaVars.length) {
-			var instr = inputs[i].dest;
-			if (instr != null) {
-				printer.buf.put2("%d. \"%s\": ", i, nonSsaVars[i].name());
-				printer.buf.putref(instr).putc('=');
-				putVal(interp.getVal(instr), nonSsaVars[i].vtype);
-			}
+		if (!running || !SsaCheckpoint.?(ip)) return;
+		var inputs = ip.inputs;
+		var more = false;
+		for (i < frame.localVars.length) {
+			var v = frame.localVars[i];
+			var instr = if (v.index >= 0, inputs[v.index].dest, v.instr);
+			var val = interp.getVal(instr);
+			putVal(i, v.name, val, v.t);
+			if (Record.?(val)) more = true;
 		}
-		infoVal(inputs);
+		moreInfo(more);
 	}
 	def infoInputs() {
-		var inputs = interp.frame.ip.inputs;
-		var vtypes = if (SsaApplyOp.?(interp.frame.ip), SsaApplyOp.!(interp.frame.ip).op.typeArgs);
+		if (!running) return;
+		var inputs = ip.inputs;
+		var vtypes = if (SsaApplyOp.?(ip), SsaApplyOp.!(ip).op.typeArgs);
+		var more = false;
 		for (i < inputs.length) {
 			var instr = inputs[i].dest;
-			if (instr != null) {
-				printer.buf.put1("%d. ", i);
-				printer.buf.putref(instr).putc('=');
-				putVal(interp.getVal(instr), if(vtypes!=null, vtypes[i]));
-			}
-		}
-		infoVal(inputs);
-	}
-	def infoVal(inputs: Array<SsaDfEdge>) {
-		if (inputs.length == 0) return;
-		Terminal.put("More info? (index): ");
-		var result = parser.getInt();
-		if (result.0 && result.1 < inputs.length) {
-			var instr = inputs[result.1].dest;
-			if (instr == null) {
-				Terminal.put("Nothing to show\n");
-				return;
-			}
+			var vtype = if(vtypes != null && i < vtypes.length, vtypes[i]);
+			vtype = if(vtype == null && SsaConst.?(instr), SsaConst.!(instr).vtype, vtype);
 			var val = interp.getVal(instr);
-			if (Record.?(val)) {
-				var r = Record.!(val), line = r.values.length;
-				if (line > PRINT_LIMIT) {
-					Terminal.put1("Do you wish to see all output (%d lines)? ", line);
-					if (!parser.getBool()) return;
-				}
-				if (V3.isClass(r.rtype)) {
-					var irclass = prog.ir.getIrClass(r.rtype);
-					for (i < r.values.length) {
-						var field = irclass.fields[i];
-						printer.buf.put1(".%q=", field.render);
-						putVal(r.values[i], irclass.fields[i].fieldType);
-					}
-					return;
-				} else if (V3.isArray(r.rtype)) {
-					for (i < r.values.length) {
-						printer.buf.put1("[%d]=", i);
-						putVal(r.values[i], null);
-					}
-					return;
-				}
+			putVal(i, null, val, vtype);
+			if (Record.?(val)) more = true;
+		}
+		moreInfo(more);
+	}
+	// Get more info for a object/array variable
+	def moreInfo(more: bool) {
+		if (more && !CLOptions.DEBUG_EXTENSION.get()) {
+			Terminal.put("More info? (index): ");
+			var result = parser.getInt();
+			if (result.0) {
+				var res = infoVal([result.1]);
+				if (!res) Terminal.put("Nothing to show\n");
 			}
-			Terminal.put("Nothing to show\n");
 		}
 	}
-	def putVal(val: Val, vtype: Type) {
-		printer.buf.puthashv(val, vtype).end();
-		if (vtype != null) {
-			printer.buf.putc(':').typeColor();
-			vtype.render(printer.buf);
-			printer.buf.end().outln();
-		} else {
-			printer.buf.outln();
+	// Get a object/array var info by traversing levels of variables.
+	// Return false if {infoIdx} out of bound or target var is either an object or array.
+	def infoVal(infoIdx: Array<int>) -> bool {
+		var instr: SsaInstr;
+		var inputs = ip.inputs;
+		// First level
+		match(ip) {
+			x: SsaApplyOp => {
+				if (infoIdx[0] < inputs.length) {
+					instr = inputs[infoIdx[0]].dest;
+				}
+			}
+			x: SsaCheckpoint => {
+				if (infoIdx[0] < frame.localVars.length) {
+					var v = frame.localVars[infoIdx[0]];
+					instr = if (v.index >= 0, inputs[v.index].dest, v.instr);
+				}
+			}
 		}
+		if (instr == null) return false;
+		var val = interp.getVal(instr);
+		// Traverse through the rest of the levels
+		for (j = 1; j < infoIdx.length; j++) {
+			if (Record.?(val) && infoIdx[j] < Record.!(val).values.length) val = Record.!(val).values[infoIdx[j]];
+			else return false;
+		}
+		if (!Record.?(val)) return false;
+		var r = Record.!(val), line = r.values.length;
+		if (!CLOptions.DEBUG_EXTENSION.get() && line > PRINT_LIMIT) {
+			Terminal.put1("Do you wish to see all output (%d lines)? ", line);
+			if (!parser.getBool()) return true;
+		}
+		match(r.rtype) {
+			x: ClassType => {
+				var irclass = prog.ir.getIrClass(r.rtype);
+				for (i < r.values.length) {
+					var name = irclass.fields[i].render(StringBuilder.new()).toString();
+					putVal(i, name, r.values[i], irclass.fields[i].fieldType);
+				}
+			}
+			x: ArrayType => {
+				for (i < r.values.length) {
+					putVal(i, null, r.values[i], x.elementType());
+				}
+			}
+			_ => return false;
+		}
+		return true;
 	}
 	def insertBreakpoint(fileName: string, line: int) -> bool {
 		for (i < prog.files.length) {
 			if (Strings.equal(prog.files[i], fileName)) {
-				if (line < prog.vst.files[i].lineEnds.length) {
+				if (line <= prog.vst.files[i].lineEnds.length + 1) {
 					var vstFile = prog.vst.files[i];
 					for (i < vstFile.classes.length) {
-						var vstMethod = findMethod(vstFile.classes[i], line);
-						if (vstMethod != null) {
-							if (insertBreakpointCL(vstFile.classes[i], vstMethod, line)) return true;
-							return false;
-						}
+						if (insertBreakpointVst(vstFile.classes[i], line)) return true;
 					}
 					for (i < vstFile.components.length) {
-						var vstMethod = findMethod(vstFile.components[i], line);
-						if (vstMethod != null) {
-							if (insertBreakpointCL(vstFile.components[i], vstMethod, line)) return true;
-							return false;
-						}
+						if (insertBreakpointVst(vstFile.components[i], line)) return true;
 					}
 				}
 				return false;
@@ -315,16 +423,21 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		}
 		return false;
 	}
-	def findMethod(vstCompound: VstCompound, line: int) -> VstMethod {
+	def insertBreakpointVst(vstCompound: VstCompound, line: int) -> bool {
+		var vstMethods = Vector<VstMethod>.new();
 		var members = vstCompound.members;
 		for (l = members; l != null; l = l.tail) {
+			// Find potential method contains target line (constructor might share same line with another method)
 			if (VstMethod.?(l.head) && VstMethod.!(l.head).body.range().contains(line, 0)) {
-				return VstMethod.!(l.head);
+				vstMethods.put(VstMethod.!(l.head));
 			}
 		}
-		return null;
+		for (i < vstMethods.length) {
+			if (insertBreakpointM(vstCompound, vstMethods[i], line)) return true;
+		}
+		return false;
 	}
-	def insertBreakpointCL(vstCompound: VstCompound, vstMethod: VstMethod, line: int) -> bool {
+	def insertBreakpointM(vstCompound: VstCompound, vstMethod: VstMethod, line: int) -> bool {
 		var ctype = vstCompound.getDeclaredType();
 		var irClass = prog.ir.getIrClass(ctype);
 		var irMethod: IrMethod;
@@ -334,11 +447,10 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 				break;
 			}
 		}
+		if (irMethod == null) return false;
 		// Generate ssa if haven't
 		if (irMethod.ssa == null) {
-			var receiver = vstCompound.declType;
-			var ta = if(irMethod.typeArgs != null, Arrays.prepend(receiver, irMethod.typeArgs.types), [receiver]);
-			var spec = prog.ir.fromIrMemberAndTypes(ta, irMethod);
+			var spec = prog.ir.fromVstMember(vstMethod);
 			irMethod.ssa = genSsa(spec, 0);
 		}
 		// Iterate ssa to find SsaCheckpoint pointing to line
@@ -386,15 +498,48 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		printer.buf.pad(' ', 16);
 		printer.buf.puts(help).outln();
 	}
+	def putBreakpoint(args: string, idx: int, source: Source) {
+		if (CLOptions.DEBUG_EXTENSION.get()) Terminal.put2("breakpoint|%s|%d\n", args, idx);
+		else {
+			if (idx == -1) Terminal.put1("Invalid breakpoint args: %s\n", args);
+			else Terminal.put2("Breakpoint %d %q\n", idx, source.render);
+		}
+	}
+	def putVal(i: int, name: string, val: Val, vtype: Type) {
+		if (CLOptions.DEBUG_EXTENSION.get()) {
+			if (name == null) name = Strings.format1("%d", i);
+			extPutVariable(i, name, val, vtype);
+		} else {
+			printer.buf.put1("%d. ", i);
+			if (name != null) printer.buf.put1("%s: ", name);
+			printer.buf.puthashv(val, vtype).end();
+			printer.printColonType(vtype);
+			printer.outln();
+		}
+	}
+	def extPutVariable(idx: int, name: string, val: Val, vtype: Type) {
+		// variable|idx|name|value|type|ref
+		Terminal.put2("variable|%d|%s|", idx, name);
+		V3.renderResult(val, vtype, printer.buf);
+		printer.buf.putc('|');
+		if (vtype != null) vtype.render(printer.buf);
+		printer.buf.put1("|%z", (Record.?(val)));
+		printer.outln();
+	}
+	def putBacktrace(s: Source) {
+		if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put1("\t%q\n", s.render);
+		else Terminal.put3("bt|%q|%s|%d\n", s.mdecl.renderLong, s.mdecl.token.fileName, s.line);
+	}
 }
 
 def INVALID = -1;
+// Support class to read command from stdin
 class DebuggerParser {
 	def STDIN = 0;
 
 	def getCommand() -> string {
 		var sb = StringBuilder.new();
-		System.puts("(debug) ");
+		if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put("(debug) ");
 		var ch = byte.!(System.fileRead(STDIN));
 		while (ch != '\n') {
 			sb.putc(ch);
@@ -421,12 +566,27 @@ class DebuggerParser {
 		}
 		return (DbgCommand.Unknown, command);
 	}
-	def parseInfo(args: string) -> DbgInfo {
-		if (args.length == 0) return DbgInfo.Invalid;
-		for (e in DbgInfo) {
-			if (Strings.equal(args, e.alias) || Strings.equal(args, e.cmdName)) return e;
+	def parseInfo(args: string) -> (DbgInfo, Array<int>) {
+		if (args.length == 0) return (DbgInfo.Invalid, null);
+		var infoType = "";
+		var infoIdx = Vector<int>.new();
+		for (i < args.length) {
+			if (args[i] == ' ') {
+				infoType = Arrays.range(args, 0, i);
+				var sepIdx = i + 1;
+				while (sepIdx < args.length) {
+					var result = Ints.parseDecimal(args, sepIdx);
+					if (result.0 > 0) infoIdx.put(result.1);
+					sepIdx += result.0 + 1;
+				}
+				break;
+			}
 		}
-		return DbgInfo.Invalid;
+		if (infoType.length == 0) infoType = args;
+		for (e in DbgInfo) {
+			if (Strings.equal(infoType, e.alias) || Strings.equal(infoType, e.cmdName)) return (e, infoIdx.extract());
+		}
+		return (DbgInfo.Invalid, null);
 	}
 	def parseBreakpoint(args: string) -> (/*fileName*/string, /*line*/int) {
 		if (args.length == 0) return ("", 0);
@@ -496,11 +656,12 @@ class Breakpoint {
 
 def storeLimit = 50;
 def storeRemove = 10;
+// Prints the source code along with instruction's execution result
 class SrcPrinter(vstFiles: Array<VstFile>, interp: SsaInterpreter) {
 	def padNum = 6;
-	def tmpBuf = TerminalBuffer.new();
+	def tmpBuf = TerminalBuffer.new(); // current line
 	def outBuf = TerminalBuffer.new();
-	def ends = Vector<int>.new();
+	def ends = Vector<int>.new(); // offset to an end of a souce line
 	var on: bool;
 	var traceCallee: bool;
 	var indent: int;
@@ -518,6 +679,7 @@ class SrcPrinter(vstFiles: Array<VstFile>, interp: SsaInterpreter) {
 	def putData(instr: SsaInstr, targetSp: int) {
 		if (!traceCallee && interp.sp != targetSp) return;
 		if (SsaCheckpoint.?(instr)) {
+			// Retrieve source code
 			var source = SsaCheckpoint.!(instr).source;
 			var point = FilePoint.new(null, source.line, source.column);
 			var vstFile = getVstFile(source.mdecl.token.fileName);
@@ -528,8 +690,10 @@ class SrcPrinter(vstFiles: Array<VstFile>, interp: SsaInterpreter) {
 			outBuf.puts(tmpBuf.extract());
 			outBuf.puts(point.extractLine(vstFile.input, vstFile.lineEnds)).ln();
 		} else if (SsaApplyOp.?(instr)) {
+			// Put input value
 			putVal(instr);
 		} else if (SsaReturn.?(instr)) {
+			// Put return value
 			var i = interp.stack[interp.sp - 1].ip; // Caller instr
 			if (!SsaApplyOp.?(i)) return;
 			putVal(i);
@@ -594,6 +758,7 @@ class SrcPrinter(vstFiles: Array<VstFile>, interp: SsaInterpreter) {
 			targetSp++;
 		}
 	}
+	// Extract tmpBuf and append to outBuf if tmpBuf's length is greater than {len}
 	def extractTmpConstraint(len: int) {
 		if (tmpBuf.length >= len) {
 			putPad();
