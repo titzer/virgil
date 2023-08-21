@@ -25,20 +25,27 @@ class Dwarf {
 		// .debug_str
 		var sectionStart = w.pos;
 		var buf = StringBuilder.new();
+		// Iterate methods and add required abbrev tags
 		for (i < prog.ir.methods.length) {
 			var m = prog.ir.methods[i];
 			if (m.source == null) continue;
 			var addr = mach.methodMap[m];
 			if (addr == null || addr.absolute < 0) continue;
-			var offset = w.pos - sectionStart;
-			var entry: DwarfSubprogram;
-			if (m.source.body != null) {
-				var fileRange = m.source.body.range(), fileNum = dirFile.files[fileRange.fileName].index;
-				entry = DwarfSubprogram.new(offset, fileNum, fileRange.beginLine, addr.absolute, addr.size);
-			} else {
-				entry = DwarfSubprogram.new(offset, 0, 0, addr.absolute, addr.size);
-			}
+			var entry = DwarfSubprogram.new();
 			info.subprograms.put(entry);
+			entry.name = w.pos - sectionStart;
+			entry.low_pc = addr.absolute;
+			entry.high_pc = u32.!(addr.size);
+			entry.rettype = m.source.getReturnType();
+			var hasRet = !VoidType.?(entry.rettype);
+			if (hasRet) info.putType(entry.rettype);
+			var hasFile = if(m.source.body != null, true);
+			if (hasFile) {
+				var fileRange = m.source.body.range();
+				entry.decl_file = dirFile.files[fileRange.fileName].index;
+				entry.decl_line = u32.!(fileRange.beginLine);
+			}
+			entry.abbrev = abbrev.getSubprogramAbbrev(hasFile, hasRet);
 			buf.reset();
 			m.source.renderLong(buf);
 			buf.out(w.putkv);
@@ -137,43 +144,15 @@ def putLength(w: DataWriter, start: int) {
 	w.atEnd();
 }
 
-class DwarfSubprogram {
-	def name: int;
-	def decl_file: u32;
-	var decl_line: u32;
-	def low_pc: long;
-	var high_pc: u32;
-	var abbrev: int;
-	new (name, decl_file, line: int, low_pc, size: long) {
-		abbrev = if (decl_file > 0, 2, 3);
-		decl_line = u32.!(line);
-		high_pc = u32.!(size);
-	}
-	def emit(w: DataWriter) {
-		match (abbrev) {
-			2 => {
-				w.put_uleb32(2u); // DW_TAG_subprogram DIE abbrev (2)
-				w.put_b32(name);
-				w.put_uleb32(decl_file);
-				w.put_uleb32(decl_line);
-				w.put_b64(low_pc);
-				w.put_uleb32(high_pc);
-			}
-			3 => {
-				w.put_uleb32(3); // DW_TAG_subprogram DIE abbrev (3)
-				w.put_b32(name);
-				w.put_b64(low_pc);
-				w.put_uleb32(high_pc);
-			}
-		}
-	}
-}
-
 class DwarfInfoSection {
 	def subprograms = Vector<DwarfSubprogram>.new();
+	def typeRef = TypeUtil.newTypeMap<int>();
+	def buf = StringBuilder.new();
+	var info_start: int;
+	var w: DataWriter;
 
 	def emit(dirFile: DwarfDirFile, w: DataWriter, codeStart: long, codeSize: long) {
-		var unitLengthStart = w.pos;
+		info_start = w.pos;
 		w.skipN(DWARF_LENGTH_SIZE); // unit_length
 		w.put_b16(DWARF_VERSION); // version
 		w.putb(DW.DW_UT_compile);
@@ -186,18 +165,68 @@ class DwarfInfoSection {
 		w.put_b64(codeStart);
 		w.put_b64(codeSize);
 		w.put_b32(0); // DW_AT_stmt_list
-		// DW_TAG_subprogram DIE abbrev (2) or (3)
+		// DW_TAG_base_type
+		this.w = w;
+		typeRef.apply(emitBaseType);
+		// DW_TAG_subprogram DIE abbrev
 		for (i < subprograms.length) {
-			subprograms[i].emit(w);
+			subprograms[i].emit(w, typeRef);
 		}
-		putLength(w, unitLengthStart);
+		putLength(w, info_start);
+	}
+	def emitBaseType(t: Type, v: int) {
+		typeRef[t] = w.pos - info_start;
+		var byteSize: int, encoding: int;
+		match (t) {
+			x: IntType => {
+				byteSize = x.size;
+				encoding = if (V3.isSigned(x), DW.DW_ATE_signed, DW.DW_ATE_unsigned);
+			}
+			x: VoidType => return;
+		}
+		w.put_uleb32(2); // DW_TAG_base_type (2)
+		w.putb(byteSize); // DW_AT_byte_size
+		w.putb(encoding); // DW_AT_encoding
+		buf.reset();
+		t.render(buf); // DW_AT_name
+		buf.out(w.putkv);
+		w.putb(0);
+	}
+	def putType(t: Type) {
+		typeRef[t] = 0;
 	}
 }
 
+class DwarfSubprogram {
+	var name: int;
+	var decl_file: u32;
+	var decl_line: u32;
+	var low_pc: long;
+	var high_pc: u32;
+	var abbrev: u32;
+	var rettype: Type;
+	def emit(w: DataWriter, typeRef: HashMap<Type, int>) {
+		w.put_uleb32(abbrev);
+		w.put_b32(name);
+		if (decl_file > 0) {
+			w.put_uleb32(decl_file);
+			w.put_uleb32(decl_line);
+		}
+		if (!VoidType.?(rettype)) w.put_b32(typeRef[rettype]);
+		w.put_b64(low_pc);
+		w.put_uleb32(high_pc);
+	}
+}
+
+var Abbrev_code: u32 = 3; // unique code for abbrev tag
+
 class DwarfAbbrevSection {
+	def abbrev = Vector<DwarfAbbrev>.new();
+	def subprogram: Array<int> = [-1, -1, -1, -1];
+
 	def emit(w: DataWriter) {
 		// DW_TAG_compile_unit DIE abbrev (1)
-		w.put_uleb32(1u);
+		w.put_uleb32(1);
 		w.put_uleb32(DW.DW_TAG_compile_unit);
 		w.putb(DW.DW_children_yes);
 		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_line_strp);
@@ -206,29 +235,57 @@ class DwarfAbbrevSection {
 		emitAbbrev(w, DW.DW_AT_high_pc, DW.DW_FORM_data8);
 		emitAbbrev(w, DW.DW_AT_stmt_list, DW.DW_FORM_sec_offset);
 		emitAbbrev(w, 0, 0);
-		// DW_TAG_subprogram DIE abbrev (2)
+		// DW_TAG_base_type (2)
 		w.put_uleb32(2);
-		w.put_uleb32(DW.DW_TAG_subprogram);
+		w.put_uleb32(DW.DW_TAG_base_type);
 		w.putb(DW.DW_children_no);
-		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_strp);
-    emitAbbrev(w, DW.DW_AT_decl_file, DW.DW_FORM_udata);
-    emitAbbrev(w, DW.DW_AT_decl_line, DW.DW_FORM_udata);
-		emitAbbrev(w, DW.DW_AT_low_pc, DW.DW_FORM_addr);
-		emitAbbrev(w, DW.DW_AT_high_pc, DW.DW_FORM_udata);
+		emitAbbrev(w, DW.DW_AT_byte_size, DW.DW_FORM_data1);
+		emitAbbrev(w, DW.DW_AT_encoding, DW.DW_FORM_data1);
+		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_string);
 		emitAbbrev(w, 0, 0);
-		// DW_TAG_subprogram DIE abbrev (3)
-		w.put_uleb32(3);
-		w.put_uleb32(DW.DW_TAG_subprogram);
-		w.putb(DW.DW_children_no);
-		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_strp);
-		emitAbbrev(w, DW.DW_AT_low_pc, DW.DW_FORM_addr);
-		emitAbbrev(w, DW.DW_AT_high_pc, DW.DW_FORM_udata);
-		emitAbbrev(w, 0, 0);
+
+		for (i < abbrev.length) {
+			abbrev[i].emit(w);
+		}
 		w.putb(0); // terminate section
 	}
 	def emitAbbrev(w: DataWriter, name: u32, form: u32) {
 		w.put_uleb32(name);
 		w.put_uleb32(form);
+	}
+	def getSubprogramAbbrev(hasFile: bool, hasRet: bool) -> u32 {
+		var id = (if(hasFile, 1) << 1) | if(hasRet, 1);
+		if (subprogram[id] == -1) {
+			subprogram[id] = abbrev.length;
+			abbrev.put(DwarfSubprogramAbbrev.new(hasFile, hasRet));
+		}
+		return abbrev[subprogram[id]].code;
+	}
+}
+
+class DwarfAbbrev {
+	def code = Abbrev_code++;
+	def emit(w: DataWriter);
+	def emitAbbrev(w: DataWriter, name: u32, form: u32) {
+		w.put_uleb32(name);
+		w.put_uleb32(form);
+	}
+}
+
+class DwarfSubprogramAbbrev(hasFile: bool, hasRet: bool) extends DwarfAbbrev {
+	def emit(w: DataWriter) {
+		w.put_uleb32(code);
+		w.put_uleb32(DW.DW_TAG_subprogram);
+		w.putb(DW.DW_children_no);
+		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_strp);
+		if (hasFile) {
+			emitAbbrev(w, DW.DW_AT_decl_file, DW.DW_FORM_udata);
+			emitAbbrev(w, DW.DW_AT_decl_line, DW.DW_FORM_udata);
+		}
+		if (hasRet) emitAbbrev(w, DW.DW_AT_type, DW.DW_FORM_ref4);
+		emitAbbrev(w, DW.DW_AT_low_pc, DW.DW_FORM_addr);
+		emitAbbrev(w, DW.DW_AT_high_pc, DW.DW_FORM_udata);
+		emitAbbrev(w, 0, 0);
 	}
 }
 
