@@ -1,0 +1,496 @@
+// Copyright 2023 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def DWARF_VERSION = 5;
+def DWARF_LENGTH_SIZE = 4; // 32-bit Dwarf format
+
+def CODE_POINTER_SIZE32: u8 = 4;
+def CODE_POINTER_SIZE64: u8 = 8;
+var codePointerSize: u8;
+
+class Dwarf {
+	def elf: ElfHeader;
+	def sections: ElfSections;
+	def debugs = sections.debugs;
+	def prog: Program;
+	def mach: MachProgram;
+	def dirFile = DwarfDirFile.new(prog);
+	def info = DwarfInfoSection.new();
+	def abbrev = DwarfAbbrevSection.new();
+	def line = DwarfLineSection.new(dirFile);
+	new(elf, sections, prog, mach) {
+		codePointerSize = if(elf.is64(), CODE_POINTER_SIZE64, CODE_POINTER_SIZE32);
+	}
+	def emit(w: DataWriter) {
+		// .debug_str
+		var sectionStart = w.pos;
+		var buf = StringBuilder.new();
+		for (i < prog.ir.methods.length) {
+			var m = prog.ir.methods[i];
+			if (m.source == null) continue;
+			var addr = mach.methodMap[m];
+			if (addr == null || addr.absolute < 0) continue;
+			var offset = w.pos - sectionStart;
+			var entry: DwarfSubprogram;
+			if (m.source.body != null) {
+				var fileRange = m.source.body.range(), fileNum = dirFile.files[fileRange.fileName].index;
+				entry = DwarfSubprogram.new(offset, fileNum, fileRange.beginLine, addr.absolute, addr.size);
+			} else {
+				entry = DwarfSubprogram.new(offset, 0, 0, addr.absolute, addr.size);
+			}
+			info.subprograms.put(entry);
+			buf.reset();
+			m.source.renderLong(buf);
+			buf.out(w.putkv);
+			w.putb(0);
+		}
+		putSectionInfo(DebugSection.str.tag, sectionStart, w);
+
+		// .debug_info
+		sectionStart = w.pos;
+		info.emit(dirFile, w, sections.text.sh_addr, sections.text.sh_size);
+		putSectionInfo(DebugSection.info.tag, sectionStart, w);
+
+		// .debug_abbrev
+		sectionStart = w.pos;
+		abbrev.emit(w);
+		putSectionInfo(DebugSection.abbrev.tag, sectionStart, w);
+
+		// .debug_line_str
+		line.w = w;
+		sectionStart = w.pos;
+		line.emitLineStr();
+		putSectionInfo(DebugSection.line_str.tag, sectionStart, w);
+
+		// .debug_line
+		sectionStart = w.pos;
+		line.codeStart = sections.text.sh_addr;
+		line.codeSize = sections.text.sh_size;
+		line.emit();
+		putSectionInfo(DebugSection.line.tag, sectionStart, w);
+	}
+	def putSectionInfo(tag: int, start: int, w: DataWriter) {
+		debugs[tag].sh_offset = start;
+		debugs[tag].sh_size = w.pos - start;
+	}
+}
+
+class DwarfDir {
+	def directory: string;
+	def index: u32;
+	var offset: int;
+	new(directory, index) { }
+}
+class DwarfFile {
+	def filename: string;
+	var index: u32;
+	var offset: int;
+	def dirIdx: u32;
+	new(filename, dirIdx) { }
+}
+class DwarfDirFile {
+	def compilationDir = DwarfDir.new(CLOptions.DWARF_CWD.val, 0u);
+	var rootFile: DwarfFile;
+	var dirCount: u32 = 1;
+	var fileCount: u32 = 1;
+	var dirs = HashMap<string, DwarfDir>.new(Strings.hash, Strings.equal);
+	def files = HashMap<string, DwarfFile>.new(Strings.hash, Strings.equal);
+	def dirOrder = Vector<DwarfDir>.new();
+
+	new(prog: Program) {
+		rootFile = toDwarfFile(prog.getMain().asMethod().source.body.range().fileName);
+		for (i < prog.files.length) {
+			var tmp = toDwarfFile(prog.files[i]);
+			files[prog.files[i]] = tmp;
+		}
+		dirs = null;
+		files.apply(orderFile);
+	}
+	def toDwarfFile(filepath: string) -> DwarfFile {
+		var r = basename(filepath), dir = r.0, file = r.1;
+		if (!dirs.has(dir)) {
+			dirs[dir] = DwarfDir.new(dir, dirCount++);
+			dirOrder.put(dirs[dir]);
+		}
+		return DwarfFile.new(file, dirs[dir].index);
+	}
+	def basename(filepath: string) -> (string, string) {
+		var path = ".", basename = filepath; 
+		for (i = filepath.length - 1; i >= 0; i--) {
+			if (filepath[i] == '/') {
+				path = Arrays.range(filepath, 0, i);
+				basename = Arrays.range(filepath, i + 1, filepath.length);
+				break;
+			}
+		}
+		return (path, basename);
+	}
+	def orderFile(name: string, info: DwarfFile) {
+		info.index = fileCount++;
+	}
+}
+
+def putLength(w: DataWriter, start: int) {
+	var length = w.pos - start - DWARF_LENGTH_SIZE;
+	w.at(start);
+	w.put_b32(length);
+	w.atEnd();
+}
+
+class DwarfSubprogram {
+	def name: int;
+	def decl_file: u32;
+	var decl_line: u32;
+	def low_pc: long;
+	var high_pc: u32;
+	var abbrev: int;
+	new (name, decl_file, line: int, low_pc, size: long) {
+		abbrev = if (decl_file > 0, 2, 3);
+		decl_line = u32.!(line);
+		high_pc = u32.!(size);
+	}
+	def emit(w: DataWriter) {
+		match (abbrev) {
+			2 => {
+				w.put_uleb32(2u); // DW_TAG_subprogram DIE abbrev (2)
+				w.put_b32(name);
+				w.put_uleb32(decl_file);
+				w.put_uleb32(decl_line);
+				w.put_b64(low_pc);
+				w.put_uleb32(high_pc);
+			}
+			3 => {
+				w.put_uleb32(3); // DW_TAG_subprogram DIE abbrev (3)
+				w.put_b32(name);
+				w.put_b64(low_pc);
+				w.put_uleb32(high_pc);
+			}
+		}
+	}
+}
+
+class DwarfInfoSection {
+	def subprograms = Vector<DwarfSubprogram>.new();
+
+	def emit(dirFile: DwarfDirFile, w: DataWriter, codeStart: long, codeSize: long) {
+		var unitLengthStart = w.pos;
+		w.skipN(DWARF_LENGTH_SIZE); // unit_length
+		w.put_b16(DWARF_VERSION); // version
+		w.putb(DW.DW_UT_compile);
+		w.putb(codePointerSize); // address_size
+		w.put_b32(0); // debug_abbrev_offset
+		// DW_TAG_compile_unit DIE abbrev (1)
+		w.put_uleb32(1u);
+		w.put_b32(dirFile.rootFile.offset);
+		w.put_b32(dirFile.compilationDir.offset);
+		w.put_b64(codeStart);
+		w.put_b64(codeSize);
+		w.put_b32(0); // DW_AT_stmt_list
+		// DW_TAG_subprogram DIE abbrev (2) or (3)
+		for (i < subprograms.length) {
+			subprograms[i].emit(w);
+		}
+		putLength(w, unitLengthStart);
+	}
+}
+
+class DwarfAbbrevSection {
+	def emit(w: DataWriter) {
+		// DW_TAG_compile_unit DIE abbrev (1)
+		w.put_uleb32(1u);
+		w.put_uleb32(DW.DW_TAG_compile_unit);
+		w.putb(DW.DW_children_yes);
+		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_line_strp);
+		emitAbbrev(w, DW.DW_AT_comp_dir, DW.DW_FORM_line_strp);
+		emitAbbrev(w, DW.DW_AT_low_pc, DW.DW_FORM_addr);
+		emitAbbrev(w, DW.DW_AT_high_pc, DW.DW_FORM_data8);
+		emitAbbrev(w, DW.DW_AT_stmt_list, DW.DW_FORM_sec_offset);
+		emitAbbrev(w, 0, 0);
+		// DW_TAG_subprogram DIE abbrev (2)
+		w.put_uleb32(2);
+		w.put_uleb32(DW.DW_TAG_subprogram);
+		w.putb(DW.DW_children_no);
+		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_strp);
+    emitAbbrev(w, DW.DW_AT_decl_file, DW.DW_FORM_udata);
+    emitAbbrev(w, DW.DW_AT_decl_line, DW.DW_FORM_udata);
+		emitAbbrev(w, DW.DW_AT_low_pc, DW.DW_FORM_addr);
+		emitAbbrev(w, DW.DW_AT_high_pc, DW.DW_FORM_udata);
+		emitAbbrev(w, 0, 0);
+		// DW_TAG_subprogram DIE abbrev (3)
+		w.put_uleb32(3);
+		w.put_uleb32(DW.DW_TAG_subprogram);
+		w.putb(DW.DW_children_no);
+		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_strp);
+		emitAbbrev(w, DW.DW_AT_low_pc, DW.DW_FORM_addr);
+		emitAbbrev(w, DW.DW_AT_high_pc, DW.DW_FORM_udata);
+		emitAbbrev(w, 0, 0);
+		w.putb(0); // terminate section
+	}
+	def emitAbbrev(w: DataWriter, name: u32, form: u32) {
+		w.put_uleb32(name);
+		w.put_uleb32(form);
+	}
+}
+
+def MIN_INSTR_LEN = 1;
+def MAX_OP_PER_INSTR = 1;
+
+def DWARFLineBase: i8 = -5;
+def DWARFLineRange: u8 = 14;
+def DWARFLineOpcodeBase: u8 = 13;
+
+def DWARF_DEFAULT_IS_STMT = 1;
+def DWARF_FLAG_IS_STMT = 1;
+def DWARF_FLAG_BASIC_BLOCK = (1 << 1);
+def DWARF_FLAG_PROLOGUE_END = (1 << 2);
+def DWARF_FLAG_EPILOGUE_BEGIN = (1 << 3);
+
+class DwarfLineSection(dirFile: DwarfDirFile) {
+	def lineEntries = Vector<DwarfLineEntry>.new();
+	var w: DataWriter;
+	var codeStart: long;
+	var codeSize: long;
+	var lineStrStart: int;
+	def maxSpecialAddrDelta: u32 = (255u - DWARFLineOpcodeBase) / DWARFLineRange;
+	
+	def addLineEntry(src: Source, label: Label, prologue_end: bool) {
+		var fileNum = dirFile.files[src.mdecl.token.fileName].index;
+		var lineEntry = DwarfLineEntry.new(fileNum, src.line, u32.!(src.column), label);
+		if (prologue_end) lineEntry.flags |= DWARF_FLAG_PROLOGUE_END;
+		lineEntries.put(lineEntry);
+	}
+	def emitLineStr() {
+		lineStrStart = w.pos;
+		putLineStrDir(dirFile.compilationDir);
+		dirFile.dirOrder.apply(putLineStrDir);
+		putLineStrFile(dirFile.rootFile.filename, dirFile.rootFile);
+		dirFile.files.apply(putLineStrFile);
+	}
+	def putLineStrDir(info: DwarfDir) {
+		info.offset = w.pos - lineStrStart;
+		w.puta(info.directory);
+		w.putb(0);
+	}
+	def putLineStrFile(name: string, info: DwarfFile) {
+		info.offset = w.pos - lineStrStart;
+		w.puta(info.filename);
+		w.putb(0);
+	}
+	def emit() {
+		var unitLengthStart = emitHeader();
+		emitLines();
+		// update unit_length, bytes after this field
+		putLength(w, unitLengthStart);
+	}
+	def emitHeader() -> int {
+		var standardOpcodeLengths: Array<byte> = [
+      0, // length of DW_LNS_copy
+      1, // length of DW_LNS_advance_pc
+      1, // length of DW_LNS_advance_line
+      1, // length of DW_LNS_set_file
+      1, // length of DW_LNS_set_column
+      0, // length of DW_LNS_negate_stmt
+      0, // length of DW_LNS_set_basic_block
+      0, // length of DW_LNS_const_add_pc
+      1, // length of DW_LNS_fixed_advance_pc
+      0, // length of DW_LNS_set_prologue_end
+      0, // length of DW_LNS_set_epilogue_begin
+      1  // length of DW_LNS_set_isa
+		];
+		var unitLengthStart = w.pos;
+		w.skipN(DWARF_LENGTH_SIZE); // unit_length
+		w.put_b16(DWARF_VERSION); // version
+		w.putb(codePointerSize); // address_size
+		w.putb(0); // segment_selector_size
+		var headerLengthStart = w.pos;
+		w.skipN(DWARF_LENGTH_SIZE); // header_length
+		w.putb(MIN_INSTR_LEN); // minimum_instruction_length
+		w.putb(MAX_OP_PER_INSTR); // maximum_operations_per_instruction
+		w.putb(DWARF_DEFAULT_IS_STMT); // default_is_stmt
+		w.putb(DWARFLineBase); // line_base
+		w.putb(DWARFLineRange); // line_range
+		w.putb(DWARFLineOpcodeBase); // opcode_base 
+		for (len in standardOpcodeLengths) w.putb(len); // standard_opcode_lengths
+		// directory table
+		w.putb(1); // directory_entry_format_count
+		w.put_uleb32(DW.DW_LNCT_path); // directory_entry_format - content type code
+		w.put_uleb32(DW.DW_FORM_line_strp); // directory_entry_format - form code
+		w.put_uleb32(dirFile.dirCount); // directories_count
+		putDirRef(dirFile.compilationDir);
+		dirFile.dirOrder.apply(putDirRef);
+		// filename table
+		w.putb(2); // file_name_entry_format_count
+		w.put_uleb32(DW.DW_LNCT_path); // file_name_entry_format - content type code
+		w.put_uleb32(DW.DW_FORM_line_strp); // file_name_entry_format - form code
+		w.put_uleb32(DW.DW_LNCT_directory_index); // file_name_entry_format - content type code
+		w.put_uleb32(DW.DW_FORM_udata); // file_name_entry_format - form code
+		w.put_uleb32(dirFile.fileCount); // file_names_count
+		putFileRef(dirFile.rootFile.filename, dirFile.rootFile);
+		dirFile.files.apply(putFileRef);
+		// update header_length, bytes after this field
+		putLength(w, headerLengthStart);
+		return unitLengthStart;
+	}
+	
+	def putDirRef(info: DwarfDir) {
+		w.put_b32(info.offset); // ref to debug_line_str
+	}
+	def putFileRef(filename: string, info: DwarfFile) {
+		w.put_b32(info.offset); // ref to debug_line_str
+		w.put_uleb32(info.dirIdx); // directory index
+	}
+	def emitLines() {
+		// init register
+		var fileNum: u32 = 1, lastLine = 1, column: u32 = 0, flags = DWARF_DEFAULT_IS_STMT;
+		var isa: u32 = 0, discriminator: u32 = 0;
+		var lastLabel: Label;
+		var endEntryEmitted = false;
+		// loop through each LineEntry and encode the dwarf line number table.
+		for (i < lineEntries.length) {
+			var lineEntry = lineEntries[i], label = lineEntry.label;
+			if (lineEntry.isEndEntry) {
+				endEntryEmitted = true;
+				emitLine(Int.MAX_VALUE, lastLabel, label);
+				continue;
+			}
+			var lineDelta = lineEntry.line - lastLine;
+			if (fileNum != lineEntry.fileNum) {
+				fileNum = lineEntry.fileNum;
+				w.putb(DW.DW_LNS_set_file);
+				w.put_uleb32(fileNum);
+			}
+			if (column != lineEntry.column) {
+				column = lineEntry.column;
+				w.putb(DW.DW_LNS_set_column);
+				w.put_uleb32(column);
+			}
+			if (discriminator != lineEntry.discriminator) {
+				discriminator = lineEntry.discriminator;
+				var size = getULEB32Size(discriminator);
+				w.putb(DW.DW_LNS_extended_op);
+				w.put_uleb32(size + 1);
+				w.putb(DW.DW_LNE_set_discriminator);
+				w.put_uleb32(discriminator);
+			}
+			if (isa != lineEntry.isa) {
+				isa = lineEntry.isa;
+				w.putb(DW.DW_LNS_set_isa);
+				w.put_uleb32(isa);
+			}
+			if ((lineEntry.flags & DWARF_FLAG_BASIC_BLOCK) > 0) {
+				w.putb(DW.DW_LNS_set_basic_block);
+			}
+			if ((lineEntry.flags & DWARF_FLAG_PROLOGUE_END) > 0) {
+				w.putb(DW.DW_LNS_set_prologue_end);
+			}
+			if ((lineEntry.flags & DWARF_FLAG_EPILOGUE_BEGIN) > 0) {
+				w.putb(DW.DW_LNS_set_epilogue_begin);
+			}
+			emitLine(lineDelta, lastLabel, label);
+			lastLine = lineEntry.line;
+			lastLabel = lineEntry.label;
+		}
+		if (!endEntryEmitted) {
+			var endLabel = Label.new();
+			endLabel.pos = int.!(codeSize);
+			emitLine(Int.MAX_VALUE, lastLabel, endLabel);
+		}
+	}
+	def emitLine(lineDelta: int, lastLabel: Label, label: Label) {
+		if (lastLabel == null) {
+			emitSetLineAddr(lineDelta, label);
+			return;
+		}
+		var addrDelta = u32.!(label.pos - lastLabel.pos);
+		emitLineAddr(lineDelta, addrDelta);
+	}
+	def emitSetLineAddr(lineDelta: int, label: Label) {
+		// emit the sequence to set the address
+		w.putb(DW.DW_LNS_extended_op);
+		w.put_uleb32(u32.!(codePointerSize + 1));
+		w.putb(DW.DW_LNE_set_address);
+		if (codePointerSize == CODE_POINTER_SIZE64) w.put_b64(label.pos + codeStart);
+		else w.put_b32(int.!(label.pos + codeStart));
+		// emit the sequence for the LineDelta and a zero address delta
+		emitLineAddr(lineDelta, 0u);
+	}
+	def emitLineAddr(lineDelta: int, addrDelta: u32) {
+		var needCopy = false;
+		if (lineDelta == Int.MAX_VALUE) {
+			if (addrDelta == maxSpecialAddrDelta) {
+				w.putb(DW.DW_LNS_const_add_pc);
+			} else if (addrDelta > 0) {
+				w.putb(DW.DW_LNS_advance_pc);
+				w.put_uleb32(addrDelta);
+			}
+			w.putb(DW.DW_LNS_extended_op);
+			w.putb(1);
+			w.putb(DW.DW_LNE_end_sequence);
+			return;
+		}
+		var tmp = lineDelta - DWARFLineBase;
+		// If the line increment is out of range of a special opcode, we must encode
+  	// it with DW_LNS_advance_line.
+		if (tmp < 0 || tmp >= DWARFLineRange || tmp + DWARFLineOpcodeBase > 255) {
+			w.putb(DW.DW_LNS_advance_line);
+			w.put_sleb32(lineDelta);
+
+			lineDelta = 0;
+			tmp = 0 - DWARFLineBase;
+			needCopy = true;
+		}
+		// Use DW_LNS_copy instead of a "line +0, addr +0" special opcode.
+		if (lineDelta == 0 && addrDelta == 0) {
+			w.putb(DW.DW_LNS_copy);
+			return;
+		}
+		// Bias the opcode by the special opcode base.
+  	tmp += DWARFLineOpcodeBase;
+		// Avoid overflow
+		if (addrDelta < 256u + maxSpecialAddrDelta) {
+			// Try using a special opcode.
+			var opcode = tmp + i32.!(addrDelta) * DWARFLineRange;
+			if (opcode <= 255) {
+				w.putb(opcode);
+				return;
+			}
+
+			// Try using DW_LNS_const_add_pc followed by special op.
+			opcode = tmp + (i32.!(addrDelta) - i32.!(maxSpecialAddrDelta)) * DWARFLineRange;
+			if (opcode <= 255) {
+				w.putb(DW.DW_LNS_const_add_pc);
+				w.putb(opcode);
+				return;
+			}
+		}
+		// Otherwise use DW_LNS_advance_pc.
+		w.putb(DW.DW_LNS_advance_pc);
+		w.put_uleb32(addrDelta);
+
+		if (needCopy)
+			w.putb(DW.DW_LNS_copy);
+		else {
+			w.putb(tmp);
+		}
+	}
+	def getULEB32Size(x: u32) -> u32 {
+		var size = 1u;
+		while (x >= 0x80) {
+			x = x >> 7;
+			size ++;
+		}
+		return size;
+	}
+}
+
+class DwarfLineEntry {
+	def fileNum: u32;
+	def line: int;
+	def column: u32;
+	var flags = DWARF_DEFAULT_IS_STMT;
+	def isa: u32;
+	def discriminator: u32;
+	def label: Label;
+	def isEndEntry: bool;
+	new(fileNum, line, column, label) { }
+}

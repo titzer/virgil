@@ -6,7 +6,7 @@ class LinuxTarget extends Target {
 	def space: AddressSpace;
 	def intNorm: IntNormalizer;
 	def machLoweringConfig: MachLoweringConfig;
-	def newBackend: (Compiler, Program, MachProgram, MachDataWriter) -> MachBackend;
+	def newBackend: (Compiler, Program, MachProgram, MachDataWriter, Dwarf) -> MachBackend;
 	def kernelCallReturnType: Type;
 	def linuxComponent = Kernel_TypeCon.new(Kernel.LINUX, kernelCallReturnType);
 	def VADDR_START = 0x08000000; // TODO: configure based on flags
@@ -49,7 +49,8 @@ class LinuxTarget extends Target {
 		elf.e_machine = elf_machine;
 
 		// allocate section headers for string, symbol table
-		var sections = if(CLOptions.SYMBOLS.val, ElfSections.new(elf));
+		var sections = if(CLOptions.SYMBOLS.val || CLOptions.DWARF.val, ElfSections.new(elf));
+		var dwarf = if(CLOptions.DWARF.val, Dwarf.new(elf, sections, prog, mach));
 
 		var pageAlign = rt.codeRegion.space.pageAlign;
 
@@ -92,7 +93,7 @@ class LinuxTarget extends Target {
 		w.skipN(int.!(elf.size()));
 
 		// emit code
-		var backend = newBackend(compiler, prog, mach, w);
+		var backend = newBackend(compiler, prog, mach, w, dwarf);
 		code.p_vaddr = w.endPageAddr();
 		backend.genAllCode();
 		rt.recordCodeStart(mach.entryStub.absolute);
@@ -142,32 +143,29 @@ class LinuxTarget extends Target {
 
 			sections.startStringSection(w);
 
-			sections.addFuncSymbol(w, ".entry", mach.entryStub);
-			if (mach.allocStub != null) sections.addFuncSymbol(w, ".alloc", mach.allocStub);
-			if (mach.signalStub != null) sections.addFuncSymbol(w, ".signal", mach.signalStub);
+			if (CLOptions.SYMBOLS.val) {
+				sections.addFuncSymbol(w, ".entry", mach.entryStub);
+				if (mach.allocStub != null) sections.addFuncSymbol(w, ".alloc", mach.allocStub);
+				if (mach.signalStub != null) sections.addFuncSymbol(w, ".signal", mach.signalStub);
 
-			var buf = StringBuilder.new();
-			for (i < prog.ir.methods.length) {
-				var m = prog.ir.methods[i];
-				if (m.source == null) continue;
-				var addr = mach.methodMap[m];
-				if (addr == null || addr.absolute < 0) continue;
-				var entry = ElfSymbol.new();
-				sections.symbols.put(entry);
-				entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
-				entry.st_name = w.pos - sections.str_start;
-				entry.st_value = addr.absolute;
-				entry.st_size = addr.size;
-				entry.st_index = i16.view(sections.text.index);
-				buf.reset();
-				m.source.renderLong(buf);
-				buf.out(w.putkv);
-				w.putb(0);
+				var buf = StringBuilder.new();
+				for (i < prog.ir.methods.length) {
+					var m = prog.ir.methods[i];
+					if (m.source == null) continue;
+					var addr = mach.methodMap[m];
+					if (addr == null || addr.absolute < 0) continue;
+					sections.addMethodSymbol(w, m, addr, buf);
+				}
+				sections.finishStringSection(w);
+				// encode the symbol table entries
+				sections.encodeSymbolTable(w);
+			} else {
+				sections.finishStringSection(w);
 			}
-			sections.finishStringSection(w);
+		}
 
-			// encode the symbol table entries
-			sections.encodeSymbolTable(w);
+		if (dwarf != null) {
+			dwarf.emit(w);
 		}
 
 		// encode ELF header section
@@ -184,31 +182,58 @@ class LinuxTarget extends Target {
 	}
 }
 
+enum DebugSection(printName: string) {
+	str(".debug_str\x00"),
+	info(".debug_info\x00"),
+	abbrev(".debug_abbrev\x00"),
+	line_str(".debug_line_str\x00"),
+	line(".debug_line\x00"),
+}
+def DebugSectionCount = 5;
+
 class ElfSections(elf: ElfHeader) {
 	def str = ElfSectionHeader.new();
 	def sym = ElfSectionHeader.new();
 	def text = ElfSectionHeader.new();
 	def data = ElfSectionHeader.new();
+	def debugs = Array<ElfSectionHeader>.new(DebugSectionCount);
 	def symbols = Vector<ElfSymbol>.new();
 
 	var str_start: int;
 
 	new() {
 		elf.sheaders.put(ElfSectionHeader.new());
-		elf.sheaders.put(str).put(sym).put(text).put(data);
-		symbols.put(ElfSymbol.new());
-		str.index = 1;
-		sym.index = 2;
-		text.index = 3;
-		data.index = 4;
+		str.index = elf.sheaders.length;
+		elf.sheaders.put(str);
+		if (CLOptions.SYMBOLS.val) {
+			sym.index = elf.sheaders.length;
+			elf.sheaders.put(sym);
+		}
+		text.index = elf.sheaders.length;
+		elf.sheaders.put(text);
+		data.index = elf.sheaders.length;
+		elf.sheaders.put(data);
+		
+		if (CLOptions.DWARF.val) {
+			for (e in DebugSection) {
+				var section = ElfSectionHeader.new();
+				debugs[e.tag] = section;
+				section.index = elf.sheaders.length;
+				elf.sheaders.put(section);
+				section.sh_type = ElfConst.SHT_PROGBITS;;
+			}
+		}
 
 		str.sh_type = ElfConst.SHT_STRTAB;
-		sym.sh_type = ElfConst.SHT_SYMTAB;
-		sym.sh_link = str.index;
-		sym.sh_entsize = if(elf.is64(),
-			ElfConst.STENTSIZE64,
-			ElfConst.STENTSIZE32);
-		sym.sh_info = 1;
+		if (CLOptions.SYMBOLS.val) {
+			symbols.put(ElfSymbol.new());
+			sym.sh_type = ElfConst.SHT_SYMTAB;
+			sym.sh_link = str.index;
+			sym.sh_entsize = if(elf.is64(),
+				ElfConst.STENTSIZE64,
+				ElfConst.STENTSIZE32);
+			sym.sh_info = 1;
+		}
 
 		elf.e_shstrndx = str.index;
 		text.sh_type = ElfConst.SHT_PROGBITS;
@@ -227,14 +252,24 @@ class ElfSections(elf: ElfHeader) {
 		str.sh_name = w.pos - str_start;
 		w.puta(".strtab\x00");
 
-		sym.sh_name = w.pos - str_start;
-		w.puta(".symtab\x00");
+		if (CLOptions.SYMBOLS.val) {
+			sym.sh_name = w.pos - str_start;
+			w.puta(".symtab\x00");
+		}
 
 		text.sh_name = w.pos - str_start;
 		w.puta(".text\x00");
 
 		data.sh_name = w.pos - str_start;
 		w.puta(".data\x00");
+
+		if (CLOptions.DWARF.val) {
+			for (e in DebugSection) {
+				var section = debugs[e.tag];
+				section.sh_name = w.pos - str_start;
+				w.puta(e.printName);
+			}
+		}
 	}
 	def finishStringSection(w: DataWriter) {
 		str.sh_size = w.pos - str_start;
@@ -257,6 +292,19 @@ class ElfSections(elf: ElfHeader) {
 		entry.st_size = addr.size;
 		entry.st_index = i16.view(text.index);
 		w.puta(str);
+		w.putb(0);
+	}
+	def addMethodSymbol(w: DataWriter, m: IrMethod, addr: Addr, buf: StringBuilder) {
+		var entry = ElfSymbol.new();
+		symbols.put(entry);
+		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
+		entry.st_name = w.pos - str_start;
+		entry.st_value = addr.absolute;
+		entry.st_size = addr.size;
+		entry.st_index = i16.view(text.index);
+		buf.reset();
+		m.source.renderLong(buf);
+		buf.out(w.putkv);
 		w.putb(0);
 	}
 }
