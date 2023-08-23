@@ -35,6 +35,8 @@ V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
 PROGRESS_ARGS=${PROGRESS_ARGS:=i}
 PROGRESS="${VIRGIL_LOC}/test/config/progress $PROGRESS_ARGS"
 
+XARGS=${XARGS:=0}
+
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
 TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm-js x86-linux x86-64-linux x86-darwin x86-64-darwin"}
 
@@ -148,7 +150,7 @@ function run_io_test() {
     fi
 
     local P=$T/$(basename $test)
-		
+
 		infile=${test##*/}.in
     if [ -f $infile ]; then
 			V3C=$AENEAS_TEST $runner $T $test $args < $infile > $P.out 2> $P.err
@@ -233,6 +235,19 @@ function run_v3c_multiple() {
     shift
     local target=$1
     shift
+
+    if [ "$XARGS" != 0 ]; then
+	if [ -z "$target" ]; then
+	    xargs echo "$@" | xargs -n$SHARDING $AENEAS_TEST $V3C_OPTS -multiple
+	else
+            local F=$VIRGIL_LOC/bin/dev/v3c-$target
+            if [ ! -x "$F" ]; then
+		F=$VIRGIL_LOC/bin/v3c-$target
+            fi
+	    V3C=$AENEAS_TEST echo "$@" | xargs -n$SHARDING $F $V3C_OPTS -multiple
+	fi
+	return
+    fi
 
     local i=1
     while [ $i -le $# ]; do
