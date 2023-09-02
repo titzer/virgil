@@ -117,3 +117,7 @@ var x: E;
 var y = foo(x);     // E value is automatically promoted to E.set
 ```
 
+## Implementation limits
+
+In the current implementation of Virgil in this repository, enum set types are available for all enum declarations with 64 or fewer values.
+This limitation is due to a simple approach of rewriting these operations to integer operations early in compilation and will be lifted in the future by tuples of as many integers as necessary.
