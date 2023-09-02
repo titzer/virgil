@@ -83,6 +83,23 @@ def revokeExecute(perm: Permission.set) -> Permission.set {
 Like all other operations on enum sets, the Virgil compiler will implement set operations with efficient bitwise arithmetic.
 Thus all enum set operations implement proper set semantics very efficiently, with no heap allocation.
 
+## Subset and superset comparisons
+
+Enum sets can also be compared for more than simple equality.
+In Virgil III, enum set values also have the *subset* (`<=`), *strict subset* (`<`), *superset* (`>=`) and *strict superset* (`>`) operations.
+
+```
+enum E { A, B, C }
+var x = E.A | E.B;
+var y = E.A | E.B | E.C;
+
+var z1 = (x < y);           // evaluates to true; x is a subset of y
+var z2 = (y < E.set.all);   // evaluates to false; y == all
+var z3 = (y <= E.set.all);  // evaluates to true
+```
+
+Like all other set operations, the Virgil compiler generates efficient bitwise operations to perform subset checks.
+
 ## Enum set iteration
 
 We've now seen that we can check whether an enum set has a given value, but it is often useful to *iterate* over the values in a set.
