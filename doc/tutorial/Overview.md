@@ -26,6 +26,7 @@ That way, you can jump right into a topic.
   * [Loops](Loops.md) for induction and iteration over arrays and ranges.
 * [Algebraic data types](ADTs.md) allow building structured data.
 * [Enums](Enums.md) allow expressing fixed sets of values and even tables.
+* [Enum sets](EnumSets.md) allow expressing a set of values from a given enum type.
 * Virgil has switches and [pattern matching](Matches.md).
 * [Ternary Expressions](Ternary.md) expressions have a slightly different syntax in Virgil.
 * [Logical](Logical.md) operations can be used to combine boolean expressions.
