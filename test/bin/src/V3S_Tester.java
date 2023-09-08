@@ -107,7 +107,7 @@ public class V3S_Tester {
 	if (o2 instanceof Boolean) return o2.equals(o1);
 	if (isIntegral(o1) && isIntegral(o2)) {
 	  int mask = maskOf(o1) & maskOf(o2);
-	  return (intValue(o1) & mask) == (intValue(o2) & mask);
+          return (intValue(o1) & mask) == (intValue(o2) & mask);
 	}
 	return o1.equals(o2);
     }

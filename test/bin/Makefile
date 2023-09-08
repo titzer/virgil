@@ -47,4 +47,4 @@ test-x86-64-linux: src/execute-arch-posix.c
 	strip $@
 
 V3S_Tester.class: src/V3S_Tester.java
-	javac -source 1.5 -target 1.5 -d . src/V3S_Tester.java
+	javac -source 1.8 -target 1.8 -d . src/V3S_Tester.java
