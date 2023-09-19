@@ -435,65 +435,72 @@ public class V3S_System {
     }
 
     public static short readBytes2(byte[] bytes, int offset, int staticOffset) {
-        int byte0 = ((int)bytes[offset + staticOffset] & 0xFF);
-        int byte1 = ((int)bytes[offset + staticOffset + 1] & 0xFF) << 8;
+        int fullOffset = offset + staticOffset;
+        int byte0 = ((int)bytes[fullOffset] & 0xFF);
+        int byte1 = ((int)bytes[fullOffset + 1] & 0xFF) << 8;
         return ((short)(byte0 | byte1));
     }
 
     public static int readBytes3(byte[] bytes, int offset, int staticOffset) {
-        int byte0 = ((int)bytes[offset + staticOffset] & 0xFF);
-        int byte1 = ((int)bytes[offset + staticOffset + 1] & 0xFF) << 8;
-        int byte2 = ((int)bytes[offset + staticOffset + 2] & 0xFF) << 16;
+        int fullOffset = offset + staticOffset;
+        int byte0 = ((int)bytes[fullOffset] & 0xFF);
+        int byte1 = ((int)bytes[fullOffset + 1] & 0xFF) << 8;
+        int byte2 = ((int)bytes[fullOffset + 2] & 0xFF) << 16;
         return byte0 | byte1 | byte2;
     }
 
     public static int readBytes4(byte[] bytes, int offset, int staticOffset) {
-        int byte0 = ((int)bytes[offset + staticOffset] & 0xFF);
-        int byte1 = ((int)bytes[offset + staticOffset + 1] & 0xFF) << 8;
-        int byte2 = ((int)bytes[offset + staticOffset + 2] & 0xFF) << 16;
-        int byte3 = ((int)bytes[offset + staticOffset + 3] & 0xFF) << 24;
+        int fullOffset = offset + staticOffset;
+        int byte0 = ((int)bytes[fullOffset] & 0xFF);
+        int byte1 = ((int)bytes[fullOffset + 1] & 0xFF) << 8;
+        int byte2 = ((int)bytes[fullOffset + 2] & 0xFF) << 16;
+        int byte3 = ((int)bytes[fullOffset + 3] & 0xFF) << 24;
         return byte0 | byte1 | byte2 | byte3;
     }
 
     public static long readBytes5(byte[] bytes, int offset, int staticOffset) {
-        long byte0 = ((long)bytes[offset + staticOffset] & 0xFF);
-        long byte1 = ((long)bytes[offset + staticOffset + 1] & 0xFF) << 8;
-        long byte2 = ((long)bytes[offset + staticOffset + 2] & 0xFF) << 16;
-        long byte3 = ((long)bytes[offset + staticOffset + 3] & 0xFF) << 24;
-        long byte4 = ((long)bytes[offset + staticOffset + 4] & 0xFF) << 32;
+        int fullOffset = offset + staticOffset;
+        long byte0 = ((long)bytes[fullOffset] & 0xFF);
+        long byte1 = ((long)bytes[fullOffset + 1] & 0xFF) << 8;
+        long byte2 = ((long)bytes[fullOffset + 2] & 0xFF) << 16;
+        long byte3 = ((long)bytes[fullOffset + 3] & 0xFF) << 24;
+        long byte4 = ((long)bytes[fullOffset + 4] & 0xFF) << 32;
         return byte0 | byte1 | byte2 | byte3 | byte4;
     }
 
     public static long readBytes6(byte[] bytes, int offset, int staticOffset) {
-        long byte0 = ((long)bytes[offset + staticOffset] & 0xFF);
-        long byte1 = ((long)bytes[offset + staticOffset + 1] & 0xFF) << 8;
-        long byte2 = ((long)bytes[offset + staticOffset + 2] & 0xFF) << 16;
-        long byte3 = ((long)bytes[offset + staticOffset + 3] & 0xFF) << 24;
-        long byte4 = ((long)bytes[offset + staticOffset + 4] & 0xFF) << 32;
-        long byte5 = ((long)bytes[offset + staticOffset + 5] & 0xFF) << 40;
+        int fullOffset = offset + staticOffset;
+        long byte0 = ((long)bytes[fullOffset] & 0xFF);
+        long byte1 = ((long)bytes[fullOffset + 1] & 0xFF) << 8;
+        long byte2 = ((long)bytes[fullOffset + 2] & 0xFF) << 16;
+        long byte3 = ((long)bytes[fullOffset + 3] & 0xFF) << 24;
+        long byte4 = ((long)bytes[fullOffset + 4] & 0xFF) << 32;
+        long byte5 = ((long)bytes[fullOffset + 5] & 0xFF) << 40;
         return byte0 | byte1 | byte2 | byte3 | byte4 | byte5;
     }
 
     public static long readBytes7(byte[] bytes, int offset, int staticOffset) {
-        long byte0 = ((long)bytes[offset + staticOffset] & 0xFF);
-        long byte1 = ((long)bytes[offset + staticOffset + 1] & 0xFF) << 8;
-        long byte2 = ((long)bytes[offset + staticOffset + 2] & 0xFF) << 16;
-        long byte3 = ((long)bytes[offset + staticOffset + 3] & 0xFF) << 24;
-        long byte4 = ((long)bytes[offset + staticOffset + 4] & 0xFF) << 32;
-        long byte5 = ((long)bytes[offset + staticOffset + 5] & 0xFF) << 40;
-        long byte6 = ((long)bytes[offset + staticOffset + 6] & 0xFF) << 48;
+        int fullOffset = offset + staticOffset;
+        long byte0 = ((long)bytes[fullOffset] & 0xFF);
+        long byte1 = ((long)bytes[fullOffset + 1] & 0xFF) << 8;
+        long byte2 = ((long)bytes[fullOffset + 2] & 0xFF) << 16;
+        long byte3 = ((long)bytes[fullOffset + 3] & 0xFF) << 24;
+        long byte4 = ((long)bytes[fullOffset + 4] & 0xFF) << 32;
+        long byte5 = ((long)bytes[fullOffset + 5] & 0xFF) << 40;
+        long byte6 = ((long)bytes[fullOffset + 6] & 0xFF) << 48;
         return byte0 | byte1 | byte2 | byte3 | byte4 | byte5 | byte6;
     }
 
     public static long readBytes8(byte[] bytes, int offset, int staticOffset) {
-        long byte0 = ((long)bytes[offset + staticOffset] & 0xFF);
-        long byte1 = ((long)bytes[offset + staticOffset + 1] & 0xFF) << 8;
-        long byte2 = ((long)bytes[offset + staticOffset + 2] & 0xFF) << 16;
-        long byte3 = ((long)bytes[offset + staticOffset + 3] & 0xFF) << 24;
-        long byte4 = ((long)bytes[offset + staticOffset + 4] & 0xFF) << 32;
-        long byte5 = ((long)bytes[offset + staticOffset + 5] & 0xFF) << 40;
-        long byte6 = ((long)bytes[offset + staticOffset + 6] & 0xFF) << 48;
-        long byte7 = ((long)bytes[offset + staticOffset + 7] & 0xFF) << 56;
+        int fullOffset = offset + staticOffset;
+        long byte0 = ((long)bytes[fullOffset] & 0xFF);
+        long byte1 = ((long)bytes[fullOffset + 1] & 0xFF) << 8;
+        long byte2 = ((long)bytes[fullOffset + 2] & 0xFF) << 16;
+        long byte3 = ((long)bytes[fullOffset + 3] & 0xFF) << 24;
+        long byte4 = ((long)bytes[fullOffset + 4] & 0xFF) << 32;
+        long byte5 = ((long)bytes[fullOffset + 5] & 0xFF) << 40;
+        long byte6 = ((long)bytes[fullOffset + 6] & 0xFF) << 48;
+        long byte7 = ((long)bytes[fullOffset + 7] & 0xFF) << 56;
         return byte0 | byte1 | byte2 | byte3 | byte4 | byte5 | byte6 | byte7;
     }
 
@@ -512,59 +519,66 @@ public class V3S_System {
     }
 
     public static void setBytes2(byte[] bytes, int offset, short value, int staticOffset) {
-        bytes[offset + staticOffset] = (byte)value;
-        bytes[offset + staticOffset + 1] = (byte)(value >> 8);
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset] = (byte)value;
+        bytes[fullOffset + 1] = (byte)(value >> 8);
     }
 
     public static void setBytes3(byte[] bytes, int offset, int value, int staticOffset) {
-        bytes[offset + staticOffset] = (byte)value;
-	bytes[offset + staticOffset + 1] = (byte)(value >> 8);
-        bytes[offset + staticOffset + 2] = (byte)(value >> 16);
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset] = (byte)value;
+        bytes[fullOffset + 1] = (byte)(value >> 8);
+        bytes[fullOffset + 2] = (byte)(value >> 16);
     }
 
     public static void setBytes4(byte[] bytes, int offset, int value, int staticOffset) {
-        bytes[offset + staticOffset] = (byte)value;
-	bytes[offset + staticOffset + 1] = (byte)(value >> 8);
-        bytes[offset + staticOffset + 2] = (byte)(value >> 16);
-        bytes[offset + staticOffset + 3] = (byte)(value >> 24);
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset] = (byte)value;
+        bytes[fullOffset + 1] = (byte)(value >> 8);
+        bytes[fullOffset + 2] = (byte)(value >> 16);
+        bytes[fullOffset + 3] = (byte)(value >> 24);
     }
 
     public static void setBytes5(byte[] bytes, int offset, long value, int staticOffset) {
-        bytes[offset + staticOffset] = (byte)value;
-        bytes[offset + staticOffset + 1] = (byte)(value >> 8);
-        bytes[offset + staticOffset + 2] = (byte)(value >> 16);
-        bytes[offset + staticOffset + 3] = (byte)(value >> 24);
-        bytes[offset + staticOffset + 4] = (byte)(value >> 32);
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset] = (byte)value;
+        bytes[fullOffset + 1] = (byte)(value >> 8);
+        bytes[fullOffset + 2] = (byte)(value >> 16);
+        bytes[fullOffset + 3] = (byte)(value >> 24);
+        bytes[fullOffset + 4] = (byte)(value >> 32);
     }
 
     public static void setBytes6(byte[] bytes, int offset, long value, int staticOffset) {
-        bytes[offset + staticOffset] = (byte)value;
-        bytes[offset + staticOffset + 1] = (byte)(value >> 8);
-        bytes[offset + staticOffset + 2] = (byte)(value >> 16);
-        bytes[offset + staticOffset + 3] = (byte)(value >> 24);
-        bytes[offset + staticOffset + 4] = (byte)(value >> 32);
-        bytes[offset + staticOffset + 5] = (byte)(value >> 40);
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset] = (byte)value;
+        bytes[fullOffset + 1] = (byte)(value >> 8);
+        bytes[fullOffset + 2] = (byte)(value >> 16);
+        bytes[fullOffset + 3] = (byte)(value >> 24);
+        bytes[fullOffset + 4] = (byte)(value >> 32);
+        bytes[fullOffset + 5] = (byte)(value >> 40);
     }
 
     public static void setBytes7(byte[] bytes, int offset, long value, int staticOffset) {
-        bytes[offset + staticOffset] = (byte)value;
-        bytes[offset + staticOffset + 1] = (byte)(value >> 8);
-        bytes[offset + staticOffset + 2] = (byte)(value >> 16);
-        bytes[offset + staticOffset + 3] = (byte)(value >> 24);
-        bytes[offset + staticOffset + 4] = (byte)(value >> 32);
-        bytes[offset + staticOffset + 5] = (byte)(value >> 40);
-        bytes[offset + staticOffset + 6] = (byte)(value >> 48);
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset] = (byte)value;
+        bytes[fullOffset + 1] = (byte)(value >> 8);
+        bytes[fullOffset + 2] = (byte)(value >> 16);
+        bytes[fullOffset + 3] = (byte)(value >> 24);
+        bytes[fullOffset + 4] = (byte)(value >> 32);
+        bytes[fullOffset + 5] = (byte)(value >> 40);
+        bytes[fullOffset + 6] = (byte)(value >> 48);
     }
 
     public static void setBytes8(byte[] bytes, int offset, long value, int staticOffset) {
-        bytes[offset + staticOffset] = (byte)value;
-        bytes[offset + staticOffset + 1] = (byte)(value >> 8);
-        bytes[offset + staticOffset + 2] = (byte)(value >> 16);
-        bytes[offset + staticOffset + 3] = (byte)(value >> 24);
-        bytes[offset + staticOffset + 4] = (byte)(value >> 32);
-        bytes[offset + staticOffset + 5] = (byte)(value >> 40);
-        bytes[offset + staticOffset + 6] = (byte)(value >> 48);
-        bytes[offset + staticOffset + 7] = (byte)(value >> 56);
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset] = (byte)value;
+        bytes[fullOffset + 1] = (byte)(value >> 8);
+        bytes[fullOffset + 2] = (byte)(value >> 16);
+        bytes[fullOffset + 3] = (byte)(value >> 24);
+        bytes[fullOffset + 4] = (byte)(value >> 32);
+        bytes[fullOffset + 5] = (byte)(value >> 40);
+        bytes[fullOffset + 6] = (byte)(value >> 48);
+        bytes[fullOffset + 7] = (byte)(value >> 56);
     }
 
     public static void setBytesFloat(byte[] bytes, int offset, float value, int staticOffset) {
