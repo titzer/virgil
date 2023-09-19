@@ -493,6 +493,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			ArrayTupleInit(elems, length) => ni = genArrayTupleInit(oi, elems, length);
 			ArrayGetElem => 		return genArrayGetElem(oi, 0);
 			ArraySetElem => 		return genArraySetElem(oi, 0);
+			ByteArrayGetField(offset) => return genByteArrayGetField(oi, offset);
+			ByteArraySetField(offset) => return genByteArraySetField(oi, offset);
 			ArrayGetElemElem(index) => 	return genArrayGetElem(oi, index);
 			ArraySetElemElem(index) => 	return genArraySetElem(oi, index);
 			ArrayGetLength => 		ni = genArrayGetLength(oi);
@@ -1450,6 +1452,33 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		oi.kill();
 		oi.remove();
 	}
+	def genByteArrayGetField(oi: SsaApplyOp, offset: int) {
+		var inputs = normRefs(oi.inputs);
+		var narr = inputs[0], ni_offset = inputs[1];
+		var fieldType = oi.op.typeArgs[0];
+		var nullity = context.compiler.nullity(oi, narr);
+		nullity = genBoundsCheck(oi, nullity).1;
+		var arrayRep = mach.arrayRep(V3.arrayByteType);
+		var arrayOffset = ptrAdd(narr, context.graph.intConst(offset));
+		var arrayElemOffset = genArrayElemOffset(arrayRep.getElemElemOffset(0), 1, ni_offset);
+		var machType = mach.machType(fieldType);
+		var loads = genNormTypedLoadsByteRegion(oi.source, machType, ptrAdd(arrayOffset, arrayElemOffset), 0);
+		mapN(oi, loads);
+	}
+	def genByteArraySetField(oi: SsaApplyOp, offset: int) {
+		var inputs = normRefs(oi.inputs);
+		var narr = inputs[0], ni_offset = inputs[1], nvalue = inputs[2];
+		var fieldType = oi.op.typeArgs[0];
+		var nullity = context.compiler.nullity(oi, narr);
+		nullity = genBoundsCheck(oi, nullity).1;
+		var arrayRep = mach.arrayRep(V3.arrayByteType);
+		var arrayOffset = ptrAdd(narr, context.graph.intConst(offset));
+		var arrayElemOffset = genArrayElemOffset(arrayRep.getElemElemOffset(0), 1, ni_offset);
+		var machType = mach.machType(fieldType);
+		genNormTypedStoresByteRegion(oi, machType, ptrAdd(arrayOffset, arrayElemOffset), 0, inputs, 2);
+		oi.kill();
+		oi.remove();
+	}
 	def genArrayElemOffset(headerSize: int, scale: int, index: SsaInstr) -> SsaInstr {
 		if (SsaConst.?(index)) {
 			// fold the offset calculation
@@ -1862,6 +1891,37 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return loads;
 	}
+	def genNormTypedLoadsByteRegion(source: Source, machType: Type, base: SsaInstr, offset: int) -> Array<SsaInstr> {
+		var tn: TypeNorm;
+		match (machType) {
+			x: IntType => tn = mach.intNorm.makeType(x);
+			_ => return [ptrLoad(machType, base, offset)];
+		}
+
+		var loads = Array<SsaInstr>.new(tn.size);
+		for (i < tn.size - 1) {
+			var et = tn.sub[i];
+			loads[i] = ptrLoad(et, base, offset);
+			offset = offset + mach.sizeOf(et);
+		}
+
+		var et = IntType.!(tn.sub[tn.size - 1]);
+		var etWidth = et.packedByteSize() * 8, read = 0;
+		for (curWidth = mach.intNorm.width; curWidth > 0; curWidth /= 2) {
+			if ((etWidth & curWidth) != 0) {
+				var tempLoad = ptrLoad(Int.getType(false, curWidth), base, offset + read / 8);
+				if (read != 0) {
+					tempLoad = apply(source, et.opShl(), [tempLoad, context.graph.intConst(read)]);
+					tempLoad = apply(source, et.opOr(), [loads[tn.size - 1], tempLoad]);
+				}
+				loads[tn.size - 1] = tempLoad;
+				read += curWidth;
+			}
+		}
+		loads[tn.size - 1] = curBlock.opIntViewI0(Int.getType(false, etWidth), et, loads[tn.size - 1]);
+
+		return loads;
+	}
 	def genNormTypedStores(oi: SsaApplyOp, nullity: Fact.set, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
 		var tn = normIntType(machType), nullCheck = !nullity.O_NO_NULL_CHECK;
 		// check for simple case first.
@@ -1878,6 +1938,34 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			if (i == check) ptrStoreT(oi.source, et, base, offset, val);
 			else if (isNonTrivialStore(init, val)) ptrStore(et, base, offset, val);
 			offset = offset + mach.sizeOf(et);
+		}
+	}
+	def genNormTypedStoresByteRegion(oi: SsaApplyOp, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
+		var tn: TypeNorm;
+		match (machType) {
+			x: IntType => tn = mach.intNorm.makeType(x);
+			_ => {
+				ptrStore(machType, base, offset, vals[start]);
+				return;
+			}
+		}
+
+		for (i < tn.size - 1) {
+			var et = tn.sub[i];
+			ptrStore(et, base, offset, vals[start + i]);
+			offset = offset + mach.sizeOf(et);
+		}
+
+		var et = IntType.!(tn.sub[tn.size - 1]), val = vals[start + tn.size - 1];
+		var etWidth = et.packedByteSize() * 8;
+		var stored = 0, curStore: SsaInstr = null;
+		for (curWidth = mach.intNorm.width; curWidth > 0; curWidth /= 2) {
+			if ((etWidth & curWidth) != 0) {
+				var valTruncated = curBlock.opIntViewI0(et, Int.getType(false, curWidth), val);
+				val = apply(oi.source, et.opShl(), [val, context.graph.intConst(curWidth)]);
+				ptrStore(Int.getType(false, curWidth), base, offset + stored / 8, valTruncated);
+				stored += curWidth;
+			}
 		}
 	}
 	def isNonTrivialStore(init: bool, v: SsaInstr) -> bool {
