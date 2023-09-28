@@ -21,19 +21,21 @@ else
   TESTS=*.v3
 fi
 
+LIB_FILES="$VIRGIL_LOC/lib/util/*.v3 $VIRGIL_LOC/lib/math/*.v3"
+
 function do_v3i() {
     print_status Running v3i
     P=$OUT/run.out
-    run_v3c "" $TESTS $VIRGIL_LOC/lib/util/*.v3
+    run_v3c "" $TESTS $LIB_FILES
     if [ "$?" != 0 ]; then
 	printf "  %sfail%s: lib tests failed to compile\n" "$RED" "$NORM"
 	exit 1
     fi
 
     if [ "$PROGRESS_PIPE" = 1 ]; then
-	run_v3c "" -run $TESTS $VIRGIL_LOC/lib/util/*.v3 | tee $P | $PROGRESS
+	run_v3c "" -run $TESTS $LIB_FILES | tee $P | $PROGRESS
     else
-	run_v3c "" -run $TESTS $VIRGIL_LOC/lib/util/*.v3 | tee $P
+	run_v3c "" -run $TESTS $LIB_FILES | tee $P
     fi
 }
 
@@ -45,7 +47,7 @@ function do_compiled() {
     R=$OUT/$target/run.out
 
     print_compiling $target
-    run_v3c $target -output=$T $TESTS $VIRGIL_LOC/lib/util/*.v3 &> $C
+    run_v3c $target -output=$T $TESTS $LIB_FILES &> $C
     check_no_red $? $C
 
     print_status Running $target
