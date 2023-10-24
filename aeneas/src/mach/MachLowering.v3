@@ -1501,8 +1501,51 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var arrayRep = mach.arrayRep(V3.arrayByteType);
 		var arrayElemOffset = if(oi.op.typeArgs[1] == V3Range.START_TYPE, offsetConst, genArrayElemOffset(arrayRep.getElemElemOffset(0), 1, offsetConst));
 		var machType = mach.machType(fieldType);
-		var loads = genNormTypedLoadsByteRegion(oi.source, machType, ptrAdd(narr_start, arrayElemOffset), 0);
+
+		var base = ptrAdd(narr_start, arrayElemOffset), offset = 0;
+		if (!IntType.?(machType)) return map1(oi, ptrLoad(machType, base, offset));
+
+		var tn = mach.intNorm.makeType(IntType.!(machType));
+
+		// Generate full-word loads for all but the last word; TODO: little/big endian
+		var loads = Array<SsaInstr>.new(tn.size), last = tn.size - 1;
+		for (i < last) {
+			var et = tn.sub[i];
+			loads[i] = ptrLoad(et, base, offset);
+			offset = offset + mach.sizeOf(et);
+		}
+
+		var et = IntType.!(tn.sub[last]);
+		if (et.width >= 8 && (et.width & et.width - 1) == 0) {
+			// common case; last load is a power of two and at least a full byte
+			loads[last] = ptrLoad(et, base, offset);
+		} else {
+			// generate multiple power-of-2 byte loads
+			var wordType = getMinimumArithSize(et.width);
+			var etWidth = et.packedByteSize() * 8, read = 0;
+			for (curWidth = mach.intNorm.width; curWidth >= 8; curWidth >>= 1) {
+				if ((etWidth & curWidth) != 0) {
+					var curType = Int.getType(false, curWidth);
+					var load = ptrLoad(curType, base, offset + (read >> 3));
+					if (curType != wordType) load = curBlock.opIntViewI0(curType, wordType, load);
+					if (read != 0) {
+						load = apply(oi.source, wordType.opShl(), [load, context.graph.intConst(read)]);
+						load = apply(oi.source, wordType.opOr(), [loads[last], load]);
+					}
+					loads[last] = load;
+					read += curWidth;
+				}
+			}
+			// sign-extend or mask off fractional upper bits if necessary
+			if (et.signed || (et.width & 7) != 0 ) loads[last] = curBlock.opIntViewI0(wordType, et, loads[last]);
+		}
 		mapN(oi, loads);
+	}
+	def getMinimumArithSize(width: int) -> IntType {
+		if (config.Int8Arith && width <= 8) return Int.getType(false, 8);
+		if (config.Int16Arith && width <= 16) return Int.getType(false, 16);
+		if (config.Int32Arith && width <= 32) return Int.getType(false, 32);
+		return Int.getType(false, 64);
 	}
 	def genByteArraySetField(oi: SsaApplyOp, offset: int) {
 		var inputs = normRefs(oi.inputs);
@@ -1515,7 +1558,36 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var offsetConst = context.graph.intConst(offset);
 		var arrayElemOffset = if(oi.op.typeArgs[1] == V3Range.START_TYPE, offsetConst, genArrayElemOffset(arrayRep.getElemElemOffset(0), 1, offsetConst));
 		var machType = mach.machType(fieldType);
-		genNormTypedStoresByteRegion(oi, machType, ptrAdd(narr_start, arrayElemOffset), 0, inputs, 2);
+		var base = ptrAdd(narr_start, arrayElemOffset), offset = 0, vals = inputs[2 ...];
+
+		if (!IntType.?(machType)) {
+			ptrStore(machType, base, offset, vals[0]);
+			oi.kill();
+			oi.remove();
+			return;
+		}
+
+		var tn = mach.intNorm.makeType(IntType.!(machType)), last = tn.size - 1;
+		// Generate full-word stores for all but the last word; TODO: little/big endian
+		for (i < last) {
+			var et = tn.sub[i];
+			ptrStore(et, base, offset, vals[i]);
+			offset = offset + mach.sizeOf(et);
+		}
+
+		var et = IntType.!(tn.sub[last]), val = vals[last], op_shr = if(et.signed, et.opSar(), et.opShr());
+		var etWidth = et.packedByteSize() * 8;
+		var stored = 0;
+		for (curWidth = mach.intNorm.width; curWidth >= 8; curWidth >>= 1) {
+			// generate multiple power-of-2 byte stores
+			if ((etWidth & curWidth) != 0) {
+				var valTruncated = val;
+				if (stored > 0) valTruncated = apply(oi.source, op_shr, [val, context.graph.intConst(stored)]);
+				var curType = Int.getType(et.signed, curWidth);
+				ptrStore(curType, base, offset + (stored >> 3), valTruncated);
+				stored += curWidth;
+			}
+		}
 		oi.kill();
 		oi.remove();
 	}
@@ -1807,7 +1879,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 						null => return ptrAdd(right, offset);
 						x: Addr => left = context.graph.valConst(pd, x.add(V3.unboxI32(offsetVal)));
 						_ => left = context.graph.valConst(pd, Int.box(V3.unboxI32(leftVal) + V3.unboxI32(offsetVal)));
-						
+
 					}
 					return ptrAdd(left, right);
 				}
@@ -1941,37 +2013,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return loads;
 	}
-	def genNormTypedLoadsByteRegion(source: Source, machType: Type, base: SsaInstr, offset: int) -> Array<SsaInstr> {
-		var tn: TypeNorm;
-		match (machType) {
-			x: IntType => tn = mach.intNorm.makeType(x);
-			_ => return [ptrLoad(machType, base, offset)];
-		}
-
-		var loads = Array<SsaInstr>.new(tn.size);
-		for (i < tn.size - 1) {
-			var et = tn.sub[i];
-			loads[i] = ptrLoad(et, base, offset);
-			offset = offset + mach.sizeOf(et);
-		}
-
-		var et = IntType.!(tn.sub[tn.size - 1]);
-		var etWidth = et.packedByteSize() * 8, read = 0;
-		for (curWidth = mach.intNorm.width; curWidth > 0; curWidth /= 2) {
-			if ((etWidth & curWidth) != 0) {
-				var curType = Int.getType(false, curWidth);
-				var tempLoad = ptrLoad(curType, base, offset + read / 8);
-				tempLoad = curBlock.opIntViewI0(curType, et, tempLoad);
-				if (read != 0) {
-					tempLoad = apply(source, et.opShl(), [tempLoad, context.graph.intConst(read)]);
-					tempLoad = apply(source, et.opOr(), [loads[tn.size - 1], tempLoad]);
-				}
-				loads[tn.size - 1] = tempLoad;
-				read += curWidth;
-			}
-		}
-		return loads;
-	}
 	def genNormTypedStores(oi: SsaApplyOp, nullity: Fact.set, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
 		var tn = normIntType(machType), nullCheck = !nullity.O_NO_NULL_CHECK;
 		// check for simple case first.
@@ -1988,31 +2029,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			if (i == check) ptrStoreT(oi.source, et, base, offset, val);
 			else if (isNonTrivialStore(init, val)) ptrStore(et, base, offset, val);
 			offset = offset + mach.sizeOf(et);
-		}
-	}
-	def genNormTypedStoresByteRegion(oi: SsaApplyOp, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
-		var tn: TypeNorm;
-		match (machType) {
-			x: IntType => tn = mach.intNorm.makeType(x);
-			_ => { ptrStore(machType, base, offset, vals[start]); return; }
-		}
-
-		for (i < tn.size - 1) {
-			var et = tn.sub[i];
-			ptrStore(et, base, offset, vals[start + i]);
-			offset = offset + mach.sizeOf(et);
-		}
-
-		var et = IntType.!(tn.sub[tn.size - 1]), val = vals[start + tn.size - 1];
-		var etWidth = et.packedByteSize() * 8;
-		var stored = 0, curStore: SsaInstr = null;
-		for (curWidth = mach.intNorm.width; curWidth > 0; curWidth /= 2) {
-			if ((etWidth & curWidth) != 0) {
-				var valTruncated = curBlock.opIntViewI0(et, Int.getType(false, curWidth), val);
-				val = apply(oi.source, et.opShl(), [val, context.graph.intConst(curWidth)]);
-				ptrStore(Int.getType(false, curWidth), base, offset + stored / 8, valTruncated);
-				stored += curWidth;
-			}
 		}
 	}
 	def isNonTrivialStore(init: bool, v: SsaInstr) -> bool {
