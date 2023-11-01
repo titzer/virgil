@@ -3,7 +3,7 @@
 Virgil is a programming language designed for building *systems*, such as virtual machines, kernels, networking stacks, databases, etc.
 Such software usually runs directly on the CPU, rather that itself on a virtual machine or interpreter, and thus necessitates a *compiler* that translates Virgil source code to native (machine) code.
 
-The Virgil compiler [Aeneas](aeneas/src/) serves the role of both an interpreter and compiler to several targets.
+The Virgil compiler [Aeneas](../../aeneas/src/) serves the role of both an interpreter and compiler to several targets.
 `Aeneas` is itself written in Virgil.
 This is often called "self-hosted", meaning that a compiler is written in the language it accepts, and thus can compile itself.
 But how does the Virgil compiler run, if not for another compiler or interpreter for Virgil?
@@ -11,7 +11,7 @@ But how does the Virgil compiler run, if not for another compiler or interpreter
 ## Self-hosting requires bootstrapping ##
 
 The process of creating a *self-hosted* compiler `K` for a new programming language `L` is called *bootstrapping*.
-This follows a tried and true pattern: before building the first compiler `K`, a compiler (or interpreter) for the language, `PreK`, is written in an existing language.
+This follows a tried-and-true pattern: before building the first compiler `K`, a compiler (or interpreter) for the language, `PreK`, is written in an existing language.
 The very first compilers had no pre-existing language to bootstrap with; they were written in assembly or machine code.
 The `PreK` implementation of `L` of Virgil III was an interpreter written in Java circa 2009 that was adapted from a Virgil II compiler, known as `VPC` (for Virgil Prototype Compiler) also written in Java.
 When `Aeneas` running on `VPC` could finally generate an executable of itself, `VPC` became unnecessary.
