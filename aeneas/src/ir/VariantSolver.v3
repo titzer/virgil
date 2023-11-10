@@ -129,7 +129,7 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		rc.variantNorm = DataVariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(ta)), null, origRanges, normRanges, ta);
 		rc.raFacts |= RaFact.RC_UNBOXED;
 	}
-	private def synthesizeClass (decl: VstClass) -> ClassType {
+	private def synthesizeClassType (decl: VstClass) -> ClassType {
 		decl.typeCon = V3Class_TypeCon.new(decl, rn.ra.prog.typeCache);
 		var classType = decl.getDeclaredType();
 		return ClassType.!(classType);
@@ -144,13 +144,11 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		// superclass for all boxed cases in this partially-unboxed variant
 		var boxedScName = StringBuilder.new().put1("%q$box", rc.oldType.render).toString();
 		var boxedScDecl = VstClass.new(false, Token.new("<generated>", boxedScName, 0, 0), null, null, null, null, null);
-		var boxedScType = synthesizeClass(boxedScDecl);
-		var boxedScRc = rn.ra.makeClass(boxedScType);
-		var verifier = Verifier.new(rn.ra.compiler, rn.ra.prog);
-		verifier.buildMembers(boxedScDecl, false);
-		var vstConstructor = VstNew.!(boxedScDecl.members.head);
-		vstConstructor.markNontrivial();
-		
+		var boxedScType = synthesizeClassType(boxedScDecl);
+		var boxedScIc = rn.newIr.makeIrClass(boxedScType);
+		var boxedScRc = RaClass.new(boxedScType, boxedScIc, null);
+		rn.ra.classes.put(boxedScRc);
+
 		for (l = rc.children; l != null; l = l.tail) {
 			var c = l.head;
 			var caseUnboxed = parentUnboxed || c.orig.boxing == Boxing.UNBOXED;
@@ -162,24 +160,59 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 				var boxedClassName = StringBuilder.new().put1("%q$box", c.oldType.render).toString();
 				var boxedClassDecl = VstClass.new(false, Token.new("<generated>", boxedClassName, 0, 0), null, ClassType.!(c.oldType).classDecl.params,
 					TypeUtil.typeRefOf(boxedScType), null, null);
-				var boxedType = synthesizeClass(boxedClassDecl);
+				var boxedType = synthesizeClassType(boxedClassDecl);
 
-				verifier.buildMembers(boxedClassDecl, true);
-				var vstConstructor = VstNew.!(boxedClassDecl.members.head);
-				vstConstructor.numParams = ClassType.!(c.oldType).classDecl.params.length() + 1;
-				vstConstructor.markNontrivial();
-				vstConstructor.thisParam = ParamDecl.new(null, TypeUtil.typeRefOf(boxedType));
-				vstConstructor.thisParam.vtype = boxedType;
-				vstConstructor.thisParam.ssa = VstSsaVar.new();
+				var builder = IrBuilder.new(boxedType, boxedScIc);
 
-				var boxedRc = rn.ra.makeClass(boxedType);
-				boxedRc.newIrType = boxedType;
-				var boxedIc = boxedRc.orig;
-				boxedIc.methods[0].source = vstConstructor;
-				for (field in boxedIc.fields) {
-					boxedRc.makeField(field, field.fieldType);
+				var paramDecls = ClassType.!(c.oldType).classDecl.params;
+				var context = SsaContext.new(rn.ra.compiler, rn.ra.prog);
+				var numParams = if(paramDecls != null, paramDecls.length(), 0);
+				var paramTypes = Array<Type>.new(numParams + 1);
+				var params = Array<SsaParam>.new(numParams + 1);
+
+				params[0] = SsaParam.new(0, boxedType);
+				paramTypes[0] = boxedType;
+				
+				if (paramDecls != null) {
+					for (l = paramDecls.list; l != null; l = l.tail) {
+						var p = l.head;
+						Terminal.put2("id=%d fieldType=%q\n", p.index, p.vtype.render);
+						paramTypes[p.index] = p.vtype;
+						params[p.index] = SsaParam.new(p.index, p.vtype);
+						builder.addIrField(IrField.new(boxedType, p.vtype));
+					}
 				}
-				rn.ra.getMethod(null, rn.ra.makeMethod([boxedType], boxedIc.methods[0], null));
+				
+				var constructor = IrMethod.new(boxedType, null, Function.siga(paramTypes, boxedType));
+				constructor.setFact(Fact.M_NEW);
+				builder.addIrMethod(constructor);
+				context.enterMethod(constructor);
+
+				constructor.ssa = SsaGraph.new(params, boxedType);
+				context.graph = constructor.ssa;
+				var block = SsaBuilder.new(context, constructor.ssa, constructor.ssa.startBlock);
+				for (i = 1; i < params.length; i++) {
+					var spec = IrSpec.new(boxedType, [boxedType], builder.fields[i-1]);
+					block.addApply(null, V3Op.newClassInitField(spec), [params[0], params[i]]);
+				}
+				block.addReturn([params[0]]);
+				context.printSsa("Generated");
+
+				var boxedIc = builder.build();
+				var boxedRc = RaClass.new(boxedType, boxedIc, boxedScRc);
+				boxedRc.newIrType = boxedType;
+				rn.ra.typeMap[boxedType] = boxedRc;
+				rn.ra.classes.put(boxedRc);
+
+				var mc = rn.ra.makeMethod([boxedType], constructor, null);
+				mc.raFacts |= RaFact.RM_LIVE;
+				rn.ra.liveMethods.put(mc);
+
+				for (i < boxedIc.fields.length) {
+					var rf = boxedRc.makeField(boxedIc.fields[i], boxedIc.fields[i].fieldType);
+					boxedIc.fields[i].raField = rf;
+					rf.raFacts |= RaFact.RF_INIT | RaFact.RF_READ; // ensure fields survive during normalization
+				}
 
 				for (i < vecT.length) {
 					var supertype = nc.TypesCompatible(vecT[i], boxedType);
