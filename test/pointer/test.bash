@@ -16,6 +16,8 @@ for target in $TEST_TARGETS; do
 	continue # skip because not native
     elif [ "$target" = wasm-js ]; then
 	TESTS=$(ls $TEST_LIST | grep -v _64.v3)
+    elif [ "$target" = wasm-spec ]; then
+	TESTS=$(ls $TEST_LIST | grep -v _64.v3)
     elif [ "$target" = x86-linux ]; then
 	TESTS=$(ls $TEST_LIST | grep -v _64.v3)
     elif [ "$target" = x86-darwin ]; then

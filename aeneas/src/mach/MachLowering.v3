@@ -1395,7 +1395,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		// allocate the array, store tag, and store length
 		mach.allocates = true;
-		var narr = apply(oi.source, V3Op.newAlloc(mach.machType(arrayType)), [size]);
+		var narr = genAlloc(oi.source, mach.machType(arrayType), size);
 		storeObjectTag(narr, arrayType);
 		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), nlen);
 		return narr;
@@ -1404,10 +1404,22 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var totalSize = mach.data.addrAlign.alignUp(hsize + len * scale);
 		// allocate the array with the known size
 		mach.allocates = true;
-		var narr = apply(source, V3Op.newAlloc(mach.machType(arrayType)), [context.graph.intConst(totalSize)]);
+		var narr = genAlloc(source, mach.machType(arrayType), context.graph.intConst(totalSize));
 		storeObjectTag(narr, arrayType); // store tag
 		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), context.graph.intConst(len)); // store length
 		return narr;
+	}
+	def genAlloc(source: Source, mtype: Type, size: SsaInstr) -> SsaInstr {
+		if (context.compiler.IrAlloc) {
+			var m = genAllocMethod(Int.TYPE);
+			var methodRef = IrSpec.new(m.receiver, TypeUtil.NO_TYPES, m);
+			var funcRep = mach.funcRep(methodRef);
+			var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+			var op = V3Op.newCallAddress(funcRep); // XXX: cache
+			return apply(source, op, [func, context.graph.nullReceiver(), size]);
+		} else {
+			return apply(source, V3Op.newAlloc(mtype), [size]);
+		}
 	}
 	def genArrayInit(oi: SsaApplyOp) -> SsaInstr {
 		if (config.ObjectSystem) return normId(oi);
@@ -1614,7 +1626,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var size = mach.getObjectSize(classType, null);
 		// allocate the object
 		mach.allocates = true;
-		var nobj = apply(oi.source, V3Op.newAlloc(mach.machType(classType)), [context.graph.intConst(size)]);
+		var nobj = genAlloc(oi.source, mach.machType(classType), context.graph.intConst(size));
 		storeObjectTag(nobj, classType);
 		if (method != null) {
 			var newRef = V3Op.extractIrSpec(oi.op, method);
@@ -2046,5 +2058,60 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		curBlock.end = true;
 		if (cfopt == null) cfopt = SsaCfOptimizer.new(context);
 		return cfopt.insertThrow(curBlock.pt, source, exception, null);
+	}
+
+	def genAllocMethod(size: IntType) -> IrMethod {
+		if (mach.allocMethod != null) return mach.allocMethod;
+		var receiverType = AnyRef.TYPE, returnType = AnyRef.TYPE, ptr = mach.data.ptrType;
+		var vst = VstMethod.new(false, Token.new(null, ".alloc", 0, 0), null, null, ReturnType.Explicit(TypeUtil.typeRefOf(returnType)), null);
+		var p_receiver = SsaParam.new(0, receiverType);
+		var p_size = SsaParam.new(1, size);
+		var graph = SsaGraph.new([p_receiver, p_size], returnType);
+		var ssa = SsaBuilder.new(context, graph, graph.startBlock);
+
+		if (CLOptions.RT_TEST_GC.get()) {
+			// Always call RiRuntime.gc()
+			var i_collect = genCallRiGc(ssa, p_size);
+			ssa.addReturn([i_collect]);
+		} else {
+			// Allocation using CiRuntime.{heapCurLoc, heapEndLoc}
+			var k_heapCur = graph.valConst(ptr, CiRuntimeModule.HEAP_CUR_LOC);
+			var k_heapEnd = graph.valConst(ptr, CiRuntimeModule.HEAP_END_LOC);
+			var i_cur = ssa.add(V3Op.newPtrLoad(ptr, ptr), [k_heapCur], Fact.O_NO_NULL_CHECK);
+			var i_next = ssa.add(V3Op.newPtrAdd(ptr, size), [i_cur, p_size], Fact.O_PURE);
+
+			if (!CLOptions.RT_GC.get()) {
+				// runtime support for GC is turned off; no need to test against end. TODO: ugly
+				ssa.add(V3Op.newPtrStore(ptr, ptr), [k_heapCur, i_next], Fact.O_NO_NULL_CHECK);
+				ssa.addReturn([i_cur]);
+			} else {
+				var i_end = ssa.add(V3Op.newPtrLoad(ptr, ptr), [k_heapEnd], Fact.O_NO_NULL_CHECK);
+				var i_lt = ssa.add(V3Op.newPtrLteq(ptr), [i_next, i_end], Fact.O_PURE);
+				var split = SsaBlockSplit.new(context, ssa);
+				ssa = split.addIf(i_lt);
+				ssa.add(V3Op.newPtrStore(ptr, ptr), [k_heapCur, i_next], Fact.O_NO_NULL_CHECK);
+				ssa.addReturn([i_cur]);
+				ssa = split.addElse();
+				var i_collect = genCallRiGc(ssa, p_size);
+				if (i_collect != null) ssa.addReturn([i_collect]);
+				else ssa.addThrow(null, V3Exception.HeapOverflow);
+				split.finish();
+			}
+		}
+
+		var meth = IrMethod.new(receiverType, null, Function.sig(size, returnType));
+		meth.ssa = graph;
+		context.prog.ir.methods.put(meth);
+		mach.allocStub = mach.addrOfMethod(meth); // is implemented by IR
+		return mach.allocMethod = meth;
+	}
+	def genCallRiGc(ssa: SsaBuilder, p_size: SsaInstr) -> SsaInstr {
+		var rt_collect = mach.runtime.getRiGc();
+		if (rt_collect == null) return null;
+		// XXX: tail call RiRuntime.gc()
+		var i_caller_ip = ssa.add(V3Op.newCallerIp(mach.code.ptrType), Ssa.NO_INSTRS, Fact.O_PURE);
+		var i_caller_sp = ssa.add(V3Op.newCallerSp(mach.data.ptrType), Ssa.NO_INSTRS, Fact.O_PURE);
+		var op = V3Op.newCallMethod(IrSpec.new(rt_collect.receiver, [rt_collect.receiver], rt_collect));
+		return ssa.add(op, [context.graph.nullReceiver(), p_size, i_caller_ip, i_caller_sp], Facts.NONE);
 	}
 }
