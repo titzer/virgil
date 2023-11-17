@@ -1,34 +1,23 @@
-// Norm for variants (both superclass and case class)
-class VariantNorm extends TypeNorm {
-	def tagType: IntType;
-	def isCase: bool;
-
-	new (oldType: Type, newType: Type, tagType: IntType, isCase: bool, sub: Array<Type>)
-		super(oldType, newType, sub) {
-	}
-}
 // Norm of a variant with unboxed cases
-class UnboxedVariantNorm extends VariantNorm {
-	// case-specific fields, null for parent
-	def caseTypes: Array<Type>;
-	def parentNorm: VariantNorm;
-	def fieldIndexes: Array<Array<int>>;
-	def tagIndex: int;
+class VariantNorm extends TypeNorm {
+	def parentNorm: VariantNorm; // null for single parent or enum
 
-	new (oldType: Type, newType: Type, tagType: IntType,
-		parentNorm, caseTypes, fieldIndexes, tagIndex, sub: Array<Type>)
-		super(oldType, newType, tagType, parentNorm != null, sub) {
-	}
+	def fieldIndexes: Array<Array<int>>;
+	def origRanges: Array<(int, int)>; // null for non-single case
+
+	def tagType: IntType;
+	def tagIndex: int;
+	var isEnum: bool = false;
+	def isCase = parentNorm != null;
+	var isSingleCase: bool = false;
+
+	new(oldType: Type, newType: Type, tagType: IntType,
+		parentNorm, origRanges, fieldIndexes, tagIndex, sub: Array<Type>) 
+		super(oldType, newType, sub) {}
 }
 
-// For variants with only a single unboxed case, or empty variants that are represented as enums
-class DataVariantNorm extends VariantNorm {
-	def origRanges: Array<(int, int)>;
-	def normRanges: Array<(int, int)>;
+class VariantBoxBuilder {
 
-	new(oldType: Type, newType: Type, tagType: IntType, origRanges, normRanges, sub: Array<Type>)
-		super(oldType, newType, tagType, true, sub) {
-	}
 }
 
 private type VariantCase(fieldTypes: Array<Array<Type>>, fieldIndexes: Array<Array<int>>) #unboxed;
@@ -72,13 +61,11 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		if (isEmpty && !closure) {
 			// normalize empty variant to just its tag; i.e. become an enum
 			var tagType = V3.getVariantTagType(rc.oldType);
-			setDataNormForChildren(rc, tagType, [tagType], RaFact.RC_ENUM | RaFact.RC_UNBOXED);
+			setVariantNormForChildren(rc, tagType, [tagType], RaFact.RC_ENUM | RaFact.RC_UNBOXED);
 			return true;
 		}
 		if (rc.children != null) {
-			if (CLOptions.UNBOX_VARIANTS.get() == VstMatcher.None) {
-				return false;
-			}
+			if (!CLOptions.UNBOX_VARIANTS.get()) return false;
 			match (rc.orig.boxing) {
 				BOXED => return false;
 				AUTO => if (!hasUnboxedCases) return false;
@@ -92,14 +79,14 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 			UNBOXED => ; // program specified unboxed; TODO: recursion or closure should be an error
 		}
 		if (rc.recursive > 1 || closure) return false; // recursive or closed over
-		unboxUsingDataNorm(rc);
+		unboxUsingSingleVariantNorm(rc);
 		return true;
 	}
-	def unboxUsingDataNorm(rc: RaClass) {
+	def unboxUsingSingleVariantNorm(rc: RaClass) {
 		// Flatten a data type
 		var of = rc.orig.fields;
 		var origRanges = Array<(int, int)>.new(of.length);
-		var normRanges = Array<(int, int)>.new(of.length);
+		var fieldIndexes = Array<Array<int>>.new(of.length);
 		var vecO = Vector<Type>.new();
 		var vecT = Vector<Type>.new();
 		// map fields of original IrClass to ranges in the original and normalized type
@@ -124,10 +111,14 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 			var fieldType = of[i].fieldType.substitute(V3.getTypeArgs(rc.oldType));
 			rn.norm(fieldType).addTo(vecO);
 			origRanges[i] = (origStart, vecO.length);
-			normRanges[i] = (normStart, vecT.length);
+			fieldIndexes[i] = Array.new(vecT.length - normStart);
+			for (j < fieldIndexes[i].length) fieldIndexes[i][j] = normStart + j;
 		}
+
+		var tagType = V3.getVariantTagType(rc.oldType);
 		var ta = vecT.extract();
-		rc.variantNorm = DataVariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(ta)), null, origRanges, normRanges, ta);
+		rc.variantNorm = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(ta)), tagType, null, origRanges, fieldIndexes, -1, ta);
+		rc.variantNorm.isSingleCase = true;
 		rc.raFacts |= RaFact.RC_UNBOXED;
 	}
 	private def synthesizeClassType (decl: VstClass) -> ClassType {
@@ -146,8 +137,11 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		var boxedScName = StringBuilder.new().put1("%q$box", rc.oldType.render).toString();
 		var boxedScDecl = VstClass.new(false, Token.new("<generated>", boxedScName, 0, 0), null, null, null, null, null);
 		var boxedScType = synthesizeClassType(boxedScDecl);
-		var boxedScIc = rn.newIr.makeIrClass(boxedScType);
+
+		var boxedScBuilder = IrBuilder.new(boxedScType, null);
+		var boxedScIc = boxedScBuilder.build();
 		var boxedScRc = RaClass.new(boxedScType, boxedScIc, null);
+		boxedScRc.newIrType = boxedScType;
 		rn.ra.classes.put(boxedScRc);
 
 		for (l = rc.children; l != null; l = l.tail) {
@@ -241,13 +235,10 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 				rf.raFacts |= RaFact.RC_UNBOXED;
 
 				var nf = Vector<Type>.new();
-				if (rf.typeNorm != null) {
-					rf.typeNorm.addTo(nf);
-				} else if (rf.fieldType != null) {
-					rn.norm(rf.fieldType).addTo(nf);
-				} else {
-					nf = Vectors.of1(rf.orig.fieldType);
-				}
+				if (rf.typeNorm != null) rf.typeNorm.addTo(nf);
+				else if (rf.fieldType != null) rn.norm(rf.fieldType).addTo(nf);
+				else nf = Vectors.of1(rf.orig.fieldType);
+
 				fieldTypes[i] = nf.extract();
 				fieldIndexes[i] = Array<int>.new(fieldTypes[i].length);
 
@@ -280,7 +271,7 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		}
 
 		vecT.put(tagType);
-		var parentNorm = UnboxedVariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(vecT.copy())), tagType, null, null, null, vecT.length - 1, vecT.copy());
+		var parentNorm = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(vecT.copy())), tagType, null, null, null, vecT.length - 1, vecT.copy());
 		rc.variantNorm = parentNorm; rc.raFacts |= RaFact.RC_UNBOXED;
 		if (verbose) Terminal.put1("variant norm %q\n", rc.variantNorm.render);
 
@@ -290,24 +281,30 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 			var vc = cases[caseIndex]; caseIndex++;
 			var caseTypes = vecT.copy();
 
+			var origRanges = Array<(int, int)>.new(vc.fieldIndexes.length);
+			var curStart = 0;
 			for (i < vc.fieldIndexes.length) {
+				origRanges[i] = (curStart, curStart + vc.fieldIndexes[i].length);
+				curStart += vc.fieldIndexes[i].length;
 				for (j < vc.fieldIndexes[i].length) {
 					caseTypes[vc.fieldIndexes[i][j]] = vc.fieldTypes[i][j];
 				}
 			}
 
-			var caseNorm = UnboxedVariantNorm.new(c.oldType, Tuple.newType(Lists.fromArray(caseTypes)), tagType, parentNorm, caseTypes, vc.fieldIndexes, vecT.length - 1, caseTypes);
+			var caseNorm = VariantNorm.new(c.oldType, Tuple.newType(Lists.fromArray(caseTypes)), tagType, parentNorm, origRanges, vc.fieldIndexes, vecT.length - 1, caseTypes);
 			c.variantNorm = caseNorm;
 			if (verbose) Terminal.put1("-- case norm %q\n", caseNorm.render);
 		}
 		
 		return true;
 	}
-	def setDataNormForChildren(rc: RaClass, tagType: IntType, sub: Array<Type>, facts: RaFact.set) {
-		rc.variantNorm = DataVariantNorm.new(rc.oldType, tagType, tagType, NO_RANGES, NO_RANGES, sub);
+	def setVariantNormForChildren(rc: RaClass, tagType: IntType, sub: Array<Type>, facts: RaFact.set) {
+		rc.variantNorm = VariantNorm.new(rc.oldType, tagType, tagType, null, Array<(int, int)>.new(0), Array<Array<int>>.new(0), 0, [tagType]);
+		rc.variantNorm.isEnum = true;
+
 		rc.raFacts |= facts;
 		for (l = rc.children; l != null; l = l.tail) {
-			setDataNormForChildren(l.head, tagType, sub, facts);
+			setVariantNormForChildren(l.head, tagType, sub, facts);
 		}
 	}
 }

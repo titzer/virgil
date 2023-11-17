@@ -41,10 +41,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	var specializer: Specializer;
 	var virtuals: List<RaVirtual>;
 	var ovfAlloc: OverflowFieldAllocator;
-	var variantSolver: VariantSolver;
+	var vs: VariantSolver;
 
 	new() {
-		variantSolver = VariantSolver.new(config, this, true);
+		vs = VariantSolver.new(config, this, true);
 	}
 
 	def normalize() {
@@ -223,7 +223,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			V3Kind.VARIANT => {
 				// try flattening variants and data types
 				var rc = ra.getClass(t);
-				if (rc != null) tn = variantSolver.normVariant(t, rc);
+				if (rc != null) tn = vs.normVariant(t, rc);
 				else tn = TypeNorm.new(t, t, null);
 			}
 			V3Kind.ENUM => {
@@ -350,32 +350,24 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	// normalize a live instance of a class
 	def normClassRecord(rc: RaClass, oldRecord: Record, array: Array<Val>) {
 		if (rc.variantNorm != null) {
-			if (DataVariantNorm.?(rc.variantNorm) && DataVariantNorm.!(rc.variantNorm).tagType != null) {
-				array[0] = Int.box(V3.getVariantTag(oldRecord.rtype));
-			}
-			if (UnboxedVariantNorm.?(rc.variantNorm)) {
-				var vrc = ra.getClass(oldRecord.rtype); // case-specific RaClass
+			var vrc = ra.getClass(oldRecord.rtype);
+			var vn = vrc.variantNorm;
+			if (!vn.isEnum) {
 				var rfs = vrc.fields;
-				var uvn = UnboxedVariantNorm.!(vrc.variantNorm);
-				// ra.dumpType(vrc);
-
 				for (i < rfs.length) {
 					var rf = rfs[i];
-					var fieldIndexes = uvn.fieldIndexes[i];
+					var fieldIndexes = vn.fieldIndexes[i];
 					var fieldArray = Array<Val>.new(fieldIndexes.length);
 					var v = oldRecord.values[i];
 
 					if (rf.fieldType == null) fieldArray[0] = normSimpleVal(null, v);
 					else normValIntoArray(v, rf.typeNorm, fieldArray, 0);
 					
-					for (j < fieldIndexes.length) {
-						Terminal.put1("Putting field into array[%d]\n", fieldIndexes[j]);
-						array[fieldIndexes[j]] = fieldArray[j];
-					}
+					for (j < fieldIndexes.length) array[fieldIndexes[j]] = fieldArray[j];
 				}
-				array[uvn.tagIndex] = Int.box(V3.getVariantTag(oldRecord.rtype));
-				return;
 			}
+			if (!vn.isSingleCase) array[vn.tagIndex] = Int.box(V3.getVariantTag(oldRecord.rtype));
+			return;
 		}
 		var rfs = rc.fields;
 		for (i < rfs.length) {
@@ -414,7 +406,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	def normSimpleVal(tn: TypeNorm, v: Val) -> Val {
 		match (v) {
 			x: Record => {
-				if (DataVariantNorm.?(tn)) return normVariantVal(DataVariantNorm.!(tn), x)[0];
+				if (VariantNorm.?(tn)) return normVariantVal(VariantNorm.!(tn), x)[0];
 				var r = recordMap[x];
 				return if(r == null, x, r);
 			}
@@ -434,10 +426,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		else vtable.put(null); // reserve a space for constructor
 		// process all methods
 		for (ml in rc.methods) {
-			for (l = ml; l != null; l = l.tail) {
-				if (rc.variantNorm != null && l.head.orig.facts.M_NEW) continue;
-				addMethod(vtable, rc, l.head);
-			}
+			for (l = ml; l != null; l = l.tail) addMethod(vtable, rc, l.head);
 		}
 		rc.normMethods = vtable.extract();
 	}
@@ -476,7 +465,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		var table = Array<IrMethod>.new(size), mtable = IrMtable.new(rm.norm, rc.minClassId, table);
 		rv.mtable = mtable;
 
-		if (rc.raFacts.RC_UNBOXED) {
+		if (rc.variantNorm != null) {
 			var ft = Function.funcRefType(rm.norm.getMethodType());
 			mtable.record = ra.prog.newRecord(V3Array.newType(ft), size);
 		}
@@ -600,15 +589,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			var receiver = ra.oldIr.getIrClass(ctype);
 			var root = ra.oldIr.getIrClass(V3.getRootType(ctype));
 			var rc = ra.getClass(rm.receiver);
-			if (rc.variantNorm != null) { // TODO: disable generation of compare method bodies
-				if (DataVariantNorm.?(rc.variantNorm)) {
-					// flattened data types will have inlined compare
-					rm.orig.ssa = SsaGraph.new([], Bool.TYPE);
-					rm.orig.ssa.startBlock.append(SsaReturn.new([rm.orig.ssa.falseConst()]));
-				} else if (UnboxedVariantNorm.?(rc.variantNorm)) {
-					// TODO: generate correct method (this is a placeholder for now)
-					rm.orig.ssa = VariantComparatorGen.new(context, root, receiver, rm.orig).generate();
-				}
+			if (false && rc.variantNorm != null) { // TODO: disable generation of compare method bodies
+				// flattened data types will have inlined compare
+				rm.orig.ssa = SsaGraph.new([], Bool.TYPE);
+				rm.orig.ssa.startBlock.append(SsaReturn.new([rm.orig.ssa.falseConst()]));
 			} else {
 				rm.orig.ssa = VariantComparatorGen.new(context, root, receiver, rm.orig).generate();
 			}
@@ -617,12 +601,6 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		if (specializer != null && rm.spec != null) {
 			// use specializer to generate appropriate code for method
 			if (specializer.normCode(context, rm)) return;
-		}
-		if (rm.orig.facts.M_NEW) {
-			// skip generating constructors for unboxed variants
-			var ctype = rm.orig.receiver;
-			var rc = ra.getClass(rm.receiver);
-			if (rc.variantNorm != null) return;
 		}
 		SsaRaNormalizer.new(context, this).build(rm.norm);
 		newIr.methods.put(rm.norm);
@@ -686,4 +664,6 @@ def live(facts: RaFact.set) -> bool {
        	return (facts & (RaFact.RC_LIVE | RaFact.RC_ALLOC)) != NONE;
 }
 def NO_VALUES = Array<Val>.new(0);
+def NO_RANGES = Array<(int, int)>.new(0);
+def ON_STACK = -1;
 def NO_FIELDS = Array<IrField>.new(0);
