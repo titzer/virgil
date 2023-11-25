@@ -3,10 +3,12 @@ class VariantNorm extends TypeNorm {
 	def parentNorm: VariantNorm; // null for single parent or enum
 	def caseFields: Array<VariantField>;
 	def tagField: VariantField;
+
+	def boxes: Array<VariantBox>;
 	var isEnum: bool = false;
 
 	new(oldType: Type, newType: Type,
-		parentNorm, caseFields, tagField, sub: Array<Type>) 
+		parentNorm, caseFields, tagField, boxes, sub: Array<Type>) 
 		super(oldType, newType, sub) {}
 	
 	def isSingleCase() -> bool {
@@ -14,6 +16,9 @@ class VariantNorm extends TypeNorm {
 	}
 	def isEmpty() -> bool {
 		return caseFields.length == 0;
+	}
+	def isBoxed() -> bool {
+		return boxes.length > 0;
 	}
 	def tagIndex() -> int {
 		// TODO: Replace when tag becomes potentially packed
@@ -36,6 +41,25 @@ class VariantNorm extends TypeNorm {
 			caseFields[i].render(buf);
 		}
 		buf.puts("}");
+		return buf;
+	}
+}
+
+class VariantBox {
+	var ic: IrClass;
+	def parent: VariantBox;
+	def normFields: Array<IrField>;
+	def boxType: ClassType;
+
+	new(boxType, normFields, parent) {}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.puts("box[");
+		for (i < normFields.length) {
+			if (i > 0) buf.csp();
+			normFields[i].render(buf);
+		}
+		buf.puts("]");
 		return buf;
 	}
 }
@@ -66,87 +90,18 @@ class Packing {
 	def newRanges: Array<(int, int)>;
 }
 
-class VariantBoxBuilder {
-	def rn: ReachabilityNormalizer;
-	def name: string;
-	private var decl: VstClass;
-
-	var ic: IrClass;
-	var rc: RaClass;
-
-	var superIc: IrClass;
-	var superRc: RaClass;
-
-	var classType: ClassType;
-	private var irBuilder: IrBuilder;
-	private var constructor: IrMethod;
-
-	new(rn, name, scType: Type, superIc, superRc) {
-		var token = Token.new("<generated>", name, 0, 0);
-		var superclass = if(scType != null, TypeUtil.typeRefOf(scType), null);
-		decl = VstClass.new(false, token, null, null, superclass, null, null);
-		decl.typeCon = V3Class_TypeCon.new(decl, rn.ra.prog.typeCache);
-		classType = ClassType.!(decl.getDeclaredType());
-		irBuilder = IrBuilder.new(classType, superIc);
-	}
-
-	def addParams(paramDecls: VstList<ParamDecl>) {
-		var context = SsaContext.new(rn.ra.compiler, rn.ra.prog);
-		var numParams = if(paramDecls != null, paramDecls.length(), 0);
-		var paramTypes = Array<Type>.new(numParams);
-		var params = Array<SsaParam>.new(numParams + 1);
-
-		params[0] = SsaParam.new(0, classType);
-
-		if (paramDecls != null) {
-			for (l = paramDecls.list; l != null; l = l.tail) {
-				var p = l.head;
-				paramTypes[p.index - 1] = p.vtype;
-				params[p.index] = SsaParam.new(p.index, p.vtype);
-				irBuilder.addIrField(IrField.new(classType, p.vtype));
-			}
-		}
-
-		constructor = IrMethod.new(classType, null, Function.siga(paramTypes, classType));
-		constructor.setFact(Fact.M_NEW);
-		irBuilder.addIrMethod(constructor);
-		context.enterMethod(constructor);
-
-		constructor.ssa = SsaGraph.new(params, classType);
-		context.graph = constructor.ssa;
-		var block = SsaBuilder.new(context, constructor.ssa, constructor.ssa.startBlock);
-		for (i = 1; i < params.length; i++) {
-			var spec = IrSpec.new(classType, [classType], irBuilder.fields[i-1]);
-			block.addApply(null, V3Op.newClassInitField(spec), [params[0], params[i]]);
-		}
-		block.addReturn([params[0]]);
-		context.printSsa("Generated");
-	}
-	def synthesize() {
-		ic = irBuilder.build();
-		rc = RaClass.new(classType, ic, superRc);
-
-		rc.newIrType = classType;
-		rn.ra.typeMap[classType] = rc;
-		rn.ra.classes.put(rc);
-
-		if (constructor != null) {
-			var mc = rn.ra.makeMethod([classType], constructor, null);
-			mc.raFacts |= RaFact.RM_LIVE;
-			rn.ra.liveMethods.put(mc);
-		}
-
-		for (i < ic.fields.length) {
-			var rf = rc.makeField(ic.fields[i], ic.fields[i].fieldType);
-			ic.fields[i].raField = rf;
-			rf.raFacts |= RaFact.RF_INIT | RaFact.RF_READ; // ensure fields survive during normalization
-		}
-	}
-}
-
-private type VariantCase(fields: Array<VariantField>) #unboxed;
+private type VariantCase(fields: Array<VariantField>, boxes: Array<VariantBox>) #unboxed;
 
 class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: bool) {
+	// TODO: change to BoxType
+	private def makeClassType(name: string, superclass: ClassType) -> ClassType {
+		var scRef = if(superclass != null, TypeUtil.typeRefOf(superclass), null);
+		var token = Token.new("<generated>", name, 0, 0);
+		var decl = VstClass.new(false, token, null, null, scRef, null, null);
+		decl.typeCon = V3Class_TypeCon.new(decl, rn.ra.prog.typeCache);
+		var classType = ClassType.!(decl.getDeclaredType());
+		return classType;
+	}
 	// lay out a variant's fields, which may be flattened
 	def normVariant(t: Type, rc: RaClass) -> TypeNorm {
 		if (rc.variantNorm != null) return rc.variantNorm; // already unboxed
@@ -238,7 +193,7 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		}
 
 		var ta = vecT.extract();
-		rc.variantNorm = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(ta)), null, caseFields, null, ta);
+		rc.variantNorm = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(ta)), null, caseFields, null, [], ta);
 
 		if (verbose) Terminal.put1("variant norm %q\n", rc.variantNorm.render);
 	}
@@ -248,26 +203,26 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 
 		var tagType = V3.getVariantTagType(rc.oldType);
 		var parentUnboxed = rc.orig.boxing == Boxing.UNBOXED;
+		var hasBoxedCase = false;
 
-		// superclass for all boxed cases in this partially-unboxed variant
+		// XXX: Remove when we move to BoxType
 		var boxedScName = StringBuilder.new().put1("%q$box", rc.oldType.render).toString();
-		var boxedScBuilder = VariantBoxBuilder.new(rn, boxedScName, null, null, null);
-		boxedScBuilder.synthesize();
+		var boxedScType = makeClassType(boxedScName, null);
+		var parentBox = VariantBox.new(boxedScType, [], null);
 
 		for (l = rc.children; l != null; l = l.tail) {
 			var c = l.head;
 			var caseUnboxed = parentUnboxed || c.orig.boxing == Boxing.UNBOXED;
 
 			if (!caseUnboxed) {
+				hasBoxedCase = true;
 				var boxedIndex = -1;
 
-				var boxedClassName = StringBuilder.new().put1("%q$box", c.oldType.render).toString();
-				var boxedClassBuilder = VariantBoxBuilder.new(rn, boxedClassName, boxedScBuilder.classType, boxedScBuilder.ic, boxedScBuilder.rc);
-				boxedClassBuilder.addParams(ClassType.!(c.oldType).classDecl.params);
-				boxedClassBuilder.synthesize();
+				var boxedName = StringBuilder.new().put1("%q$box", c.oldType.render).toString();
+				var boxedClass = makeClassType(boxedName, boxedScType);
 
 				for (i < vecT.length) {
-					var supertype = nc.UnifyRepresentations(vecT[i], boxedClassBuilder.classType);
+					var supertype = nc.UnifyRepresentations(vecT[i], boxedClass);
 					if (supertype != null) {
 						boxedIndex = i;
 						break;
@@ -275,9 +230,11 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 				}
 				if (boxedIndex < 0) {
 					boxedIndex = vecT.length;
-					vecT.put(boxedClassBuilder.classType);
+					vecT.put(boxedClass);
 				}
-				cases.put(VariantCase([VariantField.new([boxedClassBuilder.classType], [boxedIndex], (0, 0))]));
+				var box = VariantBox.new(boxedClass, c.normFields, parentBox);
+				cases.put(VariantCase([VariantField.new([boxedClass], [boxedIndex], (0, 0))], [box]));
+
 				continue;
 			}
 
@@ -325,14 +282,14 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 				rn.norm(fieldType).addTo(vecO);
 				caseFields[i] = VariantField.new(fieldTypes, indexes, (origStart, vecO.length));
 			}
-			cases.put(VariantCase(caseFields));
+			cases.put(VariantCase(caseFields, []));
 		}
 
 		if (rc.recursive > 1) return false;
 
 		vecT.put(tagType);
 		var tagField = VariantField.new([tagType], [vecT.length - 1], (0, 0));
-		var parentNorm = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(vecT.copy())), null, NO_FIELDS, tagField, vecT.copy());
+		var parentNorm = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(vecT.copy())), null, NO_FIELDS, tagField, if(hasBoxedCase, [parentBox], []), vecT.copy());
 		rc.variantNorm = parentNorm;
 		if (verbose) Terminal.put1("variant norm %q\n", rc.variantNorm.render);
 
@@ -348,7 +305,7 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 				}
 			}
 
-			var caseNorm = VariantNorm.new(c.oldType, Tuple.newType(Lists.fromArray(caseTypes)), parentNorm, vc.fields, tagField, caseTypes);
+			var caseNorm = VariantNorm.new(c.oldType, Tuple.newType(Lists.fromArray(caseTypes)), parentNorm, vc.fields, tagField, vc.boxes, caseTypes);
 			c.variantNorm = caseNorm;
 			if (verbose) Terminal.put1("-- case norm %q\n", caseNorm.render);
 		}
@@ -356,7 +313,7 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 	}
 	def setVariantNormForChildren(rc: RaClass, tagField: VariantField, sub: Array<Type>, facts: RaFact.set) {
 		var tagType = tagField.types[0];
-		rc.variantNorm = VariantNorm.new(rc.oldType, tagType, null, NO_FIELDS, tagField, [tagType]);
+		rc.variantNorm = VariantNorm.new(rc.oldType, tagType, null, NO_FIELDS, tagField, [], [tagType]);
 		rc.variantNorm.isEnum = true;
 
 		rc.raFacts |= facts;
