@@ -8,21 +8,19 @@ def CODE_POINTER_SIZE32: u8 = 4;
 def CODE_POINTER_SIZE64: u8 = 8;
 var codePointerSize: u8;
 
-var mockType = Int.getType(true, 32);
-
+// Contains logic to generate dwarf debug sections
 class Dwarf {
 	def elf: ElfHeader;
 	def sections: ElfSections;
 	def debugs = sections.debugs;
 	def prog: Program;
 	def mach: MachProgram;
-	var context: SsaContext;
+	var context: SsaContext; // Assign by SsaX86_64Gen
 	def dirFile = DwarfDirFile.new(prog);
 	def abbrev = DwarfAbbrevSection.new();
 	def info = DwarfInfoSection.new(abbrev);
 	def loclists = DwarfLocListsSection.new();
 	def line = DwarfLineSection.new(dirFile);
-	var subprogram: DwarfSubprogram;
 	def normalizer = Normalizer.new();
 	new(elf, sections, prog, mach) {
 		codePointerSize = if(elf.is64(), CODE_POINTER_SIZE64, CODE_POINTER_SIZE32);
@@ -31,7 +29,7 @@ class Dwarf {
 		// .debug_str
 		var sectionStart = w.pos;
 		var buf = StringBuilder.new();
-		// Iterate methods and add required abbrev tags
+		// Iterate methods for name and prepare subprogram information
 		for (i < prog.ir.methods.length) {
 			var m = prog.ir.methods[i];
 			if (m.source == null) continue;
@@ -51,59 +49,62 @@ class Dwarf {
 				entry.decl_file = dirFile.files[fileRange.fileName].index;
 				entry.decl_line = u32.!(fileRange.beginLine);
 			}
-			// fill the end of loclist
+			entry.abbrev = abbrev.getSubprogramAbbrev(hasFile, hasRet);
+			// Fill the end of loclist to method end
 			for (j < entry.loclistMap.length) {
-				var index = entry.loclistMap[j];
+				var index = entry.loclistMap[j] - 1;
 				if (loclists.locLists[index].end == 0) loclists.locLists[index].end = u32.!(entry.low_pc) + entry.high_pc;
 			}
-			entry.abbrev = abbrev.getSubprogramAbbrev(hasFile, hasRet);
+			// Populate method name
 			buf.reset();
 			m.source.renderLong(buf);
 			buf.out(w.putkv);
 			w.putb(0);
 		}
-		putSectionInfo(DebugSection.str.tag, sectionStart, w);
+		setSectionInfo(DebugSection.str.tag, sectionStart, w);
 
 		// .debug_loclists
 		sectionStart = w.pos;
 		loclists.emit(w);
-		putSectionInfo(DebugSection.loclists.tag, sectionStart, w);
+		setSectionInfo(DebugSection.loclists.tag, sectionStart, w);
 
 		// .debug_info
 		sectionStart = w.pos;
 		info.emit(dirFile, w, sections.text.sh_addr, sections.text.sh_size, prog.ir.classes);
-		putSectionInfo(DebugSection.info.tag, sectionStart, w);
+		setSectionInfo(DebugSection.info.tag, sectionStart, w);
 
 		// .debug_abbrev
 		sectionStart = w.pos;
 		abbrev.emit(w);
-		putSectionInfo(DebugSection.abbrev.tag, sectionStart, w);
+		setSectionInfo(DebugSection.abbrev.tag, sectionStart, w);
 
 		// .debug_line_str
 		line.w = w;
 		sectionStart = w.pos;
 		line.emitLineStr();
-		putSectionInfo(DebugSection.line_str.tag, sectionStart, w);
+		setSectionInfo(DebugSection.line_str.tag, sectionStart, w);
 
 		// .debug_line
 		sectionStart = w.pos;
 		line.codeStart = sections.text.sh_addr;
 		line.codeSize = sections.text.sh_size;
 		line.emit();
-		putSectionInfo(DebugSection.line.tag, sectionStart, w);
+		setSectionInfo(DebugSection.line.tag, sectionStart, w);
 	}
-	def putSectionInfo(tag: int, start: int, w: DataWriter) {
+	def setSectionInfo(tag: int, start: int, w: DataWriter) {
 		debugs[tag].sh_offset = start;
 		debugs[tag].sh_size = w.pos - start;
 	}
+	// Add a new variable with variable name, type and initial location. pos is the code address.
 	def addVar(newvar: (string, Type), index: int, locs: Array<(X86_64Reg, int)>, pos: int) {
 		if (context.method.subprogram == null) context.method.subprogram = DwarfSubprogram.new();
 		if (locs.length == 1) {
 			var v = DwarfVariable.new(newvar.0, newvar.1, pos);
-			if (index != -1) {
+			if (index != -1) { // Non-ssa var
 				var i = loclists.addLocList(v);
 				loclists.locLists[i-1].addLoc(u32.!(pos), locs[0]);
 				if (context.method.subprogram.loclistMap.length <= index || context.method.subprogram.loclistMap[index] == 0) {
+					// Set loclist index for non-tuple var or the first element of tuple.
 					context.method.subprogram.loclistMap.set(index, i);
 				}
 				v.setLocList(i);
@@ -112,17 +113,19 @@ class Dwarf {
 			}
 			context.method.subprogram.children.put(v);
 			info.putType(newvar.1);
-		} else {
+		} else { // Tuple
 			var len = Tuple.length(newvar.1);
 			var builder = StringBuilder.new();
 			for (i < len) {
-				builder.put2("%s.%d", newvar.0, i);
+				builder.put2("%s.%d", newvar.0, i); // expand variable name
 				var varName = builder.extract();
 				var tn = TupleNorm.!(normalizer.norm(newvar.1));
+				// Recursively expand one level at a time.
 				addVar((varName, Tuple.elementType(newvar.1, i)), index, tn.getElem(locs, i), pos);
 			}
 		}
 	}
+	// Update non-ssa var location.
 	def updateVarLoc(index: int, locs: Array<(X86_64Reg, int)>, pos: int) {
 		index = context.method.subprogram.loclistMap[index] - 1;
 		if (locs.length == 1) {
@@ -133,6 +136,7 @@ class Dwarf {
 			}
 		}
 	}
+	// Delete {n} number of variables. Add Dwarf lexical block to mark the scope of variable.
 	def deleteVar(n: int, pos: int) {
 		var code = abbrev.getAbbrev(DwarfAbbrevTag.LexicalBlock);
 		var children = context.method.subprogram.children, childLen = children.length;
@@ -157,8 +161,8 @@ class Dwarf {
 						children.put(block);
 						children = block.children;
 					}
-					if (x.abbrev == DwarfVariableLocListTag) {
-						loclists.locLists[x.index].end = u32.!(pos);
+					if (x.abbrev == DwarfVariableLocListTag) { // Set the live end
+						loclists.locLists[x.index - 1].end = u32.!(pos);
 					}
 				}
 				x: DwarfLexicalBlock => ;
@@ -291,6 +295,7 @@ def putLength(w: DataWriter, start: int) {
 	w.atEnd();
 }
 
+/* .debug_info */
 class DwarfInfoSection(abbrev: DwarfAbbrevSection) {
 	def subprograms = Vector<DwarfSubprogram>.new();
 	def typeRef = TypeUtil.newTypeMap<int>();
@@ -408,7 +413,7 @@ class DwarfInfoSection(abbrev: DwarfAbbrevSection) {
 		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.ArrayType));
 		w.put_b32(getTypeRef(t.elementType(), w.pos));
 		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.SubrangeType));
-		w.put_b32(getTypeRef(mockType, w.pos));
+		w.put_b32(getTypeRef(Int.getType(true, 32), w.pos));
 		w.put_uleb32(4); // expr length
 		w.putb(DW.DW_OP_lit4);
 		w.putb(DW.DW_OP_push_object_address);
@@ -426,15 +431,9 @@ class DwarfInfoSection(abbrev: DwarfAbbrevSection) {
 	def putType(t: Type) {
 		typeRef[t] = 0;
 	}
-	def putTypeExpand(t: Type) {
-		if (V3.isTuple(t)) {
-			Lists.apply(t.nested, putTypeExpand);
-		} else {
-			typeRef[t] = 0;
-		}
-	}
 	def getTypeRef(t: Type, pos: int) -> int {
 		if (typeRef[t] > 0) return typeRef[t];
+		// Type hasn't been emitted yet. Create a label and patch later.
 		labels.put((t, pos));
 		return 0;
 	}
@@ -466,7 +465,7 @@ class DwarfSubprogram extends DwarfDie {
 	var abbrev: u32;
 	var rettype: Type;
 	def children = Vector<DwarfDie>.new();
-	def loclistMap = Vector<int>.new();
+	def loclistMap = Vector<int>.new(); // Map to the index in loclist, start from 1.
 	def tupleNormMap = Vector<TupleNorm>.new();
 	def emit(w: DataWriter, getTypeRef: (Type, int) -> int, codeStart: long) {
 		w.put_uleb32(abbrev);
@@ -511,22 +510,24 @@ class DwarfVariable extends DwarfDie {
 		w.putb(0);
 		w.put_b32(getTypeRef(vtype, w.pos));
 		match (abbrev) {
-			DwarfVariableExprTag => {
-				if (reg != null) {
+			DwarfVariableExprTag => { // ssa variable
+				if (reg != null) { // register
 					w.put_uleb32(1); // exprloc length
 					w.putb(DWRegMap(reg));
-				} else {
+				} else { // stack location
 					var l = if (V3.isArray(vtype), 4u, 1u);
-					w.put_uleb32(sleb32_len(location) + l);
+					w.put_uleb32(sleb32_len(location) + l); // exprloc length
 					w.putb(DW.DW_OP_fbreg);
 					w.put_sleb32(location);
 					if (V3.isArray(vtype)) {
+						// Add 8 byte to skip array header
 						w.putb(DW.DW_OP_deref);
 						w.putb(DW.DW_OP_lit8);
 						w.putb(DW.DW_OP_plus);
 					}
 				}
 			}
+			// Non-ssa variable
 			DwarfVariableLocListTag => w.put_b32(loclistOffset);
 		}
 	}
@@ -562,10 +563,13 @@ class DwarfLexicalBlock extends DwarfDie {
 	}
 }
 
-var Abbrev_code: u32 = 5; // unique code for abbrev tag
-
+/* .debug_abbrev */
+def DwarfCompileUnitTag = 1u;
+def DwarfBaseTypeTag = 2u;
 def DwarfVariableExprTag = 3u;
 def DwarfVariableLocListTag = 4u;
+var Abbrev_code: u32 = 5; // next unique code for abbrev tag
+
 enum DwarfAbbrevTag {
 	LexicalBlock,
 	ClassType,
@@ -579,13 +583,12 @@ enum DwarfAbbrevTag {
 
 class DwarfAbbrevSection {
 	def abbrev = Vector<DwarfAbbrev>.new();
-	def subprogram: Array<int> = [-1, -1, -1, -1];
-	var lexicalBlock: u32;
+	def subprogram: Array<int> = [-1, -1, -1, -1]; // four types of subprogram
 	def tags = Array<u32>.new(8); // size of DwarfAbbrevTag
 
 	def emit(w: DataWriter) {
 		// DW_TAG_compile_unit DIE abbrev (1)
-		w.put_uleb32(1);
+		w.put_uleb32(DwarfCompileUnitTag);
 		w.put_uleb32(DW.DW_TAG_compile_unit);
 		w.putb(DW.DW_children_yes);
 		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_line_strp);
@@ -596,7 +599,7 @@ class DwarfAbbrevSection {
 		emitAbbrev(w, DW.DW_AT_loclists_base, DW.DW_FORM_sec_offset);
 		emitAbbrev(w, 0, 0);
 		// DW_TAG_base_type (2)
-		w.put_uleb32(2);
+		w.put_uleb32(DwarfBaseTypeTag);
 		w.put_uleb32(DW.DW_TAG_base_type);
 		w.putb(DW.DW_children_no);
 		emitAbbrev(w, DW.DW_AT_byte_size, DW.DW_FORM_data1);
@@ -604,7 +607,7 @@ class DwarfAbbrevSection {
 		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_string);
 		emitAbbrev(w, 0, 0);
 		// DW_TAG_variable - exprloc (3)
-		w.put_uleb32(3);
+		w.put_uleb32(DwarfVariableExprTag);
 		w.put_uleb32(DW.DW_TAG_variable);
 		w.putb(DW.DW_children_no);
 		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_string);
@@ -612,7 +615,7 @@ class DwarfAbbrevSection {
 		emitAbbrev(w, DW.DW_AT_location, DW.DW_FORM_exprloc);
 		emitAbbrev(w, 0, 0);
 		// DW_TAG_variable - loclistx (4)
-		w.put_uleb32(4);
+		w.put_uleb32(DwarfVariableLocListTag);
 		w.put_uleb32(DW.DW_TAG_variable);
 		w.putb(DW.DW_children_no);
 		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_string);
@@ -625,10 +628,12 @@ class DwarfAbbrevSection {
 		}
 		w.putb(0); // terminate section
 	}
+	// Emit an attribute and form code
 	def emitAbbrev(w: DataWriter, name: u32, form: u32) {
 		w.put_uleb32(name);
 		w.put_uleb32(form);
 	}
+	// Get subprogram abbrev code. Add new entry in abbrev table if it is a new type.
 	def getSubprogramAbbrev(hasFile: bool, hasRet: bool) -> u32 {
 		var id = (if(hasFile, 1) << 1) | if(hasRet, 1);
 		if (subprogram[id] == -1) {
@@ -637,6 +642,7 @@ class DwarfAbbrevSection {
 		}
 		return abbrev[subprogram[id]].code;
 	}
+	// Get abbrev code by tag. Add new entry if it is a new tag.
 	def getAbbrev(a: DwarfAbbrevTag) -> u32 {
 		if (tags[a.tag] == 0) {
 			var t: DwarfAbbrev;
@@ -658,8 +664,9 @@ class DwarfAbbrevSection {
 }
 
 class DwarfAbbrev {
-	def code = Abbrev_code++;
+	def code = Abbrev_code++; // unique code for abbrev tag
 	def emit(w: DataWriter);
+	// Emit an attribute and form code
 	def emitAbbrev(w: DataWriter, name: u32, form: u32) {
 		w.put_uleb32(name);
 		w.put_uleb32(form);
@@ -761,6 +768,7 @@ class DwarfUnspecifiedTypeAbbrev extends DwarfAbbrev {
 	}
 }
 
+/* .debug_loclists */
 class DwarfLocListsSection {
 	def locLists = Vector<DwarfLocList>.new();
 	def emit(w: DataWriter) {
@@ -769,13 +777,16 @@ class DwarfLocListsSection {
 		w.put_b16(DWARF_VERSION); // version
 		w.putb(codePointerSize); // address_size
 		w.putb(0); // segment_selector_size
-		w.put_b32(0); // offset_entry_count
+		w.put_b32(0); // offset_entry_count (Use DW_FORM_sec_offset in variable DIE so this field is zero)
 		for (i < locLists.length) {
+			// Set offset from the beginning of the .debug_loclists section
 			locLists[i].v.loclistOffset = w.pos - unitLengthStart;
+			// Emit loclist
 			locLists[i].emit(w);
 		}
 		putLength(w, unitLengthStart);
 	}
+	// Create a loclist for a variable
 	def addLocList(v: DwarfVariable) -> int {
 		locLists.put(DwarfLocList.new(v));
 		return locLists.length;
@@ -788,13 +799,15 @@ class DwarfLocList(v: DwarfVariable) {
 	def emit(w: DataWriter) {
 		for (i < entries.length) {
 			w.putb(DW.DW_LLE_offset_pair);
+			// Start of this entry
 			w.put_uleb32(entries[i].start);
+			// End of this entry: next entry start or the end of this variable
 			var end = if (i + 1 < entries.length, entries[i+1].start, end);
 			w.put_uleb32(end);
-			if (entries[i].reg != null) {
+			if (entries[i].reg != null) { // stack location
 				w.put_uleb32(1); // exprloc length
 				w.putb(DWRegMap(entries[i].reg));
-			} else {
+			} else { // register
 				w.put_uleb32(2);
 				w.putb(DW.DW_OP_fbreg);
 				w.putb(entries[i].location);
@@ -802,7 +815,7 @@ class DwarfLocList(v: DwarfVariable) {
 		}
 		w.putb(DW.DW_LLE_end_of_list);
 	}
-	def addLoc(pos: u32, loc: (/*reg*/X86_64Reg, /*location*/int)) {
+	def addLoc(pos: u32, loc: (/*reg*/X86_64Reg, /*stack location*/int)) {
 		if (entries.length != 0) {
 			var last = entries[entries.length - 1];
 			if (last.reg == loc.0 && last.location == loc.1) return;
