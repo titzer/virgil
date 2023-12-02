@@ -163,9 +163,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 		match (op.opcode) {
 			BoolEq,
 			RefEq,
-			IntEq =>		normSimpleEqualOp(app, op);
+			IntEq =>		return map1(app, normSimpleEqualOp(app, op));
 			OverloadedEq,
-			VariantEq =>		normEqualOp(app, op);
+			VariantEq =>		return map1(app, normEqualOp(app, op));
 			IntViewI =>		normIntViewI(app, op);
 			TypeCast =>		normTypeCast(app, op);
 			TypeQuery =>		normTypeQuery(app, op);
@@ -204,7 +204,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			VariantGetTag => {
 				var rc = norm.ra.makeClass(op.typeArgs[0]);
-				var t = normVariantGetTag(app, rc.variantNorm, genRefs(args), 0);
+				var t = normVariantGetTag(rc.variantNorm, genRefs(args), 0);
 				if (t != null) return map1(app, t);
 				else normDefault(app, op);
 			}
@@ -674,28 +674,45 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 	}
 	// normalize an equality operator
-	def normEqualOp(oldApp: SsaApplyOp, op: Operator) {
-		var tn = normTypeArg(op, 0);
-		if (!VariantNorm.?(tn) && V3.isVariant(tn.newType)) return normVariantEqual(oldApp, tn.newType);
-		genEqualN(oldApp, tn);
-	}
-	def normSimpleEqualOp(oldApp: SsaApplyOp, op: Operator) {
+	def normEqualOp(oldApp: SsaApplyOp, op: Operator) -> SsaInstr {
 		var tn = normTypeArg(op, 0);
 		var refs = genRefs(oldApp.inputs);
-		return map1(oldApp, curBlock.opEqualOf(op, refs[0], refs[1]));
+		if (V3.isVariant(tn.newType) && !VariantNorm.?(tn)) return normVariantEqual(oldApp, tn.newType, refs[0], refs[1]);
+		
+		if (tn.size == 0) return newGraph.trueConst();
+		if (tn.size == 1) return normSingleEqualOp(oldApp, tn.newType, refs[0], refs[1]);
+		
+		var join = opBoolAnd;
+		var expr: SsaInstr;
+		for (i < tn.size) {
+			var cmp: SsaInstr, a = refs[i], b = refs[i + tn.size];
+			cmp = normSingleEqualOp(oldApp, tn.sub[i], a, b);
+			if (expr == null) expr = cmp;
+			else expr = join(expr, cmp);
+		}
+		return expr;
 	}
-	def normVariantEqual(oldApp: SsaApplyOp, t: Type) {
+	def normSimpleEqualOp(oldApp: SsaApplyOp, op: Operator) -> SsaInstr {
+		var tn = normTypeArg(op, 0);
+		var refs = genRefs(oldApp.inputs);
+		return curBlock.opEqualOf(op, refs[0], refs[1]);
+	}
+	def normSingleEqualOp(oldApp: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+		if (V3.isVariant(t)) return normVariantEqual(oldApp, t, x, y);
+		return curBlock.opEqual(t, x, y);
+	}
+	def normVariantEqual(oldApp: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		var rc = norm.ra.getClass(t);
 		var list = rc.methods[IrUtil.EQUALS_METHOD_INDEX];
 		if (list == null) {
-			return normVariantEqual(oldApp, rc.parent.oldType);
+			return normVariantEqual(oldApp, rc.parent.oldType, x, y);
 		}
 		var rm = list.head;
 		// devirtualize methods that are not overridden
 		var tn = normType(t);
 		var t = tryDevirtualize(rm, [tn.newType]), m = t.0, newOp: Operator; // XXX: inline
 		var facts = Fact.O_PURE | Fact.O_COMMUTATIVE;
-		var newArgs = genRefs(oldApp.inputs), x = newArgs[0], y = newArgs[1];
+		var newArgs = [x, y];
 		if (t.1) {
 			newOp = V3Op.newCallVariantSelector(m);
 		} else {
@@ -710,16 +727,15 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		var call = curBlock.addApply(oldApp.source, newOp, newArgs);
 		call.setFact(facts);
-		map1(oldApp, call);
+		return call;
 	}
 	def normTupleGetElem(oldInstr: SsaInstr, args: Array<SsaDfEdge>, op: Operator, index: int) {
 		var tn = TupleNorm.!(normTypeArg(op, 0));
 		return mapNnf(oldInstr, tn.getElem(genRefs(args), index));
 	}
-	def normVariantGetTag(oi: SsaApplyOp, vn: VariantNorm, args: Array<SsaInstr>, offset: int) -> SsaInstr {
+	def normVariantGetTag(vn: VariantNorm, args: Array<SsaInstr>, offset: int) -> SsaInstr {
 		if (vn == null) return null;
 		if (vn.isSingleCase()) return newGraph.zeroConst();
-		if (vn.isEnum) return args[offset];
 		return args[offset + vn.tagIndex()];
 	}
 	def normVariantSubsume(oi: SsaApplyOp, avn: VariantNorm, rvn: VariantNorm, inputs: Range<SsaInstr>) -> Array<SsaInstr> {
@@ -754,15 +770,14 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			// XXX: CLASS_CAST special-case non-allocated classes
 			VARIANT_CAST => {
-				if (VariantNorm.?(atn) && VariantNorm.?(rtn)) {
-					var avn = VariantNorm.!(atn);
-					var rvn = VariantNorm.!(rtn);
+				if (atn != null && rtn != null && VariantNorm.?(atn) && VariantNorm.?(rtn)) {
+					var avn = VariantNorm.!(atn), rvn = VariantNorm.!(rtn);
 					if ((avn.isEnum && rvn.isEnum) || (avn.isSingleCase() && rvn.isSingleCase())) {
 						var tag = V3.getVariantTag(rtn.oldType);
 						curBlock.opIntRangeCheck(1, tag, tag + 1, oi[offset + avn.tagIndex()]);
 						for (i < avn.size) result.put(oi[offset + i]);
 					} else {
-						var tag = normVariantGetTag(oldInstr, avn, oi, offset);
+						var tag = normVariantGetTag(avn, oi, offset);
 						var expectedTag = V3.getVariantTag(rtn.oldType);
 						curBlock.opIntRangeCheck(1, expectedTag, expectedTag + 1, tag);
 						var subsumed = normVariantSubsume(oldInstr, avn, rvn, oi[offset ...]);
@@ -834,10 +849,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			// XXX: CLASS_QUERY special-case non-allocated classes
 			VARIANT_QUERY => {
-				if (VariantNorm.?(atn) && VariantNorm.?(rtn)) {
+				if (atn != null && rtn != null && VariantNorm.?(atn) && VariantNorm.?(rtn)) {
 					var vn = VariantNorm.!(rtn);
-					var tag = newGraph.intConst(V3.getVariantTag(rtn.oldType));
-					var check = curBlock.pure(V3Op.newIntEq(vn.tagType()), [oi[offset], tag]);
+					var expectedTag = newGraph.intConst(V3.getVariantTag(rtn.oldType));
+					var tag = normVariantGetTag(VariantNorm.!(atn), oi, offset);
+					var check = curBlock.pure(V3Op.newIntEq(vn.tagType()), [tag, expectedTag]);
 					return opAnd(left, check);
 				}
 				// break
@@ -1249,7 +1265,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		normType(raField.receiver); // XXX: normType() side-effect of flattening
 		var rc = norm.ra.getClass(raField.receiver);
-		if (rc.variantNorm != null) {
+		if (raField != null && rc.variantNorm != null) {
 			// field of flattened data type
 			if (!rc.variantNorm.isBoxed()) {
 				var vals = Array<SsaInstr>.new(nf.length);
