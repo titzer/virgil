@@ -6,17 +6,30 @@
 // XXX: reoptimize the control flow after inlining
 // XXX: normalize tuple returns
 class SsaInliner extends SsaRebuilder {
-	def callerBlock: SsaBlock;
 	def call: SsaApplyOp;
 	def inlinee: IrSpec;
 	def contInstrs = call.next;
-	def contEnd = callerBlock.end();
+	var callerBlock: SsaBlock;
+	var contEnd: SsaEnd;
 	var contBlock: SsaBuilder;
 	var inlinedInstrs: int;
 	var retVal: SsaInstr;
 	var returns: List<(SsaCfEdge, SsaInstr)>;
 
-	new(context: SsaContext, callerBlock, call, inlinee) super(context) {
+	new(context: SsaContext, call, inlinee) super(context) {
+		// Iterate previous instructions to find the {callerBlock}.
+		for (p = call.prev; p != call; p = p.prev) {
+			match (p) {
+				x: SsaBlock => {
+					callerBlock = x;
+					contEnd = callerBlock.end();
+					break;
+				}
+			}
+		}
+		if (callerBlock == null) return; // TODO: aborting inlining, graph is probably invalid
+
+		// Split {callerBlock} to include only instructions before the call.
 		// ==== Before ===========================================
 		// block ... prev <-> call <-> contInstrs ... contEnd
 		// ^-----------------------------------------------^
@@ -34,9 +47,9 @@ class SsaInliner extends SsaRebuilder {
 
 	def inline() {
 		var target = inlinee.asMethod().ssa;
+		if (target == context.graph) return; // cannot inline recursive call
 		instrMap.reset(target);
 		newGraph = context.graph;
-		// trim the current block to include only instructions before the call
 		curBlock = SsaBuilder.new(context, newGraph, callerBlock);
 
 		if (V3.isComponent(inlinee.receiver)) mapComponentParams(target.params);
@@ -50,6 +63,7 @@ class SsaInliner extends SsaRebuilder {
 			// inline a method with multiple blocks
 			inlineComplex(targetStart);
 		}
+		call.kill();
 	}
 	def mapComponentParams(params: Array<SsaParam>) {
 		// map parameter 0 to the null constant
@@ -97,6 +111,7 @@ class SsaInliner extends SsaRebuilder {
 	}
 	// inline a simple, straight-line method directly into this block
 	def inlineSimple(targetStart: SsaBlock) {
+		blocks = 1;
 		contBlock = curBlock;
 		genInstrs(targetStart);
 		if (returns == null) return killContinuation();
@@ -113,12 +128,9 @@ class SsaInliner extends SsaRebuilder {
 		var cb = SsaBlock.new();
 		contBlock = SsaBuilder.new(context, newGraph, cb);
 
-		var intoBlock = callerBlock; // start inlining into the callerblock
-		if (targetStart.preds.length > 0) {
-			// inlinee method contains an edge back to beginning, split
-			intoBlock = SsaBlock.new();
-			SsaBuilder.new(context, newGraph, callerBlock).addGoto(intoBlock);
-		}
+		// callerBlock -(goto)-> intoBlock
+		var intoBlock = SsaBlock.new();
+		SsaBuilder.new(context, newGraph, callerBlock).addGoto(intoBlock);
 
 		// visit all the blocks
 		genMultiBlock(targetStart, intoBlock);
@@ -203,24 +215,28 @@ class SsaInliner extends SsaRebuilder {
 // after initial SSA generation, and thus has tuning parameters appropriately set.
 class SsaEarlyInliner(context: SsaContext, compilation: Compilation, gen: VstSsaGen) {
 	var maxDepth = 5;
-	var maxInlineSize = 4;
-	var maxInlineBlocks = 1;
+	var maxInlineSize = 20;
+	var maxInlineBlocks = 5;
 	var inlines = 0;
 	def inline(genDepth: int) {
+		if (genDepth >= maxDepth) return;
 		if (V3.isComponent(context.spec.receiver)) {
 			// don't bother inlining into component constructors
 			if (context.spec.member.facts.M_NEW) return;
 		}
-		if (genDepth < maxDepth) {
-			for (l = gen.directCallTargets; l != null; l = l.tail) {
-				// generate the SSA of possible inlining candidates
-				compilation.genSsa(l.head, genDepth + 1);
-			}
+		for (l = gen.directCallTargets; l != null; l = l.tail) {
+			// generate the SSA of possible inlining candidates
+			compilation.genSsa(l.head, genDepth + 1);
 		}
 		for (l = gen.directCallBlocks; l != null; l = l.tail) {
 			tryInlining(l.head);
 		}
-		if (inlines > 0) context.printSsa("Inlined");
+		if (inlines > 0) {
+			context.printSsa("Inlined");
+			var verifier = SsaGraphVerifier.new(context);
+			verifier.allowDeadNodes = true; // TODO: dead nodes leftover from Vst -> SSA
+			verifier.verify(); // XXX: introduce verification option?
+		}
 	}
 	def tryInlining(block: SsaBlock) {
 		var i = block.next;
@@ -241,21 +257,23 @@ class SsaEarlyInliner(context: SsaContext, compilation: Compilation, gen: VstSsa
 				}
 				continue;
 			}
-			var inliner = SsaInliner.new(context, block, apply, inlinee);
+			var inliner = SsaInliner.new(context, apply, inlinee);
 			inliner.inline();
 			inlines++;
 			if (CLOptions.PRINT_INLINING.get()) {
 				var loc = if (inliner.call.source != null, inliner.call.source.render, context.spec.render);
-				Terminal.put3("Inlined %d instructions from %q into %q\n", inliner.inlinedInstrs, inlinee.render, loc);
+				Terminal.put2("Inlined %d blocks, %d instructions ", inliner.blocks, inliner.inlinedInstrs);
+				Terminal.put2("from %q into %q\n", inlinee.render, loc);
 			}
 			if (inliner.contBlock == null) return;
 		}
 	}
 	def shouldInline(inlinee: IrSpec) -> bool {
 		var ssa = inlinee.asMethod().ssa;
-		if (ssa == null) return false;
+		if (ssa == null) return false;			// IR not available
+		if (ssa == context.graph) return false;		// self-recursion
 		var facts = inlinee.member.facts;
-		if (facts.M_NEVER_INLINE) return false;
+		if (facts.M_NEVER_INLINE) return false;		// marked as never inline
 		if (facts.M_INLINE) return true;
 		return checkGraphSize(ssa, maxInlineBlocks, maxInlineSize);
 	}
