@@ -29,7 +29,7 @@ function do_int_test() {
     rm -f $ALL
 
     if [[ "$target" =~ "x86-64" ]]; then
-        HEAP='-heap-size=65m' # 64-bit needs more heap
+        HEAP='-heap-size=66m' # 64-bit needs more heap
     else
         HEAP='-heap-size=32m'
     fi
