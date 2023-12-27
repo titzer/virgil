@@ -4,13 +4,6 @@
 // Coordinates optimizations of SSA graphs, blocks, and individual instructions.
 // Provides a facade to the outside that hides details of reduction, analysis, etc.
 class SsaOptimizer(context: SsaContext) {
-	var optimize_loads: bool;
-	var optimize_branches: bool;
-	var optimize_nullchecks: bool;
-	var optimize_inits: bool;
-	var optimize_ivs: bool;
-	var optimize_licm: bool;
-	var dce: bool;
 	var marker = SsaInternalMarker.new();
 	def iopt = SsaInstrReducer.new(context);
 
@@ -75,13 +68,18 @@ class SsaOptimizer(context: SsaContext) {
 		var markInstrs = false;
 		for (i < reachable.length) {
 			var block = reachable[i];
-			var succs = block.succs();
 			if (print) Terminal.put1("block #%d\n", block.uid);
+			var succs = block.succs();
 			if (markInstrs) for (x = block.next; x != block; x = x.next) {
 				if (print) Terminal.put1(" inst #%d\n", x.uid);
 				marker.setMark(x, mark);
 			}
-			marker.setMark(block.end(), mark);
+			var end = block.end();
+			if (end == null) {
+				context.fail1("block #%d has no end", block.uid);
+				continue;
+			}
+			marker.setMark(end, mark);
 			for (s in succs) {
 				var d = s.dest;
 				if (marker.getMark(d) < 0) {
@@ -180,9 +178,9 @@ class SsaInstrMatcher {
 		inttype = IntType.!(i.op.sig.paramTypes[0]);
 		if (inttype.width <= 32) {
 			wide = false;
-			if (xconst) xint = Int.unbox(xval);
+			if (xconst) xint = V3.unboxI32(xval);
 			if (yconst) {
-				yint = Int.unbox(yval);
+				yint = V3.unboxI32(yval);
 				yzero = yint == 0;
 			}
 		} else {
@@ -250,28 +248,25 @@ class SsaInstrMatcher {
 // Flow-sensitive state for local optimizations.
 class SsaBlockState {
 	var end: bool;
-	var optimize_loads = true;	// activates load elimination
-	var optimize_nullchecks = true;	// activates null check elimination
-	var optimize_inits = false;	// activates init elimination
 	var fields: List<(SsaInstr, IrField, SsaInstr)>;
+	var inbounds: List<(SsaInstr, SsaInstr)>;
 	var nonnull: List<SsaInstr>;
 	var inits: List<IrMethod>;
 	def clear() -> this {
 		fields = null;
 		nonnull = null;
 		inits = null;
+		inbounds = null;
 		end = false;
 	}
 	def addField(receiver: SsaInstr, field: IrField, value: SsaInstr) {
-		if (optimize_loads) fields = List.new((receiver, field, value), fields);
+		fields = List.new((receiver, field, value), fields);
 	}
 	def copy() -> SsaBlockState {
 		var that = SsaBlockState.new();
 		that.end = this.end;
-		that.optimize_loads = this.optimize_loads;
-		that.optimize_nullchecks = this.optimize_nullchecks;
-		that.optimize_inits = this.optimize_inits;
 		that.fields = this.fields;
+		that.inbounds = this.inbounds;
 		that.nonnull = this.nonnull;
 		that.inits = this.inits;
 		return that;
@@ -281,6 +276,10 @@ class SsaBlockState {
 // Optimizes SSA instructions one at a time, performing such optimizations
 // as const folding, strength reduction, load elimination, and bounds check elimination.
 class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
+	var optimize_loads = true;		// activates load elimination
+	var optimize_nullchecks = true;		// activates null check elimination
+	var optimize_inits = false;		// activates init elimination
+	var optimize_bounds = true;
 	var graph: SsaGraph;
 	var prev: SsaLink;  			// instruction before the current instruction
 	var next: SsaLink;			// instruction after the current instruction
@@ -683,7 +682,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (!i.facts.O_PURE) return i;
 				var yval = norm_binop(i);
 				// ArrayGetElem(#array, #index) => K
-				if (fold) return graph.valConst(i.getType(), Record.!(xval).values[Int.unbox(yval)]);
+				if (fold) return graph.valConst(i.getType(), Record.!(xval).values[V3.unboxI32(yval)]);
 			}
 			ArraySetElem => {
 				var receiver = boundscheck(i);
@@ -799,7 +798,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (dv != null) return graph.valConst(dv.getFuncType(), FuncVal.new(dv));
 			}
 			Init(method) => {
-				if (!state.optimize_inits) return i;
+				if (!optimize_inits) return i;
 				for (l = state.inits; l != null; l = l.tail) {
 					if (l.head == method) return null;  // init[m]; init[m] => init[m]
 				}
@@ -938,7 +937,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (fold) {
 					// GetVariantTag(#K) => #K
 					if (Record.?(xval)) return graph.intConst(V3.getVariantTag(Record.!(xval).rtype));
-					return graph.intConst(Int.unbox(xval));
+					return graph.intConst(V3.unboxI32(xval));
 				}
 			}
 			ConditionalThrow(exception) => {
@@ -1019,12 +1018,14 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return i;
 	}
 	def boundscheck(i: SsaApplyOp) -> SsaInstr {
-		// XXX: introduce partial bounds checks when length is a known constant.
 		var receiver = nullcheck(i);
+		if (!optimize_bounds) return i;
+		// XXX: introduce partial bounds checks when length is a known constant.
 		if (state.end) return receiver;
+		if (findPriorBoundsCheck(i, receiver, i.input1())) return receiver;
 		// Initialize the match state for {x} and {y}.
 		var yval = binop(i);
-		if (yconst && Int.unbox(yval) < 0) {
+		if (yconst && V3.unboxI32(yval) < 0) {
 			// will always throw out of bounds, but might need a null check first.
 			if (!i.facts.O_NO_NULL_CHECK) addExplicitNullCheck(i.source, receiver);
 			return addThrow(i.source, V3Exception.BoundsCheck);
@@ -1045,7 +1046,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 
 		if (yconst) {
 			// Array length and index are constants. Static bounds check.
-			var index = Int.unbox(yval);
+			var index = V3.unboxI32(yval);
 			if (index < length) {
 				i.facts |= Facts.O_SAFE_BOUNDS;
 				return receiver;
@@ -1054,9 +1055,29 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		}
 		// Array length is a constant, try range analysis of the index.
 		var bound = posIntBound(y);
-		if (bound < 0) return receiver;
-		if (bound < length) i.facts |= Facts.O_SAFE_BOUNDS;
+		if (bound >= 0 && bound < length) i.facts |= Facts.O_SAFE_BOUNDS;
 		return receiver;
+	}
+	def findPriorBoundsCheck(i: SsaInstr, x: SsaInstr, y: SsaInstr) -> bool {
+		for (l = state.inbounds; l != null; l = l.tail) {
+			var t = l.head;
+			if (t.0 == x) {
+				i.facts |= Fact.O_NO_NULL_CHECK;
+				if (t.1 == y) {
+					i.facts |= Fact.O_NO_BOUNDS_CHECK;
+					return true;
+				}
+				if (SsaConst.?(t.1) && SsaConst.?(y)) {
+					var p = V3.unboxI32(SsaConst.!(t.1).val), yy = V3.unboxI32(SsaConst.!(y).val);
+					if (p >= 0 && p >= yy) {
+						i.facts |= Fact.O_NO_BOUNDS_CHECK;
+						return true;
+					}
+				}
+			}
+		}
+		state.inbounds = List.new((x, y), state.inbounds);
+		return false;
 	}
 	def addExplicitNullCheck(source: Source, receiver: SsaInstr) -> SsaInstr {
 		var t = receiver.getType();
@@ -1091,7 +1112,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					if (IntType.?(t)) {
 						// conversion to smaller signed type might overflow.
 						var it = IntType.!(t);
-						if (it.signed && it.width <= 32 && b > Int.unbox(it.max)) b = bound;
+						if (it.signed && it.width <= 32 && b > V3.unboxI32(it.max)) b = bound;
 					}
 					bound = b;
 				}
@@ -1105,7 +1126,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		if (IntType.?(t)) {
 			var it = IntType.!(t);
 			if (it.width > 32) return -1;
-			if (!it.signed || x.facts.V_NON_NEGATIVE) return Int.unbox(it.max);
+			if (!it.signed || x.facts.V_NON_NEGATIVE) return V3.unboxI32(it.max);
 		}
 		if (EnumType.?(t)) {
 			return EnumType.!(t).enumDecl.cases.length - 1;
@@ -1121,7 +1142,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			return receiver;
 		}
 		if (receiver.facts.V_ZERO) return addThrow(i.source, V3Exception.NullCheck);
-		if (!state.optimize_nullchecks) return receiver;
+		if (!optimize_nullchecks) return receiver;
 		for (l = state.nonnull; l != null; l = l.tail) {
 			if (l.head == receiver) {
 				i.facts |= Fact.O_NO_NULL_CHECK;
@@ -1132,7 +1153,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return receiver;
 	}
 	def lookupField(load: SsaInstr, receiver: SsaInstr, field: IrField) -> SsaInstr {
-		if (!state.optimize_loads) return load;
+		if (!optimize_loads) return load;
 		for (l = state.fields; l != null; l = l.tail) {
 			var h = l.head;
 			if (h.0 == receiver && h.1 == field) return h.2;
@@ -1376,7 +1397,7 @@ class SsaCfOptimizer(context: SsaContext) {
 		if (cmp.inputs[0].dest != key) return null;
 		var r = cmp.inputs[1].dest;
 		if (!SsaConst.?(r)) return null;
-		return SwitchCmp.new(Int.unbox(SsaConst.!(r).val), cmp, i, block.succ(0), block.succ(1));
+		return SwitchCmp.new(V3.unboxI32(SsaConst.!(r).val), cmp, i, block.succ(0), block.succ(1));
 	}
 	def verifySwitchCmpBlock(cmp: SwitchCmp, block: SsaBlock) -> bool {
 		for (i = block.next; i != block; i = i.next) {
@@ -1907,6 +1928,7 @@ class SsaLoadOptimizer(context: SsaContext) {
 			}
 			// XXX: ClassGetMethod, ClassGetVirtual for monomorphic methods.
 			ClassGetField(field) => return load(apply.input0(), field, apply);
+			VariantGetField(field) => return load(apply.input0(), field, apply);
 			ComponentGetField(field) => return load(null, field, apply);
 			ClassInitField(field) => {
 				var obj = apply.input0();

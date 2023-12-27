@@ -9,8 +9,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 	var specSet: SpecSet;
 	var arrayByteNorm = ArrayNorm.!(norm.norm(V3.arrayByteType));
 	var rangeByteNorm = RangeNorm.!(norm.norm(V3.rangeByteType));
+	var rangeStartType: Type;
 
-	new(context: SsaContext, norm) super(context) { }
+	new(context: SsaContext, norm) super(context) {
+		rangeStartType = if(norm.config.NormalizeRange, V3Range.START_TYPE, norm.config.RangeStartType);
+	}
 
 	def build(newMethod: IrMethod) {
 		newMethod.ssa = genGraph();
@@ -158,27 +161,6 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var orig = app.op, op = app.op, args = app.inputs;
 		if (context.spec != null) op = app.op.subst(context.spec.instantiateType);
 		match (op.opcode) {
-			IntQueryI => {
-				var ft = op.typeArgs[0], tt = op.typeArgs[1], x = genRef1(args[0]);
-				var ni: SsaInstr;
-				if (!IntType.?(ft)) {
-					ni = newGraph.falseConst();
-				} else {
-					ni = curBlock.opIntQueryI(IntType.!(ft), IntType.!(tt), x);
-				}
-				map1(app, ni);
-			}
-			IntCastI => {
-				var ft = op.typeArgs[0], tt = op.typeArgs[1], x = genRef1(args[0]);
-				var ni: SsaInstr;
-				if (!IntType.?(ft)) {
-					curBlock.addThrow(app.source, V3Exception.TypeCheck);
-					ni = newGraph.nullConst(tt);
-				} else {
-					ni = curBlock.opIntCastI(IntType.!(ft), IntType.!(tt), x);
-				}
-				map1(app, ni);
-			}
 			BoolEq,
 			RefEq,
 			IntEq =>		normSimpleEqualOp(app, op);
@@ -350,6 +332,14 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var nobj = if(nargs.length == 1, newGraph.nullConst(ptrType), nargs[1]);
 				return mapN(app, [nfunc, nobj]);
 			}
+			ForgeRange => {
+				var nargs = genRefs(args);
+				var en = normTypeArg(op, 0);
+				var arrayType = V3Array.newType(en.newType);
+				var nullArray = newGraph.nullConst(arrayType);
+				var length = nargs[1];
+				return mapN(app, [nullArray, nargs[0], length]);
+			}
 			RefLayoutAt => {
 				var an = arrayByteNorm;
 				var newArgs = genRefs(app.inputs);
@@ -364,7 +354,13 @@ class SsaRaNormalizer extends SsaRebuilder {
 					var c1 = curBlock.opIntULt(norm.config.ArrayLengthType, norm.config.ArrayLengthType, array_length, end_index);
 					curBlock.opConditionalThrow(V3Exception.BoundsCheck, c1);
 				}
-				return mapN(app, newArgs);
+				var rangeStart: SsaInstr;
+				if (norm.config.NormalizeRange) {
+					rangeStart = curBlock.opRangeStartPlusIndex(an.oldType, Int.TYPE, app.facts, newGraph.arrayRangeStartConst(0, an.newType), newArgs[an.size]);
+				} else {
+					rangeStart = newArgs[an.size];
+				}
+				return mapN(app, [newArgs[0], rangeStart]);
 			}
 			RefLayoutOf => {
 				var an = rangeByteNorm;
@@ -381,141 +377,116 @@ class SsaRaNormalizer extends SsaRebuilder {
 			RefLayoutIn(offset) => {
 				var an = arrayByteNorm;
 				var newArgs = genRefs(app.inputs);
-				var array = newArgs[0], pos = newArgs[an.size];
-				newArgs[an.size] = curBlock.opIntAdd(newGraph.intConst(offset), pos);
+				var array = newArgs[0], start = newArgs[an.size];
+				newArgs[an.size] = if(norm.config.NormalizeRange,
+					curBlock.opRangeStartPlusIndex(an.oldType, Int.TYPE, app.facts, start, newGraph.intConst(offset)),
+					curBlock.opIntAdd(start, newGraph.intConst(offset)));
 				return mapN(app, newArgs);
 			}
 			RefLayoutGetField(offset) => {
 				var an = arrayByteNorm;
 				var fn = normTypeArg(op, 1);
 				var newArgs = genRefs(app.inputs);
-				var array = newArgs[0], i_offset = newArgs[an.size];
+				var array = newArgs[0], start = newArgs[an.size];
+				var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
+				var result: SsaInstr;
+
 				match (fn.oldType) {
-					x: IntType => {
-						var result = genArrayByteGetMultiple(app, x, array, i_offset, offset);
-						var wt = Int.getType(false, x.byteSize() * 8);
-						result = curBlock.opIntViewI0(wt, x, result);
-						return map1(app, result);
-					}
+					x: IntType => result = curBlock.opByteArrayGetField(x, rangeStartType, offset, facts, array, start);
+					x: FloatType => result = curBlock.opByteArrayGetField(x, rangeStartType, offset, facts, array, start);
 					x: EnumType => {
 						var it = IntType.!(x.enumDecl.tagType);
-						var result = genArrayByteGetMultiple(app, it, array, i_offset, offset);
+						var wt = Int.getType(false, it.byteSize() * 8);
+						result = curBlock.opByteArrayGetField(wt, rangeStartType, offset, facts, array, start);
 						var caseCount = newGraph.intConst(x.enumDecl.cases.length);
 						var inBound = curBlock.opIntULt(norm.config.ArrayLengthType, it, result, caseCount);
-						var wt = Int.getType(false, it.byteSize() * 8);
-						result = curBlock.opIntViewI0(wt, it, result);						
+						result = curBlock.opIntViewI0(it, wt, result);
 						var split = SsaBlockSplit.new(context, curBlock);
 						curBlock = split.addIf(inBound);
 						curBlock = split.addElse();
 						curBlock = split.finish();
 						curBlock.opIntViewI0(wt, it, result);
 						result = split.addPhi(it, [result, newGraph.nullConst(it)]);
-						return map1(app, result);
-					}
-					x: FloatType => {
-						var it = Int.getType(false, x.total_width);
-						var result = genArrayByteGetMultiple(app, it, array, i_offset, offset);
-						var wt = Int.getType(false, it.byteSize() * 8);
-						result = curBlock.opIntViewI0(wt, it, result);
-						var floatViewOp = if(x.is64, V3Op.newFloat64ViewI(it), V3Op.newFloat32ViewI(it));
-						result = curBlock.addApply(app.source, floatViewOp, [result]);
-						return map1(app, result);
 					}
 					_ => context.fail1("unexpected type %q", fn.oldType.render);
 				}
+				return map1(app, result);
 			}
 			RefLayoutSetField(offset) => {
 				var fn = normTypeArg(op, 1);
 				var newArgs = genRefs(args);
-				var array = newArgs[0], i_offset = newArgs[1], val = newArgs[2];
-				match(fn.oldType) {
-					x: IntType => {
-						genArrayByteSetMultiple(app, x, array, i_offset, offset, val);
-					}
+				var array = newArgs[0], start = newArgs[1], val = newArgs[2];
+				var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
+				var result: SsaInstr;
+
+				match (fn.oldType) {
+					x: IntType => result = curBlock.opByteArraySetField(fn.oldType, rangeStartType, offset, facts, array, start, val);
+					x: FloatType => result = curBlock.opByteArraySetField(fn.oldType, rangeStartType, offset, facts, array, start, val);
 					x: EnumType => {
 						var it = IntType.!(x.enumDecl.tagType);
-						genArrayByteSetMultiple(app, it, array, i_offset, offset, val);
+						var wt = Int.getType(false, it.byteSize() * 8);
+						result = curBlock.opByteArraySetField(wt, rangeStartType, offset, facts, array, start, val);
 					}
-					x: FloatType => {
-						var it = Int.getType(false, x.total_width);
-						var width = x.byteSize();
-						val = curBlock.opIntView(x, it, val);
-						genArrayByteSetMultiple(app, it, array, i_offset, offset, val);
-					}
-					_ => context.fail1("unexpected type %q", fn.oldType.render);
 				}
+				return map1(app, result);
 			}
 			RefLayoutGetRepeatedField(offset, scale, max) => {
-				var an = arrayByteNorm;
-				var fn = normTypeArg(op, 1);
+				var rn = normTypeArg(op, 0), fn = normTypeArg(op, 1);
 				var newArgs = genRefs(args);
-				var array = newArgs[0], i_offset = newArgs[1], index = newArgs[2];
+				var array = newArgs[0], start = newArgs[1], index = newArgs[2];
 				if (context.compiler.boundsCheck(app.facts)) {
 					var oob = curBlock.opBoolNot(curBlock.opIntULt(norm.config.ArrayLengthType, norm.config.ArrayLengthType,
 						index, newGraph.intConst(max)));
 					curBlock.opConditionalThrow(V3Exception.BoundsCheck, oob);
 				}
 				var result = SsaInstr.!(newGraph.intConst(0));
-				i_offset = curBlock.opIntAdd(curBlock.opIntMul(index, newGraph.intConst(scale)), i_offset);
+				start = if(norm.config.NormalizeRange,
+					curBlock.opRangeStartPlusIndex(rn.sub[0], Int.TYPE, app.facts, start, curBlock.opIntMul(index, newGraph.intConst(scale))),
+					curBlock.opIntAdd(start, curBlock.opIntMul(index, newGraph.intConst(scale)))
+				);
+				var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
 				match (fn.oldType) {
-					x: IntType => {
-						var result = genArrayByteGetMultiple(app, x, array, i_offset, offset);
-						var wt = Int.getType(false, x.byteSize() * 8);
-						result = curBlock.opIntViewI0(wt, x, result);
-						return map1(app, result);
-					}
+					x: IntType => result = curBlock.opByteArrayGetField(x, rangeStartType, offset, facts, array, start);
+					x: FloatType => result = curBlock.opByteArrayGetField(x, rangeStartType, offset, facts, array, start);
 					x: EnumType => {
 						var it = IntType.!(x.enumDecl.tagType);
-						var result = genArrayByteGetMultiple(app, it, array, i_offset, offset);
+						result = curBlock.opByteArrayGetField(it, rangeStartType, offset, facts, array, start);
 						var caseCount = newGraph.intConst(x.enumDecl.cases.length);
 						var inBound = curBlock.opIntULt(it, it, result, caseCount);
 						var split = SsaBlockSplit.new(context, curBlock);
 						curBlock = split.addIf(inBound);
 						curBlock = split.addElse();
 						curBlock = split.finish();
-						var wt = Int.getType(false, it.byteSize() * 8);
-						result = curBlock.opIntViewI0(wt, it, result);
 						result = split.addPhi(it, [result, newGraph.nullConst(it)]);
-						return map1(app, result);
-					}
-					x: FloatType => {
-						var it = Int.getType(false, x.total_width);
-						var result = genArrayByteGetMultiple(app, it, array, i_offset, offset);
-						var wt = Int.getType(false, it.byteSize() * 8);						
-						result = curBlock.opIntViewI0(wt, it, result);
-						var floatViewOp = if(x.is64, V3Op.newFloat64ViewI(it), V3Op.newFloat32ViewI(it));
-						result = curBlock.addApply(app.source, floatViewOp, [result]);
-						return map1(app, result);
 					}
 					_ => ;
 				}
+				return map1(app, result);
 			}
 			RefLayoutSetRepeatedField(offset, scale, max) => {
-				var fn = normTypeArg(op, 1);
+				var rn = normTypeArg(op, 0), fn = normTypeArg(op, 1);
 				var newArgs = genRefs(args); 
-				var array = newArgs[0], i_offset = newArgs[1], index = newArgs[2], val = newArgs[3];
+				var array = newArgs[0], start = newArgs[1], index = newArgs[2], val = newArgs[3];
 				if (context.compiler.boundsCheck(app.facts)) {
 					var oob = curBlock.opBoolNot(curBlock.opIntULt(norm.config.ArrayLengthType, norm.config.ArrayLengthType,
 						index, newGraph.intConst(max)));
 					curBlock.opConditionalThrow(V3Exception.BoundsCheck, oob);
 				}
-				i_offset = curBlock.opIntAdd(curBlock.opIntMul(index, newGraph.intConst(scale)), i_offset);
-				match(val.getType()) {
-					x: IntType => {
-						genArrayByteSetMultiple(app, x, array, i_offset, offset, val);
-					}
+				start = if(norm.config.NormalizeRange,
+					curBlock.opRangeStartPlusIndex(rn.sub[0], Int.TYPE, app.facts, start, curBlock.opIntMul(index, newGraph.intConst(scale))),
+					curBlock.opIntAdd(start, curBlock.opIntMul(index, newGraph.intConst(scale)))
+				);
+				var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
+				var result: SsaInstr;
+				match (fn.oldType) {
+					x: IntType => result = curBlock.opByteArraySetField(fn.oldType, rangeStartType, offset, facts, array, start, val);
+					x: FloatType => result = curBlock.opByteArraySetField(fn.oldType, rangeStartType, offset, facts, array, start, val);
 					x: EnumType => {
 						var it = IntType.!(x.enumDecl.tagType);
-						genArrayByteSetMultiple(app, it, array, i_offset, offset, val);
+						result = curBlock.opByteArraySetField(it, rangeStartType, offset, facts, array, start, val);
 					}
-					x: FloatType => {
-						var it = Int.getType(false, x.total_width);
-						var op = if(x.is64, V3Op.opIntViewF64, V3Op.opIntViewF32);
-						val = curBlock.pure(op, [val]);
-						genArrayByteSetMultiple(app, it, array, i_offset, offset, val);
-					}
-					_ => ;
 				}
+				return map1(app, result);
 			}
 			PtrAtContents => {
 				// rewrite to PtrAtArrayElem
@@ -523,7 +494,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var newArgs = genRefs(args);
 				var narr = newArgs[0], start = newArgs[rn.startIndex()];
 				var arrayType = ArrayType.!(rn.sub[0]), ptrType = op.sig.returnType();
-				var op = V3Op.newPtrAtArrayElem(arrayType, norm.config.RangeStartType, ptrType);
+				var op = if(norm.config.NormalizeRange, V3Op.newPtrAddRangeStart(ptrType), V3Op.newPtrAtArrayElem(arrayType, norm.config.RangeStartType, ptrType));
 				var newInstr = curBlock.addApply(curBlock.source, op, [narr, start]);
 				newInstr.facts |= Fact.O_NO_BOUNDS_CHECK;
 				map1(app, newInstr);
@@ -540,11 +511,29 @@ class SsaRaNormalizer extends SsaRebuilder {
 					var c1 = curBlock.opU32LtEq(length, index);
 					curBlock.opConditionalThrow(V3Exception.BoundsCheck, c1);
 				}
-				var nstart = rangeStartAdd(start, index);
-				var op = V3Op.newPtrAtArrayElem(arrayType, norm.config.RangeStartType, ptrType);
-				var newInstr = curBlock.addApply(curBlock.source, op, [narr, nstart]);
+				var newInstr: SsaInstr;
+				if (norm.config.NormalizeRange) {
+					var nstart = curBlock.opRangeStartPlusIndex(rn.sub[0], Int.TYPE, app.facts, start, index);
+					var op = V3Op.newPtrAddRangeStart(ptrType);
+					newInstr = curBlock.addApply(curBlock.source, op, [narr, nstart]);
+				} else {
+					var nstart = rangeStartAdd(start, index);
+					var op = V3Op.newPtrAtArrayElem(arrayType, norm.config.RangeStartType, ptrType);
+					newInstr = curBlock.addApply(curBlock.source, op, [narr, nstart]);
+				}
 				newInstr.facts |= Fact.O_NO_BOUNDS_CHECK;
 				map1(app, newInstr);
+			}
+			PtrAtRef => {
+				if (norm.config.NormalizeRange) {
+					var newArgs = genRefs(args);
+					var ptrType = op.sig.returnType();
+					var op = V3Op.newPtrAddRangeStart(ptrType);
+					var newInstr = curBlock.addApply(curBlock.source, op, newArgs);
+					map1(app, newInstr);
+				} else {
+					normDefault(app, op);
+				}
 			}
 			PtrAtObjectField(field) => {
 				var receiver = genRef1(app.inputs[0]);
@@ -771,7 +760,13 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var s = an.size;
 				for (i < s) result.put(oi[offset + i]);
 				var array = oi[offset], len: SsaInstr;
-				result.put(newGraph.zeroConst());
+
+				if (norm.config.NormalizeRange && s <= 1) {
+					result.put(newGraph.arrayRangeStartConst(0, an.newType));
+				} else {
+					result.put(newGraph.zeroConst());
+				}
+				
 				if (array.facts.V_NON_ZERO) {
 					len = curBlock.opArrayGetLength(arrayType, array);
 				} else {
@@ -901,24 +896,29 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var rangeNorm = RangeNorm.!(normTypeArg(op, 0));
 		var startNorm = normTypeArg(op, 1), endNorm = normTypeArg(op, 2);
 		var newArgs = genRefs(oldApp.inputs);
-		var range_length = newArgs[rangeNorm.lengthIndex()];
+		var rangeStart = newArgs[rangeNorm.startIndex()], rangeLength = newArgs[rangeNorm.lengthIndex()];
 		var start = newArgs[rangeNorm.size], end = newArgs[rangeNorm.size + startNorm.size];
 		var rangeLengthType = norm.config.ArrayLengthType;
 		var startType = IntType.!(startNorm.oldType), endType = IntType.!(endNorm.oldType);
 		if (context.compiler.boundsCheck(oldApp.facts)) {
 			// XXX: manually CSE the promotions here?
-			var c1 = curBlock.opIntULt(rangeLengthType, startType, range_length, start);
+			var c1 = curBlock.opIntULt(rangeLengthType, startType, rangeLength, start);
 			curBlock.opConditionalThrow(V3Exception.BoundsCheck, c1);
 			var c2 = curBlock.opIntULt(endType, startType, end, start);
 			curBlock.opConditionalThrow(V3Exception.LengthCheck, c2);
-			var c3 = curBlock.opIntULt(rangeLengthType, endType, range_length, end);
+			var c3 = curBlock.opIntULt(rangeLengthType, endType, rangeLength, end);
 			curBlock.opConditionalThrow(V3Exception.BoundsCheck, c3);
 		}
-		var range_start = newArgs[rangeNorm.startIndex()];
 		var result = Array<SsaInstr>.new(rangeNorm.size);
 		for (i < rangeNorm.startIndex()) result[i] = newArgs[i];
 		if (startType.width > 32) start = curBlock.opIntViewI0(startType, rangeLengthType, start);
-		result[rangeNorm.startIndex()] = curBlock.opIntAdd(start, range_start);
+		
+		if (norm.config.NormalizeRange && rangeNorm.arrayNorm.size <= 1) {
+			result[rangeNorm.startIndex()] = curBlock.opRangeStartPlusIndex(rangeNorm.oldType, rangeLengthType, oldApp.facts, rangeStart, start);
+		} else {
+			result[rangeNorm.startIndex()] = curBlock.opIntAdd(start, rangeStart);
+		}
+			
 		if (endType.width > 32) end = curBlock.opIntViewI0(endType, rangeLengthType, end);
 		result[rangeNorm.lengthIndex()] = curBlock.opIntSub(end, start);
 		mapN(oldApp, result);
@@ -927,51 +927,86 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var rangeNorm = RangeNorm.!(normTypeArg(op, 0));
 		var startNorm = normTypeArg(op, 1), lengthNorm = normTypeArg(op, 2);
 		var newArgs = genRefs(oldApp.inputs);
-		var range_length = newArgs[rangeNorm.lengthIndex()];
+		var rangeStart = newArgs[rangeNorm.startIndex()], rangeLength = newArgs[rangeNorm.lengthIndex()];
 		var start = newArgs[rangeNorm.size], length = newArgs[rangeNorm.size + startNorm.size];
 		var rangeLengthType = norm.config.ArrayLengthType;
 		var startType = IntType.!(startNorm.oldType), lengthType = IntType.!(lengthNorm.oldType);
 		if (context.compiler.boundsCheck(oldApp.facts)) {
 			// XXX: manually CSE the promotions here?
-			var c1 = curBlock.opIntULt(rangeLengthType, startType, range_length, start);
+			var c1 = curBlock.opIntULt(rangeLengthType, startType, rangeLength, start);
 			curBlock.opConditionalThrow(V3Exception.BoundsCheck, c1);
-			var c2 = curBlock.opIntULt(rangeLengthType, lengthType, range_length, length);
+			var c2 = curBlock.opIntULt(rangeLengthType, lengthType, rangeLength, length);
 			curBlock.opConditionalThrow(V3Exception.LengthCheck, c2);
 			if (startType.width > 32) start = curBlock.opIntViewI0(startType, rangeLengthType, start);
 			if (lengthType.width > 32) length = curBlock.opIntViewI0(lengthType, rangeLengthType, length);
 			var end = rangeStartAdd(start, length);
-			var c3 = curBlock.opU32Lt(range_length, end);
+			var c3 = curBlock.opU32Lt(rangeLength, end);
 			curBlock.opConditionalThrow(V3Exception.BoundsCheck, c3);
+		} else {
+			if (startType.width > 32) start = curBlock.opIntViewI0(startType, rangeLengthType, start);
+			if (lengthType.width > 32) length = curBlock.opIntViewI0(lengthType, rangeLengthType, length);
 		}
-		var range_start = newArgs[rangeNorm.startIndex()];
+		
 		var result = Array<SsaInstr>.new(rangeNorm.size);
 		for (i < rangeNorm.startIndex()) result[i] = newArgs[i];
-		result[rangeNorm.startIndex()] = rangeStartAdd(start, range_start);
+		
+		if (norm.config.NormalizeRange && rangeNorm.arrayNorm.size <= 1) {
+			result[rangeNorm.startIndex()] = curBlock.opRangeStartPlusIndex(rangeNorm.oldType, rangeLengthType, oldApp.facts, rangeStart, start);
+		} else {
+			result[rangeNorm.startIndex()] = curBlock.opIntAdd(start, rangeStart);
+		}
 		result[rangeNorm.lengthIndex()] = length;
 		mapN(oldApp, result);
 	}
 	def normRangeGetElem(oldApp: SsaApplyOp, op: Operator) {
 		var rangeNorm = RangeNorm.!(normTypeArg(op, 0)), rtn = normReturnType(op);
 		var newArgs = genRefs(oldApp.inputs), width = rtn.size;
+		var indexType = norm.config.ArrayIndexType;
 		var w = rangeNorm.size;
-		var indexType = norm.config.RangeStartType;
+		var facts = oldApp.facts;
 		var start = newArgs[rangeNorm.startIndex()], length = newArgs[rangeNorm.lengthIndex()], index = newArgs[rangeNorm.size];
 		if (context.compiler.boundsCheck(oldApp.facts)) {
 			// explicit bounds check
 			var oob = curBlock.pure(Int.getType(false, 32).opLtEq(), [length, index]);
 			curBlock.opConditionalThrow(V3Exception.BoundsCheck, oob);
 		}
-		index = rangeStartAdd(start, index);
-		if (width == 1) {
-			// common case 1-1 mapping
-			var ni = curBlock.opArrayGetElem(rangeNorm.arrayNorm.newType, indexType, oldApp.facts, newArgs[0], index);
-			ni.setFact(Facts.O_SAFE_BOUNDS); // explicit bounds check, cannot be null
-			return map1(oldApp, ni);
-		} else if (width == 0) {
-			// void range access; bounds check was sufficient
-			return map0(oldApp);
+
+		if (norm.config.NormalizeRange && rangeNorm.arrayNorm.size <= 1) {
+			if (width == 1) {
+				var ni = curBlock.opNormRangeGetElem(rangeNorm.arrayNorm.newType, indexType, facts, newArgs[0], start, index);
+				ni.setFact(Facts.O_SAFE_BOUNDS);
+				return map1(oldApp, ni);
+			} else if (width == 0) {
+				return map0(oldApp);
+			}
+			
+			var vals = Array<SsaInstr>.new(width);
+			if (rangeNorm.arrayNorm.isMixed()) {
+				var array = newArgs[0];
+				for (i < width) {
+					vals[i] = curBlock.opNormRangeGetElemElem(rangeNorm.arrayNorm.newType, indexType, i, facts, array, start, index);
+					facts = facts | Facts.O_SAFE_BOUNDS;
+				}
+			} else {
+				for (i < width) {
+					vals[i] = curBlock.opNormRangeGetElem(rangeNorm.arrayNorm.sub[i], indexType, facts, newArgs[i], start, index);
+					facts = facts | Facts.O_SAFE_BOUNDS;
+				}
+			}
+			mapN(oldApp, vals);
+		} else {
+			index = rangeStartAdd(start, index);
+			if (width == 1) {
+				// common case 1-1 mapping
+				var ni = curBlock.opArrayGetElem(rangeNorm.arrayNorm.newType, indexType, oldApp.facts, newArgs[0], index);
+				ni.setFact(Facts.O_SAFE_BOUNDS); // explicit bounds check, cannot be null
+				return map1(oldApp, ni);
+			} else if (width == 0) {
+				// void range access; bounds check was sufficient
+				return map0(oldApp);
+			}
+			normArrayOrRangeGetElem(oldApp, rangeNorm.arrayNorm, indexType, width, newArgs, index, Facts.O_SAFE_BOUNDS);
 		}
-		normArrayOrRangeGetElem(oldApp, rangeNorm.arrayNorm, indexType, width, newArgs, index, Facts.O_SAFE_BOUNDS);
 	}
 	def rangeStartAdd(start: SsaInstr, index: SsaInstr) -> SsaInstr {
 		return curBlock.pure(norm.config.RangeStartType.opAdd(), [start, index]); // XXX: constant fold?
@@ -1035,29 +1070,57 @@ class SsaRaNormalizer extends SsaRebuilder {
 			var oob = curBlock.pure(Int.getType(false, 32).opLtEq(), [length, index]);
 			curBlock.opConditionalThrow(V3Exception.BoundsCheck, oob);
 		}
-		index = rangeStartAdd(start, index);
+		
 		var arrayNorm = rangeNorm.arrayNorm;
-		if (width == 1) {
-			var val = newArgs[rangeNorm.size + 1];
-			var i = curBlock.opArraySetElem(arrayNorm.newType, indexType, oldApp.facts, newArgs[0], index, val);
-			i.setFact(Facts.O_SAFE_BOUNDS);
-			return;
-		} else if (width == 0) {
-			// prior bounds check was sufficient
-			return;
-		}
-		if (arrayNorm.isMixed()) {
-			// mixed range set
-			var array = newArgs[0];
-			for (i < width) {
-				var val = newArgs[rangeNorm.size + i + 1];
-				curBlock.add(V3Op.newArraySetElemElem(arrayNorm.newType, indexType, i), [array, index, val], Facts.O_SAFE_BOUNDS);
+		var facts = oldApp.facts;
+
+		if (norm.config.NormalizeRange && arrayNorm.size <= 1) {
+			if (width == 1) {
+				var val = newArgs[rangeNorm.size + 1];
+				var i = curBlock.opNormRangeSetElem(arrayNorm.newType, indexType, facts, newArgs[0], start, index, val);
+				i.setFact(Facts.O_SAFE_BOUNDS);
+				return;
+			} else if (width == 0) {
+				// prior bounds check was sufficient
+				return;
+			}
+
+			if (arrayNorm.isMixed()) {
+				for (i < width) {
+					var val = newArgs[rangeNorm.size + i + 1];
+					curBlock.opNormRangeSetElemElem(arrayNorm.newType, indexType, i, Facts.O_SAFE_BOUNDS, newArgs[0], start, index, val);
+				}
+			} else {
+				for (i < width) {
+					var val = newArgs[rangeNorm.size + i + 1];
+					curBlock.opNormRangeSetElem(arrayNorm.sub[i], indexType, Facts.O_SAFE_BOUNDS, newArgs[i], start, index, val);
+				}
 			}
 		} else {
-			// complex range set
-			for (i < width) {
-				var val = newArgs[rangeNorm.size + i + 1];
-				curBlock.opArraySetElem(arrayNorm.sub[i], indexType, Facts.O_SAFE_BOUNDS, newArgs[i], index, val);
+			index = rangeStartAdd(start, index);
+
+			if (width == 1) {
+				var val = newArgs[rangeNorm.size + 1];
+				var i = curBlock.opArraySetElem(arrayNorm.newType, indexType, oldApp.facts, newArgs[0], index, val);
+				i.setFact(Facts.O_SAFE_BOUNDS);
+				return;
+			} else if (width == 0) {
+				// prior bounds check was sufficient
+				return;
+			}
+			if (arrayNorm.isMixed()) {
+				// mixed range set
+				var array = newArgs[0];
+				for (i < width) {
+					var val = newArgs[rangeNorm.size + i + 1];
+					curBlock.add(V3Op.newArraySetElemElem(arrayNorm.newType, indexType, i), [array, index, val], Facts.O_SAFE_BOUNDS);
+				}
+			} else {
+				// complex range set
+				for (i < width) {
+					var val = newArgs[rangeNorm.size + i + 1];
+					curBlock.opArraySetElem(arrayNorm.sub[i], indexType, Facts.O_SAFE_BOUNDS, newArgs[i], index, val);
+				}
 			}
 		}
 	}
