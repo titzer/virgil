@@ -56,7 +56,7 @@ int run(int run, int numruns, int nstdout, int nstderr, char *argv[]) {
     dup2(nstdout, 1);
     dup2(nstderr, 2);
     // execve the command
-    status = execvpe(argv[0], argv, global_envp);
+    status = execve(argv[0], argv, global_envp);
     // should not reach here unless exec failed
     printf("exec failed with status = %d, errno = %d\n", status, errno);
     exit(status);
