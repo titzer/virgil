@@ -107,7 +107,15 @@ class Arm64CodeGen extends SsaMachGen {
         super(context, mach, Arm64RegSet.SET, w) {}
 
     // Overidden Architecture Specific Routines
-    def visitApply(block: SsaBlock, i: SsaApplyOp) { context.fail("not implemented"); }
+    def visitApply(block: SsaBlock, i: SsaApplyOp) { 
+        match (i.op.opcode) {
+            IntAdd => {
+                emitIntBinop(I_ADD, i);
+            }
+			_ => context.fail("not implemented"); // TODO
+        }
+    }
+
 	def visitThrow(block: SsaBlock, i: SsaThrow) { context.fail("not implemented"); }
 	def visitIf(block: SsaBlock, i: SsaIf) { context.fail("not implemented"); }
 	def visitSwitch(block: SsaBlock, i: SsaSwitch) { context.fail("not implemented"); }
@@ -125,4 +133,117 @@ class Arm64CodeGen extends SsaMachGen {
 	def genRestoreLocal(v: VReg, reg: int) { context.fail("not implemented"); }
 	def genMoveLocLoc(src: (VReg, int), dst: (VReg, int), regClass: RegClass) { context.fail("not implemented"); }
 	def genMoveValLoc(vreg: VReg, dst: (VReg, int), regClass: RegClass) { context.fail("not implemented"); }
+
+    // Helper functions
+    // Emit code for an integer binop
+    def emitIntBinop(code: int, i: SsaApplyOp) {
+        def variant = getIntOpVariant(i);
+		emitSimpleBinop(code, variant, i);
+	}
+
+	// Emit code for a simple binop (add, sub, mul, etc...)
+    def emitSimpleBinop(code: int, variant: int, i: SsaApplyOp, maxImmWidth: ImmWidth) {
+		// XXX: select better left operand using liveness
+        m.intbinop(i);
+		match (getImm32Operand(m.y, maxImmWidth)) {
+			case Some(immOp) => {
+				def opcode = makeOpcode(code, AM_IMM, ARG_NONE, variant);
+				emit3(opcode, dfnReg(i), use(m.x), use(immOp))
+			}
+			case None => {
+				// if y is imm and too large to fit in binop, we use a
+				// const VReg. Regalloc later calls back `genMoveValLoc` to move
+				// y to reg.
+				def opcode = makeOpcode(code, AM_REG, ARG_NONE, variant);
+				emit3(opcode, dfnReg(i), use(m.x), use(m.y));
+			}
+		}
+	}
+
+	// Returns the variant for an integer operation
+	def getIntOpVariant(i: SsaApplyOp) -> byte {
+		// XXX: factor this out and clean it up
+		def t = i.op.typeArgs[0];
+        var width: int;
+
+		if (IntType.?(t)) width = IntType.!(t).width;
+		else if (t.typeCon.kind == V3Kind.ENUM) width = V3.getVariantTagType(t).width;
+		else if (t.typeCon.kind == V3Kind.ENUM_SET) width = V3.getEnumSetType(t).width;
+        else width = 64;
+
+        return if(width > 32, V_64, V_32);
+	}
+
+	// Returns Some(op) if i fits in an immediate operand with width <= maxWidth
+	// otherwise None
+    def getImm32Operand(i: SsaInstr, maxWidth: ImmWidth) -> Maybe<Operand> {
+        // null is 0 pointer
+		if (i == null) { return Maybe.Some(Operand.Immediate(Int.box(0))) }
+        // Can only use Imm32 if it is a constant
+		if (SsaConst.?(i)) {
+			def val = SsaConst.!(i).val;
+			match (val) {
+				null => { return Maybe.Some(Operand.Immediate(val)) } // Q: difference between useImm(null) and useInt(0)
+				x: Box<int> => {
+					// Check if x fits in maxWidth
+					match (maxWidth) {
+						case Imm12 => if(x.val == i12.view(x.val)) return Maybe.Some(Operand.Immediate(x));
+						case Imm16 => if(x.val == i16.view(x.val)) return Maybe.Some(Operand.Immediate(x));
+						case Imm19 => if(x.val == i19.view(x.val)) return Maybe.Some(Operand.Immediate(x));
+					}
+				}
+				x: Box<long> => context.fail("not implemented");
+				x: Addr => context.fail("not implemented");
+				x: Box<bool> => context.fail("not implemented");
+				x: ArrayRangeStart => context.fail("not implemented"); // Q: what is this?
+			}
+		}
+		return Maybe.None;
+	}
+
+	// Register allocation callback to prepend a move
+	def genMoveValLoc(src: VReg, dst: (VReg, int), regClass: RegClass) {
+		def operand = getImm32Operand(src.ssa, ImmWidth.Imm16);
+		if (regSet.isStack(dst.1)) {
+			match (operand) {
+				Some(immOp) => {
+					// Move constant directly to stack
+					emit2(putRegClassVariant(I_MOV, regClass), dfnv0(dst), op(immOp));
+				}
+				None => {
+					// Too large constant or mem loc, either way need scratch
+					genMoveValLoc(src, (null, Regs.SCRATCH_GPR), regClass);
+					genMoveValLoc((null, Regs.SCRATCH_GPR), dst, regClass);
+				}
+			}
+		} else {
+            // TODO dst can be an xmm
+            match operand {
+                Some(immOp) => {
+                    // Move constant directly to reg
+                    emit2(putRegClassVariant(I_MOV, regClass), dfnv0(dst), op(immOp));
+                }
+                None => {
+                    // Constant too large
+                    def val = SssaConst.!(src.ssa).val;
+                    match (val) {
+                        x: Box<int> => {
+                            if x.val == i16.view(x.val) {
+                                // Arm64 mov supports 16-bit immediates
+                                emit2(putVariant(I_MOV, V_32), dfnv(null, Regs.SCRATCH_GPR), useImm(val));
+                            } else {
+                                // mov followed by movk to insert imm in reg
+                                // move first 16-bits to reg
+                                emit2(putVariant(I_MOV, V_32), dfnv(null, Regs.SCRATCH_GPR), Int.box(x.val & 0xffff));
+                                // Move second 16-bits to reg
+                                def opcode = makeOpcode(I_MOVK, AM_SHIFTED_IMM, 16, V_32);
+                                emit2(opcode, dfnv(null, Regs.SCRATCH_GPR), Int.box((x.val & 0xffff0000) >> 16));
+                            }
+                        }
+                        _ => context.fail("not implemented"); // TODO
+                    }
+                }
+            }
+		}
+	}
 }
