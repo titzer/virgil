@@ -130,6 +130,33 @@ function check_no_red() {
     fi
 }
 
+# Runs tests in ./parser/*.v3
+function do_parser_tests() {
+    cd parser
+    print_status Parser ""
+    run_v3c "" -test -expect=failures.txt *.v3 | tee $OUT/out | $PROGRESS
+    # TODO: accumulate errors and continue?
+    fail_fast
+    cd ..
+}
+
+# Runs tests in ./seman/*.v3
+function do_seman_tests() {
+    cd seman
+    print_status Semantic ""
+    run_v3c "" -test -expect=failures.txt *.v3 | tee $OUT/out | $PROGRESS
+    # TODO: accumulate errors and continue?
+    fail_fast
+    cd ..
+}
+
+function fail_fast() {
+    local code="$?"
+    if [ "$code" != 0 ]; then
+	exit $code
+    fi
+}
+
 function run_io_test() {
     target=$1
     local runner=$2
