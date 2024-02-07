@@ -1,0 +1,144 @@
+// Copyright 2024 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Contains logic to generate a Darwin executable (Mach-O) file, independent of backend.
+class DarwinTarget extends Target {
+	def space: AddressSpace;
+	def intNorm: IntNormalizer;
+	def machLoweringConfig: MachLoweringConfig;
+	def newBackend: (Compiler, Program, MachProgram, MachDataWriter, Dwarf) -> MachBackend;
+	def newThreadState: void -> MachO_ThreadState;
+	def kernelCallReturnType: Type;
+	def DEFAULT_VADDR_START = 0x08000000;
+	def darwin_cpu_type: int;
+	def is64 = space.addressWidth == 64;
+
+	new(name: string, space, intNorm, machLoweringConfig, newBackend, newThreadState, darwin_cpu_type: int) super(name) { }
+
+	def configureCompiler(compiler: Compiler) {
+		compiler.Reachability = true;
+	}
+	def configureProgram(prog: Program) {
+		var mach = MachProgram.new(prog, space, space, intNorm);
+		prog.tprog = mach;
+		var rt = MachRuntime.new(mach);
+		mach.runtime = rt;
+		MachModule.install(prog, mach); // installs "Pointer" typecon
+		DarwinModule.install(prog, is64); // installs "Darwin" component
+		prog.typeEnv.add(rt.typeCon); // installs "CiRuntime" component (for RiRuntime code)
+	}
+	def computeFieldOffsets(prog: Program, b: Vector<IrField>, start: int) {
+		getRuntime(prog).mach.computeFieldOffsets(prog, b, start);
+	}
+	def addRoots(compiler: Compiler, prog: Program) {
+		getRuntime(prog).addRoots();
+	}
+	private def getRuntime(prog: Program) -> MachRuntime {
+		return MachProgram.!(prog.tprog).runtime;
+	}
+	def emit(compiler: Compiler, prog: Program) {
+		var rt = getRuntime(prog), mach = rt.mach;
+		mach.build(compiler, MachLoweringConfig.new());
+
+		var header = MachO_Header.new(is64);
+		var pageAlign = rt.codeRegion.space.pageAlign;
+		header.cputype = darwin_cpu_type;
+		header.filetype = MachO.MH_EXECUTE;
+		var startAddr = 0x10000;
+
+		// protect page zero for trapping null accesses
+		var pz = newSegmentLoad(header, "__NULL", 0);
+		pz.vmsize = pageAlign.size;
+		// stack (data) segment if a non-zero stack size is specified
+		var stackSize = pageAlign.alignUp(int.!(CLOptions.STACK_SIZE.get()));
+		if (stackSize > 0) {
+			var ss = newSegmentLoad(header, "__STACK", MachO.VM_PROT_RW);
+			ss.filesize = 0;
+			ss.fileoff = 0;
+			ss.vmsize = stackSize;
+			ss.vmaddr = startAddr;
+			rt.recordStackStart(startAddr);
+			startAddr += stackSize;
+			rt.recordStackEnd(startAddr);
+		}
+		// code (text) segment starts at page 1
+		var cs = newSegmentLoad(header, "__TEXT", MachO.VM_PROT_RX);
+		// data segment immediately follows code segment
+		var ds = newSegmentLoad(header, "__DATA", MachO.VM_PROT_RW);
+		// initial thread state for registers (includes starting IP)
+		var ts = newThreadState();
+		header.addCmd(ts);
+		// ex segment for trapping explicit checks
+		var ex = if(rt.src != null, newSegmentLoad(header, "__EX", 0));
+		// create the buffer
+		var w = MachDataWriter.new(rt.codeRegion.space.pageAlign,
+			startAddr, 300 + mach.numMethods * 50);
+		// skip mach-o headers
+		w.skipN(header.totalsize);
+		// skip page zero
+		w.skipPage();
+		// generate code and runtime tables into buffer
+		// encodeCode(w, cs, ts);
+		var backend = newBackend(compiler, prog, mach, w, null);
+		ts.rip = w.endAddr();
+		cs.vmaddr = w.endPageAddr();
+		rt.recordCodeStart(ts.rip);
+		backend.genAllCode();
+		var size = w.end();
+		if (size < pageAlign.size) w.skipN(pageAlign.size - size); // MacOS security requires >= 4096 bytes
+		rt.recordCodeEnd(w.endAddr());
+		mach.layoutMeta(w);
+		mach.layoutRuntime(w);
+		cs.filesize = w.end();
+		cs.vmsize = pageAlign.alignUp(cs.filesize);
+		cs.fileoff = 0;
+		// generate the unmapped "ex" region for trapping explicit checks
+		if (ex != null) {
+			w.skipPage();
+			var exStart = w.endPageAddr();
+			var exSize = pageAlign.alignUp(rt.src.layoutExRegion(exStart));
+			w.startAddr = w.startAddr + exSize;
+			ex.vmaddr = exStart;
+			ex.vmsize = exSize;
+			ex.filesize = 0;
+			ex.fileoff = 0;
+		}
+		// generate data into buffer
+		w.skipPage();
+		// compute starting location of data
+		w.atEnd().align(mach.data.addressSize);
+		ds.vmaddr = w.endPageAddr();
+		ds.fileoff = ds.vmaddr - w.startAddr;
+		rt.recordDataStart(w.endAddr());
+		mach.layoutData(w);
+		rt.recordDataEnd(w.endAddr());
+		rt.addHeapPointers(w);
+		ds.filesize = w.end() - ds.fileoff;
+		ds.vmsize = pageAlign.alignUp(ds.filesize + int.view(rt.heapSize));
+		// patch all addresses in the binary
+		w.patch(backend.patchCodeAddr);
+		// encode header at position 0 now that all addresses and offsets are known
+		header.encode(w.at(0));
+		header.encodeCmds(w);
+		// open the output file
+		var file = compiler.getOutputFileName(prog.name(), null);
+		var fd = System.fileOpen(file, false);
+		if (fd < 0) return prog.ERROR.OutputError(file);
+		// write the entire file from the buffer array
+		System.fileWriteK(fd, w.data, 0, w.end());
+		System.fileClose(fd);
+		// change permissions to make binary executable
+		compiler.makeExecutable(file);
+	}
+	def newSegmentLoad(header: MachO_Header, name: string, prot: int) ->  MachO_SegmentLoad {
+		var s = MachO_SegmentLoad.new(name);
+		s.initprot = prot;
+		s.maxprot = prot;
+		header.addCmd(s);
+		return s;
+	}
+}
+
+class MachO_ThreadState extends MachO_LoadCmd {
+	var rip: int;
+}

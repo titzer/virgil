@@ -1,163 +1,27 @@
 // Copyright 2022 Virgil authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-component X86_64DarwinTargets {
-	new() {
-		Aeneas.registerTarget(X86_64DarwinTarget.new("x86-64-darwin-test", true));
-		Aeneas.registerTarget(X86_64DarwinTarget.new("x86-64-darwin", false));
-	}
-}
+def SPACE = AddressSpace.new("mem", false, 64, 8,
+	Alignment.new(4096), Alignment.new(8));
 
-def STDIN = 0;
-def STDOUT = 1;
-def STDERR = 2;
+def LOWERING = MachLoweringConfig.new();
+def X86_64_DARWIN_TARGET = Aeneas.registerTarget(
+		DarwinTarget.new("x86-64-darwin", SPACE, IntNormalizers.I64LE, X86_64Common.LOWERING,
+			X86_64DarwinBackend.new(_, _, _, _, _, false),
+			MachO_X86ThreadState.new, MachO.CPU_TYPE_X86_64));
+def X86_64_DARWIN_TEST_TARGET = Aeneas.registerTarget(
+		DarwinTarget.new("x86-64-darwin-test", SPACE, IntNormalizers.I64LE, X86_64Common.LOWERING,
+			X86_64DarwinBackend.new(_, _, _, _, _, true),
+			MachO_X86_64ThreadState.new, MachO.CPU_TYPE_X86_64));
 
+// Constants for system calls.
 def SYS_exit = 0x2000001;
 def SYS_write = 0x2000004;
 def SYS_sigaction = 0x200002E;
-
 def SYS_RT_sigreturn = 0x20000B8;
 
 def Regs: X86_64Regs;
 def MRegs: X86_64RegSet;
-
-def SPACE = AddressSpace.new("mem", false, 64, 8,
-	Alignment.new(4096), Alignment.new(8));
-
-// Darwin target for x86-64 architecture. Generates an Mach-O binary directly.
-class X86_64DarwinTarget extends Target {
-	def test: bool;
-	def DEFAULT_VADDR_START: int = 0x08000000;
-
-	new(name: string, test) super(name) { }
-
-	def configureCompiler(compiler: Compiler) {
-		compiler.Reachability = true;
-	}
-	def configureProgram(prog: Program) {
-		def space = SPACE;
-		def intNorm = IntNormalizers.I64LE;
-		var mach = MachProgram.new(prog, space, space, intNorm);
-		prog.tprog = mach;
-		var rt = MachRuntime.new(mach);
-		mach.runtime = rt;
-		MachModule.install(prog, mach); // installs "Pointer" typecon
-		DarwinModule.install(prog, true); // installs "Darwin" component
-		prog.typeEnv.add(rt.typeCon); // installs "CiRuntime" component (for RiRuntime code)
-	}
-	def computeFieldOffsets(prog: Program, b: Vector<IrField>, start: int) {
-		getRuntime(prog).mach.computeFieldOffsets(prog, b, start);
-	}
-	def addRoots(compiler: Compiler, prog: Program) {
-		getRuntime(prog).addRoots();
-	}
-	private def getRuntime(prog: Program) -> MachRuntime {
-		return MachProgram.!(prog.tprog).runtime;
-	}
-	def emit(compiler: Compiler, prog: Program) {
-		var rt = getRuntime(prog), mach = rt.mach;
-		mach.build(compiler, X86_64Common.LOWERING);
-
-		var header = MachO_Header.new(true);
-		var pageAlign = rt.codeRegion.space.pageAlign;
-		header.cputype = MachO.CPU_TYPE_X86_64;
-		header.cpusubtype = MachO.CPU_SUBTYPE_X86_64;
-		header.filetype = MachO.MH_EXECUTE;
-
-		var startAddr = int.view(CLOptions.VM_START_ADDR.get());
-		if (startAddr == 0) startAddr = DEFAULT_VADDR_START;
-		// protect page zero for trapping null accesses
-		var pz = newSegmentLoad(header, "__NULL", 0);
-		pz.vmsize = pageAlign.size;
-		// stack (data) segment if a non-zero stack size is specified
-		var stackSize = pageAlign.alignUp(int.!(CLOptions.STACK_SIZE.get()));
-		if (stackSize > 0) {
-			var ss = newSegmentLoad(header, "__STACK", MachO.VM_PROT_RW);
-			ss.filesize = 0;
-			ss.fileoff = 0;
-			ss.vmsize = stackSize;
-			ss.vmaddr = startAddr;
-			rt.recordStackStart(startAddr);
-			startAddr += stackSize;
-			rt.recordStackEnd(startAddr);
-		}
-		// code (text) segment starts at page 1
-		var cs = newSegmentLoad(header, "__TEXT", MachO.VM_PROT_RX);
-		// data segment immediately follows code segment
-		var ds = newSegmentLoad(header, "__DATA", MachO.VM_PROT_RW);
-		// initial thread state for registers (includes starting IP)
-		var ts = MachO_X86_64ThreadState.new();
-		header.addCmd(ts);
-		// ex segment for trapping explicit checks
-		var ex = if(rt.src != null, newSegmentLoad(header, "__EX", 0));
-		// create the buffer
-		var w = MachDataWriter.new(rt.codeRegion.space.pageAlign,
-			startAddr, 300 + mach.numMethods * 50);
-		// skip mach-o headers
-		w.skipN(header.totalsize);
-		// skip page zero
-		w.skipPage();
-		// generate code and runtime tables into buffer
-		// encodeCode(w, cs, ts);
-		var backend = X86_64DarwinBackend.new(compiler, prog, mach, w, test);
-		ts.rip = w.endAddr();
-		cs.vmaddr = w.endPageAddr();
-		rt.recordCodeStart(ts.rip);
-		backend.genAllCode();
-		var size = w.end();
-		if (size < pageAlign.size) w.skipN(pageAlign.size - size); // MacOS requires >= 4096 byte binaries
-		rt.recordCodeEnd(w.endAddr());
-		mach.layoutMeta(w);
-		mach.layoutRuntime(w);
-		cs.filesize = w.end();
-		cs.vmsize = pageAlign.alignUp(cs.filesize);
-		cs.fileoff = 0;
-		// generate the unmapped "ex" region for trapping explicit checks
-		if (ex != null) {
-			w.skipPage();
-			var exStart = w.endPageAddr();
-			var exSize = pageAlign.alignUp(rt.src.layoutExRegion(exStart));
-			w.startAddr = w.startAddr + exSize;
-			ex.vmaddr = exStart;
-			ex.vmsize = exSize;
-			ex.filesize = 0;
-			ex.fileoff = 0;
-		}
-		// generate data into buffer
-		w.skipPage();
-		// compute starting location of data
-		w.atEnd().align(mach.data.addressSize);
-		ds.vmaddr = w.endPageAddr();
-		ds.fileoff = ds.vmaddr - w.startAddr;
-		rt.recordDataStart(w.endAddr());
-		mach.layoutData(w);
-		rt.recordDataEnd(w.endAddr());
-		rt.addHeapPointers(w);
-		ds.filesize = w.end() - ds.fileoff;
-		ds.vmsize = pageAlign.alignUp(ds.filesize + int.view(rt.heapSize));
-		// patch all addresses in the binary
-		w.patch(backend.patchCodeAddr);
-		// encode header at position 0 now that all addresses and offsets are known
-		header.encode(w.at(0));
-		header.encodeCmds(w);
-		// open the output file
-		var file = compiler.getOutputFileName(prog.name(), null);
-		var fd = System.fileOpen(file, false);
-		if (fd < 0) return prog.ERROR.OutputError(file);
-		// write the entire file from the buffer array
-		System.fileWriteK(fd, w.data, 0, w.end());
-		System.fileClose(fd);
-		// change permissions to make binary executable
-		compiler.makeExecutable(file);
-	}
-	def newSegmentLoad(header: MachO_Header, name: string, prot: int) ->  MachO_SegmentLoad {
-		var s = MachO_SegmentLoad.new(name);
-		s.initprot = prot;
-		s.maxprot = prot;
-		header.addCmd(s);
-		return s;
-	}
-}
 
 // Darwin-specific backend code generation.
 class X86_64DarwinBackend extends X86_64Backend {
@@ -169,7 +33,7 @@ class X86_64DarwinBackend extends X86_64Backend {
         def PARAM4 = Regs.R8;
         def PARAM5 = Regs.R9;
 
-	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, 
+	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, dwarf: Dwarf,
 		test: bool) super(compiler, prog, mach, w, null, test) {
 	}
 	def asm_exit_code(code: int) {
@@ -204,7 +68,7 @@ class X86_64DarwinBackend extends X86_64Backend {
 		}
 		asm.pushq_r(gpr);
 		asm.movd_r_i(SYSNUM, SYS_write);
-		asm.movd_r_i(PARAM0, STDOUT);
+		asm.movd_r_i(PARAM0, 1); // stdout
 		asm.movq_r_r(PARAM1, Regs.RSP);	// integer is on stack
 		asm.movd_r_i(PARAM2, 4);	// size to write
 		asm.syscall();
@@ -245,7 +109,7 @@ class X86_64DarwinBackend extends X86_64Backend {
 		// 1. encode a call to write() on stderr
 		var msgAddr = Addr.new(mach.codeRegion, null, 0);
 		asm.movd_r_i(SYSNUM, SYS_write);
-		asm.movd_r_i(PARAM0, STDERR);
+		asm.movd_r_i(PARAM0, 2); // stderr
 		asm.lea(PARAM1, X86_64AddrRef.new(null, null, 1, msgAddr, false));	// buffer
 		asm.movq_r_i(PARAM2, ex.length + 1);		// write size
 		asm.syscall();
@@ -280,8 +144,7 @@ class X86_64DarwinBackend extends X86_64Backend {
 }
 
 // a mach-O thread state command for x86-64
-class MachO_X86_64ThreadState extends MachO_LoadCmd {
-	var rip: int;
+class MachO_X86_64ThreadState extends MachO_ThreadState {
 	def encode(is64: bool, w: DataWriter) {
 		w.put_b32(0x5); 				// unix thread
 		w.put_b32(21 * 8 + 4 * 4);  			// 184 bytes for x86-64
