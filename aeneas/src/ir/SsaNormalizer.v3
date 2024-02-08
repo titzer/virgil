@@ -52,7 +52,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 					// receiver became void
 					newParams.put(SsaParam.new(newParams.length, tn.newType));
 					start++; // skip synthesized receiver
-				} else if (DataNorm.?(tn)) {
+				} else if (VariantNorm.?(tn)) {
 					// receiver became flattened data
 					var newIrType = norm.ra.getClass(tn.oldType).newIrType;
 					newParams.put(SsaParam.new(newParams.length, newIrType));
@@ -163,9 +163,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 		match (op.opcode) {
 			BoolEq,
 			RefEq,
-			IntEq =>		normSimpleEqualOp(app, op);
+			IntEq =>		return map1(app, normSimpleEqualOp(app, op));
 			OverloadedEq,
-			VariantEq =>		normEqualOp(app, op);
+			VariantEq,
+			BoxEq =>		return map1(app, normEqualOp(app, op));
 			IntViewI =>		normIntViewI(app, op);
 			TypeCast =>		normTypeCast(app, op);
 			TypeQuery =>		normTypeQuery(app, op);
@@ -204,10 +205,8 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			VariantGetTag => {
 				var rc = norm.ra.makeClass(op.typeArgs[0]);
-				if (rc.dataNorm != null) {
-					if (rc.dataNorm.tagType != null) return map1(app, genRef1(args[0]));
-					return map1(app, newGraph.zeroConst());
-				}
+				var t = normVariantGetTag(rc.variantNorm, genRefs(args));
+				if (t != null) return map1(app, t);
 				else normDefault(app, op);
 			}
 			VariantGetField(field) =>	normGetField(true, app, field, op);
@@ -241,7 +240,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var newOp = V3Op.newCallMethod(m);
 				var newArgs = normArgs(funcNorm, genRefs(app.inputs));
 				if (V3.isVariant(rc.oldType)) {
-					if (rc.dataNorm != null) {
+					if (rc.variantNorm != null) {
 						// flattened data type becomes component call and needs new receiver
 						newArgs = Arrays.prepend(newGraph.nullReceiver(), newArgs);
 					} else {
@@ -283,19 +282,19 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var t = extractVirtualRef(orig, method), funcNorm = t.0, m = t.1;
 				var newArgs = normArgs(funcNorm, genRefs(app.inputs));
 				if (t.2) { // still a virtual dispatch
-					if (rc.dataNorm != null) {
+					if (rc.variantNorm != null) {
 						// use the variant tag as an index into a table of functions
-						var tag = newArgs[0];
+						var tag = newArgs[rc.variantNorm.tagIndex()];
 						var record = IrSelector.!(m.member).mtable.record;
 						var table = newGraph.valConst(record.rtype, record);
-						var func = curBlock.opArrayGetElem(record.rtype, rc.dataNorm.tagType, Facts.O_SAFE_BOUNDS, table, tag);
+						var func = curBlock.opArrayGetElem(record.rtype, rc.variantNorm.tagType(), Facts.O_SAFE_BOUNDS, table, tag);
 						newArgs = Arrays.concat([func, newGraph.nullReceiver()], newArgs);
 						normCall(app, funcNorm, V3Op.newCallFunction(funcNorm.sub[0]), newArgs);
 					} else {
 						normCall(app, funcNorm, V3Op.newCallVariantSelector(m), newArgs);
 					}
 				} else {
-					if (rc.dataNorm != null) {
+					if (rc.variantNorm != null) {
 						// flattened data type becomes component call and needs new receiver
 						newArgs = Arrays.prepend(newGraph.nullReceiver(), newArgs);
 					} else {
@@ -676,28 +675,58 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 	}
 	// normalize an equality operator
-	def normEqualOp(oldApp: SsaApplyOp, op: Operator) {
-		var tn = normTypeArg(op, 0);
-		if (!DataNorm.?(tn) && V3.isVariant(tn.newType)) return normVariantEqual(oldApp, tn.newType);
-		genEqualN(oldApp, tn);
-	}
-	def normSimpleEqualOp(oldApp: SsaApplyOp, op: Operator) {
+	def normEqualOp(oldApp: SsaApplyOp, op: Operator) -> SsaInstr {
 		var tn = normTypeArg(op, 0);
 		var refs = genRefs(oldApp.inputs);
-		return map1(oldApp, curBlock.opEqualOf(op, refs[0], refs[1]));
+		match (tn) {
+			vn: VariantNorm => return normUnboxedVariantEqual(oldApp.source, vn, refs);
+			_ => return normEqualOps(oldApp.source, tn, refs);
+		}
 	}
-	def normVariantEqual(oldApp: SsaApplyOp, t: Type) {
+	def normEqualOps(source: Source, tn: TypeNorm, refs: Array<SsaInstr>) -> SsaInstr {
+		if (tn.size == 0) return newGraph.trueConst();
+		if (tn.size == 1) return normEqualOp1(source, tn.newType, refs[0], refs[1]);
+		var join = opBoolAnd;
+		var expr: SsaInstr;
+		for (i < tn.size) {
+			var cmp: SsaInstr, a = refs[i], b = refs[i + tn.size];
+			cmp = normEqualOp1(source, tn.sub[i], a, b);
+			if (expr == null) expr = cmp;
+			else expr = join(expr, cmp);
+		}
+		return expr;
+	}
+	def normSimpleEqualOp(oldApp: SsaApplyOp, op: Operator) -> SsaInstr {
+		var tn = normTypeArg(op, 0);
+		var refs = genRefs(oldApp.inputs);
+		return curBlock.opEqualOf(op, refs[0], refs[1]);
+	}
+	def normEqualOp1(source: Source, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+		if (V3.isVariant(t)) return normVariantEqual(source, t, x, y);
+		if (V3.isBox(t)) return normBoxEqualOp(source, t, x, y);
+		return curBlock.opEqual(t, x, y);
+	}
+	def normBoxEqualOp(source: Source, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+		var ic = norm.newIr.getIrClass(t);
+		x = curBlock.add(V3Op.newVariantReplaceNull(t), [x], Facts.NONE);
+		y = curBlock.add(V3Op.newVariantReplaceNull(t), [y], Facts.NONE);
+		var equals = ic.methods[IrUtil.EQUALS_METHOD_INDEX];
+		var call = V3Op.newCallMethod(IrSpec.new(t, [t], equals));
+		var app = curBlock.addApply(source, call, [x, y]);
+		return app;
+	}
+	def normVariantEqual(source: Source, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		var rc = norm.ra.getClass(t);
 		var list = rc.methods[IrUtil.EQUALS_METHOD_INDEX];
 		if (list == null) {
-			return normVariantEqual(oldApp, rc.parent.oldType);
+			return normVariantEqual(source, rc.parent.oldType, x, y);
 		}
 		var rm = list.head;
 		// devirtualize methods that are not overridden
 		var tn = normType(t);
 		var t = tryDevirtualize(rm, [tn.newType]), m = t.0, newOp: Operator; // XXX: inline
 		var facts = Fact.O_PURE | Fact.O_COMMUTATIVE;
-		var newArgs = genRefs(oldApp.inputs), x = newArgs[0], y = newArgs[1];
+		var newArgs = [x, y];
 		if (t.1) {
 			newOp = V3Op.newCallVariantSelector(m);
 		} else {
@@ -710,18 +739,70 @@ class SsaRaNormalizer extends SsaRebuilder {
 			newOp = V3Op.newCallMethod(m);
 			facts |= Fact.O_NO_NULL_CHECK;
 		}
-		var call = curBlock.addApply(oldApp.source, newOp, newArgs);
+		var call = curBlock.addApply(source, newOp, newArgs);
 		call.setFact(facts);
-		map1(oldApp, call);
+		return call;
+	}
+	// Normalize equality between two unboxed variants of the same case (e.g. x: T.A == y: T.A)
+	def normUnboxedVariantCaseEqual(source: Source, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
+		var join = opBoolAnd;
+		var expr: SsaInstr;
+		for (i < vn.caseFields.length) {
+			var cf = vn.caseFields[i];
+			for (j < cf.indexes.length) {
+				var idx = cf.indexes[j];
+				if (idx == vn.tagIndex()) continue;
+				var cmp: SsaInstr, a = refs[idx], b = refs[idx + vn.size];
+				a = curBlock.opTypeSubsume(vn.sub[idx], cf.types[j], a);
+				b = curBlock.opTypeSubsume(vn.sub[idx], cf.types[j], b);
+				cmp = normEqualOp1(source, cf.types[j], a, b);
+				if (expr == null) expr = cmp;
+				else expr = join(expr, cmp);
+			}
+		}
+		return if(expr != null, expr, newGraph.trueConst());
+	}
+	// Normalize equality between two unboxed variants of unknown case (e.g. x: T == y: T)
+	def normUnboxedVariantEqual(source: Source, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
+		if (vn.isSingleCase() || !vn.isBoxed()) return normEqualOps(source, vn, refs); // we can always do a scalar-by-scalar comparison if no boxes are involved.
+		if (vn.parentNorm != null) return normUnboxedVariantCaseEqual(source, vn, refs);
+		var xTag = normVariantGetTag(vn, refs[0 ... vn.size]);
+		var yTag = normVariantGetTag(vn, refs[vn.size ...]);
+
+		var tagsEqual = curBlock.opEqual(vn.tagType(), xTag, yTag);
+		var split = SsaBlockSplit.new(context, curBlock);
+		var results = Vector<SsaInstr>.new();
+
+		curBlock = split.addIfNot(tagsEqual);
+		results.put(newGraph.falseConst());
+
+		for (i < vn.childNorms.length) {
+			curBlock = split.addElse();
+			var cn = vn.childNorms[i];
+			var tag = V3.getVariantTag(cn.oldType);
+			curBlock = split.addIf(curBlock.opEqual(vn.tagType(), xTag, newGraph.intConst(tag)));
+			results.put(normUnboxedVariantCaseEqual(source, cn, refs));
+		}
+
+		curBlock = split.addElse();
+		results.put(newGraph.falseConst());
+		curBlock = split.finish();
+		var result = split.addPhi(Bool.TYPE, results.extract());
+		return result;
 	}
 	def normTupleGetElem(oldInstr: SsaInstr, args: Array<SsaDfEdge>, op: Operator, index: int) {
 		var tn = TupleNorm.!(normTypeArg(op, 0));
 		return mapNnf(oldInstr, tn.getElem(genRefs(args), index));
 	}
+	def normVariantGetTag(vn: VariantNorm, args: Range<SsaInstr>) -> SsaInstr {
+		if (vn == null) return null;
+		if (vn.isSingleCase()) return newGraph.zeroConst();
+		return args[vn.tagIndex()];
+	}
 	def throwTypeCheckException() {
 		curBlock.addThrow(curBlock.source, V3Exception.TypeCheck);
 	}
-	def normTypeCastRec(oi: Array<SsaInstr>, offset: int, atn: TypeNorm, rtn: TypeNorm, result: Vector<SsaInstr>) {
+	def normTypeCastRec(oldInstr: SsaApplyOp, oi: Array<SsaInstr>, offset: int, atn: TypeNorm, rtn: TypeNorm, result: Vector<SsaInstr>) {
 		match (TypeSystem.newTypeCast(atn.oldType, rtn.oldType)) {
 			TRUE => {
 				for (i < rtn.size) result.put(oi[offset + i]);
@@ -736,17 +817,18 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var tatn = TupleNorm.!(atn), trtn = TupleNorm.!(rtn);
 				if (tatn.nested.length != trtn.nested.length) return throwTypeCheckException();
 				for (i < tatn.nested.length) {
-					normTypeCastRec(oi, offset + tatn.offsets[i], tatn.nested[i], trtn.nested[i], result);
+					normTypeCastRec(oldInstr, oi, offset + tatn.offsets[i], tatn.nested[i], trtn.nested[i], result);
 				}
 				return;
 			}
 			// XXX: CLASS_CAST special-case non-allocated classes
 			VARIANT_CAST => {
-				if (DataNorm.?(atn) && DataNorm.?(rtn)) {
-					var dn = DataNorm.!(rtn);
-					var tag = V3.getVariantTag(rtn.oldType);
-					curBlock.opIntRangeCheck(1, tag, tag + 1, oi[offset]);
-					for (i < dn.size) result.put(oi[offset + i]);
+				if (atn != null && rtn != null && VariantNorm.?(atn) && VariantNorm.?(rtn)) {
+					var avn = VariantNorm.!(atn), rvn = VariantNorm.!(rtn);
+					var expectedTag = V3.getVariantTag(rtn.oldType);
+					var actualTag = normVariantGetTag(avn, oi[offset ...]);
+					curBlock.opIntRangeCheck(1, expectedTag, expectedTag + 1, actualTag);
+					for (i < avn.size) result.put(oi[offset + i]);
 					return;
 				}
 				// break
@@ -793,7 +875,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		curBlock.source = oldApp.source;
 		var atn = normTypeArg(op, 0), rtn = normTypeArg(op, 1);
 		var result = Vector<SsaInstr>.new().grow(rtn.size);  // XXX: reuse temp vector here?
-		normTypeCastRec(genRefs(oldApp.inputs), 0, atn, rtn, result);
+		normTypeCastRec(oldApp, genRefs(oldApp.inputs), 0, atn, rtn, result);
 		return mapNnf(oldApp, result.extract());
 	}
 	def normIntViewI(oldApp: SsaApplyOp, op: Operator) {
@@ -813,10 +895,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			// XXX: CLASS_QUERY special-case non-allocated classes
 			VARIANT_QUERY => {
-				if (DataNorm.?(atn) && DataNorm.?(rtn)) {
-					var dn = DataNorm.!(rtn);
-					var tag = newGraph.intConst(V3.getVariantTag(rtn.oldType));
-					var check = curBlock.pure(V3Op.newIntEq(dn.tagType), [oi[offset], tag]);
+				if (atn != null && rtn != null && VariantNorm.?(atn) && VariantNorm.?(rtn)) {
+					var vn = VariantNorm.!(rtn);
+					var expectedTag = newGraph.intConst(V3.getVariantTag(rtn.oldType));
+					var tag = normVariantGetTag(VariantNorm.!(atn), oi[offset ...]);
+					var check = curBlock.pure(V3Op.newIntEq(vn.tagType()), [tag, expectedTag]);
 					return opAnd(left, check);
 				}
 				// break
@@ -1166,16 +1249,30 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def normClassAlloc(oldApp: SsaApplyOp, m: IrMethod, op: Operator) {
 		var rc = norm.ra.getClass(op.typeArgs[0]);
-		var dn = rc.dataNorm;
-		if (dn != null) {
+		var vn = rc.variantNorm;
+		if (vn != null) {
 			var inputs = genRefs(oldApp.inputs);
-			var result = Vector<SsaInstr>.new().grow(dn.size);
-			if (dn.tagType != null) result.put(newGraph.intConst(V3.getVariantTag(rc.oldType)));
-			for (i < dn.normRanges.length) {
-				var nr = dn.normRanges[i], or = dn.origRanges[i];
-				for (j < (nr.1 - nr.0)) result.put(inputs[or.0 + j]);
+			var result = Array<SsaInstr>.new(vn.size);
+			for (i < result.length) result[i] = newGraph.nullConst(vn.sub[i]);
+			if (!vn.isSingleCase()) result[vn.tagIndex()] = newGraph.intConst(V3.getVariantTag(rc.oldType));
+			
+			if (vn.isBoxed()) {
+				var box = vn.boxes[0];
+				var constructor = box.ic.methods[0];
+				var spec = IrSpec.new(box.boxType, [box.boxType], constructor);
+				var ninputs = Array<SsaInstr>.new(box.normFields.length);
+				var idx = 0;
+				for (i < box.origRanges.length) {
+					var or = box.origRanges[i], start = or.0, end = or.1;
+					for (j = start; j < end; j++) ninputs[idx++] = inputs[j];
+				}
+				result[vn.caseFields[0].indexes[0]] = curBlock.opClassAlloc(spec, ninputs);
+			} else {
+				for (field in vn.caseFields) {
+					for (j < field.indexes.length) result[field.indexes[j]] = curBlock.opTypeSubsume(field.types[j], vn.sub[field.indexes[j]], inputs[field.origRange.0 + j]);
+				}
 			}
-			return mapNnf(oldApp, result.extract());
+			return mapNnf(oldApp, result);
 		}
 		if (m == null) {
 			// trivial constructor
@@ -1209,16 +1306,33 @@ class SsaRaNormalizer extends SsaRebuilder {
 			if (!isVariant) addNullCheck(oldApp, ninputs[0]);
 			return map0(oldApp);
 		}
-		if (raField.raFacts.RC_UNBOXED) {
+		normType(raField.receiver); // XXX: normType() side-effect of flattening
+		var rc = norm.ra.getClass(raField.receiver);
+		if (isVariant && raField != null && rc.variantNorm != null) {
 			// field of flattened data type
-			normType(raField.receiver); // XXX: normType() side-effect of flattening
-			var rc = norm.ra.getClass(raField.receiver);
-			var vals = Array<SsaInstr>.new(nf.length);
-			var start = rc.dataNorm.normRanges[raField.orig.index].0;
-			for (i < vals.length) {
-				vals[i] = ninputs[start + i];
+			if (!rc.variantNorm.isBoxed()) {
+				var vals = Array<SsaInstr>.new(nf.length);
+				var cf = rc.variantNorm.caseFields[raField.orig.index];
+				
+				for (i < vals.length) vals[i] = curBlock.opTypeSubsume(rc.variantNorm.sub[cf.indexes[i]], cf.types[i], ninputs[cf.indexes[i]]);
+				return mapNnf(oldApp, vals);
 			}
-			return mapNnf(oldApp, vals);
+
+			// field of flattened but boxed variant case
+			var cf = rc.variantNorm.caseFields[0];
+			var box = rc.variantNorm.boxes[0];
+			var receiver = curBlock.opTypeSubsume(rc.variantNorm.sub[0], box.boxType, ninputs[cf.indexes[0]]);
+			if (V3Op.needsNullCheck(oldApp, receiver)) receiver = curBlock.add(V3Op.newVariantReplaceNull(box.boxType), [receiver], Facts.NONE);
+			if (nf.length == 1) {
+				var read = curBlock.opGetField(IrSpec.new(box.boxType, [box.boxType], box.ic.fields[raField.normIndex]), receiver);
+				read.facts = read.facts | raField.facts();
+				return map1(oldApp, read);
+			}
+			var vals = Array<SsaInstr>.new(nf.length);
+			for (i < vals.length) {
+				vals[i] = curBlock.opGetField(IrSpec.new(box.boxType, [box.boxType], box.ic.fields[raField.normIndex + i]), receiver);
+			}
+			return mapN(oldApp, vals);
 		}
 		var receiver = ninputs[0];
 		if (nf.length == 1) {
@@ -1239,12 +1353,13 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var raField = extractFieldRef(oldApp, field);
 		var newArgs = genRefs(oldApp.inputs), receiver = newArgs[0];
 		var nf = raField.norm;
+		var rc = norm.ra.getClass(raField.receiver);
 		if (nf == null || nf.length == 0 || !raField.raFacts.RF_READ) {
 			// OPT: remove write to useless field
 			// OPT: remove write of zero-width field
 			// OPT: remove write of write-only field
 			return addNullCheck(oldApp, receiver);
-		} else if (raField.raFacts.RC_UNBOXED) {
+		} else if (rc.variantNorm != null) {
 			// init/set of field of flattened data type
 			return map0(oldApp);
 		} else if (nf.length == 1) {
