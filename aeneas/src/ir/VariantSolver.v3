@@ -1,0 +1,170 @@
+// Copyright 2024 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class VariantNorm extends TypeNorm {
+	def fields: Array<VariantField>;
+
+	def tag: VariantField;
+	var tagValue: int = -1;
+
+	// for each field, this is the start + end index when ClassAlloc is called
+	var fieldRanges: Array<(int, int)>;
+
+	new(oldType: Type, newType: Type, sub: Array<Type>, fields, tag)
+		super(oldType, newType, sub) {}
+
+	// represent empty variant as tag
+	def isEnum() -> bool { return size == 1 && tag != null && fields.length == 0; }
+	def isEnumCase() -> bool { return size == 1 && tag != null && tagValue >= 0 && fields.length == 0; }
+
+	def tagType() -> IntType { return IntType.!(tag.tn.first()); }
+	def tagIndex() -> int { return tag.indexes[0]; }
+	
+	// represent single-case, unboxed variant without its tag
+	def isTagless() -> bool { return tag == null; }
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put3("%q ## %q |%d|", oldType.render, newType.render, size);
+		buf.puts(" [");
+		for (i < sub.length) {
+			if (i > 0) buf.csp();
+			sub[i].render(buf);
+		}
+		buf.puts("] {");
+		if (tag != null) {
+			buf.put1("tag: %q", tag.render);
+		}
+		for (i < fields.length) {
+			if (i > 0 || tag != null) buf.csp();
+			fields[i].render(buf);
+		}
+		buf.puts("}");
+		return buf;
+	}
+}
+
+// Metadata about a variant's fields before/after normalization
+class VariantField {
+	def tn: TypeNorm;
+	def indexes: Array<int>; // Indexes into the variant's representation to extract the field from
+
+	new(tn, indexes) {}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.puts("(");
+		for (i < indexes.length) {
+			if (i > 0) buf.csp();
+			buf.put1("#%d", indexes[i]);
+		}
+		buf.puts(")");
+		if (tn != null) buf.put1(": [%q]", tn.newType.render);
+		return buf;
+	}
+}
+
+def ON_STACK = -1;
+
+class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: bool) {
+	def normVariant(t: Type, rc: RaClass) -> TypeNorm {
+		if (rc.variantNorm != null) return rc.variantNorm;
+		if (rc.orig.boxing == Boxing.BOXED) rn.mapSimple(t);
+
+		var prev = rc.recursive;
+		match (rc.recursive) {
+			ON_STACK => {
+				rc.recursive = 2; // cycle detected; box
+			}
+			0 => {
+				rc.recursive = ON_STACK;
+				tryUnboxing(rc);
+				if (rc.recursive == ON_STACK) rc.recursive = 1;
+				if (rc.variantNorm != null) return rc.variantNorm;
+			}
+		}
+		return rn.mapSimple(t); 
+	}
+	def setVariantNormForChildren(rc: RaClass, tagType: IntType, tagField: VariantField) {
+		var vn = VariantNorm.new(rc.oldType, tagType, [tagType], [], tagField);
+		vn.tagValue = V3.getVariantTag(rc.oldType);
+		rc.raFacts |= RaFact.RC_ENUM;
+		
+		for (l = rc.children; l != null; l = l.tail) {
+			setVariantNormForChildren(l.head, tagType, tagField);
+		}
+	}
+	def tryUnboxing(rc: RaClass) -> bool {
+		if (rc.variantNorm != null) return true; // already done
+		while (rc.parent != null) rc = rc.parent;
+		
+		rn.makeNormFields(rc);
+
+		var isEmpty = rc.normFields.length == 0;
+		var closure = rc.raFacts.RC_CLOSURE;
+
+		for (l = rc.children; l != null; l = l.tail) {
+			var c = l.head;
+			rn.makeNormFields(c);
+			if (c.normFields.length > 0) isEmpty = false;
+			closure |= c.raFacts.RC_CLOSURE;
+		}
+
+		if (isEmpty && !closure) {
+			// normalize empty variant to just its tag; i.e. become an enum
+			var tagType = V3.getVariantTagType(rc.oldType);
+			var tagTypeNorm = rn.mapSimple(tagType);
+			var tagField = VariantField.new(tagTypeNorm, [0]);
+			setVariantNormForChildren(rc, tagType, tagField);
+			return true;
+		}
+		if (rc.children != null) {
+			// TODO: multi-case variant unboxing
+			return false;
+		}
+		match (rc.orig.boxing) {
+			BOXED => return false;
+			AUTO => if (rc.normFields.length > nc.MaxFlatDataValues && CLOptions.UNBOX_ALL.get()) return false;
+			UNBOXED => ; // program specified unboxed; TODO: recursion or closure should be an error
+		}
+		if (rc.recursive > 1 || closure) return false; // recursive or closed over
+		unboxUsingTaglessVariantNorm(rc);
+		return true;
+	}
+	def unboxUsingTaglessVariantNorm(rc: RaClass) {
+		var ofs = rc.orig.fields;
+		var fields = Array<VariantField>.new(ofs.length);
+
+		var vecO = Vector<Type>.new();
+		var vecT = Vector<Type>.new();
+		var fieldRanges = Array<(int, int)>.new(ofs.length);
+
+		for (i < ofs.length) {
+			var normStart = vecT.length, origStart = vecO.length;
+			var rf = rc.fields[i];
+			var tn: TypeNorm, indexes: Array<int>;
+
+			if (rf != null && rf.normIndex >= 0) {
+				if (rf.typeNorm != null) tn = rf.typeNorm;
+				else if (rf.fieldType != null) tn = rn.norm(rf.fieldType);
+				else tn = rn.mapSimple(rf.orig.fieldType);
+
+				tn.addTo(vecT);
+				indexes = Array<int>.new(tn.size);
+				for (j < indexes.length) indexes[j] = normStart + j;
+				fields[i] = VariantField.new(tn, indexes);
+			} else {
+				fields[i] = VariantField.new(null, []);
+			}
+			
+			var fieldType = ofs[i].fieldType.substitute(V3.getTypeArgs(rc.oldType));
+			rn.norm(fieldType).addTo(vecO);
+			fieldRanges[i] = (origStart, vecO.length);
+		}
+
+		var ta = vecT.extract();
+		var vn = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(ta)), ta, fields, null);
+		vn.fieldRanges = fieldRanges;
+		rc.variantNorm = vn;
+
+		if (verbose) Terminal.put1("variant norm %q\n", rc.variantNorm.render);
+	}
+}
