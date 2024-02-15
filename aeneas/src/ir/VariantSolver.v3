@@ -63,6 +63,35 @@ class VariantField {
 }
 
 def ON_STACK = -1;
+def EMPTY_FIELD = VariantField.new(null, []);
+def NO_FIELDS = Array<VariantField>.new(0);
+
+private class ScalarSet(unifyFn: (Type, Type) -> Type) {
+	def types = Vector<Type>.new();
+	var used = Vector<bool>.new();
+
+	def addScalar(t: Type) -> (Type, int) {
+		for (i < types.length) {
+			if (used[i]) continue;
+
+			var supertype = unifyFn(t, types[i]);
+			if (supertype != null) {
+				used[i] = true;
+				return (types[i] = supertype, i);
+			}
+		}
+		types.put(t);
+		used.put(true);
+		return (t, types.length - 1);
+	}
+	def addField(tn: TypeNorm) -> Array<int> {
+		if (tn.sub == null) return [addScalar(tn.newType).1];
+		var arr = Array<int>.new(tn.size);
+		for (i < tn.size) arr[i] = addScalar(tn.sub[i]).1;
+		return arr;
+	}
+	def resetUsed() { for (i < used.length) used[i] = false; }
+}
 
 class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: bool) {
 	// Normalizes a non-recursive variant, returns either a VariantNorm for an unboxed variant,
@@ -85,9 +114,10 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		}
 		return rn.mapSimple(t); 
 	}
-	// Try to unbox a variant in one of two ways:
+	// Try to unbox a variant in one of three ways:
 	// 1. If a (non-closure) variant has all empty fields in all cases, represent it as a single uN tag (enum representation).
 	// 2. If a variant has only one case, represent it as a tagless tuple of scalars (data representation).
+	// 3. If a variant has multiple cases and is marked #unboxed, use a flattened representation with the smallest set of scalars.
 	private def tryUnboxing(rc: RaClass) -> bool {
 		if (rc.variantNorm != null) return true; // already done
 		while (rc.parent != null) rc = rc.parent;
@@ -113,8 +143,12 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 			return true;
 		}
 		if (rc.children != null) {
-			// TODO: multi-case variant unboxing
-			return false;
+			// multi-case variant unboxing
+			if (closure) return false;
+			match (rc.orig.boxing) {
+				BOXED, AUTO => return false;
+				_ => return unboxUsingTaggedVariantNorm(rc);
+			}
 		}
 		match (rc.orig.boxing) {
 			BOXED => return false;
@@ -136,20 +170,16 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		for (i < ofs.length) {
 			var normStart = vecT.length, origStart = vecO.length;
 			var rf = rc.fields[i];
-			var tn: TypeNorm, indexes: Array<int>;
+			var indexes: Array<int>;
 
 			if (rf != null && rf.normIndex >= 0) {
-				if (rf.typeNorm != null) tn = rf.typeNorm;
-				else if (rf.fieldType != null) rf.typeNorm = tn = rn.norm(rf.fieldType);
-				else tn = rn.norm(rf.orig.fieldType);
-
+				var tn = fieldNorm(rf);
 				tn.addTo(vecT);
+
 				indexes = Array<int>.new(tn.size);
 				for (j < indexes.length) indexes[j] = normStart + j;
 				fields[i] = VariantField.new(tn, indexes);
-			} else {
-				fields[i] = VariantField.new(null, []);
-			}
+			} else fields[i] = EMPTY_FIELD;
 			
 			var fieldType = ofs[i].fieldType.substitute(V3.getTypeArgs(rc.oldType));
 			rn.norm(fieldType).addTo(vecO);
@@ -163,8 +193,67 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 
 		if (verbose) Terminal.put1("variant norm %q\n", rc.variantNorm.render);
 	}
+	private def unboxUsingTaggedVariantNorm(rc: RaClass) -> bool {
+		var vecT = Vector<Type>.new();
+		var parentUnboxed = rc.orig.boxing == Boxing.UNBOXED;
+
+		var scalars = ScalarSet.new(nc.UnifyRepresentations(rn.ra.compiler, rn.ra.prog, _, _));
+		var cases: List<(Array<VariantField>, Array<(int, int)>)>;
+
+		for (l = rc.children; l != null; l = l.tail) {
+			var c = l.head;
+			var ofs = c.orig.fields;
+
+			var fields = Array<VariantField>.new(ofs.length);
+			var fieldRanges = Array<(int, int)>.new(ofs.length);
+			var vecO = Vector<Type>.new();
+
+			scalars.resetUsed();
+			for (i < ofs.length) {
+				var rf = c.fields[i];
+
+				if (rf != null && rf.normIndex >= 0) {
+					var tn = fieldNorm(rf);
+					var indexes = scalars.addField(tn);
+					fields[i] = VariantField.new(tn, indexes);
+				} else fields[i] = EMPTY_FIELD;
+
+				var origStart = vecO.length;
+				var fieldType = ofs[i].fieldType.substitute(V3.getTypeArgs(rc.oldType));
+				rn.norm(fieldType).addTo(vecO);
+				fieldRanges[i] = (origStart, vecO.length);
+			}
+
+			cases = List<(Array<VariantField>, Array<(int, int)>)>.new((fields, fieldRanges), cases);
+		}
+
+		if (rc.recursive > 1) return false;
+		// now that we know it's not recursive, we can safely assign the variant norms
+
+		cases = Lists.reverse(cases);
+
+		var tagType = V3.getVariantTagType(rc.oldType);
+		scalars.types.put(tagType);
+
+		var types = scalars.types.extract();
+		var tagField = VariantField.new(rn.norm(tagType), [types.length - 1]);
+		var newType = Tuple.newType(Lists.fromArray(types));
+
+		var parentNorm = VariantNorm.new(rc.oldType, newType, types, NO_FIELDS, tagField);
+		rc.variantNorm = parentNorm;
+
+		for (l = rc.children; l != null; l = l.tail) {
+			var c = l.head;
+			var vn = VariantNorm.new(c.oldType, newType, types, cases.head.0, tagField);
+			vn.fieldRanges = cases.head.1;
+			vn.tagValue = V3.getVariantTag(c.oldType);
+			c.variantNorm = vn;
+			cases = cases.tail;
+		}
+		return true;
+	}
 	private def unboxUsingEnumVariantNorm(rc: RaClass, tagType: IntType, tagField: VariantField) {
-		var vn = VariantNorm.new(rc.oldType, tagType, [tagType], [], tagField);
+		var vn = VariantNorm.new(rc.oldType, tagType, [tagType], NO_FIELDS, tagField);
 		vn.tagValue = V3.getVariantTag(rc.oldType);
 		rc.raFacts |= RaFact.RC_ENUM;
 		rc.variantNorm = vn;
@@ -172,5 +261,10 @@ class VariantSolver(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: b
 		for (l = rc.children; l != null; l = l.tail) {
 			unboxUsingEnumVariantNorm(l.head, tagType, tagField);
 		}
+	}
+	private def fieldNorm(rf: RaField) -> TypeNorm {
+		if (rf.typeNorm != null) return rf.typeNorm;
+		else if (rf.fieldType != null) return rf.typeNorm = rn.norm(rf.fieldType);
+		else return rn.norm(rf.orig.fieldType);
 	}
 }
