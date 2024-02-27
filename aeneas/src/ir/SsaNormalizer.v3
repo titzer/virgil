@@ -283,7 +283,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 				if (t.2) { // still a virtual dispatch
 					if (rc.isUnboxed()) {
 						// use the variant tag as an index into a table of functions
-						var tag = newArgs[0];
+						var tag = normVariantGetTag(rc.variantNorm, newArgs);
 						var record = IrSelector.!(m.member).mtable.record;
 						var table = newGraph.valConst(record.rtype, record);
 						var func = curBlock.opArrayGetElem(record.rtype, rc.variantNorm.tagType(), Facts.O_SAFE_BOUNDS, table, tag);
@@ -298,7 +298,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 						newArgs = Arrays.prepend(newGraph.nullReceiver(), newArgs);
 					} else {
 						// for variant calls, replace null receiver with record
-						var obj = newArgs[0];
+						var obj = normVariantGetTag(rc.variantNorm, newArgs);
 						if (!obj.facts.V_NON_ZERO) {
 							newArgs[0] = curBlock.add(V3Op.newVariantReplaceNull(m.receiver), [obj], Facts.NONE);
 							norm.newIr.makeIrClass(m.receiver).facts |= Fact.C_HEAP;
@@ -690,41 +690,56 @@ class SsaRaNormalizer extends SsaRebuilder {
 	// normalize an equality operator
 	def normEqualOp(oldApp: SsaApplyOp, op: Operator) {
 		var tn = normTypeArg(op, 0);
-		if (!VariantNorm.?(tn) && V3.isVariant(tn.newType)) return normVariantEqual(oldApp, tn.newType);
-		genEqualN(oldApp, tn);
+		var refs = genRefs(oldApp.inputs);
+		if (!VariantNorm.?(tn) && V3.isVariant(tn.newType)) return map1(oldApp, normVariantEqual(oldApp, tn.newType, refs[0], refs[1]));
+		map1(oldApp, normEqual(oldApp, tn, refs));
+	}
+	def normEqual1(oldApp: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+		if (V3.isVariant(t)) return normVariantEqual(oldApp, t, x, y);
+		return curBlock.opEqual(t, x, y);
+	}
+	def normEqual(oldApp: SsaApplyOp, tn: TypeNorm, refs: Array<SsaInstr>) -> SsaInstr {
+		if (tn.size == 0) return newGraph.trueConst();
+		if (tn.size == 1) return normEqual1(oldApp, tn.newType, refs[0], refs[1]);
+		
+		var expr: SsaInstr;
+		for (i < tn.size) {
+			var cmp = normEqual1(oldApp, tn.sub[i], refs[i], refs[i + tn.size]);
+			expr = if(expr == null, cmp, opBoolAnd(expr, cmp));
+		}
+		return expr;
 	}
 	def normSimpleEqualOp(oldApp: SsaApplyOp, op: Operator) {
 		var tn = normTypeArg(op, 0);
 		var refs = genRefs(oldApp.inputs);
 		return map1(oldApp, curBlock.opEqualOf(op, refs[0], refs[1]));
 	}
-	def normVariantEqual(oldApp: SsaApplyOp, t: Type) {
+	def normVariantEqual(oldApp: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		var rc = norm.ra.getClass(t);
 		var list = rc.methods[IrUtil.EQUALS_METHOD_INDEX];
 		if (list == null) {
-			return normVariantEqual(oldApp, rc.parent.oldType);
+			return normVariantEqual(oldApp, rc.parent.oldType, x, y);
 		}
 		var rm = list.head;
 		// devirtualize methods that are not overridden
 		var tn = normType(t);
 		var t = tryDevirtualize(rm, [tn.newType]), m = t.0, newOp: Operator; // XXX: inline
 		var facts = Fact.O_PURE | Fact.O_COMMUTATIVE;
-		var newArgs = genRefs(oldApp.inputs), x = newArgs[0], y = newArgs[1];
 		if (t.1) {
 			newOp = V3Op.newCallVariantSelector(m);
 		} else {
-			var obj = newArgs[0];
+			var obj = x;
 			if (!obj.facts.V_NON_ZERO) {
 				// XXX: make CallVariantMethod operator for null replacement?
-				newArgs[0] = curBlock.add(V3Op.newVariantReplaceNull(m.receiver), [obj], Facts.NONE);
+				x = curBlock.add(V3Op.newVariantReplaceNull(m.receiver), [obj], Facts.NONE);
 				norm.newIr.getIrClass(m.receiver).facts |= Fact.C_HEAP;
 			}
 			newOp = V3Op.newCallMethod(m);
 			facts |= Fact.O_NO_NULL_CHECK;
 		}
-		var call = curBlock.addApply(oldApp.source, newOp, newArgs);
+		var call = curBlock.addApply(oldApp.source, newOp, [x, y]);
 		call.setFact(facts);
-		map1(oldApp, call);
+		return call;
 	}
 	def normVariantGetTag(vn: VariantNorm, args: Range<SsaInstr>) -> SsaInstr {
 		if (vn == null) return null;
@@ -1196,7 +1211,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 			for (i < vn.fields.length) {
 				var f = vn.fields[i];
 				var fieldRanges = vn.fieldRanges[i], os = fieldRanges.0;
-				for (j < f.indexes.length) result[f.indexes[j]] = inputs[os + j];
+				for (j < f.indexes.length) {
+					var idx = f.indexes[j];
+					result[idx] = curBlock.opTypeSubsume(f.tn.at(j), vn.at(idx), inputs[os + j]);
+				}
 			}
 			return mapNnf(oldApp, result);
 		}
@@ -1238,7 +1256,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 			// field of unboxed data type
 			var vals = Array<SsaInstr>.new(nf.length);
 			var field = rc.variantNorm.fields[raField.orig.index];
-			for (i < vals.length) vals[i] = ninputs[field.indexes[i]];
+			for (i < vals.length) {
+				var idx = field.indexes[i];
+				vals[i] = curBlock.opTypeSubsume(rc.variantNorm.sub[idx], field.tn.at(i), ninputs[idx]);
+			}
 			return mapNnf(oldApp, vals);
 		}
 		var receiver = ninputs[0];
