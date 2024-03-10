@@ -72,3 +72,29 @@ Yes, but we can *get more confidence* that these binaries do not contain backdoo
 * _Determinism._ As a language with well-specified semantics and no platform-specific behavior, all stable compiler binaries produce bit-equivalent results, particularly when compiling the compiler itself
 * _Auditability._ At the revision where a new stable compiler is checked in, we can run the compiler in the *interpreter* (even an external one), which has a tracing mode that we can actively verify the execution steps of interpreting the compiler
 
+## Mechanics of bootstrapping
+
+Bootstrapping the compiler happens every time we run the command `aeneas bootstrap` or run `make`.
+It's a necessary step if we want to have an executable binary for the current source code, e.g. after making a change.
+(We can also run a modified compiler on a Virgil interpreter, and we do often for testing, but bootstrapping allows us to have a binary).
+
+### `bin/stable/`
+
+The `bin/stable/` directory contains checked-in binaries of the compiler for a set of stable target platforms.
+It is updated relatively infrequently, about once or twice per year, or when new language features become stable.
+As such, it may have minor bugs that have been fixed in the current source code.
+The `bin/v3c` command in a freshly-cloned repo will automatically find and use the appropriate stable binary for the host platform, so no configuration is necessary.
+Though there isn't a command-line alias for this, we can call this compiler `v3c-stable`.
+
+### `bin/bootstrap/`
+
+Compiling the sources of the Aeneas compiler with `v3c-stable` produces an intermediate binary called the bootstrap compiler (`v3c-bootstrap`) stored in `bin/bootstrap` directory.
+This happens when running `aeneas bootstrap` command, or through `make` in the top-level directory.
+Normally, this compiler is only used in the next step, which is to compile the compiler again.
+
+### `bin/current`
+
+Compiling the sources of the Aeneas compiler with `v3c-bootstrap` produces a new executable called the current compiler (`v3c-current`) stored in the `bin/current` directory.
+Thus `v3c-current` is the result of compiling the current source of the compiler with itself.
+As long as the semantics of the Virgil language don't change, and there aren't any significant bugs, `v3i(src)` (i.e. running the current sources in a Virgil interpreter) is equivalent to running `v3c-bootstrap` or `v3c-current`.
+If this is true, then compiling the source again with `v3c-current` should produce itself as output.
