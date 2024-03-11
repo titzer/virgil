@@ -178,9 +178,9 @@ function run_io_test() {
 
     local P=$T/$(basename $test)
 
-		infile=${test##*/}.in
+    infile=${test##*/}.in
     if [ -f $infile ]; then
-			V3C=$AENEAS_TEST $runner $T $test $args < $infile > $P.out 2> $P.err
+	V3C=$AENEAS_TEST $runner $T $test $args < $infile > $P.out 2> $P.err
     elif [ -f $test.in ]; then
 	V3C=$AENEAS_TEST $runner $T $test $args < $test.in > $P.out 2> $P.err
     else
