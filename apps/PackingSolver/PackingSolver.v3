@@ -1,0 +1,426 @@
+// Copyright 2024 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+/*
+Scalars can either be 'ref' or 'nonref' scalars, and are handled by the GC in
+different ways. The GC knows whether a specific slot is a ref or nonref scalar
+by using compile-time information (the stackmap).
+
+For ref scalars, the runtime can specify different 'classes' that it is able to
+recognize and distinguish, and whether those representations will be scanned by
+the GC. For instance, on x86-64, the classes available are:
+- 0b_????_????_????_????_...._...._...._...._...._...._...._...._...._...._...._..?0 [scanned]
+- 0b_????_????_????_????_????_????_????_????_????_????_????_????_????_????_????_???1 [ignored]
+
+Based on each class, the packing solver is able to squeeze other fields into the
+unassigned portions of the representation.
+*/
+
+type Bit {
+	case Unassigned; // ?
+	case Fixed(v: u1); // 0 or 1
+	case Unusable; // .
+}
+
+ // TODO: Allow non-contiguous intervals to be represented
+type Interval(s: int, e: int) {
+	def render(sb: StringBuilder) -> StringBuilder {
+		return sb.put2("%d-%d", s, e);
+	}
+}
+
+component PackingStates {
+	def fromString(s: string) -> PackingState {
+		var bits = Vector<Bit>.new();
+		for (c in s) {
+			match (c) {
+				_ => ;
+				'0' => bits.put(Bit.Fixed(0));
+				'1' => bits.put(Bit.Fixed(1));
+				'.' => bits.put(Bit.Unusable);
+				'?' => bits.put(Bit.Unassigned);
+			}
+		}
+		for (i < bits.length / 2) {
+			var x = bits[i];
+			bits[i] = bits[bits.length - i - 1];
+			bits[bits.length - i - 1] = x;
+		}
+		return PackingState.new(bits.extract());
+	}
+
+	def mergeBit(a: Bit, b: Bit) -> (Bit, bool) {
+		match (a) {
+			Unassigned => return (b, true);
+			Unusable => match (b) {
+				Unassigned => return (Bit.Unusable, true);
+				_ => return (Bit.Unusable, false);
+			}
+			Fixed(x) => match (b) {
+				Unusable => return (a, false);
+				Unassigned => return (a, true);
+				Fixed(y) => return (a, x == y);
+			}
+		}
+	}
+	def mergeBits(a: Array<Bit>, b: Array<Bit>) -> Array<Bit> {
+		if (a.length != b.length) return null;
+		var c = Array<Bit>.new(a.length);
+		for (i < a.length) {
+			var ab = mergeBit(a[i], b[i]);
+			if (!ab.1) return null;
+			c[i] = ab.0;
+		}
+		return c;
+	}
+}
+
+class PackingState(bits: Array<Bit>) {
+	def size = bits.length;
+	
+	def render(s: StringBuilder) -> StringBuilder {
+		for (i < bits.length) {
+			var b = bits[bits.length - i - 1];
+			match (b) {
+				Unassigned => s.putc('?');
+				Fixed(v) => s.put1("%d", v);
+				Unusable => s.putc('_');
+			}
+		}
+		return s;
+	}
+	def getIntervalsForSize(s: int) -> Array<Interval> {
+		var i = 0;
+		var intervals = Vector<Interval>.new();
+
+		for (i < size - s + 1) {
+			var isEmpty = true;
+			for (j < s) {
+				if (bits[i + j] != Bit.Unassigned) {
+					isEmpty = false;
+					break;
+				}
+			}
+			if (isEmpty) intervals.put(Interval(i, i + s));
+		}
+		return intervals.extract();
+	}
+	def assignInterval(i: Interval) {
+		for (j = i.s; j < i.e; j++) bits[j] = Bit.Unusable;
+	}
+	def unassignInterval(i: Interval) {
+		for (j = i.s; j < i.e; j++) bits[j] = Bit.Unassigned;
+	}
+	def copy() -> PackingState { return PackingState.new(Arrays.dup(bits)); }
+}
+
+type PackingField {
+	case Nonref(size: int);
+	case Ref;
+}
+
+type FieldLoc(caseIdx: int, fieldIdx: int) {
+	def hash() -> int { return caseIdx * 31 + fieldIdx; }
+
+	def equal(other: FieldLoc) -> bool { return caseIdx == other.caseIdx && fieldIdx == other.fieldIdx; }
+}
+
+type DecisionTree {
+	case Leaf(caseIdx: int);
+	case Node(bit: int, children: Array<DecisionTree>);
+}
+
+class PackingSolver(size: u8, gcPatterns: GcPatterns) {
+	var cases: Array<Array<PackingField>>;
+	var fieldOrder: Array<FieldLoc>;
+	var assignments = HashMap<FieldLoc, Interval>.new(FieldLoc.hash, FieldLoc.equal);
+
+	def reset() {
+		cases = null;
+		fieldOrder = null;
+		assignments = HashMap<FieldLoc, Interval>.new(FieldLoc.hash, FieldLoc.equal);
+	}
+
+	def canDistinguish(state: Array<PackingState>, elements: Array<bool>) -> bool {
+		// TODO: split on bits with the most unassigned
+		var numElements = 0;
+		for (i in elements) if (i) numElements++;
+		if (numElements <= 1) return true;
+
+		// for (i < state.length) Terminal.put2("state %d: %q\n", i, state[i].render);
+
+		for (i < size) {
+			// try to split on this bit
+			var numZeros = 0, numOnes = 0, numUnassigned = 0;
+			for (j < state.length) {
+				if (!elements[j]) continue;
+				match (state[j].bits[i]) {
+					Fixed(v) => if (v == 0) numZeros++; else numOnes++;
+					Unassigned => numUnassigned++;
+					Unusable => ;
+				}
+			}
+
+			if (numUnassigned == 0 && (numZeros == 0 || numOnes == 0)) {
+				continue; // useless
+			}
+
+			var zeros = Array<bool>.new(elements.length);
+			var ones = Array<bool>.new(elements.length);
+			var parity: u1 = 0;
+			var temporaryBits = Vector<int>.new();
+
+			for (j < state.length) {
+				if (!elements[j]) continue;
+				match (state[j].bits[i]) {
+					Unusable => zeros[j] = ones[j] = true;
+					Fixed(v) => {
+						if (v == 0) zeros[j] = true;
+						else ones[j] = true;
+					}
+					Unassigned => {
+						temporaryBits.put(j);
+						state[j].bits[i] = Bit.Fixed(parity);
+						if (parity == 0) zeros[j] = true;
+						else ones[j] = true;
+						parity++;
+					}
+				}
+			}
+
+			if (canDistinguish(state, zeros) && canDistinguish(state, ones)) {
+				return true;
+			}
+			for (j < temporaryBits.length) state[temporaryBits[j]].bits[i] = Bit.Unassigned;
+		}
+		return false;
+	}
+
+	def checkDistinguishable(state: Array<PackingState>) -> bool {
+		// if there are enough aligned ?s, we can just use them to tag
+		var unassigned = Vector<int>.new();
+		for (i < size) {
+			var allUnassigned = true;
+			for (j < state.length) {
+				if (state[j].bits[i] != Bit.Unassigned) {
+					allUnassigned = false;
+					break;
+				}
+			}
+			if (allUnassigned) unassigned.put(i);
+		}
+
+		var result = false;
+		if (1 << byte.!(unassigned.length) >= state.length) {
+			result = true;
+		} else {
+			// difficult case: we have to build the decision tree and check
+			var elements = Array<bool>.new(state.length);
+			for (i < elements.length) elements[i] = true;
+			result = canDistinguish(state, elements);
+		}
+
+		if (result) {
+			for (i < state.length) Terminal.put2("-> %d: %q\n", i, state[i].render);
+		}
+
+		return result;
+	}
+
+	// Backtracking solver
+	def solve(idx: int, state: Array<PackingState>) -> HashMap<FieldLoc, Interval> {
+		// for (i < state.length) Terminal.put3("%d %d: %q\n", idx, i, state[i].render);
+		if (idx == fieldOrder.length) return if(checkDistinguishable(state), assignments, null);
+
+		var fieldLoc = fieldOrder[idx];
+		var caseIdx = fieldLoc.caseIdx, fieldIdx = fieldLoc.fieldIdx;
+		var field = cases[caseIdx][fieldIdx];
+		var possibleIntervals = state[caseIdx].getIntervalsForSize(PackingField.Nonref.!(field).size);
+		if (possibleIntervals.length == 0) return null;
+
+		for (interval in possibleIntervals) {
+			state[caseIdx].assignInterval(interval);
+			assignments[fieldLoc] = interval;
+			var result = solve(idx + 1, state);
+			if (result != null) return result;
+			state[caseIdx].unassignInterval(interval);
+		}
+		return null;
+	}
+
+	// Find a packing for a single scalar
+	def solveScalar(cases: Array<Array<PackingField>>, preassigned: Array<(FieldLoc, Interval)>) -> HashMap<FieldLoc, Interval> {
+		var isRefScalar = false;
+		for (i < cases.length) {
+			var caseHasRef = false;
+			for (field in cases[i]) {
+				match (field) {
+					Ref => {
+						if (caseHasRef) return null; // cannot pack more than one ref into a single scalar per case
+						isRefScalar = caseHasRef = true;
+					}
+					_ => ;
+				}
+			}
+		}
+
+		var initialState = Array<PackingState>.new(cases.length);
+		if (isRefScalar) {
+			for (i < cases.length) {
+				var c = cases[i];
+				var casePacking: PackingState;
+
+				var containsRef = false;
+				for (j < cases[i].length) {
+					var f = cases[i][j], fl = FieldLoc(i, j);
+					match (f) {
+						Ref => {
+							assignments[fl] = gcPatterns.refInterval;
+							casePacking = gcPatterns.scanned.copy();
+							casePacking.assignInterval(gcPatterns.refInterval);
+							containsRef = true;
+						}
+						_ => ;
+					}
+				}
+
+				if (!containsRef) casePacking = gcPatterns.ignored.copy();
+				initialState[i] = casePacking;
+			}
+		} else {
+			// can use all bits
+			var basePacking = PackingState.new(Array<Bit>.new(size));
+			for (i < cases.length) initialState[i] = basePacking.copy();
+		}
+
+		for (assignment in preassigned) {
+			var fl = assignment.0, interval = assignment.1;
+			initialState[fl.caseIdx].assignInterval(interval);
+			assignments[fl] = interval;
+		}
+
+		var fieldsToSolve = Vector<FieldLoc>.new();
+		for (i < cases.length) {
+			for (j < cases[i].length) {
+				var fl = FieldLoc(i, j);
+				if (!assignments.has(fl)) fieldsToSolve.put(fl);
+			}
+		}
+		fieldOrder = fieldsToSolve.extract();
+		this.cases = cases;
+
+		for (i < initialState.length) Terminal.put2("   %d: %q\n", i, initialState[i].render);
+		var solution = solve(0, initialState);
+		if (solution == null) return null;
+
+		return assignments;
+	}
+}
+
+type GcPatterns(scanned: PackingState, refInterval: Interval, ignored: PackingState);
+def X86_64_PATTERN = GcPatterns(
+	PackingStates.fromString("????_????_????_????_...._...._...._...._...._...._...._...._...._...._...._..?0"),
+	Interval(2, 48),
+	PackingStates.fromString("????_????_????_????_????_????_????_????_????_????_????_????_????_????_????_???1")
+);
+def X86_PATTERN = GcPatterns(
+	PackingStates.fromString("...._...._...._...._...._...._...._..?0"),
+	Interval(2, 32),
+	PackingStates.fromString("????_????_????_????_????_????_????_???1")
+);
+
+def test(solver: PackingSolver, cases: Array<Array<PackingField>>, preassigned: Array<(FieldLoc, Interval)>) {
+	solver.reset();
+	Terminal.put("\n\n");
+
+	var solution = solver.solveScalar(cases, preassigned);
+
+	if (solution == null) {
+		Terminal.put("no solution found\n");
+		return;
+	}
+
+	for (i < cases.length) {
+		Terminal.put1("case #%d:\n", i);
+		for (j < cases[i].length) {
+			Terminal.put2("  field #%d: %q\n", j, solution[FieldLoc(i, j)].render);
+		}
+	}
+}
+
+def main() {
+	var solver = PackingSolver.new(32, X86_PATTERN);
+
+	// General purpose
+	test(solver, [
+		[PackingField.Nonref(16), PackingField.Nonref(15)],
+		[PackingField.Nonref(16), PackingField.Nonref(12)]
+	], []);
+	
+	test(solver, [
+		[PackingField.Nonref(16), PackingField.Nonref(16)],
+		[PackingField.Nonref(16), PackingField.Nonref(12)]
+	], []);
+
+	test(solver, [
+		[PackingField.Nonref(16), PackingField.Nonref(15)],
+		[PackingField.Nonref(15), PackingField.Nonref(16)]
+	], []);
+
+	test(solver, [
+		[PackingField.Nonref(15), PackingField.Nonref(15)],
+		[PackingField.Nonref(7), PackingField.Nonref(15), PackingField.Nonref(8)],
+		[PackingField.Nonref(15), PackingField.Nonref(15)]
+	], []);
+
+	// Assigned intervals
+	test(solver, [
+		[PackingField.Nonref(16), PackingField.Nonref(15)],
+		[PackingField.Nonref(16), PackingField.Nonref(12)]
+	], [(FieldLoc(0, 0), Interval(12, 28))]); // should fail, because we don't support non-contiguous intervals
+
+	test(solver, [
+		[PackingField.Nonref(16), PackingField.Nonref(15)],
+		[PackingField.Nonref(16), PackingField.Nonref(12)]
+	], [(FieldLoc(0, 0), Interval(16, 32))]);
+
+	// References
+	test(solver, [
+		[PackingField.Ref],
+		[PackingField.Nonref(16)]
+	], []);
+
+	test(solver, [
+		[PackingField.Ref],
+		[PackingField.Nonref(16)],
+		[PackingField.Nonref(16)]
+	], []);
+
+	test(solver, [
+		[PackingField.Ref],
+		[PackingField.Nonref(31)],
+		[PackingField.Nonref(31)]
+	], []);
+
+	test(solver, [
+		[PackingField.Ref],
+		[PackingField.Nonref(30)],
+		[PackingField.Nonref(30)]
+	], []);
+
+	test(solver, [
+		[PackingField.Ref, PackingField.Nonref(1)],
+		[PackingField.Ref, PackingField.Nonref(1)]
+	], []);
+
+	test(solver, [
+		[PackingField.Ref, PackingField.Nonref(1)],
+		[PackingField.Nonref(31)]
+	], []);
+
+	// option<ref>
+	test(solver, [
+		[PackingField.Ref],
+		[]
+	], []);
+}
