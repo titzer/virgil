@@ -27,6 +27,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 		forAll(vst.enums, verifyEnum);
 		forAll(vst.layouts, verifyLayout);
 		forAll(vst.exports, verifyExport);
+		forAll(vst.packings, verifyPacking);
 		forAll<VstComponent>(vst.components, typeCheckVstCompound);
 		forAll<VstClass>(vst.classes, typeCheckVstCompound);
 		forAll<VstEnum>(vst.enums, typeCheckVstCompound);
@@ -89,6 +90,10 @@ class Verifier(compiler: Compiler, prog: Program) {
 			prog.layouts[name] = layoutDecl;
 		}
 		prog.vst.packings.putv(file.packings);
+		for (i < file.packings.length) {
+			var packingDecl = file.packings[i];
+			var cv = makeVerifier(packingDecl, null, file);
+		}
 		prog.vst.exports.putv(file.exports);
 	}
 	def addInitFor(decl: VstCompound) {
@@ -225,6 +230,35 @@ class Verifier(compiler: Compiler, prog: Program) {
 		var binding = VarBinding.ComponentMethod.!(decl.expr.varbind);
 		var spec = VstIr.specOf(ir, binding.member.receiver.getDeclaredType(), binding.member, binding.typeArgs);
 		ir.addRoot(decl.expname, spec);
+	}
+	def verifyPacking(decl: VstPacking) {
+		var cv = decl.verifier;
+		decl.bitWidth = verifyPackingSize(cv, decl.size);
+		// check param uniqueness
+		env.reset();
+		env.enterScope();
+		for (p = decl.pparams.list; p != null; p = p.tail) {
+			var param = p.head, name = param.token.image;
+			var prev = env.lookupVar(name, 0);
+			if (prev != null) {
+				cv.errAtDecl(param).ParamDeclError(Strings.format1("param \"%s\" redefined", name));
+			}
+			env.bindVar(name, param);
+			param.bitWidth = verifyPackingSize(cv, param.size);
+		}
+		// check packing pattern for all bits present for all params
+		cv.checkPackingExpr(env, decl.expr, decl.bitWidth);
+		// TODO: pad the packing pattern to the bitwidth of the declaration if necessary
+		// Check that all fields have all bits used.
+		for (p = decl.pparams.list; p != null; p = p.tail) {
+			var param = p.head;
+			if (param.bitPos < param.bitWidth) cv.errAtDecl(param).PackingBitsMissing(param.token.image, param.bitWidth, param.bitPos);
+		}
+	}
+	def verifyPackingSize(cv: VstCompoundVerifier, lit: Literal) -> byte {
+		var size = tryUnboxPositiveInt(lit, -1);
+		if (size <= 0 || size > MAX_PACKING_WIDTH) cv.errAtExpr(lit).set("PackingDeclError", Strings.format1("expected packing size >= 0 and <= %d", MAX_PACKING_WIDTH));
+		return byte.view(size);
 	}
 	def typeCheckVstCompound(decl: VstCompound) {
 		var tc = TypeChecker.new(ERROR, decl.verifier.file);
@@ -829,6 +863,56 @@ class VstCompoundVerifier {
 	def canAccessMember(decl: VstMember) -> bool {
 		return !decl.isPrivate || decl.receiver.verifier.file == this.file;
 	}
+	def checkPackingExpr(env: VarEnvironment, expr: VstPackingExpr, bitWidth: byte) {
+		var decl = VstPacking.!(compound);
+		match (expr) {
+			Bits(token, rep) => {
+				var pl = decl.pparams.list;
+				for (i < rep.length) {
+					var t = rep[i], offset = t.0, bit = t.1;
+					match (bit) {
+						Assigned(ch) => {
+							var param: PackingParamDecl;
+							for (p = pl; p != null; p = p.tail) { // XXX: linear search
+								if (p.head.token.image[0] == ch) { param = p.head; break; }
+							}
+							if (param == null) {
+								errInsideToken(token, offset).UnresolvedPackingBit(ch);
+							} else {
+								var pos = param.bitPos++;
+								if (pos >= param.bitWidth) errInsideToken(token, offset).ExtraPackingBit(param.name(), param.bitWidth);
+							}
+						}
+						_ => ;
+					}
+				}
+				if (rep.length > bitWidth) errAtToken(token).BitPatternTooLong(bitWidth, rep.length);
+			}
+			Tuple(list) => {
+				for (l = list.list; l != null; l = l.tail) {
+					checkPackingExpr(env, l.head, MAX_PACKING_WIDTH); // TODO: proper size
+				}
+			}
+			App(p, args) => { // TODO
+				// TODO: resolve and apply packing {p}
+				for (l = args.list; l != null; l = l.tail) {
+					checkPackingExpr(env, l.head, MAX_PACKING_WIDTH); // TODO: proper size
+				}
+			}
+			Field(f) => {
+				var decl = env.lookupVar(f.ident.name.image, 0);
+				match (decl) {
+					x: PackingParamDecl => {
+						if (x.bitPos > 0) errAtToken(f.ident.name).PackingParamReused(f.ident.name.image);
+						else x.bitPos = x.bitWidth;
+					}
+					_ => errAtToken(f.ident.name).UnresolvedIdentifier(f.ident.name); // XXX: better error message
+				}
+			}
+			Literal(lit) => { // TODO: enforce maximum packing size
+			}
+		}
+	}
 	// -- Utility methods to generate errors -----------------------------------
 	def getErrorType() -> Type {
 		return ERROR.getErrorType();
@@ -851,6 +935,9 @@ class VstCompoundVerifier {
 	def errAtToken(token: Token) -> SourceCodeError {
 		return errAtRange(token.range());
 	}
+	def errInsideToken(token: Token, offset: int) -> SourceCodeError {
+		return errAtPoint(token.rangeOf(offset).end());
+	}
 	def errAtExpr(expr: Expr) -> SourceCodeError {
 		return errAtRange(expr.range());
 	}
@@ -859,6 +946,7 @@ class VstCompoundVerifier {
 	}
 }
 
+def MAX_PACKING_WIDTH = byte.!(Int.MAX_WIDTH);
 def FLOW_THRU = 0;
 def FLOW_END  = 1;
 def FLOW_RET  = 2;
@@ -1532,7 +1620,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 						var mtref = member.mtref;
 						expr.receiver = x.expr;
 						expr.write = AppBinding.Apply(V3Op.newRefLayoutSetRepeatedField(
-							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),	
+							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),
 							Facts.NONE);
 						visitRepeatedIndex(expr.exprs);
 						return mtref.getType();
