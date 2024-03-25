@@ -12,6 +12,7 @@ That way, you can jump right into a topic.
 * How to use [variables and definitions](Variables.md).
 * Add some structure to our code instead by using [components](Components.md).
 * [Primitive types](Primitives.md) are numbers, booleans, strings, characters.
+* [Numbers](Numbers.md) include both fixed-size integers and floating-point numbers.
 * [Methods](Methods.md) make up most of the logic of programs.
 * [Local Variables](Locals.md) are how we store data in methods.
 * [Arithmetic](Arith.md) on numbers in Virgil is a lot more general than other programming languages.
