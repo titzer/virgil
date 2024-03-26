@@ -4,7 +4,8 @@ Virgil III offers a small set of primitive types that are useful for performing 
 
 ## Booleans ##
 
-With only two values, `true`, and `false`, booleans are represented in Virgil with the type `bool`. Here are some example uses of boolean variables, with and without type inference.
+With only two values, `true`, and `false`, booleans are represented in Virgil with the type `bool`.
+Here are some example uses of boolean variables, with and without type inference.
 
 ```
 // with declared types
@@ -18,7 +19,8 @@ var d = false;
 
 ## Integers ##
 
-Virgil supports fixed-width signed and unsigned integer types of size 1 to 64 bits. The most common is the `int` type, a _signed_ 32-bit value. Constants can be written in decimal, hexadecimal, or binary.
+Virgil supports fixed-width signed and unsigned integer types of size 1 to 64 bits.
+The most common is the `int` type, a _signed_ 32-bit value. Constants can be written in decimal, hexadecimal, or binary.
 
 ```
 // with declared types
@@ -108,9 +110,12 @@ var e = '\xF1'; // == 241
 var f = '\xFF'; // == 255
 ```
 
-## Implicit byte promotion ##
+## Implicit integer promotion ##
 
-Virgil automatically promotes smaller width integer values to larger width integer values when necessary. Such a promotion does not change the _value_ of an integer, just its representation. The most common example is extending `byte` values to `int` values where necessary, zero-extending them. 
+Virgil automatically promotes smaller-width integer values to larger-width integer values when necessary.
+Such a promotion does not change the _value_ of an integer, just its representation.
+For more information on how numbers relate to their representations, see (here)[Numbers.md].
+The most common example is extending `byte` values to `int` values where necessary, zero-extending them. 
 
 
 ## Void ##
@@ -137,7 +142,7 @@ Why would we want `void` to be a real type and have an actual value? We will see
 
 ## Floating point ##
 
-Virgil is currently adding support for floating point numbers. Like Java, Virgil supports single-precision (32-bit) and double-precision (64-bit) floating point numbers that conform the the IEEE 754 specification for floating point.
+Virgil supports single-precision (32-bit) and double-precision (64-bit) floating point numbers that conform the the IEEE 754 specification for floating point.
 
 ```
 // float is a single-precision 32-bit floating point value 
