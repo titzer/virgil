@@ -342,38 +342,72 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		rc.normFields = fields.extract();
 	}
+	private def genVariantScalarView(curBlock: SsaBuilder, oldType: Type, newType: Type, scalar: SsaInstr) -> SsaInstr {
+		if (IntType.?(newType)) return curBlock.opIntView(oldType, IntType.!(newType), scalar);
+		if (IntType.?(oldType)) {
+			match (newType) {
+				x: FloatType => {
+					var op = if(x.is64, V3Op.newFloat64ViewI(oldType), V3Op.newFloat32ViewI(oldType));
+					return curBlock.add(op, [scalar], Fact.O_PURE);
+				}
+			}
+		}
+		if (newType == AnyRef.TYPE) return scalar; // crashes in Interpreter
+		return curBlock.opTypeSubsume(oldType, newType, scalar);
+	}
+	private def getIrMethod(rc: RaClass) -> IrMethod {
+		var vn = rc.variantNorm, receiver = vn.oldType;
+		var context = SsaContext.new(ra.compiler, ra.prog);
+		var resultType = Tuple.fromTypeArray(if(vn.sub == null, [vn.newType], vn.sub));
+		var meth = IrMethod.new(receiver, null, Function.siga(vn.vecO, resultType));
+		
+		var params = Array<SsaParam>.new(meth.sig.paramTypes.length + 1);
+		params[0] = SsaParam.new(0, receiver);
+		for (i = 1; i < params.length; i++) params[i] = SsaParam.new(i, meth.sig.paramTypes[i - 1]);
+		
+		var inputs = Array<SsaInstr>.new(meth.sig.paramTypes.length);
+		for (i < inputs.length) inputs[i] = SsaInstr.!(params[i+1]);
+
+		meth.ssa = SsaGraph.new(params, meth.sig.returnType());
+		context.enterMethod(meth);
+
+		var block = SsaBuilder.new(context, meth.ssa, meth.ssa.startBlock);
+		var result = VariantSsaGen.buildClassAlloc(meth.ssa, block, vn, inputs);
+		block.addReturn(result);
+		context.printSsa("ClassAlloc");
+
+		return meth;
+	}
+	private def normRecordAsArray(rc: RaClass, oldRecord: Record, array: Array<Val>) {
+		var rfs = rc.fields;
+		for (i < rfs.length) {
+			var rf = rfs[i];
+			if (rf != null && rf.normIndex >= 0) {
+				var v = oldRecord.values[i];
+				if (rf.fieldType == null) array[rf.normIndex] = normSimpleVal(null, v);
+				else normValIntoArray(v, rf.typeNorm, array, rf.normIndex);
+			}
+		}
+	}
 	// normalize a live instance of a class
 	def normClassRecord(rc: RaClass, oldRecord: Record, array: Array<Val>) {
 		var vrc = ra.getClass(oldRecord.rtype), vn = vrc.variantNorm;
-		if (vn == null) {
-			var rfs = rc.fields;
-			for (i < rfs.length) {
-				var rf = rfs[i];
-				if (rf != null && rf.normIndex >= 0) {
-					var v = oldRecord.values[i];
-					if (rf.fieldType == null) array[rf.normIndex] = normSimpleVal(null, v);
-					else normValIntoArray(v, rf.typeNorm, array, rf.normIndex);
-				}
-			}
+		if (vn == null) return normRecordAsArray(rc, oldRecord, array);
+
+		if (vn.isEnum()) {
+			array[0] = Int.box(vn.tagValue);
 			return;
 		}
 
-		if (!vn.isTagless()) array[vn.tagIndex()] = Int.box(vn.tagValue);
-		if (vn.isEnum()) return;
+		// XXX: Reuse instead of rebuilding each time
+		var interp = SsaInterpreter.new(ra.prog, null);
+		var spec = IrSpec.new(vn.oldType, null, getIrMethod(vrc));
+		var input = Array<Val>.new(vn.vecO.length);
+		normRecordAsArray(vrc, oldRecord, input);
 
-		var rfs = vrc.fields;
-		for (i < vrc.fields.length) {
-			var rf = vrc.fields[i];
-			if (rf != null && rf.normIndex >= 0) {
-				var v = oldRecord.values[i];
-				var indexes = vn.fields[i].indexes;
-				// XXX: get rid of fieldArray or reuse
-				var fieldArray = Array<Val>.new(indexes.length);
-				if (rf.fieldType == null) fieldArray[0] = normSimpleVal(null, v);
-				else normValIntoArray(v, rf.typeNorm, fieldArray, 0);
-				for (j < indexes.length) array[indexes[j]] = fieldArray[j];
-			}
-		}
+		var result = interp.invoke(Closure.new(Values.BOTTOM, spec), input);
+		var tv = TupleVal.!(result);
+		for (i < tv.values.length) array[i] = tv.values[i];
 	}
 	// normalize the live instances of a simple (i.e. size-1 element) array type
 	def normSimpleArrayRecord(record: Record) {
