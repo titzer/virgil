@@ -10,10 +10,23 @@ enum Scalar(size: byte, ty: Type) {
 	R64(64, AnyRef.TYPE),
 	Ref(64, AnyRef.TYPE),
 }
-
-def getTypeFromScalarSet(s: Scalar.set) -> Type {
-	for (i in s) return i.ty;
+def getScalarFromSet(s: Scalar.set) -> Scalar {
+	for (i in s) return i;
+	return Scalar.B32; // should be unreachable
+}
+def getTypeFromScalarSet(s: Scalar.set, usePacking: bool) -> Type {
+	for (i in s) return if(usePacking, IntRep.getType(i), i.ty);
 	return null;
+}
+
+class VariantPattern(scalars: Array<ScalarPattern>) {
+	def render(buf: StringBuilder) -> StringBuilder {
+		for (i < scalars.length) {
+			if (i > 0) buf.putc('|');
+			buf.put1("%q", scalars[i].render);
+		}
+		return buf;
+	}
 }
 
 class VariantNorm extends TypeNorm {
@@ -27,6 +40,8 @@ class VariantNorm extends TypeNorm {
 	var fieldRanges: Array<(int, int)>;
 	var children: List<VariantNorm>;
 
+	var repPatterns: Array<RepPattern>; // rep patterns for each scalar, or null if no packing
+
 	new(oldType: Type, newType: Type, sub: Array<Type>, fields, tag)
 		super(oldType, newType, sub) {}
 
@@ -36,6 +51,8 @@ class VariantNorm extends TypeNorm {
 
 	def tagType() -> IntType { return IntType.!(tag.tn.first()); }
 	def tagIndex() -> int { return tag.indexes[0]; }
+
+	def isPacked() -> bool { return repPatterns != null; }
 	
 	// represent single-case, unboxed variant without its tag
 	def isTagless() -> bool { return tag == null; }
@@ -48,12 +65,10 @@ class VariantNorm extends TypeNorm {
 			sub[i].render(buf);
 		}
 		buf.puts("] {");
-		if (tag != null) {
-			buf.put1("tag: %q", tag.render);
-		}
+		if (tag != null) buf.put1("ftag: %q", tag.render);
 		for (i < fields.length) {
 			if (i > 0 || tag != null) buf.csp();
-			fields[i].render(buf);
+			buf.put2("f%d=%q", i, fields[i].render);
 		}
 		buf.puts("}");
 		return buf;
@@ -64,6 +79,7 @@ class VariantNorm extends TypeNorm {
 class VariantField {
 	def tn: TypeNorm;
 	def indexes: Array<int>; // Indexes into the variant's representation to extract the field from
+	var assignments: Array<Interval>; // null, if no packing
 
 	new(tn, indexes) {}
 
@@ -72,9 +88,10 @@ class VariantField {
 		for (i < indexes.length) {
 			if (i > 0) buf.csp();
 			buf.put1("#%d", indexes[i]);
+			if (assignments != null) buf.put1("@%q", assignments[i].render);
 		}
+		if (tn != null) buf.put1(": %q", tn.newType.render);
 		buf.puts(")");
-		if (tn != null) buf.put1(": [%q]", tn.newType.render);
 		return buf;
 	}
 }
@@ -83,7 +100,150 @@ def ON_STACK = -1;
 def EMPTY_FIELD = VariantField.new(null, []);
 def NO_FIELDS = Array<VariantField>.new(0);
 
+class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
+	var normFields: Array<Array<Type>>;
+
+	var fields: Vector<CaseField>; // an ordering of fields to solve for during packing
+
+	// final solutions
+	var scalarAsns: HashMap<CaseField, int>; // field location -> scalar idx
+	var intervalAsns: HashMap<CaseField, Interval>; // field location -> interval within scalar
+	var state: Array<VariantPattern>;
+
+	var curRep: Vector<Scalar.set>;
+	var curUsed: Vector<byte>;
+	
+	// Perform recursive backtracking on the potential representation.
+	// With each scalar in each case, we have several choices to make:
+	// 1. Pack this scalar with an existing scalar
+	// 2. Append this scalar as a new scalar.
+	// We can only determine distinguishability after all the scalars have been assigned. Heuristics will help speed this part up.
+	private def tryRepresentationForField(curCase: int, curField: int) -> bool {
+		if (curCase >= normFields.length) {
+			// XXX: check distinguishable
+			return solvePacking();
+		}
+		if (curField >= normFields[curCase].length) {
+			// move on to next case
+			curUsed = Vector<byte>.new();
+			for (i < curRep.length) curUsed.put(0);
+			return tryRepresentationForField(curCase + 1, 0);
+		}
+		
+		var sc = vnorm.nc.GetScalar(vnorm.rn.ra.compiler, vnorm.rn.ra.prog, normFields[curCase][curField]);
+		var bw = vnorm.nc.GetBitWidth(vnorm.rn.ra.compiler, vnorm.rn.ra.prog, normFields[curCase][curField]);
+		if (!usePacking) bw = 64; // then no fields can be merged!
+		
+		var none: Scalar.set;
+
+		for (i < curRep.length) {
+			if (curUsed[i] >= 64) continue;
+			var oldRep = curRep[i];
+
+			if ((sc & oldRep) != none) {
+				curUsed[i] += bw; curRep[i] = sc & oldRep;
+				scalarAsns[CaseField(curCase, curField)] = i;
+				if (tryRepresentationForField(curCase, curField + 1)) return true;
+				curUsed[i] -= bw; curRep[i] = oldRep;
+			}
+		}
+
+		var len = curRep.length;
+		curRep.put(sc); curUsed.put(bw);
+		scalarAsns[CaseField(curCase, curField)] = curRep.length - 1;
+		if (tryRepresentationForField(curCase, curField + 1)) return true;
+		curRep.resize(len); curUsed.resize(len);
+
+		return false;
+	}
+	private def canDistinguish(active: Array<bool>) {
+		// TODO - this is where unassigned bits will get assigned
+	}
+	private def checkDistinguishable() -> bool {
+		return true; // true, since we add a tag scalar - this will change
+	}
+	private def solveField(idx: int) -> bool {
+		if (idx >= fields.length) return checkDistinguishable();
+		var field = fields[idx];
+		var scalarAsn = scalarAsns[field];
+
+		// try to squeeze this field into this scalar
+		var casePattern = state[field.caseIdx];
+		var bw = vnorm.nc.GetBitWidth(vnorm.rn.ra.compiler, vnorm.rn.ra.prog, normFields[field.caseIdx][field.fieldIdx]);
+		var scalar = casePattern.scalars[scalarAsn];
+		var intervals = scalar.getIntervalsForSize(bw);
+
+		if (intervals.length == 0) return false;
+		for (interval in intervals) {
+			scalar.assignInterval(interval);
+			intervalAsns[field] = interval;
+			var result = solveField(idx + 1);
+			if (result) return true;
+			scalar.unassignInterval(interval);
+		}
+		return false;
+	}
+	private def getScalarPattern(s: Scalar) -> ScalarPattern {
+		// XXX: Should be based on scalar type
+		return ScalarPattern.new(Array<PackingBit>.new(s.size));
+	}
+	private def solvePacking() -> bool {
+		var cases = Array<VariantPattern>.new(normFields.length);
+		// build up patterns from the individual cases
+		for (i < normFields.length) {
+			var patterns = Array<ScalarPattern>.new(curRep.length);
+			for (j < curRep.length) patterns[j] = getScalarPattern(getScalarFromSet(curRep[j]));
+			cases[i] = VariantPattern.new(patterns);
+		}
+		state = cases;
+
+		var result = solveField(0);
+		if (result) Terminal.put1("%q\n", render);
+		return result;
+	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		for (i < normFields.length) {
+			if (i > 0) buf.csp();
+			buf.put1("c%d: [", i);
+			for (j < normFields[i].length) {
+				if (j > 0) buf.csp();
+				var cf = CaseField(i, j);
+				var field = normFields[i][j];
+				buf.put2("f%d=%q: ", j, field.render);
+
+				if (!scalarAsns.has(cf)) buf.puts("?");
+				else if (!intervalAsns.has(cf)) buf.put1("#%d@?", scalarAsns[cf]);
+				else buf.put2("#%d@%q", scalarAsns[cf], intervalAsns[cf].render);
+			}
+			buf.puts("]");
+		}
+		buf.ln();
+		for (i < state.length) {
+			buf.put1("%q\n", state[i].render);
+		}
+		return buf;
+	}
+	def reset() {
+		scalarAsns = HashMap<CaseField, int>.new(CaseField.hash, CaseField.==);
+		intervalAsns = HashMap<CaseField, Interval>.new(CaseField.hash, CaseField.==);
+		curRep = Vector<Scalar.set>.new();
+		curUsed = Vector<byte>.new();
+		fields = Vector<CaseField>.new();
+	}
+	def solve(cases: Array<Array<Type>>) -> bool {
+		reset();
+		normFields = cases;
+
+		// TODO: Express solving constraints here (from annotations)
+		for (i < normFields.length) {
+			for (j < normFields[i].length) fields.put(CaseField(i, j));
+		}
+		return tryRepresentationForField(0, 0);
+	}
+}
+
 class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: bool) {
+	def usePacking = CLOptions.PACKING.get();
 	// Normalizes a non-recursive variant, returns either a VariantNorm for an unboxed variant,
 	// or a simple TypeNorm for a boxed variant
 	def normVariant(t: Type, rc: RaClass) -> TypeNorm {
@@ -182,48 +342,9 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		vn.vecO = vecO.extract();
 		rc.variantNorm = vn;
 
+		// TODO: packing
+
 		if (verbose) Terminal.put1("variant norm %q\n", rc.variantNorm.render);
-	}
-	// Perform recursive backtracking on the potential representation.
-	// With each scalar in each case, we have several choices to make:
-	// 1. Merge this scalar with an existing scalar in the representation that hasn't been used by the current case.
-	// 2. Append this scalar as a new scalar.
-	// We can only determine distinguishability after all the scalars have been assigned. Heuristics will help speed this part up.
-	var assignments: HashMap<CaseField, int>;
-	private def tryRepresentationForField(curRep: Vector<Scalar.set>, curUsed: Vector<bool>, fields: Array<Array<Type>>, curCase: int, curField: int) -> bool {	
-		if (curCase >= fields.length) {
-			// XXX: check distinguishable
-			return true; // true, since we add a tag scalar - this will change once packing is involved
-		}
-		if (curField >= fields[curCase].length) {
-			// move on to next case
-			curUsed = Vector<bool>.new();
-			for (i < curRep.length) curUsed.put(false);
-			return tryRepresentationForField(curRep, curUsed, fields, curCase + 1, 0);
-		}
-		
-		var sc = nc.GetScalar(rn.ra.compiler, rn.ra.prog, fields[curCase][curField]);
-		var none: Scalar.set;
-
-		for (i < curRep.length) {
-			if (curUsed[i]) continue;
-			var oldRep = curRep[i];
-
-			if ((sc & oldRep) != none) {
-				curUsed[i] = true; curRep[i] = sc & oldRep;
-				assignments[CaseField(curCase, curField)] = i;
-				if (tryRepresentationForField(curRep, curUsed, fields, curCase, curField + 1)) return true;
-				curUsed[i] = false; curRep[i] = oldRep;
-			}
-		}
-
-		var len = curRep.length;
-		curRep.put(sc); curUsed.put(true);
-		assignments[CaseField(curCase, curField)] = curRep.length - 1;
-		if (tryRepresentationForField(curRep, curUsed, fields, curCase, curField + 1)) return true;
-		curRep.resize(len); curUsed.resize(len);
-
-		return false;
 	}
 	private def unboxUsingTaggedVariantNorm(rc: RaClass) -> bool {
 		var vecT = Vector<Type>.new();
@@ -269,21 +390,21 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		if (rc.recursive > 1) return false;
 		// now that we know it's not recursive, we can safely assign the variant norm
 
-		assignments = HashMap<CaseField, int>.new(CaseField.hash, CaseField.==);
-		var curRep = Vector<Scalar.set>.new();
-		var used = Vector<bool>.new();
-
-		tryRepresentationForField(curRep, used, normFields, 0, 0);
+		var solver = VariantSolver.new(this, usePacking);
+		var result = solver.solve(normFields);
+		if (!result) return false; // XXX: warn that no solution was found
 
 		var tagType = V3.getVariantTagType(rc.oldType);
-		var types = Array<Type>.new(curRep.length + 1);
-		for (i < curRep.length) types[i] = getTypeFromScalarSet(curRep[i]);
-		types[curRep.length] = tagType;
+		var types = Array<Type>.new(solver.curRep.length + 1);
+		for (i < solver.curRep.length) types[i] = getTypeFromScalarSet(solver.curRep[i], usePacking);
+		types[solver.curRep.length] = tagType;
 
-		var tagField = VariantField.new(rn.norm(tagType), [curRep.length]);
+		var tagField = VariantField.new(rn.norm(tagType), [solver.curRep.length]);
 		var newType = Tuple.newType(Lists.fromArray(types));
 
 		var parentNorm = VariantNorm.new(rc.oldType, newType, types, NO_FIELDS, tagField);
+		Terminal.put1("%q\n", parentNorm.render);
+
 		var childrenNorms: List<VariantNorm>;
 		rc.variantNorm = parentNorm;
 
@@ -296,7 +417,11 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 				var rf = child.fields[j];
 				if (rf != null && rf.normIndex >= 0) {
 					var fr = child.fieldRangesT[j];
-					for (k < fr.1 - fr.0) child.variantFields[j].indexes[k] = assignments[CaseField(i, fr.0 + k)];
+					if (usePacking) child.variantFields[j].assignments = Array<Interval>.new(fr.1 - fr.0);
+					for (k < fr.1 - fr.0) {
+						child.variantFields[j].indexes[k] = solver.scalarAsns[CaseField(i, fr.0 + k)];
+						if (usePacking) child.variantFields[j].assignments[k] = solver.intervalAsns[CaseField(i, fr.0 + k)];
+					}
 				}
 			}
 
@@ -304,12 +429,27 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 			vn.fieldRanges = child.fieldRangesT;
 			vn.vecO = child.vecO;
 			vn.tagValue = V3.getVariantTag(child.oldType);
+
+			if (usePacking) {
+				var repPatterns = Array<RepPattern>.new(solver.curRep.length);
+				for (j < solver.curRep.length) {
+					var rp = RepPattern.new();
+					rp.scalar = getScalarFromSet(solver.curRep[j]);
+					rp.pattern = solver.state[i].scalars[j];
+					rp.assignments = Array<Interval>.new(normFields[j].length);
+					repPatterns[j] = rp;
+				}
+				vn.repPatterns = repPatterns;
+			}
 			
 			child.variantNorm = vn;
 			children = children.tail;
 			childrenNorms = List<VariantNorm>.new(vn, childrenNorms);
+
+			Terminal.put1("  %q\n", vn.render);
 		}
 		parentNorm.children = childrenNorms;
+		
 		return true;
 	}
 	private def unboxUsingEnumVariantNorm(rc: RaClass, tagType: IntType, tagField: VariantField) {
@@ -324,5 +464,20 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		if (rf.typeNorm != null) return rf.typeNorm;
 		else if (rf.fieldType != null) return rf.typeNorm = rn.norm(rf.fieldType);
 		else return rn.norm(rf.orig.fieldType);
+	}
+}
+
+class RepPattern {
+	var scalar: Scalar;
+	var assignments: Array<Interval>; // mapping from idx -> intervals
+	var pattern: ScalarPattern; // contains information about concrete bits
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put2("%s:%q [", scalar.name, pattern.render);
+		for (i < assignments.length) {
+			if (i > 0) buf.csp();
+			buf.put2("#%d->%q", i, assignments[i].render);
+		}
+		return buf.puts("]");
 	}
 }
