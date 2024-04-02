@@ -96,8 +96,8 @@ var x = map(a, ClassMap.get);
 // standard array map utility
 def map<A, B>(array: Array<A>, func: A -> B) -> Array<B> {
     if (array == null) return null;
-    var max = array.length, r = Array<B>.new(max);
-    for (i = 0; i < max; i++) r(i) = func(array(i));
+    var r = Array<B>.new(array.length);
+    for (i < array.length) r[i] = func(array[i]);
     return r;
 }
 ```
