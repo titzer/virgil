@@ -15,31 +15,18 @@ class NormalizerConfig {
 	var AnyRefOverflow: bool;
 	var NormalizeRange: bool;
 
-	var UnifyRepresentations: (Compiler, Program, Type, Type) -> Type = UnboxingUtil.defaultUnifyRepresentations;
+	var GetScalar: (Compiler, Program, Type) -> Scalar.set = defaultGetScalar;
 
 	def setSignatureLimits(maxp: int, maxr: int) {
 		if (maxp < MaxParams) MaxParams = maxp;
 		if (maxr < MaxReturnValues) MaxReturnValues = maxr;
 	}
 }
-
-component UnboxingUtil {
-	def defaultUnifyRepresentations(compiler: Compiler, prog: Program, a: Type, b: Type) -> Type {
-		if (IntType.?(a) && IntType.?(b)) {
-			return if(IntType.!(a).width > IntType.!(b).width, a, b);
-		}
-		return if(a == b, a, null);
-	}
-	def defaultMachUnifyRepresentations(getRuntime: Program -> MachRuntime, compiler: Compiler, prog: Program, a: Type, b: Type) -> Type {
-		var mach = getRuntime(prog).mach;
-		if (a == b) return a;
-		if (IntType.?(a) && IntType.?(b))
-			return if(IntType.!(a).width > IntType.!(b).width, a, b);
-		if (mach.isRefType(a) && mach.isRefType(b)) return AnyRef.TYPE;
-		return null;
-	}
-	def makeMachUnifyRepresentations(getRuntime: Program -> MachRuntime) -> (Compiler, Program, Type, Type) -> Type {
-		return defaultMachUnifyRepresentations(getRuntime, _, _, _, _);
+def defaultGetScalar(compiler: Compiler, prog: Program, t: Type) -> Scalar.set {
+	match (t) {
+		x: IntType => return if(x.width <= 32, Scalar.B32, Scalar.B64); // XXX: Scalar.R32, once packed refs
+		x: FloatType => return if(x.is64, Scalar.F64, Scalar.F32);
+		_ => return Scalar.Ref;
 	}
 }
 
@@ -55,9 +42,11 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	var specializer: Specializer;
 	var virtuals: List<RaVirtual>;
 	var ovfAlloc: OverflowFieldAllocator;
-	var vs: VariantSolver;
 
-	new() { vs = VariantSolver.new(config, this, CLOptions.PRINT_RA.get()); }
+	var vn: VariantNormalizer;
+	var variantInterp = SsaInterpreter.new(ra.prog, null); // interpreter to normalize records
+
+	new() { vn = VariantNormalizer.new(config, this, CLOptions.PRINT_RA.get()); }
 
 	def normalize() {
 		if (CLOptions.PRINT_DEAD_CODE.get()) DeadCodeAnalyzer.new(ra).report();
@@ -230,7 +219,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			VARIANT => {
 				// try flattening variants and data types
 				var rc = ra.getClass(t);
-				if (rc != null) tn = vs.normVariant(t, rc);
+				if (rc != null) tn = vn.normVariant(t, rc);
 				else tn = TypeNorm.new(t, t, null);
 			}
 			ENUM => {
@@ -354,37 +343,59 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		rc.normFields = fields.extract();
 	}
+	private def normRecordAsArray(rc: RaClass, oldRecord: Record, array: Array<Val>) {
+		var rfs = rc.fields;
+		for (i < rfs.length) {
+			var rf = rfs[i];
+			if (rf != null && rf.normIndex >= 0) {
+				var v = oldRecord.values[i];
+				if (rf.fieldType == null) array[rf.normIndex] = normSimpleVal(null, v);
+				else normValIntoArray(v, rf.typeNorm, array, rf.normIndex);
+			}
+		}
+	}
+	private def getClassAllocIr(vn: VariantNorm) -> IrMethod {
+		var context = SsaContext.new(ra.compiler, ra.prog);
+		var meth = IrMethod.new(vn.oldType, null, Function.siga(vn.vecO, vn.newType));
+		
+		var params = Array<SsaParam>.new(meth.sig.paramTypes.length + 1);
+		var inputs = Array<SsaInstr>.new(meth.sig.paramTypes.length);
+		params[0] = SsaParam.new(0, vn.oldType);
+		for (i < inputs.length) inputs[i] = params[i + 1] = SsaParam.new(i, meth.sig.paramTypes[i]);
+
+		meth.ssa = SsaGraph.new(params, meth.sig.returnType());
+		context.enterMethod(meth);
+
+		var s = SsaRaNormalizer.new(context, this);
+		s.newGraph = meth.ssa;
+		s.curBlock = SsaBuilder.new(context, meth.ssa, meth.ssa.startBlock);
+
+		var r = s.genVariantClassAlloc(vn, inputs);
+		s.curBlock.addReturn(r);
+		context.printSsa("ClassAlloc");
+
+		return meth;
+	}
+	def normalizeRecord(rc: RaClass, vn: VariantNorm, input: Array<Val>, output: Array<Val>) {
+		if (rc.orig.methods[0] == null || rc.orig.methods[0].source != null) rc.orig.methods[0] = getClassAllocIr(vn); // source != null means the original, generated constructor is still present
+		var result = variantInterp.invoke(Closure.new(Values.BOTTOM, IrSpec.new(vn.oldType, null, rc.orig.methods[0])), input);
+		match (result) {
+			x: TupleVal => for (i < x.values.length) output[i] = x.values[i];
+			x: Val => output[0] = x;
+		}
+	}
 	// normalize a live instance of a class
 	def normClassRecord(rc: RaClass, oldRecord: Record, array: Array<Val>) {
 		var vrc = ra.getClass(oldRecord.rtype), vn = vrc.variantNorm;
-		if (vn == null) {
-			var rfs = rc.fields;
-			for (i < rfs.length) {
-				var rf = rfs[i];
-				if (rf != null && rf.normIndex >= 0) {
-					var v = oldRecord.values[i];
-					if (rf.fieldType == null) array[rf.normIndex] = normSimpleVal(null, v);
-					else normValIntoArray(v, rf.typeNorm, array, rf.normIndex);
-				}
-			}
+		if (vn == null) return normRecordAsArray(rc, oldRecord, array);
+
+		if (vn.isEnum()) {
+			array[vn.tagIndex()] = Int.box(vn.tagValue);
 			return;
-		}
-
-		if (!vn.isTagless()) array[vn.tagIndex()] = Int.box(vn.tagValue);
-		if (vn.isEnum()) return;
-
-		var rfs = vrc.fields;
-		for (i < vrc.fields.length) {
-			var rf = vrc.fields[i];
-			if (rf != null && rf.normIndex >= 0) {
-				var v = oldRecord.values[i];
-				var indexes = vn.fields[i].indexes;
-				// XXX: get rid of fieldArray or reuse
-				var fieldArray = Array<Val>.new(indexes.length);
-				if (rf.fieldType == null) fieldArray[0] = normSimpleVal(null, v);
-				else normValIntoArray(v, rf.typeNorm, fieldArray, 0);
-				for (j < indexes.length) array[indexes[j]] = fieldArray[j];
-			}
+		} else {
+			var input = Array<Val>.new(vn.vecO.length);
+			normRecordAsArray(vrc, oldRecord, input);
+			normalizeRecord(vrc, vn, input, array);
 		}
 	}
 	// normalize the live instances of a simple (i.e. size-1 element) array type
