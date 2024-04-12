@@ -12,6 +12,7 @@ enum RegShift { LSL, LSR, ASR, NONE } // NONE shift is reserved for instructions
 enum DataRegExtend { UXTB, UXTH, UXTW, UXTX, SXTB, SXTH, SXTW, SXTX }
 // Register extensions in load/store instructions
 enum MemRegExtend(id: u3) { UXTW(2), LSL(3), SXTW(6), SXTX(7) }
+enum Arm64PatchKind { REL_IMM19, ABS_IMM16, REL_IMM26 }
 
 // Base class for all Arm64 registers
 // regnum 0-32
@@ -130,10 +131,41 @@ component Arm64Conds {
 // and a 'q' (64-bit) variant. The suffixes resemble x86 conventions
 // to align with the x86 assemblers.
 class Arm64Assembler(w: DataWriter) {
+	// The position of the start of the last patchable instruction in w
+	var patchPos = 0;
+	// The kind of the last patchable instruction in w
+	var patchKind = Arm64PatchKind.REL_IMM19;
+
 	def pos() -> int { return w.pos; }
 	private def ones = Arm64Gpr.new("", "", 0x1F); // register with all ones for regnum
 
 	def svc() -> this { emit(0xD4000001); }
+
+	// -------------------Address patching functions------------------------------------
+
+	// Get int at position pos in w. TODO: Add to w methods?
+	private def get_b32(pos: int) -> int {
+		return int.view(w.data[pos])
+			| (int.view(w.data[pos + 1]) << 8)
+			| (int.view(w.data[pos + 2]) << 16)
+			| (int.view(w.data[pos + 3]) << 24);
+	}
+
+	def patch_ABS_i16(pos: int, imm: u16) -> this {
+		def oldPos = w.pos;
+		def immMask = 0xFFE0001F;
+		def instr = get_b32(pos);
+		w.at(pos);
+		w.put_b32(instr & immMask | (int.view(imm) << 5));
+		w.at(oldPos);
+	}
+	def patch_REL_i26(pos: int, imm: i26) -> this {
+		def oldPos = w.pos;
+		def immMask = 0xFC000000;
+		def instr = get_b32(pos);
+		w.put_b32(instr & immMask | int.view(imm));	
+		w.at(oldPos);
+	}
 
 	// ------- Load/Store instructions have 5 addressing modes -----------------------------------------------------
 	// - base register only (no offset) [base{, #0}]
@@ -171,11 +203,16 @@ class Arm64Assembler(w: DataWriter) {
 	}
 	// literal loads are += 1 MB from PC. Offset = imm * 4 
 	def ldrliterald_r_i(rt: Arm64Reg, imm: i19) -> this {
+		patchKind = Arm64PatchKind.REL_IMM19;
+		patchPos = w.pos;
 		emit((0xC << 24) | (int.view(imm) << 5) | int.view(rt.regnum));
 	}
 	def ldrliteralq_r_i(rt: Arm64Reg, imm: i19) -> this {
+		patchKind = Arm64PatchKind.REL_IMM19;
+		patchPos = w.pos;
 		emit((0x2C << 24) | (int.view(imm) << 5) | int.view(rt.regnum));
 	}
+	// shift == 4 if imm == 1 else 0
 	def ldrd_r_r_r_ex_i(rt: Arm64Reg, rn: Arm64Reg, rm: Arm64Reg, ex: MemRegExtend, imm: u1) -> this {
 		emit((0x5C3 << 21) | (int.view(rm.regnum) << 16) | (int.view(ex.id) << 13) |
 			(int.view(imm) << 12) | (1 << 11) | (int.view(rn.regnum) << 5) | int.view(rt.regnum));
@@ -226,8 +263,28 @@ class Arm64Assembler(w: DataWriter) {
 	// - extended register - reg <- reg + extend(reg) (sh imm3)
 	// ------------------------------------------------------------------------
 
-	def movd_r_i(rd: Arm64Reg, imm: u16) -> this { emit_r_i(rd, imm, 0xA5); }
-	def movq_r_i(rd: Arm64Reg, imm: u16) -> this { emit_r_i(rd, imm, 0x1A5); }
+	// Move optionally shifted imm into reg, keeping other bits unchanged. rd <- imm << (lsl * 16)
+	def movkd_r_i_i(rd: Arm64Reg, imm: u16, lsl: u1) -> this {
+		patchKind = Arm64PatchKind.ABS_IMM16;
+		patchPos = w.pos;
+		emit((0xE5 << 23) | (int.view(lsl) << 21) | (int.view(imm) << 5) | int.view(rd.regnum));
+	}
+	def movkq_r_i_i(rd: Arm64Reg, imm: u16, lsl: u2) -> this {
+		patchKind = Arm64PatchKind.ABS_IMM16;
+		patchPos = w.pos;
+		emit((0x1E5 << 23) | (int.view(lsl) << 21) | (int.view(imm) << 5) | int.view(rd.regnum));
+	}
+
+	def movd_r_i(rd: Arm64Reg, imm: u16) -> this {
+		patchKind = Arm64PatchKind.ABS_IMM16;
+		patchPos = w.pos;
+		emit_r_i(rd, imm, 0xA5);
+	}
+	def movq_r_i(rd: Arm64Reg, imm: u16) -> this {
+		patchKind = Arm64PatchKind.ABS_IMM16;
+		patchPos = w.pos;
+		emit_r_i(rd, imm, 0x1A5);
+	}
 	def movd_r_r(rd: Arm64Reg, rm: Arm64Reg) -> this {
 		emit_r_r_r_sh_i(rd, ones, rm, RegShift.LSL, 0, 0x2A);
 	}
@@ -307,10 +364,25 @@ class Arm64Assembler(w: DataWriter) {
 		emit_r_r_r_sh_i(rd, rn, rm, RegShift.LSL, 0x1F, 0x9B);
 	}
 
+	// --------------------Branch instructions ---------------------------------
+	
+	// branch unconditionally PC-relative to PC + imm * 4
+	def b_i(imm: u26) -> this {
+		patchKind = Arm64PatchKind.REL_IMM26;
+		patchPos = w.pos;
+		emit((5 << 26) | imm);
+	}
+	// branch with link PC-relative. Set X30 to PC + 4
+	def bl_i(imm: u26) -> this {
+		patchKind = Arm64PatchKind.REL_IMM26;
+		patchPos = w.pos;
+		emit((0x25 << 26) | imm);
+	}
+
 	// ------------- Helper functions for emitting addressing modes  -----------
 
 	private def emit_r_i(rd: Arm64Reg, imm: u16, code: u9) {
-		emit((int.view(code) << 23) | (int.view(imm) << 5) | rd.regnum);	
+		emit((int.view(code) << 23) | (int.view(imm) << 5) | int.view(rd.regnum));	
 	}
 	// unfortunately, sometimes opcodes are u9
 	private def emit_r_r_i_i(rd: Arm64Reg, rn: Arm64Reg, imm: u12, lsl12: u1, code: u9) {
