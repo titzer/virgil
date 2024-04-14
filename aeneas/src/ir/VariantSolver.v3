@@ -1,14 +1,16 @@
 // Copyright 2024 Virgil authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// The set of individually register-allocatable storage locations across all targets.
+// An individual target may support only a subset of scalars.
 enum Scalar(size: byte, ty: Type) {
-	B32(32, Int.getType(true, 32)),
-	B64(64, Int.getType(true, 64)),
-	F32(32, Float.FLOAT32),
-	F64(64, Float.FLOAT64),
-	R32(32, AnyRef.TYPE),
-	R64(64, AnyRef.TYPE),
-	Ref(64, AnyRef.TYPE),
+	B32(32, Int.getType(true, 32)),		// <= 32-bit non-references
+	B64(64, Int.getType(true, 64)),		// <= 64-bit non-references
+	F32(32, Float.FLOAT32),			// 32-bit floats
+	F64(64, Float.FLOAT64),			// 64-bit floats
+	R32(32, AnyRef.TYPE),			// <= 32-bit (possibly tagged) references
+	R64(64, AnyRef.TYPE),			// <= 64-bit (possibly tagged) references
+	Ref(64, AnyRef.TYPE),			// references of opaque size
 }
 def getScalarFromSet(s: Scalar.set) -> Scalar {
 	for (i in s) return i;
@@ -29,14 +31,14 @@ class VariantPattern(scalars: Array<ScalarPattern>) {
 	}
 }
 
+// The normalization of a variant, including the mapping of its fields to bit ranges within scalars.
 class VariantNorm extends TypeNorm {
 	def fields: Array<VariantField>;
-	var vecO: Array<Type>; // types that are passed to `ClassAlloc`
-	var fieldRanges: Array<(int, int)>; // for each field, this is the [start, end) interval in vecO
-
 	def tag: VariantField;
-	var tagValue: int = -1;
+	var vecO: Array<Type>;
+	var fieldRanges: Array<(int, int)>; // (start, end) index for ClassAlloc instructions
 	
+	var tagValue: int = -1;
 	var children: List<VariantNorm>;
 
 	new(oldType: Type, newType: Type, sub: Array<Type>, fields, tag)
@@ -45,7 +47,6 @@ class VariantNorm extends TypeNorm {
 	// represent empty variant as tag
 	def isEnum() -> bool { return size == 1 && tag != null && fields.length == 0; }
 	def isEnumCase() -> bool { return size == 1 && tag != null && tagValue >= 0 && fields.length == 0; }
-
 	def tagType() -> IntType { return IntType.!(tag.tn.first()); }
 	def tagIndex() -> int { return tag.indexes[0]; }
 	
@@ -74,15 +75,12 @@ class VariantNorm extends TypeNorm {
 	}
 }
 
-// Metadata about a variant's fields before/after normalization
-class VariantField {
-	def tn: TypeNorm;
-	def indexes: Array<int>; // Indexes into the variant's representation to extract the field from
+// Metadata about a variant's fields before/after normalization.
+// The field {indexes} indicates which scalars store the field.
+class VariantField(tn: TypeNorm, indexes: Array<int>) {
 	var intervals: Array<Interval>; // null, if no packing
-
-	new(tn, indexes) {}
-
 	def isPacked() -> bool { return intervals != null; }
+
 	def render(buf: StringBuilder) -> StringBuilder {
 		buf.puts("(");
 		for (i < indexes.length) {
@@ -292,11 +290,15 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool, useTagScalar: bo
 	}
 }
 
+// Contains the logic for choosing the representation of a variant (i.e. normalizing it) in terms
+// of scalars, which includes unboxing and (in the future) packing fields.
 class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: bool) {
-	// Normalizes a non-recursive variant, returns either a VariantNorm for an unboxed variant,
-	// or a simple TypeNorm for a boxed variant
+	private var assignments: HashMap<CaseField, int>; // used in unboxing solving algorithm
+
+	// Entrypoint into representation selection. Recursively tries to unbox and pack this variant.
+	// Returns either a {VariantNorm} for an unboxed variant or a simple {TypeNorm} for a boxed variant.
 	def normVariant(t: Type, rc: RaClass) -> TypeNorm {
-		if (rc.variantNorm != null) return rc.variantNorm;
+		if (rc.variantNorm != null) return rc.variantNorm; // already done
 		if (rc.orig.boxing == Boxing.BOXED) rn.mapSimple(t);
 
 		var prev = rc.recursive;
@@ -323,13 +325,13 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		
 		rn.makeNormFields(rc);
 
-		var isEmpty = rc.normFields.length == 0;
+		var isEmpty = rc.liveFields.length == 0;
 		var closure = rc.raFacts.RC_CLOSURE;
 
 		for (l = rc.children; l != null; l = l.tail) {
 			var c = l.head;
 			rn.makeNormFields(c);
-			if (c.normFields.length > 0) isEmpty = false;
+			if (c.liveFields.length > 0) isEmpty = false;
 			closure |= c.raFacts.RC_CLOSURE;
 		}
 
@@ -351,7 +353,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		}
 		match (rc.orig.boxing) {
 			BOXED => return false;
-			AUTO => if (rc.normFields.length > nc.MaxFlatDataValues) return false;
+			AUTO => if (rc.liveFields.length > nc.MaxFlatDataValues) return false;
 			UNBOXED => ; // program specified unboxed; TODO: recursion or closure should be an error
 		}
 		if (rc.recursive > 1 || closure) return false; // recursive or closed over
@@ -388,7 +390,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 			var rf = rc.fields[i];
 			var startT = fieldTypes.length;
 
-			if (rf != null && rf.normIndex >= 0) {
+			if (rf != null && rf.normIndices.0 >= 0) {
 				var tn = fieldNorm(rf);
 				tn.addTo(fieldTypes);
 				fields[i] = VariantField.new(tn, Array<int>.new(tn.size));
@@ -409,7 +411,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		var ofs = rc.orig.fields;
 		for (i < ofs.length) {
 			var rf = rc.fields[i];
-			if (rf != null && rf.normIndex >= 0) {
+			if (rf != null && rf.normIndices.0 >= 0) {
 				var fr = rc.fieldRangesT[i];
 				if (shouldPack) rc.variantFields[i].intervals = Array<Interval>.new(fr.1 - fr.0);
 				for (j < fr.1 - fr.0) {
