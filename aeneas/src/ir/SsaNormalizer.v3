@@ -590,7 +590,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			var read = curBlock.opArrayGetElem(V3.arrayByteType, indexType, facts,
 				array, curBlock.opIntAdd(newGraph.intConst(i + offset), i_offset));
 			read = curBlock.opIntViewI0(Byte.TYPE, wt, read);
-			var shifted = if(i == 0, read, curBlock.addApplyF(wt.opShl(), [read, newGraph.intConst(8 * i)], Facts.O_SAFE_SHIFT));
+			var shifted = if(i == 0, read, curBlock.addApplyF(wt.opShl(), [read, newGraph.intConst(8 * i)], Fact.O_PURE | Fact.O_NO_SHIFT_CHECK));
 			result = curBlock.addApplyF(wt.opOr(), [result, shifted], Fact.O_PURE);
 			facts |= Fact.O_NO_NULL_CHECK;
 		}
@@ -603,7 +603,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
 		var indexType = norm.config.RangeStartType;
 		for (i < size) {
-			var shifted = curBlock.addApplyF(it.opShr(), [val, newGraph.intConst(8 * i)], Facts.O_SAFE_SHIFT);
+			var shifted = curBlock.addApplyF(it.opShr(), [val, newGraph.intConst(8 * i)], Fact.O_PURE | Fact.O_NO_SHIFT_CHECK);
 			var b = curBlock.opIntViewI0(it, Byte.TYPE, shifted);
 			var write = curBlock.opArraySetElem(array.getType(), indexType, facts,
 				array, curBlock.opIntAdd(newGraph.intConst(i + offset), i_offset), b);
@@ -766,7 +766,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	// Normalize equality between two unboxed variants of unknown case (e.g. x: T == y: T)
 	def normUnboxedVariantEqual(i_old: SsaApplyOp, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
-		if (vn.hasNoTag()) return normEqual(i_old, vn, refs); // we can always do a scalar-by-scalar comparison if no boxes are involved.
+		if (vn.isTagless()) return normEqual(i_old, vn, refs); // we can always do a scalar-by-scalar comparison if no boxes are involved.
 		var ct = ClassType.!(vn.oldType);
 		if (ct.superType != null) return normUnboxedVariantCaseEqual(i_old, vn, refs);
 
@@ -795,11 +795,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def normVariantGetTag(vn: VariantNorm, args: Range<SsaInstr>) -> SsaInstr {
 		if (vn == null) return null;
-		if (vn.hasNoTag()) return newGraph.zeroConst();
-		if (vn.hasExplicitTag() && vn.tag.isPacked()) {
-			var tag = vn.tag, tagIdx = tag.indexes[0], tagInterval = tag.intervals[0];
-			return genExtractInterval(args[tagIdx], tagInterval, IntRepType.!(vn.at(tagIdx)), tag.tn.at(0));
-		}
+		if (vn.isTagless()) return newGraph.zeroConst();
 		return args[vn.tagIndex()];
 	}
 	def normTupleGetElem(i_old: SsaInstr, args: Array<SsaDfEdge>, op: Operator, index: int) {
@@ -1296,7 +1292,12 @@ class SsaRaNormalizer extends SsaRebuilder {
 		normType(raField.receiver); // XXX: normType() side-effect of flattening
 		if (isVariant && raField != null && rc.isUnboxed()) {
 			// field of unboxed data type
-			var vals = genVariantGetField(rc, raField, rc.variantNorm, ai_new);
+			var vals = Array<SsaInstr>.new(nf.length);
+			var field = rc.variantNorm.fields[raField.orig.index];
+			for (i < vals.length) {
+				var idx = field.indexes[i];
+				vals[i] = genVariantScalarView(rc.variantNorm.at(idx), field.tn.at(i), ai_new[idx]);
+			}
 			return mapNnf(i_old, vals);
 		}
 		var receiver = ai_new[0];
@@ -1370,52 +1371,17 @@ class SsaRaNormalizer extends SsaRebuilder {
 
 		var result = Array<SsaInstr>.new(vn.size);
 		for (i < result.length) result[i] = newGraph.nullConst(vn.at(i));
+		if (!vn.isTagless()) result[vn.tagIndex()] = newGraph.intConst(vn.tagValue);
 		
-		if (vn.hasExplicitTag()) {
-			if (vn.tag.isPacked()) {
-				var tagIdx = vn.tag.indexes[0];
-				result[tagIdx] = genSetInterval(result[tagIdx], newGraph.intConst(vn.tagValue), vn.tag.intervals[0], vn.tag.tn.newType, IntRepType.!(vn.at(tagIdx)));
-			} else {
-				result[vn.tagIndex()] = newGraph.intConst(vn.tagValue);
-			}
-		}
-
 		for (i < vn.fields.length) {
 			var f = vn.fields[i];
 			var fieldRanges = vn.fieldRanges[i], os = fieldRanges.0;
 			for (j < f.indexes.length) {
 				var idx = f.indexes[j];
-				if (!f.isPacked()) result[idx] = genVariantScalarView(f.tn.at(j), vn.at(idx), ai_inputs[os + j]);
-				else result[idx] = genSetInterval(result[idx], ai_inputs[os + j], f.intervals[j], f.tn.at(j), IntRepType.!(vn.at(idx)));
+				result[idx] = genVariantScalarView(f.tn.at(j), vn.at(idx), ai_inputs[os + j]);
 			}
 		}
 		return result;
-	}
-	def genExtractInterval(scalar: SsaInstr, interval: Interval, ft: IntRepType, tt: Type) -> SsaInstr {
-		if (interval.start > 0) scalar = curBlock.addApplyF(ft.opShr(), [scalar, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
-		scalar = genVariantScalarView(ft, tt, scalar);
-		return scalar;
-	}
-	def genSetInterval(scalar: SsaInstr, value: SsaInstr, interval: Interval, ft: Type, tt: IntRepType) -> SsaInstr {
-		var intRep = genVariantScalarView(ft, tt, value);
-		intRep = curBlock.addApplyF(tt.opShl(), [intRep, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
-		return curBlock.pure(tt.opOr(), [scalar, intRep]);
-	}
-	def genVariantGetField(rc: RaClass, raField: RaField, vn: VariantNorm, ninputs: Array<SsaInstr>) -> Array<SsaInstr> {
-		var nf = raField.liveFields(norm.ra);
-		var vals = Array<SsaInstr>.new(nf.length);
-		var field = rc.variantNorm.fields[raField.orig.index];
-
-		for (i < vals.length) {
-			var idx = field.indexes[i];
-			if (field.isPacked()) {
-				var irt = IntRepType.!(vn.at(idx));
-				vals[i] = genExtractInterval(ninputs[idx], field.intervals[i], IntRepType.!(vn.at(idx)), field.tn.at(i));
-			} else {
-				vals[i] = genVariantScalarView(rc.variantNorm.at(idx), field.tn.at(i), ninputs[idx]);
-			}
-		}
-		return vals;
 	}
 	def normNullCheck(oldApp: SsaApplyOp, op: Operator) {
 		var newArgs = genRefs(oldApp.inputs);
