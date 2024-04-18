@@ -324,6 +324,7 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 		if (normFields.length <= 1) {
 			var types = getTypes(false);
 			curSoln = VariantSolution.new(normFields, assignments, state, explicitTag, types);
+			curSoln.hasIntervals = usePacking;
 			return true; // single case is always distinguishable
 		}
 
@@ -341,7 +342,6 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 	}
 	private def getTypes(useTagScalar: bool) -> Array<Type> {
 		var types = Array<Type>.new(curRep.length + if(useTagScalar, 1));
-
 		for (i < curRep.length) types[i] = getTypeFromScalarSet(curRep[i], usePacking);
 
 		// simplification: if every field assigned to this scalar has the same type, we should use that type instead
@@ -359,11 +359,11 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 				caseUses[scalarIdx]++;
 
 				if (caseUses[scalarIdx] > 1) uniqueTypes[scalarIdx] = null;
-				else if (uniqueTypes[scalarIdx] != normFields[i][j]) uniqueTypes[scalarIdx] = null;
+				else if (uniqueTypes[scalarIdx] != null && uniqueTypes[scalarIdx] != normFields[i][j]) uniqueTypes[scalarIdx] = null;
 				if (uses[scalarIdx] == 1 && uniqueTypes[scalarIdx] == null) uniqueTypes[scalarIdx] = normFields[i][j];
 			}
 		}
-		for (i < uniqueTypes.length) if (uses[i] >= 1 && uniqueTypes[i] != null) types[i] = uniqueTypes[i];
+		for (i < uniqueTypes.length) if (uniqueTypes[i] != null) types[i] = uniqueTypes[i];
 
 		var tagType = Int.getType(false, getTagLength(normFields.length));
 		if (useTagScalar) types[curRep.length] = tagType;
@@ -375,6 +375,8 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 // of scalars, which includes unboxing and (in the future) packing fields.
 class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: bool) {
 	def PRINT_PACKING = CLOptions.PRINT_PACKING.get();
+	def buf = TerminalBuffer.new();
+
 	private var assignments: HashMap<CaseField, int>; // used in unboxing solving algorithm
 
 	// Entrypoint into representation selection. Recursively tries to unbox and pack this variant.
@@ -427,7 +429,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		}
 		if (rc.children != null) {
 			// multi-case variant unboxing
-			if (closure) return false;
+			if (closure) return printNoUnboxReason(rc, false, true);
 			match (rc.orig.boxing) {
 				BOXED, AUTO => return false;
 				_ => return unboxUsingTaggedVariantNorm(rc);
@@ -438,7 +440,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 			AUTO => if (rc.liveFields.length > nc.MaxFlatDataValues) return false;
 			UNBOXED => ; // program specified unboxed; TODO: recursion or closure should be an error
 		}
-		if (rc.recursive > 1 || closure) return false; // recursive or closed over
+		if (rc.recursive > 1 || closure) return printNoUnboxReason(rc, rc.recursive > 1, closure); // recursive or closed over
 		unboxUsingTaglessVariantNorm(rc);
 		return true;
 	}
@@ -449,15 +451,14 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		var solver = VariantSolver.new(this, shouldPack);
 		var solution = solver.solve([normFields]);
 
-		var types = Arrays.map(solver.curRep.extract(), getTypeFromScalarSet(_, shouldPack));
-		var vn = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(types)), types, rc.variantFields, null);
+		var vn = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(solution.types)), solution.types, rc.variantFields, null);
 
 		vn.fieldRanges = rc.fieldRangesO;
 		vn.vecO = rc.vecO;
 		rc.variantNorm = vn;
 		setVariantFields(rc, 0, solution);
 
-		if (verbose) Terminal.put1("variant norm %q\n", rc.variantNorm.render);
+		printNorm(rc, vn);
 	}
 	private def getNormFieldsForCase(rc: RaClass) -> Array<Type> {
 		var rfs = rc.fields;
@@ -552,7 +553,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 			parentNorm.children = List<VariantNorm>.new(vn, parentNorm.children);
 			if (verbose) Terminal.put1("  %q\n", vn.render);
 		}
-
+		printNorm(rc, parentNorm);
 		return true;
 	}
 	private def unboxUsingEnumVariantNorm(rc: RaClass, tagType: IntType, tagField: VariantField) {
@@ -573,6 +574,47 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 	}
 	def getBitWidth(t: Type) -> byte {
 		return nc.GetBitWidth(rn.ra.compiler, rn.ra.prog, t);
+	}
+	private def printSingleNorm(rc: RaClass, vn: VariantNorm) {
+		buf.typeColor().put1("              %q ", rc.oldType.render).end();
+				
+		for (field in vn.fields) {
+			if (field == EMPTY_FIELD) continue;
+			for (j < field.tn.size) {
+				buf.put2("%q.%d:", field.tn.oldType.render, j).green().put1("%q", field.tn.at(j).render).end()
+					.puts("->").cyan().put1("#%d", field.indexes[j]);
+				if (field.intervals != null && field.intervals[j] != EMPTY_INTERVAL) buf.put1("@%q", field.intervals[j].render);
+				buf.end();
+			}
+			buf.putc(' ');
+		}
+		buf.outln();
+		buf.outt();
+	}
+	private def printNorm(rc: RaClass, vn: VariantNorm) {
+		if (!PRINT_PACKING) return;
+		buf.puts("Unboxing for: ").typeColor().put1("%q", vn.oldType.render).end().puts(" ## ");
+		buf.puts("[");
+		for (i < vn.size) {
+			if (i > 0) buf.csp();
+			buf.green().put1("%q", vn.at(i).render).end();
+		}
+		buf.puts("]\n");
+
+		if (rc.children == null) {
+			printSingleNorm(rc, vn);
+		} else {
+			for (l = rc.children; l != null; l = l.tail) printSingleNorm(l.head, l.head.variantNorm);
+		}
+	}
+	private def printNoUnboxReason(rc: RaClass, recursive: bool, closure: bool) -> bool {
+		if (PRINT_PACKING) {
+			var reason = Strings.format2("%s%s", if(recursive, "recursive ", ""), if(closure, "closure", ""));
+			buf.puts("Unboxing for: ").typeColor().put1("%q", rc.oldType.render).end();
+			buf.puts(" - no unboxing because ").red().puts(reason).ln().end();
+		}
+		buf.outt();
+		return false;
 	}
 }
 
