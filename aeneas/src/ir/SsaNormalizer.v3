@@ -1340,7 +1340,6 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 	}
 	def genVariantScalarView(oldType: Type, newType: Type, i_scalar: SsaInstr) -> SsaInstr {
-		if (oldType == newType) return i_scalar;
 		if (IntType.?(oldType) && IntType.?(newType)) return curBlock.opIntView(oldType, IntType.!(newType), i_scalar);
 		if (IntType.?(oldType)) {
 			match (newType) {
@@ -1352,14 +1351,29 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		if (IntType.?(newType)) {
 			// XXX: Hack - Something goes wrong with the JVM backend if we use `oneConst()` and `zeroConst()` here
-			var one = newGraph.valConst(newType, IntType.!(newType).box(1));
+			var one = newGraph.valConst(newType, IntType.!(newType).box(1)), zero = newGraph.nullConst(newType);
 			match (oldType) {
 				x: BoolType => {
-					var split = SsaBlockSplit.new(context, curBlock);
-					curBlock = split.addIf(i_scalar);
-					curBlock = split.addElse();
-					curBlock = split.finish();
-					return split.addPhi(newType, [one, newGraph.nullConst(newType)]);
+					// XXX: Use SsaBlockSplit or make a new `BoolViewI` opcode
+					var tblock = context.newBuilder(), fblock = context.newBuilder();
+					curBlock.addIf(i_scalar, tblock.block, fblock.block);
+					var succs = curBlock.block.succs();
+					if (succs.length == 1) {
+						// condition folded
+						if (succs[0].dest == tblock.block) {
+							curBlock = tblock;
+							return one;
+						} else {
+							curBlock = fblock;
+							return zero;
+						}
+					} else {
+						var mergeBuilder = context.newBuilder();
+						tblock.addGoto(mergeBuilder.block);
+						fblock.addGoto(mergeBuilder.block);
+						curBlock = mergeBuilder;
+						return curBlock.addPhi(newType, [one, zero]);
+					}
 				}
 				x: FloatType => return curBlock.pure(if(x.is64, V3Op.opIntViewF64, V3Op.opIntViewF32), [i_scalar]);
 				x: IntType => return curBlock.opTypeSubsume(oldType, newType, i_scalar);
@@ -1388,12 +1402,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 
 		if (vn.hasExplicitTag()) {
-			if (vn.tag.isPacked()) {
-				var tagIdx = vn.tag.indexes[0];
-				result[tagIdx] = genSetInterval(result[tagIdx], newGraph.intConst(vn.tagValue), vn.tag.intervals[0], true, vn.tag.tn.newType, IntRepType.!(vn.at(tagIdx)));
-			} else {
-				result[vn.tagIndex()] = newGraph.intConst(vn.tagValue);
-			}
+			var tagIdx = vn.tag.indexes[0];
+			if (IntRepType.?(vn.at(tagIdx))) result[tagIdx] = genSetInterval(result[tagIdx], newGraph.intConst(vn.tagValue), vn.tag.intervals[0], vn.tag.tn.newType, IntRepType.!(vn.at(tagIdx)));
+			else result[tagIdx] = newGraph.intConst(vn.tagValue);
 		}
 
 		for (i < vn.fields.length) {
@@ -1401,25 +1412,28 @@ class SsaRaNormalizer extends SsaRebuilder {
 			var fieldRanges = vn.fieldRanges[i], os = fieldRanges.0;
 			for (j < f.indexes.length) {
 				var idx = f.indexes[j];
-				if (!f.isPacked() || !IntRepType.?(vn.at(idx))) {
-					result[idx] = genVariantScalarView(f.tn.at(j), vn.at(idx), ai_inputs[os + j]);
-				} else {
-					var scalar = IntRepType.!(vn.at(idx)).scalar;
-					var isRefField = scalar.isRef && scalar != Scalar.Ref && norm.config.RefPattern != null && f.intervals[j] == norm.config.RefPattern.refInterval;
-					result[idx] = genSetInterval(result[idx], ai_inputs[os + j], f.intervals[j], !isRefField, f.tn.at(j), IntRepType.!(vn.at(idx)));
-				}
+				if (IntRepType.?(vn.at(idx))) result[idx] = genSetInterval(result[idx], ai_inputs[os + j], f.intervals[j], f.tn.at(j), IntRepType.!(vn.at(idx)));
+				else result[idx] = genVariantScalarView(f.tn.at(j), vn.at(idx), ai_inputs[os + j]);
 			}
 		}
 		return result;
 	}
 	def genExtractInterval(scalar: SsaInstr, interval: Interval, ft: IntRepType, tt: Type) -> SsaInstr {
-		if (interval.start > 0) scalar = curBlock.addApplyF(ft.opShr(), [scalar, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
+		var shouldMask = (ft.scalar.isRef && ft.scalar != Scalar.Ref) && (norm.config.RefPattern != null && interval == norm.config.RefPattern.refInterval);
+		if (shouldMask) {
+			var maskL = norm.config.RefPattern.refInterval.asMask();
+			var mask = if(ft.scalar.size == 64, newGraph.longConst(maskL), newGraph.intConst(int.view(maskL)));
+			scalar = curBlock.pure(ft.opAnd(), [scalar, mask]);
+		} else if (interval.start > 0) {
+			scalar = curBlock.addApplyF(ft.opShr(), [scalar, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
+		}
 		scalar = genVariantScalarView(ft, tt, scalar);
 		return scalar;
 	}
-	def genSetInterval(scalar: SsaInstr, value: SsaInstr, interval: Interval, shift: bool, ft: Type, tt: IntRepType) -> SsaInstr {
+	def genSetInterval(scalar: SsaInstr, value: SsaInstr, interval: Interval, ft: Type, tt: IntRepType) -> SsaInstr {
 		var intRep = genVariantScalarView(ft, tt, value);
-		if (shift && interval.start > 0) intRep = curBlock.addApplyF(tt.opShl(), [intRep, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
+		var shouldShift = !tt.scalar.isRef || (norm.config.RefPattern != null && interval != norm.config.RefPattern.refInterval);
+		if (shouldShift && interval.start > 0) intRep = curBlock.addApplyF(tt.opShl(), [intRep, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
 		var noop = scalar == null || (SsaConst.?(scalar) && Long.unboxSU(SsaConst.!(scalar).val, false) == 0);
 		return if(noop, intRep, curBlock.pure(tt.opOr(), [scalar, intRep]));
 	}
@@ -1430,20 +1444,8 @@ class SsaRaNormalizer extends SsaRebuilder {
 
 		for (i < vals.length) {
 			var idx = field.indexes[i];
-			if (field.isPacked() && IntRepType.?(vn.at(idx))) {
-				var irt = IntRepType.!(vn.at(idx));
-				var isRefField = irt.scalar.isRef && irt.scalar != Scalar.Ref && norm.config.RefPattern != null && field.intervals[i] == norm.config.RefPattern.refInterval;
-				if (isRefField) {
-					var maskL = norm.config.RefPattern.refInterval.asMask();
-					var mask = if(irt.scalar.size == 64, newGraph.longConst(maskL), newGraph.intConst(int.view(maskL)));
-					var refVal = curBlock.pure(irt.opAnd(), [ninputs[idx], mask]);
-					vals[i] = genVariantScalarView(irt, field.tn.at(i), refVal);
-				} else {
-					vals[i] = genExtractInterval(ninputs[idx], field.intervals[i], irt, field.tn.at(i));
-				}
-			} else {
-				vals[i] = genVariantScalarView(rc.variantNorm.at(idx), field.tn.at(i), ninputs[idx]);
-			}
+			if (IntRepType.?(vn.at(idx))) vals[i] = genExtractInterval(ninputs[idx], field.intervals[i], IntRepType.!(vn.at(idx)), field.tn.at(i));
+			else vals[i] = genVariantScalarView(rc.variantNorm.at(idx), field.tn.at(i), ninputs[idx]);
 		}
 		return vals;
 	}
