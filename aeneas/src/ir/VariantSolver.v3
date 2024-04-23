@@ -122,21 +122,30 @@ type FlattenedExpr(assignment: Array<(int, Interval)>, pattern: ScalarPattern, s
 
 class PackingContext {
 	def vars = Strings.newMap<int>();
+	def keyList = Vector<string>.new();
 
-	def addVar(name: string, fieldIdx: int) { vars[name] = fieldIdx; }
+	def addVar(name: string, fieldIdx: int) {
+		if (!vars.has(name)) keyList.put(name);
+		vars[name] = fieldIdx;
+	}
 	def getVar(name: string) -> int { return vars[name]; }
+	def getVarFromChar(c: byte) -> int {
+		for (i < keyList.length) if (keyList[i][0] == c) return vars[keyList[i]];
+		return -1;
+	}
 }
 
 class VariantProblemGen(vn: VariantNormalizer) {
 	var normFields: Array<Array<Type>>;
 	var assignments = HashMap<CaseField, (int, Interval)>.new(CaseField.hash, CaseField.==);
 	var state: Array<VariantPattern>;
+	var hasPackingExpr: bool;
 
 	def generateProblemFromRc(rc: RaClass) -> VariantProblem {
 		var shouldPack = rc.orig.packed;
 		var numChildren = Lists.length(rc.children);
 		normFields = Array<Array<Type>>.new(if(rc.children == null, 1, numChildren));
-		state = Array<VariantPattern>.new(numChildren);
+		state = Array<VariantPattern>.new(normFields.length);
 
 		if (rc.children == null) {
 			normFields[0] = getNormFieldsForCase(rc);
@@ -150,12 +159,13 @@ class VariantProblemGen(vn: VariantNormalizer) {
 			}
 		}
 		var problem = VariantProblem.new(normFields, assignments, shouldPack);
-		if (shouldPack) problem.state = state;
+		if (hasPackingExpr) problem.state = state;
 		return problem;
 	}
 	private def processAnnotationsForCase(rc: RaClass, caseIdx: int) {
 		if (!rc.orig.packed) return;
 		var packingExpr = rc.orig.packingExpr;
+		if (packingExpr != null) hasPackingExpr = true;
 
 		var patterns = Vector<ScalarPattern>.new();
 		var scalarIdx = 0;
@@ -166,13 +176,12 @@ class VariantProblemGen(vn: VariantNormalizer) {
 			if (rf == null) continue;
 			context.addVar(rf.orig.source.name(), rf.normIndices.0);
 		}
-
 		for (l = packingExpr; l != null; l = l.tail) {
 			var expr = processPackingExpr(context, caseIdx, l.head);
 			for (i < expr.assignment.length) {
 				assignments[CaseField(caseIdx, expr.assignment[i].0)] = (scalarIdx, expr.assignment[i].1);
-				patterns.put(expr.pattern);
 			}
+			patterns.put(expr.pattern);
 			scalarIdx++;
 		}
 		state[caseIdx] = VariantPattern.new(patterns.extract());
@@ -186,7 +195,15 @@ class VariantProblemGen(vn: VariantNormalizer) {
 				return FlattenedExpr([(fieldIdx, Interval(0, size))], pattern, size);
 			}
 			Literal(l) => { // write into pattern
-				return FlattenedExpr([], ScalarPattern.new([]), 0); // todo
+				match (l) {
+					x: IntLiteral => {
+						var t = IntType.!(x.exactType);
+						var val = Long.unboxSU(x.val, false);
+						var bits = Array<PackingBit>.new(t.width);
+						for (i < t.width) bits[i] = PackingBit.Fixed(u1.view(val >> i & 1));
+						return FlattenedExpr([], ScalarPattern.new(bits), t.width); // todo
+					}
+				}
 			}	
 			Concat(l) => {
 				var combined = FlattenedExpr([], ScalarPattern.new([]), 0);
@@ -202,7 +219,31 @@ class VariantProblemGen(vn: VariantNormalizer) {
 				}
 				return combined;
 			}
-			Bits(t, b) => { // process as intervals
+			Bits(t, rep) => { // process as intervals
+				var curBits = Array<PackingBit>.new(rep.length);
+				var assignments = Vector<(int, Interval)>.new();
+				var curByte: byte = 0, oldByte: byte = 0;
+				var curStart: byte = 0, oldStart: byte = 0;
+				for (i < rep.length) {
+					oldByte = curByte;
+					oldStart = curStart;
+					match (rep[i].1) {
+						Assigned(ch) => {
+							if (ch != curByte) {
+								curByte = ch;
+								curStart = byte.view(i);
+							}
+							curBits[i] = PackingBit.Assigned(0);
+						}
+						Fixed(v), Unassigned => {
+							curByte = 0;
+							curBits[i] = rep[i].1;
+						}
+					}
+					if (oldByte != curByte && oldByte != 0) assignments.put((context.getVarFromChar(oldByte), Interval(oldStart, byte.view(i))));
+				}
+				if (curByte != 0) assignments.put((context.getVarFromChar(curByte), Interval(curStart, byte.view(rep.length))));
+				return FlattenedExpr(assignments.extract(), ScalarPattern.new(curBits), byte.view(curBits.length));
 			}
 			App(p, args) => {
 				var decl = vn.rn.ra.prog.packings[p.ident.name.image];
@@ -380,15 +421,22 @@ class VariantSolver(vnorm: VariantNormalizer) {
 		explicitTagLength = getTagLength(problem.normFields.length);
 		usePacking = problem.usePacking;
 
+		Terminal.put1("problem=%q\n", problem.render);
+
 		for (i < normFields.length) {
 			for (j < normFields[i].length) {
 				if (!assignments.has(CaseField(i, j))) {
 					fields.put(CaseField(i, j));
 				} else {
 					var assn = assignments[CaseField(i, j)];
-					if (curRep.length <= assn.0) curRep.putn(Scalar.set.all, assn.0 + 1 - curRep.length);
+					if (curRep.length <= assn.0) {
+						var grow = assn.0 + 1 - curRep.length;
+						curRep.putn(Scalar.set.all, grow);
+						curUsed.putn(0, grow);
+					}
 					var sc = vnorm.getScalar(normFields[i][j]);
 					curRep[assn.0] &= sc;
+					curUsed[assn.0] += vnorm.getBitWidth(normFields[i][j]);
 				}
 			}
 		}
