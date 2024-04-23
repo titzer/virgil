@@ -41,6 +41,8 @@ class VariantNorm extends TypeNorm {
 	var tagValue: int = -1;
 	var children: List<VariantNorm>;
 
+	var pattern: VariantPattern;
+
 	new(oldType: Type, newType: Type, sub: Array<Type>, fields, tag)
 		super(oldType, newType, sub) {}
 
@@ -77,7 +79,7 @@ class VariantNorm extends TypeNorm {
 
 // Metadata about a variant's fields before/after normalization.
 // The field {indexes} indicates which scalars store the field.
-class VariantField(tn: TypeNorm, indexes: Array<int>) {
+class VariantField(rf: RaField, tn: TypeNorm, indexes: Array<int>) {
 	var intervals: Array<Interval>; // null, if no packing
 	def isPacked() -> bool { return intervals != null; }
 
@@ -95,7 +97,7 @@ class VariantField(tn: TypeNorm, indexes: Array<int>) {
 }
 
 def ON_STACK = -1;
-def EMPTY_FIELD = VariantField.new(null, []);
+def EMPTY_FIELD = VariantField.new(null, null, []);
 def NO_FIELDS = Array<VariantField>.new(0);
 
 def copyMap<T, U>(x: HashMap<T, U>) -> HashMap<T, U> {
@@ -295,7 +297,7 @@ class VariantProblemGen(vn: VariantNormalizer) {
 			if (rf != null && rf.normIndices.0 >= 0) {
 				var tn = vn.fieldNorm(rf);
 				tn.addTo(fieldTypes);
-				fields[i] = VariantField.new(tn, Array<int>.new(tn.size));
+				fields[i] = VariantField.new(rf, tn, Array<int>.new(tn.size));
 			} else fields[i] = EMPTY_FIELD;
 
 			var origStart = vecO.length;
@@ -420,8 +422,12 @@ class VariantSolver(vnorm: VariantNormalizer) {
 
 		explicitTagLength = getTagLength(problem.normFields.length);
 		usePacking = problem.usePacking;
-
-		Terminal.put1("problem=%q\n", problem.render);
+		
+		if (problem.state != null) {
+			var numScalars = problem.state[0].scalars.length;
+			curRep.putn(vnorm.nc.UsedScalars, numScalars);
+			for (i < numScalars) curUsed.put(0);
+		}
 
 		for (i < normFields.length) {
 			for (j < normFields[i].length) {
@@ -429,20 +435,18 @@ class VariantSolver(vnorm: VariantNormalizer) {
 					fields.put(CaseField(i, j));
 				} else {
 					var assn = assignments[CaseField(i, j)];
-					if (curRep.length <= assn.0) {
-						var grow = assn.0 + 1 - curRep.length;
-						curRep.putn(Scalar.set.all, grow);
-						curUsed.putn(0, grow);
-					}
 					var sc = vnorm.getScalar(normFields[i][j]);
 					curRep[assn.0] &= sc;
-					curUsed[assn.0] += vnorm.getBitWidth(normFields[i][j]);
 				}
 			}
 		}
 		if (baseState != null) {
 			for (i < baseState.length) {
-				for (j < curRep.length) curRep[j] = getScalarsWithSize(curRep[j], byte.view(baseState[i].scalars[j].bits.length));
+				for (j < curRep.length) {
+					curRep[j] = getScalarsWithSize(curRep[j], byte.view(baseState[i].scalars[j].bits.length));
+					var scalar = getScalarFromSet(curRep[j]);
+					baseState[i].scalars[j] = baseState[i].scalars[j].padTo(scalar.size);
+				}
 			}
 		}
 		var solvable = tryRepresentationForField(0, 0);
@@ -511,8 +515,9 @@ class VariantSolver(vnorm: VariantNormalizer) {
 
 			if (explicitTagLength > 0 && longest.size() >= explicitTagLength) {
 				for (j < state.length) {
+					var realTag = normFields.length - j - 1; // variants are in reverse order
 					for (k < explicitTagLength) {
-						var bit = u1.!((j >> k) & 1);
+						var bit = u1.!((realTag >> k) & 1);
 						state[j].scalars[i].bits[longest.start + k] = PackingBit.Fixed(bit);
 					}
 				}
@@ -671,7 +676,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 			// normalize empty variant to just its tag; i.e. become an enum
 			var tagType = V3.getVariantTagType(rc.oldType);
 			var tagTypeNorm = rn.norm(tagType);
-			var tagField = VariantField.new(tagTypeNorm, [0]);
+			var tagField = VariantField.new(null, tagTypeNorm, [0]);
 			unboxUsingEnumVariantNorm(rc, tagType, tagField);
 			return true;
 		}
@@ -704,6 +709,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		vn.vecO = rc.vecO;
 		rc.variantNorm = vn;
 		setVariantFields(rc, 0, solution);
+		vn.pattern = solution.state[0];
 
 		printNorm(rc, vn);
 	}
@@ -738,9 +744,9 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		if (solution == null) return false; // XXX: warn that no solution was found
 
 		var tagField: VariantField;
-		if (solution.hasTagScalar) tagField = VariantField.new(rn.norm(solution.tagType), [solution.types.length - 1]);
+		if (solution.hasTagScalar) tagField = VariantField.new(null, rn.norm(solution.tagType), [solution.types.length - 1]);
 		else if (solution.explicitTag.0 >= 0) {
-			tagField = VariantField.new(rn.norm(solution.tagType), [solution.explicitTag.0]);
+			tagField = VariantField.new(null, rn.norm(solution.tagType), [solution.explicitTag.0]);
 			tagField.intervals = [solution.explicitTag.1];
 		}
 		var newType = Tuple.newType(Lists.fromArray(solution.types));
@@ -753,16 +759,18 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		var caseIdx = 0;
 		for (l = rc.children; l != null; l = l.tail) {
 			var child = l.head;
-			setVariantFields(child, caseIdx++, solution);
+			setVariantFields(child, caseIdx, solution);
 
 			var vn = VariantNorm.new(child.oldType, newType, solution.types, child.variantFields, tagField);
 			vn.fieldRanges = child.fieldRangesO;
 			vn.vecO = child.vecO;
 			vn.tagValue = V3.getVariantTag(child.oldType);
+			vn.pattern = solution.state[caseIdx];
 			child.variantNorm = vn;
 			
 			parentNorm.children = List<VariantNorm>.new(vn, parentNorm.children);
 			if (verbose) Terminal.put1("  %q\n", vn.render);
+			caseIdx++;
 		}
 		printNorm(rc, parentNorm);
 		return true;
@@ -786,19 +794,23 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 	def getBitWidth(t: Type) -> byte {
 		return nc.GetBitWidth(rn.ra.compiler, rn.ra.prog, t);
 	}
+	private def printField(field: VariantField, idx: int, tag: bool) {
+		if (tag) buf.puts("tag:");
+		else buf.put2("%s.%d:", field.rf.orig.source.name(), idx);
+		buf.green().put1("%q", field.tn.at(idx).render).end().puts("->").cyan().put1("#%d", field.indexes[idx]);
+		if (field.intervals != null && field.intervals[idx] != EMPTY_INTERVAL) buf.put1("@%q", field.intervals[idx].render);
+		buf.end().putc(' ');
+	}
 	private def printSingleNorm(rc: RaClass, vn: VariantNorm) {
 		buf.typeColor().put1("              %q ", rc.oldType.render).end();
 				
 		for (field in vn.fields) {
 			if (field == EMPTY_FIELD) continue;
-			for (j < field.tn.size) {
-				buf.put2("%q.%d:", field.tn.oldType.render, j).green().put1("%q", field.tn.at(j).render).end()
-					.puts("->").cyan().put1("#%d", field.indexes[j]);
-				if (field.intervals != null && field.intervals[j] != EMPTY_INTERVAL) buf.put1("@%q", field.intervals[j].render);
-				buf.end().putc(' ');
-			}
+			for (j < field.tn.size) printField(field, j, false);
 		}
+		if (vn.tag != null) printField(vn.tag, 0, true);
 		buf.outln();
+		if (vn.pattern != null) buf.purple().put1("                  %q\n", vn.pattern.render).end();
 		buf.outt();
 	}
 	private def printNorm(rc: RaClass, vn: VariantNorm) {
