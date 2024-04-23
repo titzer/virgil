@@ -29,6 +29,9 @@ class VariantPattern(scalars: Array<ScalarPattern>) {
 		}
 		return buf;
 	}
+	def copy() -> VariantPattern {
+		return VariantPattern.new(Arrays.map(scalars, ScalarPattern.copy));
+	}
 }
 
 // The normalization of a variant, including the mapping of its fields to bit ranges within scalars.
@@ -361,20 +364,62 @@ class VariantSolution {
 	var hasTagScalar = false;
 	var tagType: IntType;
 
+	var cachedScore = -1;
+
 	new(normFields, assignments, state, explicitTag, types) {}
 
 	def copy() -> VariantSolution {
-		return VariantSolution.new(
+		var vs = VariantSolution.new(
 			normFields,
-			copyMap(assignments),
-			Arrays.dup(state),
+			copyMap<CaseField, (int, Interval)>(assignments),
+			Arrays.map(state, VariantPattern.copy),
 			explicitTag,
 			Arrays.dup(types)
 		);
+		vs.tagType = tagType;
+		vs.hasIntervals = hasIntervals;
+		vs.hasTagScalar = hasTagScalar;
+		return vs;
+	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		for (i < normFields.length) {
+			if (i > 0) buf.csp();
+			buf.put1("c%d: [", i);
+			for (j < normFields[i].length) {
+				if (j > 0) buf.csp();
+				var cf = CaseField(i, j);
+				var field = normFields[i][j];
+				buf.put2("f%d=%q: ", j, field.render);
+
+				if (!assignments.has(cf)) {
+					buf.puts("?");
+				} else {
+					var a = assignments[cf], scalarIdx = a.0, interval = a.1;
+					if (interval == EMPTY_INTERVAL) buf.put1("#%d@?", scalarIdx);
+					else buf.put2("#%d@%q", scalarIdx, interval.render);
+				}
+			}
+			buf.puts("]");
+		}
+		buf.ln();
+		if (state != null) for (i < state.length) buf.put1("%q\n", state[i].render);
+		return buf;
 	}
 	def score() -> int {
-		// TODO
-		return 0;
+		if (cachedScore >= 0) return cachedScore;
+		// XXX: better score function
+		var total = types.length * 50;
+		total += if(!hasTagScalar, 100);
+		// estimate access cost
+		if (hasIntervals) {
+			for (i < normFields.length) {
+				for (j < normFields[i].length) {
+					var assn = assignments[CaseField(i, j)];
+					if (assn.1 != EMPTY_INTERVAL && assn.1.start > 0) total += 10;
+				}
+			}
+		}
+		return total;
 	}
 }
 def getTagLength(numCases: int) -> byte {
@@ -390,6 +435,8 @@ class VariantSolver(vnorm: VariantNormalizer) {
 	var fields = Vector<CaseField>.new(); // an ordering of fields to solve for during packing
 
 	var curSoln: VariantSolution;
+	var bestSoln: VariantSolution;
+
 	var assignments = HashMap<CaseField, (int, Interval)>.new(CaseField.hash, CaseField.==);
 	var baseState: Array<VariantPattern>;
 	var state: Array<VariantPattern>;
@@ -422,7 +469,7 @@ class VariantSolver(vnorm: VariantNormalizer) {
 
 		explicitTagLength = getTagLength(problem.normFields.length);
 		usePacking = problem.usePacking;
-		
+
 		if (problem.state != null) {
 			var numScalars = problem.state[0].scalars.length;
 			curRep.putn(vnorm.nc.UsedScalars, numScalars);
@@ -449,10 +496,10 @@ class VariantSolver(vnorm: VariantNormalizer) {
 				}
 			}
 		}
-		var solvable = tryRepresentationForField(0, 0);
-		return if(solvable, curSoln, null);
+		tryRepresentationForField(0, 0);
+		return bestSoln;
 	}
-	private def tryRepresentationForField(curCase: int, curField: int) -> bool {
+	private def tryRepresentationForField(curCase: int, curField: int) {
 		if (curCase >= normFields.length) {
 			// XXX: check distinguishable
 			return solvePacking();
@@ -463,7 +510,8 @@ class VariantSolver(vnorm: VariantNormalizer) {
 			for (i < curRep.length) curUsed.put(0);
 			return tryRepresentationForField(curCase + 1, 0);
 		}
-		if (assignments.has(CaseField(curCase, curField))) return tryRepresentationForField(curCase, curField + 1);
+		var cf = CaseField(curCase, curField);
+		if (assignments.has(cf) && assignments[cf].0 != -1) return tryRepresentationForField(curCase, curField + 1);
 		
 		var sc = vnorm.getScalar(normFields[curCase][curField]);
 		var bw = getBitWidth(normFields[curCase][curField]);
@@ -479,19 +527,19 @@ class VariantSolver(vnorm: VariantNormalizer) {
 
 			if (newRep != none) {
 				curUsed[i] += bw; curRep[i] = newRep;
-				assignments[CaseField(curCase, curField)] = (i, EMPTY_INTERVAL);
-				if (tryRepresentationForField(curCase, curField + 1)) return true;
+				assignments[cf] = (i, EMPTY_INTERVAL);
+				tryRepresentationForField(curCase, curField + 1);
+				assignments[cf] = (-1, EMPTY_INTERVAL);
 				curUsed[i] -= bw; curRep[i] = oldRep;
 			}
 		}
 
 		var len = curRep.length;
 		curRep.put(sc); curUsed.put(bw);
-		assignments[CaseField(curCase, curField)] = (curRep.length - 1, EMPTY_INTERVAL);
-		if (tryRepresentationForField(curCase, curField + 1)) return true;
+		assignments[cf] = (curRep.length - 1, EMPTY_INTERVAL);
+		tryRepresentationForField(curCase, curField + 1);
 		curRep.resize(len); curUsed.resize(len);
-
-		return false;
+		assignments[cf] = (-1, EMPTY_INTERVAL);
 	}
 	private def tryExplicitTaggingHeuristic() -> bool {
 		for (i < state[0].scalars.length) {
@@ -527,9 +575,8 @@ class VariantSolver(vnorm: VariantNormalizer) {
 		}
 		return false;
 	}
-	private def solvePacking() -> bool {
+	private def solvePacking() {
 		var cases = Array<VariantPattern>.new(normFields.length);
-
 		state = baseState;
 		if (state == null) {
 			// build up patterns from the individual cases
@@ -540,10 +587,9 @@ class VariantSolver(vnorm: VariantNormalizer) {
 			}
 			state = cases;
 		}
-
-		return solveField(0);
+		solveField(0);
 	}
-	private def solveField(idx: int) -> bool {
+	private def solveField(idx: int) {
 		if (idx >= fields.length) {
 			return checkDistinguishable();
 		}
@@ -556,15 +602,14 @@ class VariantSolver(vnorm: VariantNormalizer) {
 		var scalar = casePattern.scalars[scalarIdx];
 		var intervals = scalar.getIntervalsForSize(bw);
 
-		if (intervals.length == 0) return false;
+		if (intervals.length == 0) return;
 		for (interval in intervals) {
 			scalar.assignInterval(interval);
 			assignments[field] = (scalarIdx, interval);
 			var result = solveField(idx + 1);
-			if (result) return true;
+			assignments[field] = (scalarIdx, EMPTY_INTERVAL);
 			scalar.unassignInterval(interval);
 		}
-		return false;
 	}
 	private def getScalarPattern(s: Scalar) -> ScalarPattern {
 		// XXX: Should be based on scalar type
@@ -573,12 +618,19 @@ class VariantSolver(vnorm: VariantNormalizer) {
 	private def canDistinguish(active: Array<bool>) {
 		// TODO - this is where unassigned bits will get assigned
 	}
-	private def checkDistinguishable() -> bool {
+	private def updateSoln(soln: VariantSolution) {
+		if (bestSoln == null || bestSoln.score() > soln.score()) {
+			bestSoln = soln.copy();
+			// Terminal.put2("updating with soln[score=%d] %q\n", bestSoln.score(), bestSoln.render);
+		}
+	}
+	private def checkDistinguishable() {
 		if (normFields.length <= 1) {
 			var types = getTypes(false);
 			curSoln = VariantSolution.new(normFields, assignments, state, explicitTag, types);
 			curSoln.hasIntervals = usePacking;
-			return true; // single case is always distinguishable
+			updateSoln(curSoln);
+			return; // single case is always distinguishable
 		}
 
 		var packedTag: bool;
@@ -589,9 +641,19 @@ class VariantSolver(vnorm: VariantNormalizer) {
 		curSoln.tagType = Int.getType(false, getTagLength(normFields.length));
 		curSoln.hasTagScalar = !packedTag;
 		curSoln.hasIntervals = usePacking;
+		updateSoln(curSoln);
+
+		if (packedTag) {
+			// undo assignments
+			for (i < state.length) {
+				for (j < explicitTagLength) {
+					state[i].scalars[explicitTag.0].bits[explicitTag.1.start + j] = PackingBit.Unassigned;
+				}
+			}
+			explicitTag = (-1, EMPTY_INTERVAL);
+		}
 
 		// TODO: try difficult tagging
-		return true;
 	}
 	private def getTypes(useTagScalar: bool) -> Array<Type> {
 		var types = Array<Type>.new(curRep.length + if(useTagScalar, 1));
@@ -742,6 +804,8 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		var solution = solver.solve(problem);
 
 		if (solution == null) return false; // XXX: warn that no solution was found
+
+		Terminal.put1("solution=%q\n", solution.render);
 
 		var tagField: VariantField;
 		if (solution.hasTagScalar) tagField = VariantField.new(null, rn.norm(solution.tagType), [solution.types.length - 1]);
