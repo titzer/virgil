@@ -80,7 +80,7 @@ In Virgil layouts, field overlapping within a layout is strictly prohibited to p
 ```
 layout DeviceRegister {
        +0    command:   u16;    
-       +1    status:    u16;    // Overlaps, illeagal
+       +1    status:    u16;    // Overlaps, illegal
        =3;                    
 }
 ```

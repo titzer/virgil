@@ -24,12 +24,13 @@ var b = StringBuilder.new();
 - `.grow(size)` - Suggests a new capacity for the buffer to optimize performance.
 
 ### Advanced Data Handling
-- `.putk("substring", start, end)` - Adds a substring based on specified range.
+- `.putk("substring", start, end)` - Adds a substring from `{start}` to `{end}`.
+- `.putr(Range<byte>)` - Adds a range of bytes.
 - `.pad(char, length)` - Pads the buffer with a character up to a specified length.
 
 ### Utility Functions
 - `.ln()` - Appends a newline.
-- `.tab()` - Adds a tabulation character.
+- `.tab()` - Adds a tab.
 
 ### Method Chaining
 By returning `this` from most methods, `StringBuilder` allows chaining of method calls to streamline string building:
@@ -45,6 +46,11 @@ Supports format strings for simplifying complex string constructions:
 - `%s` for strings.
 - `%z` for booleans.
 - `%q` for custom callback functions that manipulate the `StringBuilder`.
+
+Usage:
+- `put1(fmt: string, p1: T1)` - Format a string, rendering `(1)` argument according to `{fmt}`.
+- `put2(fmt: string, p1: T1, p2: T2)` - Format a string, rendering `(2)` argument according to `{fmt}`.
+- `put3(fmt: string, p1: T1, p2: T2, p3: T3)` - Format a string, rendering `(3)` argument according to `{fmt}`.
 
 ## Example Usage in Practice
 ```virgil
