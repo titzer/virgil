@@ -3,21 +3,24 @@
 
 // The set of individually register-allocatable storage locations across all targets.
 // An individual target may support only a subset of scalars.
-enum Scalar(size: byte, ty: Type) {
-	B32(32, Int.getType(true, 32)),		// <= 32-bit non-references
-	B64(64, Int.getType(true, 64)),		// <= 64-bit non-references
-	F32(32, Float.FLOAT32),			// 32-bit floats
-	F64(64, Float.FLOAT64),			// 64-bit floats
-	R32(32, AnyRef.TYPE),			// <= 32-bit (possibly tagged) references
-	R64(64, AnyRef.TYPE),			// <= 64-bit (possibly tagged) references
-	Ref(64, AnyRef.TYPE),			// references of opaque size
+enum Scalar(size: byte, ty: Type, isRef: bool) {
+	B32(32, Int.getType(true, 32), false),	// <= 32-bit non-references
+	B64(64, Int.getType(true, 64), false),	// <= 64-bit non-references
+	F32(32, Float.FLOAT32, false),		// 32-bit floats
+	F64(64, Float.FLOAT64, false),		// 64-bit floats
+	R32(32, AnyRef.TYPE, true),		// <= 32-bit (possibly tagged) references
+	R64(64, AnyRef.TYPE, true),		// <= 64-bit (possibly tagged) references
+	Ref(64, AnyRef.TYPE, true),		// references of opaque size
 }
 def getScalarFromSet(s: Scalar.set) -> Scalar {
 	for (i in s) return i;
 	return Scalar.B32; // should be unreachable
 }
 def getTypeFromScalarSet(s: Scalar.set, usePacking: bool) -> Type {
-	for (i in s) return if(usePacking, IntRep.getType(i), i.ty);
+	for (i in s) {
+		if (i == Scalar.Ref) return AnyRef.TYPE;
+		return IntRep.getType(i);
+	}
 	return null;
 }
 
@@ -37,7 +40,9 @@ class VariantNorm extends TypeNorm {
 	def tag: VariantField;
 	var vecO: Array<Type>;
 	var fieldRanges: Array<(int, int)>; // (start, end) index for ClassAlloc instructions
-	
+
+	var pattern: VariantPattern;
+
 	var tagValue: int = -1;
 	var children: List<VariantNorm>;
 
@@ -79,6 +84,7 @@ class VariantNorm extends TypeNorm {
 // The field {indexes} indicates which scalars store the field.
 class VariantField(tn: TypeNorm, indexes: Array<int>) {
 	var intervals: Array<Interval>; // null, if no packing
+	
 	def isPacked() -> bool { return intervals != null; }
 
 	def render(buf: StringBuilder) -> StringBuilder {
@@ -169,7 +175,7 @@ def getTagLength(numCases: int) -> byte {
 	return i;
 }
 
-class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
+class VariantSolver(vnorm: VariantNormalizer, usePacking: bool, verbose: bool) {
 	var normFields: Array<Array<Type>>;
 
 	var fields = Vector<CaseField>.new(); // an ordering of fields to solve for during packing
@@ -185,6 +191,10 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 	var curUsed = Vector<byte>.new();
 	var bwCache = TypeUtil.newTypeMap<byte>();
 
+	private def isRef(t: Type) -> bool {
+		var scalar = getScalarFromSet(vnorm.getScalar(t));
+		return scalar.isRef;
+	}
 	private def getBitWidth(t: Type) -> byte {
 		if (bwCache.has(t)) return bwCache[t];
 		return bwCache[t] = vnorm.getBitWidth(t);
@@ -267,8 +277,9 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 
 			if (explicitTagLength > 0 && longest.size() >= explicitTagLength) {
 				for (j < state.length) {
+					var realTag = state.length - j - 1;
 					for (k < explicitTagLength) {
-						var bit = u1.!((j >> k) & 1);
+						var bit = u1.!((realTag >> k) & 1);
 						state[j].scalars[i].bits[longest.start + k] = PackingBit.Fixed(bit);
 					}
 				}
@@ -283,11 +294,20 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 		// build up patterns from the individual cases
 		for (i < normFields.length) {
 			var patterns = Array<ScalarPattern>.new(curRep.length);
-			for (j < curRep.length) patterns[j] = getScalarPattern(getScalarFromSet(curRep[j]));
+			for (j < curRep.length) {
+				var containsRef = false;
+				for (k < normFields[i].length) {
+					// XXX: Make this less indirect
+					if (assignments[CaseField(i, k)].0 == j && isRef(normFields[i][k])) containsRef = true;
+				}
+			
+				var s = getScalarFromSet(curRep[j]);
+				if (s.isRef && s != Scalar.Ref && vnorm.nc.RefPattern != null) patterns[j] = if(containsRef, vnorm.nc.RefPattern.ptrref, vnorm.nc.RefPattern.nonptrref).copy();
+				else patterns[j] = ScalarPattern.new(Array<PackingBit>.new(s.size));
+			}
 			cases[i] = VariantPattern.new(patterns);
 		}
 		state = cases;
-
 		return solveField(0);
 	}
 	private def solveField(idx: int) -> bool {
@@ -301,7 +321,9 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 		var casePattern = state[field.caseIdx];
 		var bw = vnorm.nc.GetBitWidth(vnorm.rn.ra.compiler, vnorm.rn.ra.prog, normFields[field.caseIdx][field.fieldIdx]);
 		var scalar = casePattern.scalars[scalarIdx];
-		var intervals = scalar.getIntervalsForSize(bw);
+
+		var isRef = isRef(normFields[field.caseIdx][field.fieldIdx]);
+		var intervals = if(isRef && vnorm.nc.RefPattern != null, [vnorm.nc.RefPattern.refInterval], scalar.getIntervalsForSize(bw));
 
 		if (intervals.length == 0) return false;
 		for (interval in intervals) {
@@ -312,10 +334,6 @@ class VariantSolver(vnorm: VariantNormalizer, usePacking: bool) {
 			scalar.unassignInterval(interval);
 		}
 		return false;
-	}
-	private def getScalarPattern(s: Scalar) -> ScalarPattern {
-		// XXX: Should be based on scalar type
-		return ScalarPattern.new(Array<PackingBit>.new(s.size));
 	}
 	private def canDistinguish(active: Array<bool>) {
 		// TODO - this is where unassigned bits will get assigned
@@ -448,10 +466,11 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		var normFields = getNormFieldsForCase(rc);
 		var shouldPack = rc.orig.packed;
 
-		var solver = VariantSolver.new(this, shouldPack);
+		var solver = VariantSolver.new(this, shouldPack, verbose);
 		var solution = solver.solve([normFields]);
 
 		var vn = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(solution.types)), solution.types, rc.variantFields, null);
+		if (solution.hasIntervals) vn.pattern = solution.state[0];
 
 		vn.fieldRanges = rc.fieldRangesO;
 		vn.vecO = rc.vecO;
@@ -522,7 +541,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		var shouldPack = rc.orig.packed;
 		var needsTagScalar = !shouldPack;
 		
-		var solver = VariantSolver.new(this, shouldPack);
+		var solver = VariantSolver.new(this, shouldPack, verbose);
 		var solution = solver.solve(normFields);
 		if (solution == null) return false; // XXX: warn that no solution was found
 
@@ -542,7 +561,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		caseIdx = 0;
 		for (l = rc.children; l != null; l = l.tail) {
 			var child = l.head;
-			setVariantFields(child, caseIdx++, solution);
+			setVariantFields(child, caseIdx, solution);
 
 			var vn = VariantNorm.new(child.oldType, newType, solution.types, child.variantFields, tagField);
 			vn.fieldRanges = child.fieldRangesO;
@@ -552,6 +571,9 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 			
 			parentNorm.children = List<VariantNorm>.new(vn, parentNorm.children);
 			if (verbose) Terminal.put1("  %q\n", vn.render);
+			if (solution.hasIntervals) vn.pattern = solution.state[caseIdx];
+
+			caseIdx++;
 		}
 		printNorm(rc, parentNorm);
 		return true;
@@ -588,6 +610,7 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 			}
 		}
 		buf.outln();
+		if (vn.pattern != null) buf.purple().put1("                  %q\n", vn.pattern.render).end();
 		buf.outt();
 	}
 	private def printNorm(rc: RaClass, vn: VariantNorm) {
@@ -600,11 +623,8 @@ class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbos
 		}
 		buf.puts("]\n");
 
-		if (rc.children == null) {
-			printSingleNorm(rc, vn);
-		} else {
-			for (l = rc.children; l != null; l = l.tail) printSingleNorm(l.head, l.head.variantNorm);
-		}
+		if (rc.children == null) printSingleNorm(rc, vn);
+		else for (l = rc.children; l != null; l = l.tail) printSingleNorm(l.head, l.head.variantNorm);
 	}
 	private def printNoUnboxReason(rc: RaClass, recursive: bool, closure: bool) -> bool {
 		if (PRINT_PACKING) {
