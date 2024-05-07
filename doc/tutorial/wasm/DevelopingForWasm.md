@@ -182,5 +182,5 @@ Export[3]:
 
 ```
 
-A fully functional example of how to use Virgil to create Wasm for the Web can be see in the [WebMandelbrot application](apps/WebMandelbrot).
+A fully functional example of how to use Virgil to create Wasm for the Web can be see in the [WebMandelbrot application](../../../apps/WebMandelbrot).
 Of course, using the import/export mechanism of Virgil, we can define programs that use any core Wasm API, including WASI!
