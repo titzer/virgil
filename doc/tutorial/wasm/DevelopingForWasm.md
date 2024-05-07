@@ -116,7 +116,7 @@ One drawback to the Wasm target is that it does not yet print source-level stack
 > Stacktrace on Wasm target (running on node):
 ```
 % v3c-wave -symbols NullCheck.v3
-% ./NullCheck
+% node virgil/rt/wave/wave.node.js NullCheck.wasm
 wasm://wasm/9875f20a:1
 
 
@@ -133,7 +133,7 @@ RuntimeError: unreachable
     at node:internal/main/run_main_module:17:47
 ```
 
-Note that safety checks such as `NullCheck` and `BoundsCheck` may show up as "unreachable" on Wasm targets.
+Note that Virgil safety check errors such as `NullCheckException` and `BoundsCheckException` may show up as "unreachable" on Wasm targets.
 
 ## Defining your own Wasm imports
 
@@ -182,5 +182,5 @@ Export[3]:
 
 ```
 
-A fully functional example of how to use Virgil to create Wasm for the Web can be see in the (WebMandelbrot application)[apps/WebMandelbrot].
+A fully functional example of how to use Virgil to create Wasm for the Web can be see in the [WebMandelbrot application](apps/WebMandelbrot).
 Of course, using the import/export mechanism of Virgil, we can define programs that use any core Wasm API, including WASI!
