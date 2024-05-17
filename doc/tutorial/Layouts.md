@@ -74,6 +74,25 @@ var last = str.name[str.length - 1];     // access is dynamically bounds-checked
 Repeated fields allow expressing fixed-size arrays inside a layout.
 Accesses to repeated fields are indexed with `[]` and the index is bounds-checked against the statically-declared number of elements in the field.
 
+## Field Overlapping and Memory Skipping in Layouts
+In Virgil layouts, field overlapping within a layout is strictly prohibited to prevent data corruption and ensure data integrity. Each field must have a unique, non-overlapping byte offset. 
+
+```
+layout DeviceRegister {
+       +0    command:   u16;    
+       +1    status:    u16;    // Overlaps, illegal
+       =3;                    
+}
+```
+However, Virgil layouts allow skipping regions of memory within the layout.
+```
+layout DeviceRegister {
+       +0    command:   u16;    // Command field, 2 bytes
+       // skipped 2 bytes
+       +4    status:    u16;    // Status field, 2 bytes
+       =6;                       // Total size = 6 bytes
+}
+```
 ## Overlaying layouts on byte arrays (`Ref.at` and `Ref.of`)
 
 A layout in Virgil is not a data structure, but instead a view on underlying storage.
