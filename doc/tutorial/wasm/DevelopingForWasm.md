@@ -32,15 +32,15 @@ Code Disassembly:
 
 Thus, we can generate standalone (we might say *barebones*) Wasm programs from Virgil easily.
 
-## The `v3c-wave` script
+## The `v3c-wasm-wave` script
 
 For larger Virgil programs, a more complete Wasm solution is needed.
 For example, as seen in other tutorials, Virgil offers a small set of system APIs supported on all targets via the `System` component, which offers basics like standard in/out and file access.
 This is a minimum for command-line utilities such as the compiler itself.
 
-The `v3c-wave` script offers a nearly feature-complete target for Wasm.
-This "wave" target stands for "WebAssembly Virgil Environment" and compiles Virgil to WebAssembly using a small set of Wasm imports tailored to Virgil's needs.
-The `v3c-wave` script mirrors the `v3c-x86-linux` and other target scripts and compiles your program along with a runtime system, garbage collector, and `System` implementation into a `.wasm` module that can be run on both `node` and `Wizard`.
+The `v3c-wasm-wave` script offers a nearly feature-complete target for Virgil on Wasm.
+This "wave" target stands for "(W)eb(A)ssembly (V)irgil (E)nvironment" and compiles Virgil to WebAssembly using a small set of Wasm imports tailored to Virgil's needs.
+The `v3c-wasm-wave` script mirrors the `v3c-x86-linux` and other target scripts and compiles your program along with a runtime system, garbage collector, and `System` implementation into a `.wasm` module that can be run on both `node` and `Wizard`.
 
 > HelloWorld.v3
 ```
@@ -52,7 +52,7 @@ def main() {
 This program can be compiled easily:
 
 ```
-% virgil/bin/dev/v3c-wave HelloWorld.v3
+% virgil/bin/dev/v3c-wasm-wave HelloWorld.v3
 % ls HelloWorld*
 HelloWorld	HelloWorld.v3	HelloWorld.wasm
 ```
@@ -71,13 +71,13 @@ Note that we can also run `HelloWorld.wasm` on `node` using a helper script `wav
 The JavaScript helper code is in `virgil/rt/wave` and contains the implementation of imported functions.
 
 ```
-% node virgil/rt/wave/wave.node.js ./HelloWorld.wasm
+% node virgil/rt/wasm-wave/wave.node.js ./HelloWorld.wasm
 Hello World!
 ```
 
 (Note that the shell script wrapper can be edited, either manually or automatically, to run `node` with the JavaScript helper).
 
-### Stacktraces on the `v3c-wave` target
+### Stacktraces on the `v3c-wasm-wave` target
 
 The "wave" target for Virgil is *nearly* feature complete.
 It offers the standard I/O features of `System` as well as a runtime system with a precise, moving garbage collector.
@@ -103,7 +103,7 @@ One drawback to the Wasm target is that it does not yet print source-level stack
 
 > Stacktrace on Wasm target (running on Wizard):
 ```
-% v3c-wave -symbols NullCheck.v3
+% v3c-wasm-wave -symbols NullCheck.v3
 % ./NullCheck
 <wasm func ".entry"> +6
   <wasm func "NullCheck.main"> +3
@@ -115,8 +115,8 @@ One drawback to the Wasm target is that it does not yet print source-level stack
 
 > Stacktrace on Wasm target (running on node):
 ```
-% v3c-wave -symbols NullCheck.v3
-% node virgil/rt/wave/wave.node.js NullCheck.wasm
+% v3c-wasm-wave -symbols NullCheck.v3
+% node virgil/rt/wasm-wave/wave.node.js NullCheck.wasm
 wasm://wasm/9875f20a:1
 
 
@@ -124,7 +124,7 @@ RuntimeError: unreachable
     at NullCheck.sum (<anonymous>:wasm-function[9]:0x28d)
     at NullCheck.main (<anonymous>:wasm-function[6]:0x188)
     at .entry (<anonymous>:wasm-function[5]:0x17d)
-    at Object.<anonymous> (/Users/titzer/virgil/rt/wave/wave.node.js:91:20)
+    at Object.<anonymous> (/Users/titzer/virgil/rt/wasm-wave/wave.node.js:91:20)
     at Module._compile (node:internal/modules/cjs/loader:1092:14)
     at Object.Module._extensions..js (node:internal/modules/cjs/loader:1121:10)
     at Module.load (node:internal/modules/cjs/loader:972:32)
