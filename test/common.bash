@@ -438,9 +438,9 @@ function convert_to_io_target() {
     if [ "$target" = "jvm" ]; then
 	target=jar
     elif [ "$target" = "wasm-js" ]; then
-	target=wave
+	target=wasm-wave
     elif [ "$target" = "wasm-spec" ]; then
-	target=wave
+	target=wasm-wave
     fi
     echo $target
 }

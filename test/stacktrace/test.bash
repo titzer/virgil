@@ -9,7 +9,7 @@ fi
 
 for target in $TEST_TARGETS; do
     target=$(convert_to_io_target $target)
-    if [ "$target" = "wave" ]; then
+    if [ "$target" = "wasm-wave" ]; then
         continue # TODO: stacktrace tests for wave
     elif [ "$target" = "jar" ]; then
         continue # TODO: stacktrace tests for jar
