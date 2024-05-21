@@ -7,10 +7,11 @@ else
 	TESTS=*.v3
 fi
 
-for target in $TEST_TARGETS; do
-    target=$(convert_to_io_target $target)
+for target in $(get_io_targets); do
     if [ "$target" = "wasm-wave" ]; then
-        continue # TODO: stacktrace tests for wave
+        continue # TODO: stacktrace tests for wasm-wave
+    elif [ "$target" = "wasm-linux" ]; then
+        continue # TODO: stacktrace tests for wasm-linux
     elif [ "$target" = "jar" ]; then
         continue # TODO: stacktrace tests for jar
     fi

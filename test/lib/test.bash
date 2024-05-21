@@ -58,11 +58,10 @@ function do_compiled() {
     fi
 }
 
-for target in $TEST_TARGETS; do
+for target in $(get_io_targets); do
     if [ "$target" = v3i ]; then
 	do_v3i
     else
-	target=$(convert_to_io_target $target)
 	do_compiled
     fi
 done

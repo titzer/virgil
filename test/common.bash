@@ -433,16 +433,23 @@ function compile_aeneas() {
     fi
 }
 
-function convert_to_io_target() {
-    target=$1
-    if [ "$target" = "jvm" ]; then
-	target=jar
-    elif [ "$target" = "wasm-js" ]; then
-	target=wasm-wave
-    elif [ "$target" = "wasm-spec" ]; then
-	target=wasm-wave
-    fi
-    echo $target
+function get_io_targets() {
+    result=""
+    for target in $TEST_TARGETS; do
+	case $target in
+	    jvm)
+		result="$result jar"
+		;;
+	    wasm-js)
+		;&
+	    wasm-spec)
+		result="$result wasm-wave" #TODO: wasm-linux
+		;;
+	    *)
+		result="$result $target"
+	esac
+    done
+    echo $result
 }
 
 function is_gc_target() {

@@ -11,10 +11,9 @@ fi
 ALL_TARGETS=""
 
 # expand targets to include the -nogc and -nort versions
-for target in $TEST_TARGETS; do
-    target=$(convert_to_io_target $target)
-    if [ "$target" = "wave" ]; then
-	ALL_TARGETS="$ALL_TARGETS wave wave-nogc"
+for target in $(get_io_targets); do
+    if [ "$target" =~ ^wasm ]; then
+	ALL_TARGETS="$ALL_TARGETS $target $target-nogc"
     elif [ "$target" = "v3i" ]; then
 	ALL_TARGETS="$ALL_TARGETS v3i v3i-ra"
     elif [[ "$target" =~ ^x86 ]]; then
