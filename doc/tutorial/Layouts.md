@@ -168,11 +168,11 @@ Some file and network formats, or layouts specified by a kernel on a big-endian 
 To support this, Virgil has a `#big-endian` modifier for both layouts and fields that overrides the default.
 The Virgil compiler will transparently perform endianness conversion when reading and writing these fields.
 
-## Future extensions: off-heap layouts
+## Off-heap layouts
 
 Layouts allow a Virgil program to specify an exact layout of a data structure that uses primitive data.
 As we saw, layouts are used with `Ref<L>` to overlay a view on an underlying byte array (or range).
 They are particularly useful for dealing with hardware and software that have binary data structures, like an underlying OS kernel.
 Often, these data structures are not, and can't be, in the Virgil heap or Virgil byte arrays, which may be moved at any time by the Virgil GC.
-In the future, Virgil will support using `Ref<L>` to refer to data that is stored off-heap.
-Thus, the same ergonomic usage applies, and most code can be written to be entirely agnostic of whether the data they manipulate through references is stored in the heap or off of the heap!
+With off-heap `Range` types, Virgil now supports using `Ref<L>` to refer to data that is stored off-heap, e.g. in the execution stack or memory-mapped files, shared memory, etc.
+This allows Virgil code to be written agnostic of whether the data they manipulate through references is stored in the heap or off of the heap!
