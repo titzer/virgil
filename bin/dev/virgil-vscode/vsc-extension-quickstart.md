@@ -27,3 +27,7 @@
 
 * To start using your extension with Visual Studio Code copy it into the `<user home>/.vscode/extensions` folder and restart Code.
 * To share your extension with the world, read on https://code.visualstudio.com/docs about publishing an extension.
+
+## To rebuild the extension
+
+* Since virgil wants to stay minimal. Not all required files are in the current directory (especially in tree-sitter-virgil). You can unzip the `virgil-0.0.1.vsix` file and it will contain all the necessary files to rebuild the extension.
