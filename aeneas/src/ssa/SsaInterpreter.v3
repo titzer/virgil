@@ -46,7 +46,37 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 		if (printer != null) traceInstr(i);
 		match (i) {
 			x: SsaApplyOp => {
-				return doOp(x);
+				var n = SsaInstr.!(x.next);
+				// Set up arguments to Eval.doOp
+				args.typeArgs = x.op.typeArgs;
+				var inputs = x.inputs, arity = inputs.length;
+				var a = args.vals_storage;
+				if (arity > a.length) a = args.vals_storage = Array.new(a.length + arity + 16);
+				for (j < arity) a[j] = getVal(inputs[j].dest);
+				args.vals = a[0 ... arity];
+				// Evaluate the operator
+				var r = Eval.doOp(x.op, args);
+				if (tailCalled) {
+					tailCalled = false;
+					return frame.ip; // pushed a frame, {frame.ip} is already correct
+				}
+				if (exception != null) r = exception;
+				match (r) {
+					y: Exception => {
+						this.exception = y;
+						if (printer != null) { printer.buf.put1("= !%s", y.error).ln(); printer.flush(); }
+						frame = null;
+					}
+					y: Val => {
+						setVal(i, y);
+						if (printer != null && !tailCalled) putEqVal(y, x.op.sig.returnType());
+					}
+					null => {
+						setVal(i, null);
+						if (printer != null && !tailCalled) putEqVal(null, x.op.sig.returnType());
+					}
+				}
+				return n;
 			}
 			x: SsaPhi => {
 				return SsaInstr.!(i.next);
@@ -57,13 +87,13 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 			x: SsaIf =>  {
 				var cond = getVal(x.inputs[0].dest), taken = Bool.unbox(cond);
 				var which = if(taken, 0, 1);
-				return doGoto(x.succs[which]);
+				return doGoto(x.succs[which]); // XXX: destination should not have phis if edge-split
 			}
 			x: SsaSwitch => {
 				var key = getVal(x.inputs[0].dest);
 				var which = Int.unbox(key);
 				if (u32.view(which) >= u32.view(x.succs.length)) which = x.succs.length - 1;
-				return doGoto(x.succs[which]);
+				return doGoto(x.succs[which]); // XXX: destination should not have phis if edge-split
 			}
 			x: SsaReturn => {
 				var r: Val;
@@ -81,14 +111,14 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 					retVal = r;
 					return null;
 				} else {
-					frame = frame.prev;
+					this.args.frame = frame = frame.prev;
 					setVal(frame.ip, r);
 					return SsaInstr.!(frame.ip.next);
 				}
 			}
 			x: SsaThrow => {
 				exception = Exception.new(x.exception, null, getStackTrace(x.source));
-				unwind();
+				frame = null;
 				return null;
 			}
 			x: SsaParam, x: SsaCheckpoint, x: SsaNewVar, x: SsaDeleteVar, x: SsaUpdateVar => {
@@ -172,51 +202,22 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 		if (frame.fp + g.numValues >= values.length) values = Arrays.grow(values, INITIAL_VALUES + values.length * 2);
 	}
 	private def doGoto(target: SsaCfEdge) -> SsaInstr {
-		var block = frame.block = target.dest;
+		var block = frame.block = target.dest, di = target.desti;
 		var next: SsaInstr;
 		for (i = block.next; i != block; i = i.next) {
 			match (i) {
-				x: SsaPhi => phiMoves.put(x, getVal(x.inputs[target.desti].dest));
+				x: SsaPhi => phiMoves.put(x, getVal(x.inputs[di].dest));
 				x: SsaInstr => { next = x; break; }
 				_ => return fail("no SsaInstr successor");
 			}
 		}
 		// apply deferred phi moves
-		for (i < phiMoves.length) setVal(phiMoves[i]);
-		phiMoves.resize(0);
-		return if(next != null, next, fail("fell off the end of the block"));
-	}
-	private def doOp(i: SsaApplyOp) -> SsaInstr {
-		var n = SsaInstr.!(i.next);
-		// Set up arguments to Eval.doOp
-		args.frame = frame;
-		args.typeArgs = i.op.typeArgs;
-		var inputs = i.inputs;
-		var v = args.growVals(inputs.length);
-		for (j < inputs.length) v[j] = getVal(inputs[j].dest);
-		// Evaluate the operator
-		var r = Eval.doOp(i.op, args);
-		if (tailCalled) {
-			tailCalled = false;
-			return frame.ip; // pushed a frame, {frame.ip} is already correct
+		var max = phiMoves.length;
+		if (max > 0) {
+			for (i < max) setVal(phiMoves[i]);
+			phiMoves.resize(0);
 		}
-		if (exception != null) r = exception;
-		match (r) {
-			x: Exception => {
-				this.exception = x;
-				if (printer != null) { printer.buf.put1("= !%s", x.error).ln(); printer.flush(); }
-				unwind();
-			}
-			x: Val => {
-				setVal(i, x);
-				if (printer != null && !tailCalled) putEqVal(x, i.op.sig.returnType());
-			}
-			null => {
-				setVal(i, null);
-				if (printer != null && !tailCalled) putEqVal(null, i.op.sig.returnType());
-			}
-		}
-		return n;
+		return next;
 	}
 	private def fail<T>(msg: string) -> T {
 		var d: T;
@@ -225,7 +226,7 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 			if (frame != null) {
 				if (frame.ip != null) buf.put1(", near @%d", frame.ip.uid);
 				if (frame.block != null) buf.put1(", in block #%d", frame.block.uid);
-				unwind();
+				frame = null;
 			}
 			exception = Exception.new("SsaEvalInternalError", buf.toString(), getStackTrace(null));
 			if (CLOptions.FATAL.val) System.error(exception.error, exception.msg);
@@ -257,7 +258,7 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 			f = prev.next;
 			if (f == null) f = prev.next = SsaIntFrame.new(prev);
 		}
-		frame = f;
+		this.args.frame = frame = f;
 		var meth = spec.asMethod();
 		f.spec = spec;
 		var ssa = meth.ssa;
@@ -322,9 +323,6 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 				printer.buf.puthashv(arg, param.getType());
 			}
 		}
-	}
-	def unwind() {
-		frame = null;
 	}
 }
 class SsaIntArguments(prog: Program) extends Arguments {
