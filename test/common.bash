@@ -441,7 +441,8 @@ function get_io_targets() {
 		result="$result jar"
 		;;
 	    wasm-js)
-		;&
+		result="$result wasm-wave" #TODO: wasm-linux
+		;;
 	    wasm-spec)
 		result="$result wasm-wave" #TODO: wasm-linux
 		;;
