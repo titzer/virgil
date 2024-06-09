@@ -56,7 +56,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	var ovfAlloc: OverflowFieldAllocator;
 
 	var vn: VariantNormalizer;
-	var variantInterp = SsaInterpreter.new(ra.prog, null); // interpreter to normalize records
+	var variantInterp = SsaInterpreter.new(ra.prog, null).setTrace(CLOptions.TRACE.get()); // interpreter to normalize records
 
 	new() { vn = VariantNormalizer.new(config, this, CLOptions.PRINT_RA.get()); }
 
@@ -106,7 +106,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				var oldRecord = rc.instances.head;
 				newRecord = ra.prog.newRecord(tn.newType, rc.liveFields.length);
 				complexRecordMap[oldRecord] = NO_VALUES;
-				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord.values));
+				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
 			}
 			ra.prog.setComponentRecord(comp, newRecord);
 		} else if (!rc.isUnboxed()) {
@@ -114,7 +114,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			for (l = rc.instances; l != null; l = l.tail) {
 				var oldRecord = l.head, newRecord = ra.prog.newRecord(tn.newType, rc.liveFields.length);
 				recordMap[oldRecord] = newRecord;
-				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord.values));
+				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
 			}
 		} else {
 			// synthesize a component type for flattened data types and variants
@@ -348,15 +348,6 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		rc.liveFields = fields.extract();
 	}
 	private def normRecordAsArray(rc: RaClass, oldRecord: Record, array: Array<Val>) {
-		var rfs = rc.fields;
-		for (i < rfs.length) {
-			var rf = rfs[i];
-			if (rf != null && rf.normIndices.0 >= 0) {
-				var v = oldRecord.values[i];
-				if (rf.fieldType == null) array[rf.normIndices.0] = normSimpleVal(null, v);
-				else normValIntoArray(v, rf.typeNorm, array, rf.normIndices.0);
-			}
-		}
 	}
 	private def getClassAllocIr(vn: VariantNorm) -> IrMethod {
 		var context = SsaContext.new(ra.compiler, ra.prog);
@@ -365,7 +356,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		var params = Array<SsaParam>.new(meth.sig.paramTypes.length + 1);
 		var inputs = Array<SsaInstr>.new(meth.sig.paramTypes.length);
 		params[0] = SsaParam.new(0, vn.oldType);
-		for (i < inputs.length) inputs[i] = params[i + 1] = SsaParam.new(i, meth.sig.paramTypes[i]);
+		for (i < inputs.length) inputs[i] = params[i + 1] = SsaParam.new(i + 1, meth.sig.paramTypes[i]);
 
 		meth.ssa = SsaGraph.new(params, meth.sig.returnType());
 		context.enterMethod(meth);
@@ -380,26 +371,61 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 
 		return meth;
 	}
-	def normalizeRecord(rc: RaClass, vn: VariantNorm, input: Array<Val>, output: Array<Val>) {
-		if (rc.orig.methods[0] == null || rc.orig.methods[0].source != null) rc.orig.methods[0] = getClassAllocIr(vn); // source != null means the original, generated constructor is still present
-		var result = variantInterp.invoke(Closure.new(Values.BOTTOM, IrSpec.new(vn.oldType, null, rc.orig.methods[0])), input);
-		match (result) {
-			x: TupleVal => for (i < x.values.length) output[i] = x.values[i];
-			x: Val => output[0] = x;
-		}
+	// normalize an old record of a class into a new record of a class
+	def normClassRecord(rc: RaClass, oldRecord: Record, newRecord: Record) {
+		normalizeFields(rc.fields, oldRecord.values, newRecord.values);
 	}
-	// normalize a live instance of a class
-	def normClassRecord(rc: RaClass, oldRecord: Record, array: Array<Val>) {
-		var vrc = ra.getClass(oldRecord.rtype), vn = vrc.variantNorm;
-		if (vn == null) return normRecordAsArray(rc, oldRecord, array);
+	// normalize an old record of a variant into a (potentially unboxed) array of values
+	def normVariantRecord(vn: VariantNorm, oldRecord: Record) -> Array<Val> {
+		var result = complexRecordMap[oldRecord];
+		if (result != null) return result;
+		result = Array<Val>.new(vn.size);
 
+		var rc = ra.getClass(oldRecord.rtype);
+		vn = VariantNorm.!(norm(oldRecord.rtype));
 		if (vn.isEnum()) {
-			array[vn.tagIndex()] = Int.box(vn.tagValue);
-			return;
+			return complexRecordMap[oldRecord] = [Int.box(vn.tagValue)];
+		} else if (rc.isUnboxed()) {
+			var inputs = Vector<Val>.new().grow(rc.liveFields.length); // XXX: cache cumulative normalized size
+			var ofs = rc.orig.fields;
+			for (i < ofs.length) {
+				var rf = rc.fields[i];
+				if (rf != null && rf.normIndices.0 >= 0) { // live field
+					var pos = inputs.length, size = rf.normIndices.1 - rf.normIndices.0;
+					inputs.resize(pos + size);
+					normValIntoArray(oldRecord.values[i], rf.typeNorm, inputs.array, pos);
+				} else { // dead field, supply bottoms
+					var ft = ofs[i].fieldType;
+					if (ft.open()) ft = ft.substitute(V3.getTypeArgs(vn.oldType));
+					var tn = norm(ft);
+					inputs.putn(Values.BOTTOM, tn.size);
+				}
+			}
+
+			// Unboxed variants might require some type conversions; generate and run the constructor to do so.
+			var constructor = rc.orig.methods[0];
+			if (constructor == null || constructor.source != null) constructor = rc.orig.methods[0] = getClassAllocIr(vn);
+			var r = variantInterp.invoke(Closure.new(Values.BOTTOM, IrSpec.new(vn.oldType, TypeUtil.NO_TYPES, constructor)), inputs.extract());
+			match (r) {
+				x: TupleVal => for (i < x.values.length) result[i] = x.values[i];
+				x: Val => result[0] = x;
+			}
 		} else {
-			var input = Array<Val>.new(vn.vecO.length);
-			normRecordAsArray(vrc, oldRecord, input);
-			normalizeRecord(vrc, vn, input, array);
+			var newRecord = ra.prog.newRecord(vn.newType, rc.liveFields.length);
+			normalizeFields(rc.fields, oldRecord.values, newRecord.values);
+			recordMap[oldRecord] = newRecord;
+			result[0] = newRecord;
+		}
+		return complexRecordMap[oldRecord] = result;
+	}
+	def normalizeFields(rfs: Array<RaField>, oldVals: Array<Val>, newVals: Array<Val>) {
+		for (i < rfs.length) {
+			var rf = rfs[i];
+			if (rf != null && rf.normIndices.0 >= 0) {
+				var v = oldVals[i];
+				if (rf.fieldType == null) newVals[rf.normIndices.0] = normSimpleVal(null, v);
+				else normValIntoArray(v, rf.typeNorm, newVals, rf.normIndices.0);
+			}
 		}
 	}
 	// normalize the live instances of a simple (i.e. size-1 element) array type
@@ -429,9 +455,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	def normSimpleVal(tn: TypeNorm, v: Val) -> Val {
 		match (v) {
 			x: Record => {
-				if (VariantNorm.?(tn) && VariantNorm.!(tn).isEnum()) return normVariantVal(VariantNorm.!(tn), x)[0];
 				var r = recordMap[x];
-				return if(r == null, x, r);
+				if (r != null) return r;
+				if (VariantNorm.?(tn)) return normVariantRecord(VariantNorm.!(tn), x)[0];
+				return x;
 			}
 			_ => return v;
 		}
@@ -529,8 +556,8 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				var simple = recordMap[x];
 				if (simple != null) return (array[index] = simple, ()).1;
 				if (VariantNorm.?(tn)) {
-					// flattened data type
-					var result = normVariantVal(VariantNorm.!(tn), x);
+					// potentially flattened data type
+					var result = normVariantRecord(VariantNorm.!(tn), x);
 					for (i < result.length) array[index + i] = result[i];
 				} else {
 					var result = complexRecordMap[x];
@@ -565,14 +592,6 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			}
 			_ => if (index < array.length) array[index] = v;
 		}
-	}
-	def normVariantVal(vn: VariantNorm, x: Record) -> Array<Val> {
-		var result = complexRecordMap[x];
-		if (result != null) return result;
-		result = Array.new(vn.size);
-		complexRecordMap[x] = result; // skip this work next time
-		normClassRecord(ra.getClass(vn.oldType), x, result);
-		return result;
 	}
 	def normalizeMethodRef(spec: IrSpec) -> (RaMethod, IrSpec) {
 		// XXX: canonicalize normalized IrSpecs
