@@ -161,6 +161,24 @@ var c: Range<(int, int)> = [(33, 44)];
 
 Virgil ranges, like Virgil arrays, are _not_ co-variantly typed. See the section on [variance](Variance.md) for more details.
 
+## Off-heap `Range`s
+
+Ranges allow a Virgil program to represent references to part of an `Array`.
+As we saw above, this comes with a lot of advantages, like syntactic convenience and robustness.
+Yet Ranges also have another superpower: they can point to off-heap data.
+An off-heap `Range` can be made through the unsafe operation `CiRuntime.forgeRange`, as shown below.
+After creation, such a Range can be used anywhere in the program, which allow Virgil code to be written agnostic of whether the data they manipulate through references is stored in the heap or off of the heap!
+
+```
+var length = 1024;
+var ptr = Linux.syscall(SYS_mmap, (... length));     // memory-map file and return its address
+var range = CiRuntime.forgeRange<byte>(ptr, length); // refer to raw memory as a range
+var h = hash(range);
+def hash(x: Range<byte>) -> int {
+    ...
+}
+```
+
 ## Performance expectations
 
 Ranges in Virgil are effectively tuples of three values: an underlying array, a start index, and a length.
