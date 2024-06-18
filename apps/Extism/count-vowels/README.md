@@ -1,6 +1,6 @@
-# examples/count-vowels
+# CountVowels
 
-The `count-vowels.wasm` plugin can be run from the top-level of the repo by
+The `CountVowels.wasm` plugin can be run from the top-level of the repo by
 typing:
 
 ```bash
@@ -10,5 +10,3 @@ $ ./scripts/python-server.sh
 
 Then open your browser window to:
 http://localhost:8080/examples/count-vowels
-
-![count-vowels demo](count-vowels-demo.png)
