@@ -5,6 +5,8 @@ Here are a few [Extism] plugins written using the Virgil programming language.
 [Extism]: https://extism.org/
 
 * [greet](greet)
+* [count-vowels](count-vowels)
+* [http-get](http-get)
 
 ## Build
 
@@ -17,7 +19,7 @@ $ ./build.sh
 
 ## Run
 
-To run the examples with the [Extism CLI], type:
+To run all the examples with the [Extism CLI], type:
 
 ```bash
 $ ./run.sh
