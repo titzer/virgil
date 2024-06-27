@@ -1,4 +1,4 @@
-/* 
+/*
  * Ideas for programmable meta objects and meta classes.
  * Instead of using the vague and slightly intimidating "meta" word, we'll use "model".
  */
@@ -125,4 +125,230 @@ private enum JetEngineDesign {
 // Private means it cannot be named outside this file.
 private model JetCar.model(jet: JetEngineDesign) extends Car.model(2) {
 	// JetCar instances are not special (i.e. no subclass of Car). Only the model is special.
+}
+
+
+
+/*
+ * Example B: modeling Wasm GC objects in V3 implementation and Native.
+ * 1. Wasm structs and arrays have declarations that have finality, a super type, and fields or element types.
+ * 2. Every wasm struct or array instance refers to its declaration.
+ * 3. On native targets, we want to allow storing the fields in an extension of a struct or array instance.
+ * 4. We want to optimize space by collapsing Virgil's metadata with our model classes, i.e. allow the
+      model class instance to serve as the metaobject.
+ */
+
+// The superclass of both host and wasm objects.
+class Object {
+	def render(buf: StringBuilder) -> StringBuilder;
+}
+
+// The superclass of all host objects.
+class HostObject extends Object {
+	def render(buf: StringBuilder) -> StringBuilder;
+}
+
+// Superclass of all module-level declarations.
+class Decl {
+}
+
+// Superclass of all heap type declarations. All heap types are (or should be) canonicalized.
+model HeapType.decl(final: bool, superTypes: Array<HeapTypeDecl>) extends Decl {
+	def var canon_id: int;			// computed during canonicalization
+}
+
+// Signatures are heap types.
+model Sig.decl extends HeapType.decl {
+	def paramTypes: Array<ValueType>;
+	def resultTypes: Array<ValueType>;
+	new(final: bool, superTypes: Array<HeapTypeDecl>, paramTypes, resultTypes) super(final, superTypes) { }
+}
+
+// All wasm objects have to come from a declaration.
+// Here we use a model class to represent declarations, and instances of the declaration are inside.
+model WasmObject.decl extends HeapType.decl {
+	new(final: bool, superTypes: Array<HeapTypeDecl>) super(final, superTypes) { }
+
+	// WasmObject is the supertype of all wasm objects.
+	class WasmObject extends Object {
+	}
+}
+
+// All wasm struct instances come from a declaration.
+// A struct declaration has the finality, the supertypes, and the field types.
+// Different target platforms will represent Wasm struct instances differently
+model WasmStruct.decl extends WasmObject.decl {
+	def fieldTypes: Array<StorageType>;
+	new(final: bool, superTypes: Array<HeapTypeDecl>, fieldTypes) super(final, superTypes) { }
+	def alloc() -> WasmStruct;		// abstract; implemented by V3 or Native
+
+	class WasmStruct extends WasmObject {
+		def [i: int] -> Value;		// abstract; read a field
+		def [i: int] = val: Value;	// abstract; write a field
+	}
+}
+
+// All wasm arrays instances come from a declaration.
+// An array declaration has the finality, the supertypes, and an element type.
+// Different target platforms will represent Wasm array instances differently
+model WasmArray.decl extends WasmObject.decl {
+	def elemType: StorageType;
+	new(final: bool, superTypes: Array<HeapTypeDecl>, elemType) super(final, superTypes) { }
+	def alloc(len: u31) -> WasmArray;	// abstract; implemented by V3 or Native
+
+	class WasmArray extends WasmObject {
+		def [i: int] -> Value;		// abstract; read an element
+		def [i: int] = val: Value;	// abstract; write an element
+		def length() -> u31;		// abstract; get length
+	}
+}
+
+//================================================================================================
+// V3 implementation of WasmStruct and WasmArray
+//================================================================================================
+// The V3 implementation of Wasm struct instances just uses boxed values.
+model V3WasmStruct.decl extends WasmStruct.decl {
+	new(final: bool, superTypes: Array<HeapTypeDecl>, fieldTypes: Array<StorageType>)
+		super(final, superTypes, fieldTypes) { } // XXX: redeclaration of constructor
+	def alloc() -> V3WasmStruct { return V3WasmStruct.new(); }
+
+	class V3WasmStruct extends WasmStruct {
+		private def fields = Array<Value>.new(fieldTypes.length);
+		def [i: int] -> Value		{ return fields[i]; }
+		def [i: int] = val: Value	{ fields[i] = fieldTypes.assertAssignable(val); }
+	}
+}
+
+// The V3 implementation of Wasm array instances just uses boxed values.
+model V3WasmArray.decl extends WasmArray.decl {
+	new(final: bool, superTypes: Array<HeapTypeDecl>, elemType: StorageType)
+		super(final, superTypes) { } // XXX: redeclaration of constructor
+	def alloc(len: u31) -> V3WasmArray { return V3WasmArray.new(len); }
+
+	class V3WasmArray(len: u31) extends WasmArray {
+		private def elems = Array<Value>.new(len);
+		def [i: int] -> Value		{ return elems[i]; }
+		def [i: int] = val: Value	{ elems[i] = elemType.assertAssignable(val); }
+		def length() -> u31		{ return u31.!(elems.length); }
+	}
+}
+
+// Factory methods to make new declarations.
+component V3Objects {
+	def defineStruct = V3WasmStructDecl.new;
+	def defineArray = V3WasmArray.new;
+}
+
+//================================================================================================
+// Native implementation of WasmStruct and WasmArray
+//================================================================================================
+
+// A native wasm struct has a special layout where fields are appended to the end of the NativeWasmStruct
+// instance through some runtime magic.
+// The #runtime-extensible and #meta annotations are representation hints that allow runtime programmability,
+// but have no semantic meaning at the source level.
+model NativeWasmStruct.decl extends WasmStruct.decl #runtime-extensible #meta {
+	def fieldOffsets: Array<u31>;		// maps fields to their offset in the extension
+	def extra: u31;				// total size of extension of instance
+	new(final: bool, superTypes: Array<HeapTypeDecl>, fieldTypes: Array<StorageType>, fieldOffsets, extra)
+		super(final, superTypes, fieldTypes) { } // XXX: redeclaration of constructor
+	def alloc() -> NativeWasmStruct {
+		return CiRuntime.newExtended<NativeWasmStruct>(extra); // some runtime magic
+	}
+
+	class NativeWasmStruct extends WasmStruct { #frequent
+		def [i: int] -> Value {
+			return NativeObjects.read_value(this, fieldOffsets[i], fieldTypes[i]);
+		}
+		def [i: int] = val: Value {
+			return NativeObjects.write_value(this, fieldOffsets[i], fieldTypes[i], val);
+		}
+	}
+}
+
+// A native wasm array has a special layout where the elements are appended to the end of the NativeWasmArray.
+// The #runtime-extensible and #meta annotations are representation hints that allow runtime programmability,
+// but have no semantic meaning at the source level.
+model NativeWasmArray.decl extends WasmArray.decl #runtime-extensible #meta {
+	def elemSize: u31;
+	new(final: bool, superTypes: Array<HeapTypeDecl>, elemType: StorageType, elemSize)
+		super(final, superTypes, elemType) { }
+	def alloc(len: u31) -> NativeWasmArray {
+		var extra = elemSize * len;
+		return CiRuntime.newPadded<NativeWasmArray>(extra, len);	// some runtime magic
+	}
+
+	class NativeWasmArray(len: u31) extends WasmArray { #frequent
+		def [i: int] -> Value {
+			if (i < 0 || i >= len) System.error("BoundsCheckException", "");
+			return NativeObjects.read_value(this, elemSize * i, elemType);
+		}
+		def [i: int] = val: Value {
+			elemType.assertAssignable(val);
+			if (i < 0 || i >= len) System.error("BoundsCheckException", "");
+			return NativeObjects.write_value(this, elemSize * i, elemType, val);
+		}
+		def length() -> u31 {
+			return len;
+		}
+	}
+}
+
+// Factory and utility methods for native objects.
+component NativeObjects {
+	def defineStruct(final: bool, superTypes: Array<WasmType>, fieldTypes: Array<StorageType>) -> NativeWasmStruct.decl {
+		var fieldOffsets = Array<int>.new(fieldTypes.length);
+		// TODO: need to compute fieldOffsets
+		return NativeWasmStruct.decl.new(final, superTypes, fieldTypes, fieldOffsets);
+	}
+
+	def defineArray(final: bool, superTypes: Array<WasmType>, elemType: StorageType) -> NativeWasmArray.decl {
+		var elemSize = 0;
+		// TODO: need to compute elemSize
+		return NativeWasmArray.decl.new(final, superTypes, elemType, elemSize);
+	}
+
+	def read_value<T>(obj: T, offset: int, ft: StorageType) -> Value {
+		var ptr = Pointer.atEnd(obj) + offset;
+		match (ft.rep) {
+			I8 =>	return Value.I32(u32.view(ptr.load<i8>()));
+			U8 =>	return Value.I32(u32.view(ptr.load<u8>()));
+			I16 =>	return Value.I32(u32.view(ptr.load<i16>()));
+			U16 =>	return Value.I32(u32.view(ptr.load<u16>()));
+			I32 =>	return Value.I32(u32.view(ptr.load<u32>()));
+			I64 =>	return Value.I64(ptr.load<u64>());
+			F32 =>	return Value.F32(ptr.load<u32>());
+			F64 =>	return Value.F64(ptr.load<u64>());
+			V128 =>	return Value.V128(ptr.load<u64>(), (ptr + 8).load<u64>());
+			REF =>	return Value.Ref(ptr.load<Object>());
+		}
+	}
+	def write_value<T>(obj: T, offset: int, ft: StorageType, v: Value) {
+		ft.assertAssignable(v);
+		var ptr = Pointer.atEnd(obj) + offset;
+		match (ft.rep) {
+			I8 =>	ptr.store<i8>(i8.view(low32(v)));
+			U8 =>	ptr.store<u8>(u8.view(low32(v)));
+			I16 =>	ptr.store<i16>(i16.view(low32(v)));
+			U16 =>	ptr.store<u16>(u16.view(low32(v)));
+			I32 =>	ptr.store<u32>(low32(v));
+			I64 =>	ptr.store<u64>(Value.I64.!(v).val);
+			F32 =>	ptr.store<u32>(Value.F32.!(v).val);
+			F64 =>	ptr.store<u64>(Value.F64.!(v).val);
+			V128 =>	{
+				var w = Value.V128.!(v);
+				(ptr + 0).store<u64>(w.low);
+				(ptr + 8).store<u64>(w.high);
+			}
+			REF =>	ptr.store<Object>(Value.Ref.!(v).val);
+		}
+	}
+	def low32(v: Value) -> u32 {
+		match (v) {
+			I32(val) => return val;
+			I64(val) => return u32.view(val);
+			_ => System.error("TypeCheckException", "expected Value.I32 or Value.I64");
+		}
+		return 0;
+	}
 }
