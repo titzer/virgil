@@ -1,0 +1,329 @@
+// Copyright 2024 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// The set of individually register-allocatable storage locations across all targets.
+// An individual target may support only a subset of scalars.
+enum Scalar(width: byte, ty: Type) {
+	B32(32, Int.getType(true, 32)),		// <= 32-bit non-references
+	B64(64, Int.getType(true, 64)),		// <= 64-bit non-references
+	F32(32, Float.FLOAT32),			// 32-bit floats
+	F64(64, Float.FLOAT64),			// 64-bit floats
+	R32(32, AnyRef.TYPE),			// <= 32-bit (possibly tagged) references
+	R64(64, AnyRef.TYPE),			// <= 64-bit (possibly tagged) references
+	Ref(64, AnyRef.TYPE),			// references of opaque size
+}
+
+// The normalization of a variant, including the mapping of its fields to bit ranges within scalars.
+class VariantNorm extends TypeNorm {
+	def fields: Array<VariantField>;
+	def tag: VariantField;
+	var vecO: Array<Type>;
+	var fieldRanges: Array<(int, int)>; // (start, end) index for ClassAlloc instructions
+	
+	var tagValue: int = -1;
+	var children: List<VariantNorm>;
+
+	new(oldType: Type, newType: Type, sub: Array<Type>, fields, tag)
+		super(oldType, newType, sub) {}
+
+	// represent empty variant as tag
+	def isEnum() -> bool { return size == 1 && tag != null && fields.length == 0; }
+	def isEnumCase() -> bool { return size == 1 && tag != null && tagValue >= 0 && fields.length == 0; }
+	def tagType() -> IntType { return IntType.!(tag.tn.first()); }
+	def tagIndex() -> int { return tag.indexes[0]; }
+	
+	// represent single-case, unboxed variant without its tag
+	def hasNoTag() -> bool { return tag == null; }
+	// tagging is explicit - may be packed, or a separate scalar
+	def hasExplicitTag() -> bool { return tag != null; }
+	// tagging is implicit (i.e. decision tree required)
+	def hasImplicitTag() -> bool { return false; }
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put3("%q ## %q |%d|", oldType.render, newType.render, size);
+		buf.puts(" [");
+		for (i < sub.length) {
+			if (i > 0) buf.csp();
+			sub[i].render(buf);
+		}
+		buf.puts("] {");
+		if (tag != null) buf.put1("ftag: %q", tag.render);
+		for (i < fields.length) {
+			if (i > 0 || tag != null) buf.csp();
+			buf.put2("f%d=%q", i, fields[i].render);
+		}
+		buf.puts("}");
+		return buf;
+	}
+}
+
+// Metadata about a variant's fields before/after normalization.
+// The field {indexes} indicates which scalars store the field.
+class VariantField(tn: TypeNorm, indexes: Array<int>) {
+	var intervals: Array<Interval>; // null, if no packing
+	def isPacked() -> bool { return intervals != null; }
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.puts("(");
+		for (i < indexes.length) {
+			if (i > 0) buf.csp();
+			buf.put1("#%d", indexes[i]);
+			if (intervals != null) buf.put1("@%q", intervals[i].render);
+		}
+		if (tn != null) buf.put1(": %q", tn.newType.render);
+		buf.puts(")");
+		return buf;
+	}
+}
+
+def ON_STACK = -1;
+def EMPTY_FIELD = VariantField.new(null, []);
+def NO_FIELDS = Array<VariantField>.new(0);
+
+// Contains the logic for choosing the representation of a variant (i.e. normalizing it) in terms
+// of scalars, which includes unboxing and (in the future) packing fields.
+class VariantNormalizer(nc: NormalizerConfig, rn: ReachabilityNormalizer, verbose: bool) {
+	def PRINT_PACKING = CLOptions.PRINT_PACKING.get();
+	def buf = TerminalBuffer.new();
+
+	private var assignments: HashMap<CaseField, int>; // used in unboxing solving algorithm
+
+	// Entrypoint into representation selection. Recursively tries to unbox and pack this variant.
+	// Returns either a {VariantNorm} for an unboxed variant or a simple {TypeNorm} for a boxed variant.
+	def normVariant(t: Type, rc: RaClass) -> TypeNorm {
+		if (rc.variantNorm != null) return rc.variantNorm; // already done
+		if (rc.orig.boxing == Boxing.BOXED) rn.mapSimple(t);
+
+		var prev = rc.recursive;
+		match (rc.recursive) {
+			ON_STACK => {
+				rc.recursive = 2; // cycle detected; box
+			}
+			0 => {
+				rc.recursive = ON_STACK;
+				tryUnboxing(rc);
+				if (rc.recursive == ON_STACK) rc.recursive = 1;
+				if (rc.variantNorm != null) return rc.variantNorm;
+			}
+		}
+		return rn.mapSimple(t); 
+	}
+	// Try to unbox a variant in one of three ways:
+	// 1. If a (non-closure) variant has all empty fields in all cases, represent it as a single uN tag (enum representation).
+	// 2. If a variant has only one case, represent it as a tagless tuple of scalars (data representation).
+	// 3. If a variant has multiple cases and is marked #unboxed, use a flattened representation with the smallest set of scalars.
+	private def tryUnboxing(rc: RaClass) -> bool {
+		if (rc.variantNorm != null) return true; // already done
+		while (rc.parent != null) rc = rc.parent;
+		
+		rn.makeNormFields(rc);
+
+		var isEmpty = rc.liveFields.length == 0;
+		var closure = rc.raFacts.RC_CLOSURE;
+
+		for (l = rc.children; l != null; l = l.tail) {
+			var c = l.head;
+			rn.makeNormFields(c);
+			if (c.liveFields.length > 0) isEmpty = false;
+			closure |= c.raFacts.RC_CLOSURE;
+		}
+
+		if (isEmpty && !closure) {
+			// normalize empty variant to just its tag; i.e. become an enum
+			var tagType = V3.getVariantTagType(rc.oldType);
+			var tagTypeNorm = rn.norm(tagType);
+			var tagField = VariantField.new(tagTypeNorm, [0]);
+			unboxUsingEnumVariantNorm(rc, tagType, tagField);
+			return true;
+		}
+		if (rc.children != null) {
+			// multi-case variant unboxing
+			if (closure) return printNoUnboxReason(rc, false, true);
+			match (rc.orig.boxing) {
+				BOXED, AUTO => return false;
+				_ => return unboxUsingTaggedVariantNorm(rc);
+			}
+		}
+		match (rc.orig.boxing) {
+			BOXED => return false;
+			AUTO => if (rc.liveFields.length > nc.MaxFlatDataValues) return false;
+			UNBOXED => ; // program specified unboxed; TODO: recursion or closure should be an error
+		}
+		if (rc.recursive > 1 || closure) return printNoUnboxReason(rc, rc.recursive > 1, closure); // recursive or closed over
+		unboxUsingTaglessVariantNorm(rc);
+		return true;
+	}
+	private def unboxUsingTaglessVariantNorm(rc: RaClass) {
+		var normFields = getNormFieldsForCase(rc);
+		var shouldPack = rc.orig.packed;
+
+		var solver = VariantSolver.new(this);
+		var solution = solver.solve(VariantProblem.new([normFields], null, shouldPack));
+
+		var vn = VariantNorm.new(rc.oldType, Tuple.newType(Lists.fromArray(solution.types)), solution.types, rc.variantFields, null);
+
+		vn.fieldRanges = rc.fieldRangesO;
+		vn.vecO = rc.vecO;
+		rc.variantNorm = vn;
+		setVariantFields(rc, 0, solution);
+
+		printNorm(rc, vn);
+	}
+	private def getNormFieldsForCase(rc: RaClass) -> Array<Type> {
+		var rfs = rc.fields;
+		var fields = Array<VariantField>.new(rfs.length);
+
+		rc.fieldRangesO = Array<(int, int)>.new(rfs.length);
+		rc.fieldRangesT = Array<(int, int)>.new(rfs.length);
+		
+		var fieldTypes = Vector<Type>.new();
+		var vecO = Vector<Type>.new();
+
+		for (i < rfs.length) {
+			var rf = rc.fields[i];
+			var startT = fieldTypes.length;
+
+			if (rf != null && rf.normIndices.0 >= 0) {
+				var tn = fieldNorm(rf);
+				tn.addTo(fieldTypes);
+				fields[i] = VariantField.new(tn, Array<int>.new(tn.size));
+			} else fields[i] = EMPTY_FIELD;
+
+			var origStart = vecO.length;
+			var fieldType = rc.orig.fields[i].fieldType.substitute(V3.getTypeArgs(rc.oldType));
+			rn.norm(fieldType).addTo(vecO);
+			rc.fieldRangesO[i] = (origStart, vecO.length);
+			rc.fieldRangesT[i] = (startT, fieldTypes.length);
+		}
+
+		rc.variantFields = fields;
+		rc.vecO = vecO.extract();
+		return fieldTypes.extract();
+	}
+	private def setVariantFields(rc: RaClass, caseIdx: int, soln: VariantSolution) {
+		var ofs = rc.orig.fields;
+		for (i < ofs.length) {
+			var rf = rc.fields[i];
+			if (rf != null && rf.normIndices.0 >= 0) {
+				var fr = rc.fieldRangesT[i];
+				if (soln.hasIntervals) rc.variantFields[i].intervals = Array<Interval>.new(fr.1 - fr.0);
+				for (j < fr.1 - fr.0) {
+					var assignment = soln.assignments[CaseField(caseIdx, fr.0 + j)];
+					rc.variantFields[i].indexes[j] = assignment.0;
+					if (soln.hasIntervals) rc.variantFields[i].intervals[j] = assignment.1;
+				}
+			}
+		}
+	}
+	private def unboxUsingTaggedVariantNorm(rc: RaClass) -> bool {
+		var vecT = Vector<Type>.new();
+		var parentUnboxed = rc.orig.boxing == Boxing.UNBOXED;
+
+		var numChildren = Lists.length(rc.children);
+		var normFields = Array<Array<Type>>.new(numChildren);
+
+		var caseIdx = 0;
+		for (l = rc.children; l != null; l = l.tail) normFields[caseIdx++] = getNormFieldsForCase(l.head);
+
+		if (rc.recursive > 1) return false;
+		// now that we know it's not recursive, we can safely assign the variant norm
+
+		var shouldPack = rc.orig.packed;
+		var needsTagScalar = !shouldPack;
+		
+		var solver = VariantSolver.new(this);
+		var solution = solver.solve(VariantProblem.new(normFields, null, shouldPack));
+		if (solution == null) return false; // XXX: warn that no solution was found
+
+		var tagField: VariantField;
+		if (solution.hasTagScalar) tagField = VariantField.new(rn.norm(solution.tagType), [solution.types.length - 1]);
+		else if (solution.explicitTag.0 >= 0) {
+			tagField = VariantField.new(rn.norm(solution.tagType), [solution.explicitTag.0]);
+			tagField.intervals = [solution.explicitTag.1];
+		}
+		var newType = Tuple.newType(Lists.fromArray(solution.types));
+
+		var parentNorm = VariantNorm.new(rc.oldType, newType, solution.types, NO_FIELDS, tagField);
+		if (verbose) Terminal.put1("%q\n", parentNorm.render);
+		rc.variantNorm = parentNorm;
+		var children = rc.children;
+
+		caseIdx = 0;
+		for (l = rc.children; l != null; l = l.tail) {
+			var child = l.head;
+			setVariantFields(child, caseIdx++, solution);
+
+			var vn = VariantNorm.new(child.oldType, newType, solution.types, child.variantFields, tagField);
+			vn.fieldRanges = child.fieldRangesO;
+			vn.vecO = child.vecO;
+			vn.tagValue = V3.getVariantTag(child.oldType);
+			child.variantNorm = vn;
+			
+			parentNorm.children = List<VariantNorm>.new(vn, parentNorm.children);
+			if (verbose) Terminal.put1("  %q\n", vn.render);
+		}
+		printNorm(rc, parentNorm);
+		return true;
+	}
+	private def unboxUsingEnumVariantNorm(rc: RaClass, tagType: IntType, tagField: VariantField) {
+		var vn = VariantNorm.new(rc.oldType, tagType, [tagType], NO_FIELDS, tagField);
+		vn.tagValue = V3.getVariantTag(rc.oldType);
+		rc.raFacts |= RaFact.RC_ENUM;
+		rc.variantNorm = vn;
+		
+		for (l = rc.children; l != null; l = l.tail) unboxUsingEnumVariantNorm(l.head, tagType, tagField);
+	}
+	private def fieldNorm(rf: RaField) -> TypeNorm {
+		if (rf.typeNorm != null) return rf.typeNorm;
+		else if (rf.fieldType != null) return rf.typeNorm = rn.norm(rf.fieldType);
+		else return rn.norm(rf.orig.fieldType);
+	}
+	def getScalar(t: Type) -> Scalar.set {
+		return nc.GetScalar(rn.ra.compiler, rn.ra.prog, t);
+	}
+	def getBitWidth(t: Type) -> byte {
+		return nc.GetBitWidth(rn.ra.compiler, rn.ra.prog, t);
+	}
+	private def printSingleNorm(rc: RaClass, vn: VariantNorm) {
+		buf.typeColor().put1("              %q ", rc.oldType.render).end();
+				
+		for (field in vn.fields) {
+			if (field == EMPTY_FIELD) continue;
+			for (j < field.tn.size) {
+				buf.put2("%q.%d:", field.tn.oldType.render, j).green().put1("%q", field.tn.at(j).render).end()
+					.puts("->").cyan().put1("#%d", field.indexes[j]);
+				if (field.intervals != null && field.intervals[j] != EMPTY_INTERVAL) buf.put1("@%q", field.intervals[j].render);
+				buf.end().putc(' ');
+			}
+		}
+		buf.outln();
+		buf.outt();
+	}
+	private def printNorm(rc: RaClass, vn: VariantNorm) {
+		if (!PRINT_PACKING) return;
+		buf.puts("Unboxing for: ").typeColor().put1("%q", vn.oldType.render).end().puts(" ## ");
+		buf.puts("[");
+		for (i < vn.size) {
+			if (i > 0) buf.csp();
+			buf.green().put1("%q", vn.at(i).render).end();
+		}
+		buf.puts("]\n");
+
+		if (rc.children == null) {
+			printSingleNorm(rc, vn);
+		} else {
+			for (l = rc.children; l != null; l = l.tail) printSingleNorm(l.head, l.head.variantNorm);
+		}
+	}
+	private def printNoUnboxReason(rc: RaClass, recursive: bool, closure: bool) -> bool {
+		if (PRINT_PACKING) {
+			var reason = Strings.format2("%s%s", if(recursive, "recursive ", ""), if(closure, "closure", ""));
+			buf.puts("Unboxing for: ").typeColor().put1("%q", rc.oldType.render).end();
+			buf.puts(" - no unboxing because ").red().puts(reason).ln().end();
+		}
+		buf.outt();
+		return false;
+	}
+}
+
+def EMPTY_INTERVAL = Interval(0, 0);
