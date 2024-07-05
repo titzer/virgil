@@ -2,7 +2,7 @@
 
 Virgil is designed as a lightweight programming language with a clear separation between what is in the language versus what is in the libraries.
 For example, in Virgil, the language provides constructs to define classes, enums, or algebraic data types, but there are no _built-in_ ones.
-The only built-in types are the primitives (`int`, `bool`, `void`, `float`, etc), and the type constructors (`Array`, functions, and tuples).
+The only built-in types are the primitives (`int`, `bool`, `void`, `float`, etc), and the type constructors (`Array`, `Range`, functions, and tuples).
 The `string` type is simply an alias for `Array<byte>`.
 
 This is in contrast to languages like Java and C#, where many language concepts rely on support in the standard library and thus refer to certain built-in classes.
