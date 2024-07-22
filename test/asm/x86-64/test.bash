@@ -13,6 +13,7 @@ fi
 
 LIB_UTIL="${VIRGIL_LOC}/lib/util/*.v3"
 LIB_ASM="${VIRGIL_LOC}/lib/asm/x86-64/*.v3"
+LIB_TEST="${VIRGIL_LOC}/lib/test/*.v3"
 
 printf "  Generating (v3i)..."
 run_v3c "" -run ./X86_64AssemblerTestGen.v3 $LIB_ASM $LIB_UTIL $@ > $S
@@ -40,3 +41,6 @@ if [ $X != 0 ]; then
     echo $L.diff
     head -n 10 $L.diff
 fi
+
+printf "  Testing disassembler..."
+run_v3c "" -run ./X86_64DisassemblerTest.v3 $LIB_UTIL $LIB_ASM $LIB_TEST | tee $OUT/disass.out | $PROGRESS
