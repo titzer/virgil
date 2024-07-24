@@ -36,9 +36,15 @@ printf "  Assembling (as)..."
 as -o $OBJECT $ASM
 objdump -d $OBJECT > $ASM_OBJDUMP
 check $?
+grep -q ';' $ASM_OBJDUMP
+if [ "$?" != 0 ]; then
+    # This objdump version doesn't output comments, strip comments in Virgil assembler dump.
+    sed 's/;.*$//g' $VIRGIL_OBJDUMP > $VIRGIL_OBJDUMP.2
+    mv $VIRGIL_OBJDUMP.2 $VIRGIL_OBJDUMP
+fi
 
 printf "  Comparing..."
-diff -i -b $ASM_OBJDUMP $VIRGIL_OBJDUMP > $DIFF_OBJDUMP
+diff -B -i -b $ASM_OBJDUMP $VIRGIL_OBJDUMP > $DIFF_OBJDUMP
 X=$?
 check $X
 
