@@ -2,6 +2,7 @@ AENEAS_SOURCE=aeneas/src/*/*.v3
 LIB_UTIL=lib/util/*.v3
 LIB_ASM=lib/asm/*/*.v3
 LIB_RT=rt/*/*.v3
+
 UTILS=bin/utils/vctags bin/utils/progress bin/utils/nu bin/utils/np bin/utils/demangle
 
 all: bootstrap utils TAGS
