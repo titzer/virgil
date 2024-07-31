@@ -8,4 +8,4 @@ TEST_DIR="${VIRGIL_LOC}/test"
 
 "${TEST_DIR}"/configure
 
-V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="wasm-js" "${TEST_DIR}"/all.bash
+V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="wasm" "${TEST_DIR}"/all.bash
