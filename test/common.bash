@@ -26,8 +26,6 @@ RT_LOC=$VIRGIL_LOC/rt
 GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
-NATIVE_SOURCES="$RT_LOC/native/*.v3"
-GC_SOURCES="${GC_LOC}/*.v3"
 V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
@@ -394,19 +392,6 @@ function execute_tests() {
     done
 }
 
-function set_os_sources() {
-    target=$1
-    if [ "$target" = "x86-darwin" ]; then
-	export OS_SOURCES="$RT_LOC/x86-darwin/*.v3"
-    elif [ "$target" = "x86-64-darwin" ]; then
-	export OS_SOURCES="$RT_LOC/x86-64-darwin/*.v3"
-    elif [ "$target" = "x86-linux" ]; then
-	export OS_SOURCES="$RT_LOC/x86-linux/*.v3"
-    elif [ "$target" = "x86-64-linux" ]; then
-	export OS_SOURCES="$RT_LOC/x86-64-linux/*.v3"
-    fi
-}
-
 function compile_aeneas() {
     local HOST_AENEAS=$1
     local TARGET_DIR=$2/$3
@@ -458,6 +443,8 @@ function is_gc_target() {
     elif [ "$target" = "x86-linux" ]; then
 	return 0
     elif [ "$target" = "x86-64-linux" ]; then
+	return 0
+    elif [ "$target" = "wasm" ]; then
 	return 0
     fi
     return 1

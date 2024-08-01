@@ -8,16 +8,35 @@ else
   TESTS=$(cat core.gc cast.gc variants.gc large.gc)
 fi
 
+function set_rt_files() {
+    target=$1
+    N="$RT_LOC/native/"
+    GC_SOURCES="${GC_LOC}/*.v3"
+
+    if [ "$target" = "x86-darwin" ]; then
+	export RT_FILES="$RT_LOC/x86-darwin/*.v3 $N/*.v3 $GC_SOURCES"
+    elif [ "$target" = "x86-64-darwin" ]; then
+	export RT_FILES="$RT_LOC/x86-64-darwin/*.v3 $N/*.v3 $GC_SOURCES"
+    elif [ "$target" = "x86-linux" ]; then
+	export RT_FILES="$RT_LOC/x86-linux/*.v3 $N/*.v3 $GC_SOURCES"
+    elif [ "$target" = "x86-64-linux" ]; then
+	export RT_FILES="$RT_LOC/x86-64-linux/*.v3 $N/*.v3 $GC_SOURCES"
+    elif [ "$target" = "wasm" ]; then
+	export RT_FILES="./EmptySystem.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3 $GC_SOURCES"
+    fi
+}
+
+
 function compile_gc_tests() {
     local SHARDING=100
     local target=$1
     shift
 
-    RT_FILES="-rt.files=$(echo $OS_SOURCES $NATIVE_SOURCES $GC_SOURCES)"
     local i=1
+    RT_OPT="-rt.files=$(echo $RT_FILES)"
     while [ $i -le $# ]; do
 	local args=${@:$i:$SHARDING}
-	run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k "$RT_FILES" -multiple $args
+	run_v3c "" -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k "$RT_OPT" -multiple $args
 	i=$(($i + $SHARDING))
     done
 }
@@ -49,7 +68,7 @@ function do_int_test() {
 }
 
 function do_exe_test() {
-    set_os_sources $target
+    set_rt_files $target
     T=$OUT/$target
     mkdir -p $T
     C=$T/compile.out
