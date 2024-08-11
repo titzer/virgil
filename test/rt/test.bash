@@ -15,9 +15,27 @@ function compile_target_tests_with_flags() {
         if [ -f $test.flags ]; then
             FLAGS=$(cat $test.flags)
         fi
+        grep -sq 'def\ TARGET_' $test > /dev/null
+        if [ $? = 0 ]; then
+            target_field="TARGET_${target//-/_}"
+            FLAGS="$FLAGS -redef-field=${target_field}=true"
+        fi
         run_v3c $target $FLAGS -output=$T $test &> $C
         trace_test_retval $?
     done
+}
+
+# TODO: reserved code test is special in that it needs to copy and patch a binary, integrate better
+function run_reserved_code_test() {
+    if [ ! -x $T/reserved_code ]; then
+        return 0
+    fi
+    if [ ! -x $CONFIG/run-$target ]; then # TODO: better output for skipped targets
+        return 0
+    fi
+    cp $T/reserved_code $T/reserved_code2
+    $T/reserved_code $T/reserved_code2
+    $T/reserved_code2
 }
 
 for target in $TEST_TARGETS; do
@@ -29,5 +47,8 @@ for target in $TEST_TARGETS; do
         print_compiling $target
         compile_target_tests_with_flags $target $TESTS | $PROGRESS
         run_or_skip_io_tests $target $TESTS
+        print_status Running $target "reserved_code"
+        run_reserved_code_test | $PROGRESS
     fi
 done
+
