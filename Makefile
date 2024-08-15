@@ -1,7 +1,7 @@
 LIB_UTIL=lib/util/*.v3
 LIB_ASM=lib/asm/*/*.v3
 LIB_RT=rt/*/*.v3
-UTILS=bin/utils/vctags bin/utils/progress bin/utils/nu
+UTILS=bin/utils/vctags bin/utils/progress bin/utils/nu bin/utils/np
 
 all: bootstrap utils TAGS
 
@@ -13,6 +13,9 @@ bin/utils/progress: bootstrap apps/Progress/* $(LIB_UTIL)
 
 bin/utils/nu: bootstrap apps/NumUtil/* $(LIB_UTIL)
 	(cd apps/NumUtil && v3c-host -program-name=nu -output=../../bin/utils/ *.v3 `cat DEPS`)
+
+bin/utils/np: bootstrap apps/NumParse/* $(LIB_UTIL)
+	(cd apps/NumParse && v3c-host -program-name=np -output=../../bin/utils/ *.v3 `cat DEPS`)
 
 utils: $(UTILS)
 
