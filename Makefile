@@ -1,3 +1,4 @@
+AENEAS_SOURCE=aeneas/src/*/*.v3
 LIB_UTIL=lib/util/*.v3
 LIB_ASM=lib/asm/*/*.v3
 LIB_RT=rt/*/*.v3
@@ -19,14 +20,17 @@ bin/utils/np: bootstrap apps/NumParse/* $(LIB_UTIL)
 
 utils: $(UTILS)
 
-bootstrap: bin/stable/*/* aeneas/src/*/*.v3 $(LIB_UTIL) $(LIB_RT) $(LIB_ASM)
+bootstrap: bin/stable/*/* $(AENEAS_SOURCE) $(LIB_UTIL) $(LIB_RT) $(LIB_ASM)
 	bin/dev/aeneas bootstrap
 
 clean:
 	rm -f TAGS $(UTILS)
 	bin/dev/aeneas clean
 
-TAGS: aeneas/src/*/*.v3 $(LIB_UTIL) $(LIB_RT) bin/utils/vctags
+stable: bin/stable/*/* $(AENEAS_SOURCE) $(LIB_UTIL) $(LIB_RT) $(LIB_ASM)
+	V3C_OPTS=-redef-field=Debug.UNSTABLE=false bin/dev/aeneas bootstrap
+
+TAGS: $(AENEAS_SOURCE) $(LIB_UTIL) $(LIB_RT) bin/utils/vctags
 	bin/dev/aeneas tags
 
-.PHONY: utils bootstrap clean
+.PHONY: utils bootstrap clean stable
