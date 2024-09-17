@@ -2,7 +2,7 @@
 
 . ../common.bash funexpr
 
-V3C_OPTS="$V3C_OPTS -fun-exprs"
+V3C_OPTS="$V3C_OPTS -fun-exprs -simple-bodies"
 
 if [ $# -gt 0 ]; then
 	TESTS="$@"
