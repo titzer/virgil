@@ -1,9 +1,6 @@
 // Copyright 2024 Virgil Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Arm64 instructions are ints that look like <arg2><arg1><am><code>
-// where each part of the instruction is a byte
-
 // masks
 def MASK_CODE = 0xff;
 def MASK_AM = 0xff00;
@@ -18,10 +15,14 @@ def SHIFT_ARG2: byte = 24;
 
 // codes
 def I_ADDD: byte = 0x01;	def I_ADDQ: byte = 0x11;
-def I_MOVZ: byte = 0x02;
-def I_MOVK: byte = 0x03;
-def I_LDR: byte = 0x04;
-def I_STR: byte = 0x05;
+def I_SUBD: byte = 0x02;	def I_SUBQ: byte = 0x12;
+def I_LDRD: byte = 0x03;	def I_LDRQ: byte = 0x13;
+def I_STRD: byte = 0x04;	def I_STRQ: byte = 0x14;
+def I_MOVD: byte = 0x05;	def I_MOVQ: byte = 0x15;
+def I_MULD: byte = 0x06;	def I_MULQ: byte = 0x16;
+def I_SDIVD: byte = 0x07;	def I_SDIVQ: byte = 0x17;
+def I_UDIVD: byte = 0x08;	def I_UDIVQ: byte = 0x18;
+def I_BL: byte = 0x09;
 
 def I_QD_DIFF: byte = I_ADDQ - I_ADDD;
 
@@ -30,6 +31,11 @@ def AM_NONE: byte = 0x00;
 def AM_R_R_I_I: byte = 0x01;
 def AM_R_R_R_SH_I: byte = 0x02;
 def AM_R_R_R_EX_I: byte = 0x03;
+def AM_R_I: byte = 0x04;
+def AM_R_R: byte = 0x05;
+def AM_R_R_R: byte = 0x06;
+def AM_M_R: byte = 0x07;
+def AM_R_M: byte = 0x08;
 
 // arguments
 def ARG_NONE: byte = 0x00;
@@ -37,10 +43,33 @@ def ARG_SH_NONE: byte = 0x01;
 def ARG_SH_LSL: byte = 0x02;
 def ARG_SH_LSR: byte = 0x03;
 def ARG_SH_ASR: byte = 0x04;
+def ARG_DATA_EX_UXTB: byte = 0x05;
+def ARG_DATA_EX_UXTH: byte = 0x06;
+def ARG_DATA_EX_UXTX: byte = 0x07;
+def ARG_DATA_EX_UXTW: byte = 0x08;
+def ARG_DATA_EX_SXTB: byte = 0x09;
+def ARG_DATA_EX_SXTH: byte = 0x0A;
+def ARG_DATA_EX_SXTW: byte = 0x0B;
+def ARG_DATA_EX_SXTX: byte = 0x0C;
+def ARG_MEM_EX_UXTW: byte = 0x0D;
+def ARG_MEM_EX_LSL: byte = 0x0E;
+def ARG_MEM_EX_SXTW: byte = 0x0F;
+def ARG_MEM_EX_SXTX: byte = 0x10;
+
+// ========================================
+// Opcode interface.
+// Arm64 opcodes are ints that look like <arg2><arg1><am><code>
+// where each part of the instruction is a byte
+// ========================================
 
 def makeOpcode(code: byte, am: byte, arg1: byte, arg2: byte) -> int {
 	return (int.view(code) << SHIFT_CODE) | (int.view(am) << SHIFT_AM)
 		 | (int.view(arg1) << SHIFT_ARG1) | (int.view(arg2) << SHIFT_ARG2);
+}
+
+def makeSimpleOpcode(code: byte, am: byte) -> int {
+	return (int.view(code) << SHIFT_CODE) | (int.view(am) << SHIFT_AM)
+		 | (int.view(ARG_NONE) << SHIFT_ARG1) | (int.view(ARG_NONE) << SHIFT_ARG2);
 }
 
 def getCode(opcode: int) -> byte {
@@ -59,30 +88,37 @@ def getArg2(opcode: int) -> byte {
 	return byte.view((opcode & MASK_ARG2) >> SHIFT_ARG2);
 }
 
-// useful constants
-def MAX_IMM16_MOV = 0xffff;
-def MIN_IMM16_MOV = 0xffff0000;
-
 def MRegs: Arm64RegSet;
 def Regs: Arm64Regs;
 def Conds: Arm64Conds; // TODO
 
 // Code generation for the Arm64 backend
 class SsaArm64Gen extends SsaMachGen {
-	def asm: Arm64Assembler; // TODO
+	def asm: Arm64Assembler;
 	def m = SsaInstrMatcher.new();
-	def dwarf: Dwarf; // What is this?
+	def dwarf: Dwarf;
+	def patcher: Arm64AddrPatcher;
 
-	new(context: SsaContext, mach: MachProgram, asm, w: MachDataWriter, dwarf)
+	var retLoc: VReg;
+
+	new(context: SsaContext, mach: MachProgram, asm, w: MachDataWriter, dwarf, patcher)
 	super(context, mach, Arm64RegSet.SET, w) {}
 
+	// ========================================
 	// Overidden Architecture Specific Routines
+	// ========================================
+
 	def visitApply(block: SsaBlock, i: SsaApplyOp) {
 		match (i.op.opcode) {
-			IntAdd => {
-				emitIntBinop(I_ADDD, i);
-			}
-			_ => unimplemented(); // TODO
+			IntAdd => emitIntBinop(I_ADDD, i);
+			IntSub => emitIntBinop(I_SUBD, i);
+			IntMul => emitIntBinop(I_MULD, i);
+			IntDiv => emitIntDiv(i);
+
+			CallAddress(funcRep) => emitCall(i, funcRep);
+			TupleGetElem => ; // do nothing; calls will define their projections
+
+			_ => return context.fail1("unexpected opcode %s", i.op.opcode.name);
 		}
 	}
 
@@ -91,32 +127,74 @@ class SsaArm64Gen extends SsaMachGen {
 	def visitSwitch(block: SsaBlock, i: SsaSwitch) { unimplemented(); }
 	def visitGoto(block: SsaBlock, target: SsaGoto) { unimplemented(); }
 
-	// Regalloc callbacks to add moves
-	def genSaveLocal(reg: int, v: VReg) { unimplemented(); }
-	def genRestoreLocal(v: VReg, reg: int) { unimplemented(); }
+	// Register allocation callback. Save a local variable onto the stack, loc -> v
+	def genSaveLocal(loc: int, v: VReg) {
+		if (regSet.isCallerStack(loc)) return; // defined by caller, nothing to do
+		genMoveLocLoc((null, loc), (v, v.spill), v.regClass);
+	}
 
+	// Register allocation callback. Restore a local variable from the stack, v -> loc
+	def genRestoreLocal(v: VReg, loc: int) {
+		genMoveLocLoc((v, v.spill), (null, loc), v.regClass);
+	}
+
+	// Register allocation callback.
 	def genMoveLocLoc(src: (VReg, int), dst: (VReg, int), regClass: RegClass) {
-		unimplemented();
+		if (regSet.isStack(src.1) && regSet.isStack(dst.1)) {
+			def scratch_def = Operand.Def(null, MRegs.SCRATCH_GPR);
+			def scratch_use = Operand.Use(null, MRegs.SCRATCH_GPR);
+			emit2(makeSimpleOpcode(ldrCode(regClass), AM_R_M), op(scratch_def), usev(src));
+			emit2(makeSimpleOpcode(strCode(regClass), AM_M_R), dfnv(dst), op(scratch_use));
+		} else if (regSet.isStack(src.1)) {
+			emit2(makeSimpleOpcode(ldrCode(regClass), AM_R_M), dfnv(dst), usev(src));
+		} else if (regSet.isStack(dst.1)) {
+			emit2(makeSimpleOpcode(strCode(regClass), AM_M_R), dfnv(dst), usev(src));
+		} else {
+			emit2(makeSimpleOpcode(moveCode(regClass), AM_R_R), dfnv(dst), usev(src));
+		}
 	}
 
-	// Register allocation callback to prepend a move
+	// Register allocation callback.
 	def genMoveValLoc(src: VReg, dst: (VReg, int), regClass: RegClass) {
-		unimplemented();
+		if (regSet.isStack(dst.1)) {
+			var scratch = MRegs.SCRATCH_GPR;
+			genMoveValLoc(src, (null, scratch), regClass);
+			genMoveLocLoc((null, scratch), dst, regClass);
+		} else {
+			var opcode = moveCode(regClass);
+			var code = if(regClass == RegClass.I32, I_MOVD, I_MOVQ);
+			var isImm = tryUseImm(src.ssa), immOp = if(isImm, popLastOperand());
+
+			if (isImm) {
+				emit2(makeSimpleOpcode(code, AM_R_I), op(Operand.Def(dst)), op(immOp));
+			} else {
+				emit2(makeSimpleOpcode(code, AM_R_R), op(Operand.Def(dst)), op(immOp));
+			}
+		}
 	}
 
+	// Assemble an arch instruction into assembly.
 	def assemble(opcode: int, a: Array<Operand>) {
 		if (opcode < 0) {
 			match (opcode) {
 				ArchInstrs.ARCH_ENTRY => {
 					var adjust = frameAdjust();
 					// allocate frame
-					if (adjust > 0) asm.subq_r_r_i_i(Regs.SP, Regs.SP, u12.view(adjust), 0);
+					if (adjust > 0) {
+						// Save R0 (return addr) on stack
+						asm.subq_r_r_i_i(Regs.SP, Regs.SP, u12.view(adjust), 0);
+						asm.strq_r_r_i(Regs.R30, Regs.SP, 0);
+					}
 				}
 				ArchInstrs.ARCH_BLOCK => return; // TODO
 				ArchInstrs.ARCH_RET => {
 					var adjust = frameAdjust();
 					// deallocate frame
-					if (adjust > 0) asm.addq_r_r_i_i(Regs.SP, Regs.SP, u12.view(adjust), 0);
+					if (adjust > 0) {
+						// Restore R0 (return addr) from stack
+						asm.ldrq_r_r_i(Regs.R30, Regs.SP, 0);
+						asm.addq_r_r_i_i(Regs.SP, Regs.SP, u12.view(adjust), 0);
+					}
 					asm.ret();
 					return;
 				}
@@ -129,6 +207,8 @@ class SsaArm64Gen extends SsaMachGen {
 
 		def am = getAM(opcode);
 		match (getAM(opcode)) {
+			AM_R_R => assemble_r_r(toGpr(a[0]), toGpr(a[1]), opcode);
+			AM_R_R_R => assemble_r_r_r(toGpr(a[0]), toGpr(a[1]), toGpr(a[2]), opcode);
 			AM_R_R_I_I => {
 				def imm = u12.view(toB32(toImm(a[2])));
 				def lsl12 = u1.view(getArg1(opcode));
@@ -139,13 +219,120 @@ class SsaArm64Gen extends SsaMachGen {
 				def imm = u6.view(getArg2(opcode));
 				assemble_r_r_r_sh_i(toGpr(a[0]), toGpr(a[1]), toGpr(a[2]), sh, imm, opcode);
 			}
+			AM_R_R_R_EX_I => {
+				def ex = toDataRegExtend(getArg1(opcode));
+				def imm = u3.view(getArg2(opcode));
+				assemble_r_r_r_ex_i(toGpr(a[0]), toGpr(a[1]), toGpr(a[2]), ex, imm, opcode);
+			}
+			AM_R_I => {
+				def imm = u16.view(toB32(toImm(a[1])));
+				assemble_r_i(toGpr(a[0]), imm, opcode);
+			}
+			AM_M_R => {
+				def imm = i9.view(loc_m(toLoc(a[0])));
+				assemble_r_r_i(Regs.SP, toGpr(a[1]), imm, opcode);
+			}
+			AM_R_M => {
+				def imm = i9.view(loc_m(toLoc(a[1])));
+				assemble_r_r_i(Regs.SP, toGpr(a[0]), imm, opcode);	
+			}
+			AM_NONE => {
+				assemble_none(opcode, a);
+			}
 			_ => return context.fail1("unknown addressing mode %d", am);
+		}
+	}
+
+	def getOutput() -> ArchInstrBuffer {
+		if (out != null) return out;
+		return out = Arm64InstrBuffer.new(this, context.prog, Arm64RegSet.SET);
+	}
+
+	// ========================================
+	// Helper Functions
+	// ========================================
+
+	// ========================================
+	// Assembling Helpers
+	// ========================================	
+
+	def assemble_none(opcode: int, a: Array<Operand>) {
+		match (getCode(opcode)) {
+			I_BL => {
+				var target: bool, outgoing: MachCallConv, livepoint = -1;
+				for (o in a) {
+					match (o) {
+						Immediate(val) => {
+							asm.bl_i(patcher.REL_IMM26_MARKER);
+							patcher.record(Addr.!(val));
+							target = true;
+							break;
+						}
+						Use(vreg, assignment) => {
+							unimplemented();
+							target = true;
+							break;
+						}
+						RefMap(lp, o) => {
+							livepoint = lp;
+							outgoing = o;
+						}
+						_ => ;
+					}
+				}
+				if (!target) context.fail("no target for call");
+				if (livepoint >= 0 && mach.runtime.gc != null) {
+					var off = patcher.mw.offset();
+					var entry = buildStackMap(off, outgoing, livepoint);
+					if (entry >= 0) mach.runtime.gc.recordStackRefMap(off, getSource(a), entry);
+				}
+				recordReturnSource(a);
+			}
+		}
+	}
+
+	def assemble_r_r_i(rt: Arm64Gpr, rn: Arm64Gpr, imm: i9, opcode: int) {
+		match (getCode(opcode)) {
+			I_STRD => asm.strd_r_r_i(rt, rn, imm);
+			I_LDRD => asm.ldrd_r_r_i(rt, rn, imm);
+
+			I_STRQ => asm.strq_r_r_i(rt, rn, imm);
+			I_LDRQ => asm.ldrq_r_r_i(rt, rn, imm);
+		}
+	}
+
+	def assemble_r_r_r(rd: Arm64Gpr, rn: Arm64Gpr, rm: Arm64Gpr, opcode: int) {
+		match (getCode(opcode)) {
+			I_UDIVD => asm.udivd_r_r_r(rd, rn, rm);
+			I_SDIVD => asm.sdivd_r_r_r(rd, rn, rm);
+
+			I_UDIVQ => asm.udivq_r_r_r(rd, rn, rm);
+			I_SDIVQ => asm.sdivq_r_r_r(rd, rn, rm);
+		}
+	}
+
+	def assemble_r_i(rd: Arm64Gpr, imm: u16, opcode: int) {
+		match (getCode(opcode)) {
+			I_MOVD => asm.movd_r_i(rd, imm);
+			I_MOVQ => asm.movq_r_i(rd, imm);
+			_ => invalidOpcode(opcode);
+		}
+	}
+
+	def assemble_r_r(rd: Arm64Gpr, rn: Arm64Gpr, opcode: int) {
+		match (getCode(opcode)) {
+			I_MOVD => asm.movd_r_r(rd, rn);
+			I_MOVQ => asm.movq_r_r(rd, rn);
+			_ => invalidOpcode(opcode);
 		}
 	}
 
 	def assemble_r_r_i_i(rd: Arm64Gpr, rn: Arm64Gpr, imm: u12, lsl12: u1, opcode: int) {
 		match (getCode(opcode)) {
 			I_ADDD => asm.addd_r_r_i_i(rd, rn, imm, lsl12);
+			I_SUBD => asm.subd_r_r_i_i(rd, rn, imm, lsl12);
+
+			I_SUBQ => asm.subq_r_r_i_i(rd, rn, imm, lsl12);
 			I_ADDQ => asm.addq_r_r_i_i(rd, rn, imm, lsl12);
 			_ => invalidOpcode(opcode);
 		}
@@ -153,9 +340,99 @@ class SsaArm64Gen extends SsaMachGen {
 	def assemble_r_r_r_sh_i(rd: Arm64Gpr, rn: Arm64Gpr, rm: Arm64Gpr, sh: RegShift, imm: u6, opcode: int) {
 		match (getCode(opcode)) {
 			I_ADDD => asm.addd_r_r_r_sh_i(rd, rn, rm, sh, u5.view(imm));
+			I_SUBD => asm.subd_r_r_r_sh_i(rd, rn, rm, sh, u5.view(imm));
+
 			I_ADDQ => asm.addq_r_r_r_sh_i(rd, rn, rm, sh, imm);
+			I_SUBQ => asm.subq_r_r_r_sh_i(rd, rn, rm, sh, imm);
 			_ => invalidOpcode(opcode);
 		}
+	}
+	def assemble_r_r_r_ex_i(rd: Arm64Gpr, rn: Arm64Gpr, rm: Arm64Gpr, ex: DataRegExtend, imm: u3, opcode: int) {
+		match (getCode(opcode)) {
+			I_ADDD => asm.addd_r_r_r_ex_i(rd, rn, rm, ex, imm);
+			I_SUBD => asm.subd_r_r_r_ex_i(rd, rn, rm, ex, imm);
+
+			I_ADDQ => asm.addq_r_r_r_ex_i(rd, rn, rm, ex, imm);
+			I_SUBQ => asm.subq_r_r_r_ex_i(rd, rn, rm, ex, imm);
+			_ => invalidOpcode(opcode);
+		}
+	}
+
+	// ========================================
+	// Emit Helpers
+	// ========================================	
+
+	// Emit code for an integer binop
+	def emitIntBinop(code: byte, i: SsaApplyOp) {
+		emitSimpleBinop(selectWidth(i, code), i, m.intbinop(i));
+	}
+
+	// Emit code for a simple binop (add, sub, mul, etc...)
+	def emitSimpleBinop(code: byte, i: SsaApplyOp, unused: int) {
+		// XXX: select better left operand using liveness
+		dfnReg(i);
+		useReg(m.x);
+
+		var opcode: int;
+		if (tryUseImm(m.y)) {
+			opcode = makeOpcode(code, AM_R_R_I_I, 0, ARG_NONE);
+		} else {
+			opcode = makeOpcode(code, AM_R_R_R_SH_I, ARG_SH_LSL, 0);
+			useReg(m.y);
+		}
+		emitN(opcode);
+	}
+
+	def emitIntDiv(i: SsaApplyOp) {
+		var it = IntType.!(i.op.typeArgs[0]);
+		dfnReg(i);
+		useReg(m.x);
+		useReg(m.y);
+		if (it.signed) emitN(makeSimpleOpcode(selectWidth(i, I_SDIVD), AM_R_R_R));
+		else emitN(makeSimpleOpcode(selectWidth(i, I_UDIVD), AM_R_R_R));
+	}
+
+	def emitCall(call: SsaApplyOp, funcRep: Mach_FuncRep) {
+		var func = call.input0(), mi: MachInstr;
+		var conv = frame.allocCallerSpace(Arm64VirgilCallConv.getForFunc(mach, funcRep));
+
+		// define the return value(s) of the call
+		var rv = getProjections(call);
+		for (i < rv.length) {
+			var r = rv[i];
+			if (r != null) dfnFixed(r, conv.calleeRet(i));
+		}
+		kill(MRegs.ALL);
+		refmap(conv);
+		var skip = 0;
+		if (SsaConst.?(func)) {
+			var target = Addr.!(SsaConst.!(func).val);
+			useImm(target);
+			if (Address<IrMethod>.?(target) && V3.isComponent(Address<IrMethod>.!(target).val.receiver)) skip = 1;
+		} else {
+			useFixed(func, MRegs.NOT_PARAM);
+		}
+
+		// use the arguments to the call
+		var inputs = call.inputs;
+		for (i = 1 + skip; i < inputs.length; i++) {  // input[0] == func
+			useFixed(inputs[i].dest, conv.calleeParam(i - 1));
+		}
+		useExSource(null, call.source);
+		emitN(makeSimpleOpcode(I_BL, AM_NONE));
+	}
+
+	// ========================================
+	// Misc Helpers
+	// ========================================	
+
+	def roundUpTo16(x: int) -> int {
+		return ((x + 15) & ~15);
+	}
+
+	def frameAdjust() -> int {
+		// Add space for return address
+		return roundUpTo16(frame.size() + mach.code.addressSize);
 	}
 
 	def selectWidth(i: SsaApplyOp, code: byte) -> byte {
@@ -171,37 +448,21 @@ class SsaArm64Gen extends SsaMachGen {
 		return 64;
 	}
 
-	// Emit code for an integer binop
-	def emitIntBinop(code: byte, i: SsaApplyOp) {
-		def width = intOpWidth(i);
-		emitSimpleBinop(selectWidth(i, code), i);
-	}
-
-	// Emit code for a simple binop (add, sub, mul, etc...)
-	def emitSimpleBinop(code: byte, i: SsaApplyOp) {
-		// XXX: select better left operand using liveness
-		m.intbinop(i);
-		dfnReg(i);
-		use(m.x);
-
-		var opcode: int;
-		if (tryUseImm32(m.y)) {
-			opcode = makeOpcode(code, AM_R_R_I_I, 0, ARG_NONE);
-		} else {
-			opcode = makeOpcode(code, AM_R_R_R_SH_I, ARG_SH_LSL, 0);
-			use(m.y);
-		}
-		emitN(opcode);
-	}
-
-	def tryUseImm32(i: SsaInstr) -> bool {
+	def tryUseImm(i: SsaInstr) -> bool {
 		if (i == null) { useInt(0); return true; }
 		if (SsaConst.?(i)) {
 			var val = SsaConst.!(i).val;
 			match (val) {
 				null => { useImm(val); return true; }
 				x: Box<int> => { useImm(val); return true; }
-				x: Box<long> => if(x.val == int.view(x.val)) { useInt(int.view(x.val)); return true; }
+				x: Box<long> => {
+					if (x.val == int.view(x.val)) {
+						useInt(int.view(x.val));
+					} else {
+						useImm(val);
+					}
+					return true;
+				}
 				x: Addr => { useImm(val); return true; }
 				x: Box<bool> => { useInt(if(x.val, 1, 0)); return true; }
 				x: ArrayRangeStart => { useImm(val); return true; }
@@ -227,6 +488,22 @@ class SsaArm64Gen extends SsaMachGen {
 		var gpr = MRegs.toGpr(loc);
 		if (gpr == null) return V3.fail1("expected GPR, got %s", regSet.identify(loc));
 		return gpr;
+	}
+	
+	// Returns a (positive) offset from RSP for the location of this `loc`.
+	def loc_m(loc: int) -> int {
+		loc = frame.un64(loc);
+		var wordSize = mach.data.addressSize, offset = 0;
+		if (loc >= regSet.calleeStart) {
+			offset = wordSize * (loc - regSet.calleeStart);
+		} else if (loc >= regSet.callerStart) {
+			offset = frame.size() + (wordSize * (loc - regSet.callerStart));
+		} else if (loc >= regSet.spillStart) {
+			offset = wordSize * (loc - regSet.spillStart + frame.spillArgs);
+		} else {
+			return V3.fail1("invalid spill location %s", regSet.identify(loc));
+		}
+		return offset;
 	}
 
 	def toB32(val: Val) -> int {
@@ -256,10 +533,72 @@ class SsaArm64Gen extends SsaMachGen {
 			}
 		}
 	}
+	def toDataRegExtend(ex: byte) -> DataRegExtend {
+		match (ex) {
+			ARG_DATA_EX_SXTB => return DataRegExtend.SXTB;
+			ARG_DATA_EX_SXTH => return DataRegExtend.SXTH;
+			ARG_DATA_EX_SXTW => return DataRegExtend.SXTW;
+			ARG_DATA_EX_SXTX => return DataRegExtend.SXTX;
+			ARG_DATA_EX_UXTB => return DataRegExtend.UXTB;
+			ARG_DATA_EX_UXTH => return DataRegExtend.UXTH;
+			ARG_DATA_EX_UXTW => return DataRegExtend.UXTW;
+			ARG_DATA_EX_UXTX => return DataRegExtend.UXTX;
+			_ => {
+				context.fail1("unknown data reg extend %d", ex);
+				return DataRegExtend.SXTB;
+			}
+		}
+	}
+	def toMemRegExtend(ex: byte) -> MemRegExtend {
+		match (ex) {
+			ARG_MEM_EX_UXTW => return MemRegExtend.UXTW;
+			ARG_MEM_EX_LSL => return MemRegExtend.LSL;
+			ARG_MEM_EX_SXTW => return MemRegExtend.SXTW;
+			ARG_MEM_EX_SXTX => return MemRegExtend.SXTX;
+			_ => {
+				context.fail1("unknown data mem extend %d", ex);
+				return MemRegExtend.LSL;
+			}
+		}
+	}
 
-	def frameAdjust() -> int {
-		// assumes return address already pushed
-		return frame.size() - mach.code.addressSize;
+	def popLastOperand() -> Operand { // XXX: clean up uses of this
+		var o = operands[operands.length - 1];
+		operands.resize(operands.length - 1);
+		return o;
+	}
+
+	def moveCode(regClass: RegClass) -> byte {
+		return if(regClass == RegClass.I32 || regClass == RegClass.F32, I_MOVD, I_MOVQ);
+	}
+	def ldrCode(regClass: RegClass) -> byte {
+		return if(regClass == RegClass.I32 || regClass == RegClass.F32, I_LDRD, I_LDRQ);
+	}
+	def strCode(regClass: RegClass) -> byte {
+		return if(regClass == RegClass.I32 || regClass == RegClass.F32, I_STRD, I_STRQ);
+	}
+
+	def recordReturnSource(a: Array<Operand>) {
+		if (rtsrc == null) return;
+		match (a[a.length - 1]) {
+			ExSource(ex, src) => rtsrc.recordReturnSource(patcher.mw.offset(), src);
+			_ => ;
+		}
+	}
+	def recordExSource(a: Array<Operand>) {
+		if (rtsrc == null) return;
+		if (a.length == 0) return;
+		match (a[a.length - 1]) {
+			ExSource(ex, src) => if (ex != null) rtsrc.recordSource(patcher.mw.offset(), src);
+			_ => ;
+		}
+	}
+	def getSource(a: Array<Operand>) -> Source {
+		if (a.length == 0) return null;
+		match (a[a.length - 1]) {
+			ExSource(ex, src) => return src;
+			_ => return null;
+		}
 	}
 
 	def invalidOpcode(opcode: int) {
@@ -267,4 +606,81 @@ class SsaArm64Gen extends SsaMachGen {
 	}
 
 	def unimplemented() { context.fail("unimplemented"); }
+}
+
+class Arm64InstrBuffer extends ArchInstrBuffer {
+	new(codegen: SsaArm64Gen, prog: Program, regSet: MachRegSet) super(codegen, prog, regSet) { }
+	def putArchInstr(indent: int, i: ArchInstr) -> int {
+		def opcode = int.view(i.opcode()), a = i.operands;
+		var name: string, shift: string;
+		def arg1 = getArg1(opcode), arg2 = getArg2(opcode);
+
+		match (getCode(opcode)) {
+			I_ADDD => name = "addd";
+			I_ADDQ => name = "addq";
+			I_SUBD => name = "subd";
+			I_SUBQ => name = "subq";
+			I_MOVD => name = "movd";
+			I_MOVQ => name = "movq";
+			I_MULD => name = "muld";
+			I_MULQ => name = "mulq";
+			I_UDIVD => name = "udivd";
+			I_UDIVQ => name = "udivq";
+			I_SDIVD => name = "sdivd";
+			I_SDIVQ => name = "sdivq";
+			I_LDRD => name = "ldrd";
+			I_LDRQ => name = "ldrq";
+			I_STRD => name = "strd";
+			I_STRQ => name = "strq";
+			I_BL => name = "bl";
+			_ => {
+				return putSimpleInstr(indent, i);
+			}
+		}
+
+		match (getArg1(opcode)) {
+			ARG_SH_LSL => shift = "lsl";
+			ARG_SH_LSR => shift = "lsr";
+			ARG_SH_ASR => shift = "asr";
+			ARG_DATA_EX_UXTB => shift = "uxtb";
+			ARG_DATA_EX_UXTH => shift = "uxth";
+			ARG_DATA_EX_UXTW => shift = "uxtw";
+			ARG_DATA_EX_UXTX => shift = "uxtx";
+			ARG_DATA_EX_SXTB => shift = "sxtb";
+			ARG_DATA_EX_SXTH => shift = "sxth";
+			ARG_DATA_EX_SXTW => shift = "sxtw";
+			ARG_DATA_EX_SXTX => shift = "sxtx";
+		}
+
+		match (getAM(opcode)) {
+			AM_R_R_I_I => {
+				putIndent(indent);
+				puts(name);
+				sp();
+				putOperands(a);
+				csp();
+				puts("lsl");
+				sp();
+				putImm(Box<int>.new(if(arg1 == 1, 12, 0)));
+			}
+			AM_R_R_R_SH_I, AM_R_R_R_EX_I => {
+				putIndent(indent);
+				puts(name);
+				sp();
+				putOperands(a);
+				csp();
+				puts(shift);
+				sp();
+				putImm(Box<int>.new(arg2));
+			}
+			_ => {
+				putIndent(indent);
+				puts(name);
+				sp();
+				putOperands(a);
+			}
+		}
+
+		return indent;
+	}
 }
