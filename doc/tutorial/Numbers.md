@@ -1,7 +1,7 @@
 # Numbers #
 
 Numbers in Virgil are represented by two main kinds of types: fixed-size integers and floating point.
-Both are efficient value types, i.e. the compiler will represent them as corresponding machine-level types without needed to allocate boxes for them or expose their identities.
+Both are efficient value types, i.e. the compiler will represent them as corresponding machine-level types without boxing.
 Virgil is unique in that the rules for integer types and floating point types prevent several common sources of confusion and bugs, particularly around rounding and conversions.
 In particular, Virgil strives to preserve the meaning of numbers across representation changes to avoid subtle bugs.
 
@@ -101,8 +101,8 @@ var n: double = double.view(m); // reinterpret long bits as double
 
 ## Comparisons across representations
 
-Virgil's rules for numbers ensures that comparisons of numbers with mixed signs, or even mixing floating point and integer, always works as expected.
-For example, if we compare an integer with a floating point number, then the integer _should not be rounded first_.
+Virgil's rules for numbers ensure that comparisons of numbers with different signs, or even comparing floating point numbers and integers, always works as expected.
+For example, if we compare an integer with a floating point number, then the integer _will not be rounded improperly_.
 Rounding in comparisons must use the proper rounding direction, depending on the comparison.
 For now, Virgil is conservative by requiring promotion of the integer (which fails type checking if not possible).
 In the future, it is possible to relax the restrictions and have the compiler insert the correct rounding(s).
