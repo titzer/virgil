@@ -114,7 +114,7 @@ var f = '\xFF'; // == 255
 
 Virgil automatically promotes smaller-width integer values to larger-width integer values when necessary.
 Such a promotion does not change the _value_ of an integer, just its representation.
-For more information on how numbers relate to their representations, see (here)[Numbers.md].
+For more information on how numbers relate to their representations, see [here](Numbers.md).
 The most common example is extending `byte` values to `int` values where necessary, zero-extending them. 
 
 
