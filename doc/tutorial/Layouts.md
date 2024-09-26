@@ -4,7 +4,7 @@ Virgil is a language for writing systems software at the lowest level.
 Such software often has to manipulate data in formats that are specified by software and hardware that cannot be changed.
 For example, bootstrapping the language, implementing high-performance (zero-copying) I/O, and interacting with memory-mapped I/O devices requires reading and writing data in specific formats.
 Prior to the introduction of layouts in Virgil, such interactions were done with byte-by-byte encoding or direct pointers.
-With the addition of layouts, this code because easier and safer to write, making it a breeze to deal with data in binary formats.
+With the addition of layouts, this code becomes easier and safer to write, making it a breeze to deal with data in binary formats.
 
 ## Specifying a memory layout
 
@@ -37,7 +37,7 @@ Every field must have an explicit offset[^1].
 While being a little more work to write, this allows for the most general descriptions, including skipping padding and choosing exact alignment.
 The compiler will check that fields do not overlap or overflow the specified layout size.
 
-[^1] The offset of a field can be written in hexadecimal, which makes it easy to align, e.g. to powers of two.
+[^1]: The offset of a field can be written in hexadecimal, which makes it easy to align, e.g. to powers of two.
 
 ## Allowable layout field types
 
