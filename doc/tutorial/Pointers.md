@@ -135,7 +135,7 @@ Linux.syscall(SYS_read, (STDIN, Pointer.atContents(buf), buf.length));
 
 ## Prefer off-heap `Range`s instead of `Pointer`s
 
-Recently, Virgil added the (Ranges)[Ranges.md].
+Recently, Virgil added the [Ranges](Ranges.md).
 Ranges are more general than arrays, as they can represent a subset of an array within a larger array.
 But better than that, a `Range<T>` reference can be used to point to off-heap data, such as the execution stack, code, or memory-mapped regions.
 Because Ranges are bounds checked, they are generally preferrable to raw `Pointer` values.
