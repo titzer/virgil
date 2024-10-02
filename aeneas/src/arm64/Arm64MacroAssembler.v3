@@ -1,0 +1,161 @@
+// Copyright 2024 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def Regs: Arm64Regs;
+
+class Arm64AddrPatcher {
+	def mw: MachDataWriter;
+	def asm: Arm64MacroAssembler;
+	def ABS_IMM16_MARKER: i16 = 0x3388;
+	def REL_IMM26_MARKER: i26 = 0xDD2341;
+
+	new(mw, asm) {}
+
+	def record(addr: Addr) {
+		mw.recordArm64Patch(addr, asm.patchKind, asm.patchPos);
+	}
+	def patch(kind: Arm64PatchKind, posAddr: int, absAddr: int) {
+		def pos = mw.pos;
+		match (kind) {
+			ABS_IMM16 => {
+				if (!i16.?(absAddr))
+					return V3.fail("Arm64AddrPatcher failed patch of kind ABS_IMM16 because the address overflows i16");
+				asm.patch_ABS_i16(pos, i16.!(absAddr));
+			}
+			REL_IMM26 => {
+				var relAddr = (absAddr - posAddr) / 4;
+				if (!i26.?(relAddr))
+					return V3.fail("Arm64AddrPatcher failed patch of kind REL_IMM26 because the address overflows i26");
+				asm.patch_REL_i26(pos, i26.!((absAddr - posAddr) / 4));
+			}
+			_ => unknownPatchKind();
+		}
+	}
+	def unknownPatchKind() {
+		return V3.fail("Arm64AddrPatcher Encountered Unknown Patch Kind");
+	}
+}
+
+// Adds additional functionality to the base Arm64 assembler.
+// - Supports instructions with address operands.
+// - Supports instructions that emit multiple Arm instructions. For example,
+// data operations with immediates in Arm only allow small immediates. Here
+// we can support an addition with any sized immediate by casing on the size
+// and emitting multiple Arm64 instructions in some cases. These instructions use
+// the second scratch register, R17.
+class Arm64MacroAssembler extends Arm64Assembler {
+	def mw: MachDataWriter;
+	var patcher: Arm64AddrPatcher;
+
+	new(mw) super(mw) {
+		patcher = Arm64AddrPatcher.new(mw, this);
+	}
+
+	def bl_a(a: Addr) -> this {
+		bl_i26(patcher.REL_IMM26_MARKER);
+		patcher.record(a);
+	}
+	def b_a(a: Addr) -> this {
+		b_i26(patcher.REL_IMM26_MARKER);
+		patcher.record(a);
+	}
+	def movd_r_a_a(rd: Arm64Gpr, low16: Addr, high16: Addr) -> this {
+		movd_r_i16(rd, patcher.ABS_IMM16_MARKER);
+		patcher.record(low16);
+		// Move high 16 bits of table addr
+		movkd_r_i16_u1(rd, patcher.ABS_IMM16_MARKER, 1);
+		patcher.record(high16);
+	}
+	def movd_r_i32(rd: Arm64Gpr, imm: int) -> this {
+		if (short.?(imm)) {
+			movd_r_i16(rd, short.!(imm));
+		} else {
+			var low16 = imm & 0xFF;
+			var high16 = (imm & 0xFF00) >> 16;
+			movd_r_i16(rd, short.!(low16));
+			movkd_r_i16_u1(rd, short.!(high16), 1);
+		}
+	}
+	def movq_r_i64(rd: Arm64Gpr, imm: long) -> this {
+		if (short.?(imm)) {
+			movd_r_i16(rd, short.!(imm));
+		} else if (int.?(imm)) {
+			var low16 = imm & 0xFF;
+			var high16 = (imm & 0xFF00) >> 16;
+			movd_r_i16(rd, short.!(low16));
+			movkd_r_i16_u1(rd, short.!(high16), 1);
+		} else if (i48.?(imm)) {
+			var low16 = imm & 0xFF;
+			var mid16 = (imm & 0xFF00) >> 16;
+			var high16 = (imm & 0xFF0000) >> 32;
+			movd_r_i16(rd, short.!(low16));
+			movkd_r_i16_u1(rd, short.!(mid16), 1);
+			movkq_r_i16_u2(rd, short.!(mid16), 2);	
+		} else {
+			var low16 = imm & 0xFF;
+			var midLow16 = (imm & 0xFF00) >> 16;
+			var midHigh16 = (imm & 0xFF0000) >> 32;
+			var high16 = (imm & 0xFF000000) >> 48;
+			movd_r_i16(rd, short.!(low16));
+			movkd_r_i16_u1(rd, short.!(midLow16), 1);
+			movkq_r_i16_u2(rd, short.!(midHigh16), 2);	
+			movkq_r_i16_u2(rd, short.!(high16), 3);	
+		}
+	}
+	def addd_r_r_i32_u1(rd: Arm64Gpr, rn: Arm64Gpr, imm: int, lsl12: u1) -> this {
+		if (i12.?(imm)) addd_r_r_i12_u1(rd, rn, i12.!(imm), lsl12);
+		else {
+			movd_r_i32(Regs.R17, imm);
+			addd_r_r_r_sh_u5(rd, rn, Regs.R17, RegShift.LSL, 0);
+		}
+	}
+	def addq_r_r_i64_u1(rd: Arm64Gpr, rn: Arm64Gpr, imm: long, lsl12: u1) -> this {
+		if (i12.?(imm)) addq_r_r_i12_u1(rd, rn, i12.!(imm), lsl12);
+		else {
+			movq_r_i64(Regs.R17, imm);
+			addq_r_r_r_sh_u6(rd, rn, Regs.R17, RegShift.LSL, 0);
+		}
+	}
+	def subd_r_r_i32_u1(rd: Arm64Gpr, rn: Arm64Gpr, imm: int, lsl12: u1) -> this {
+		if (i12.?(imm)) subd_r_r_i12_u1(rd, rn, i12.!(imm), lsl12);
+		else {
+			movd_r_i32(Regs.R17, imm);
+			subd_r_r_r_sh_u5(rd, rn, Regs.R17, RegShift.LSL, 0);
+		}
+	}
+	def subq_r_r_i64_u1(rd: Arm64Gpr, rn: Arm64Gpr, imm: long, lsl12: u1) -> this {
+		if (i12.?(imm)) subq_r_r_i12_u1(rd, rn, i12.!(imm), lsl12);
+		else {
+			movq_r_i64(Regs.R17, imm);
+			subq_r_r_r_sh_u6(rd, rn, Regs.R17, RegShift.LSL, 0);
+		}
+	}
+	def ldrd_r_r_i32(rt: Arm64Gpr, rn: Arm64Gpr, imm: int) -> this {
+		if (i9.?(imm)) ldrd_r_r_i9(rt, rn, i9.!(imm));
+		else {
+			movd_r_i32(Regs.R17, imm);
+			ldrd_r_r_r_ex_u1(rt, rn, Regs.R17, MemRegExtend.LSL, 0);
+		}
+	}
+	def ldrq_r_r_i32(rt: Arm64Gpr, rn: Arm64Gpr, imm: int) -> this {
+		if (i9.?(imm)) ldrq_r_r_i9(rt, rn, i9.!(imm));
+		else {
+			movd_r_i32(Regs.R17, imm);
+			ldrq_r_r_r_ex_u1(rt, rn, Regs.R17, MemRegExtend.LSL, 0);
+		}
+	}
+	def strd_r_r_i32(rt: Arm64Gpr, rn: Arm64Gpr, imm: int) -> this {
+		if (i9.?(imm)) strd_r_r_i9(rt, rn, i9.!(imm));
+		else {
+			movd_r_i32(Regs.R17, imm);
+			strd_r_r_r_ex_u1(rt, rn, Regs.R17, MemRegExtend.LSL, 0);
+		}
+	}
+	def strq_r_r_i32(rt: Arm64Gpr, rn: Arm64Gpr, imm: int) -> this {
+		if (i9.?(imm)) strq_r_r_i9(rt, rn, i9.!(imm));
+		else {
+			movd_r_i32(Regs.R17, imm);
+			strq_r_r_r_ex_u1(rt, rn, Regs.R17, MemRegExtend.LSL, 0);
+		}
+	}
+}
