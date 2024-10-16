@@ -84,7 +84,7 @@ some additional runtime code, which is also [implemented](Runtime.md) in Virgil.
 
 ### Garbage Collector
 
-Virgil is a memory-safe language without automatic memory management via garbage collection.
+Virgil is a memory-safe language with automatic memory management via garbage collection.
 The entire garbage collector is written in Virgil.
 It has a key interplay with the compiler which is documented [here](Gc.md).
 
