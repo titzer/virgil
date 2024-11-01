@@ -60,6 +60,12 @@ class MachLoweringConfig {
 		if (tt.width < 64) return ArithWidth.Sub64;
 		return ArithWidth.Exactly64;
 	}
+	def getMinimumArithSize(width: int) -> IntType {
+		if (Int8Arith && width <= 8) return Int.getType(false, 8);
+		if (Int16Arith && width <= 16) return Int.getType(false, 16);
+		if (Int32Arith && width <= 32) return Int.getType(false, 32);
+		return Int.getType(false, 64);
+	}
 }
 
 // Helper for normalizing a graph in place.
@@ -471,7 +477,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				// identity, except for wide integer types
 				var tn = normIntType(i_old.op.typeArgs[0]);
 				var inputs = normRefs(i_old.inputs);
-				i_new = wideInputs(i_old.op, tn, inputs, Facts.NONE);
+				i_new = wideInputs(i_old.op, tn, inputs, Fact.O_PURE);
 			}
 			FloatRoundI(is64) => {
 				var inputs = normRefs(i_old.inputs);
@@ -500,8 +506,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			NormRangeGetElemElem(index) =>	return genNormRangeGetElem(i_old, index);
 			NormRangeSetElem =>		return genNormRangeSetElem(i_old, 0);
 			NormRangeSetElemElem(index) =>	return genNormRangeSetElem(i_old, index);
-			ByteArrayGetField(offset) => return genByteArrayGetField(i_old, offset);
-			ByteArraySetField(offset) => return genByteArraySetField(i_old, offset);
+			ByteArrayGetField(offset, order) => return genByteArrayGetField(i_old, offset, order);
+			ByteArraySetField(offset, order) => return genByteArraySetField(i_old, offset, order);
 			ArrayGetElemElem(index) => 	return genArrayGetElem(i_old, index);
 			ArraySetElemElem(index) => 	return genArraySetElem(i_old, index);
 			ArrayGetLength => 		i_new = genArrayGetLength(i_old);
@@ -1501,102 +1507,93 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		i_old.kill();
 		i_old.remove();
 	}
-	def genByteArrayGetField(i_old: SsaApplyOp, offset: int) {
+	def genByteArrayGetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) {
 		var inputs = normRefs(i_old.inputs);
-		var narr = inputs[0], ni_start = inputs[1];
+		var ni_arr = inputs[0], ni_start = inputs[1];
 		var fieldType = i_old.op.typeArgs[0];
-		var narr_start = ptrAdd(narr, ni_start);
-		var nullity = context.compiler.nullity(i_old, narr_start);
-		if (!nullity.O_NO_NULL_CHECK && !config.ImplicitNullChecks) genNullCheck0(i_old.source, narr_start);
-		var offsetConst = context.graph.intConst(offset);
-		var arrayRep = mach.arrayRep(V3.arrayByteType);
-		var arrayElemOffset = if(i_old.op.typeArgs[1] == V3Range.START_TYPE, offsetConst, genArrayElemOffset(arrayRep.getElemElemOffset(0), 1, offsetConst));
-		var machType = mach.machType(fieldType);
+		var base = ptrAdd(ni_arr, ni_start);
+		var nullity = context.compiler.nullity(i_old, base);
+		if (!nullity.O_NO_NULL_CHECK && !config.ImplicitNullChecks) genNullCheck0(i_old.source, base);
+		if (i_old.op.typeArgs[1] != V3Range.START_TYPE) offset += mach.arrayRep(V3.arrayByteType).getElemElemOffset(0);
 
-		var base = ptrAdd(narr_start, arrayElemOffset), offset = 0;
-		if (!IntType.?(machType)) return map1(i_old, ptrLoad(machType, base, offset));
+		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
+		var t = decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder), tn = t.0, accesses = t.1;
 
-		var tn = mach.intNorm.makeType(IntType.!(machType));
-
-		// Generate full-word loads for all but the last word; TODO: little/big endian
-		var loads = Array<SsaInstr>.new(tn.size), last = tn.size - 1;
-		for (i < last) {
-			var et = tn.sub[i];
-			loads[i] = ptrLoad(et, base, offset);
-			offset = offset + mach.sizeOf(et);
-		}
-
-		var et = IntType.!(tn.sub[last]);
-		if (et.width >= 8 && (et.width & et.width - 1) == 0) {
-			// common case; last load is a power of two and at least a full byte
-			loads[last] = ptrLoad(et, base, offset);
-		} else {
-			// generate multiple power-of-2 byte loads
-			var wordType = getMinimumArithSize(et.width);
-			var etWidth = et.packedByteSize() * 8, read = 0;
-			for (curWidth = mach.intNorm.width; curWidth >= 8; curWidth >>= 1) {
-				if ((etWidth & curWidth) != 0) {
-					var curType = Int.getType(false, curWidth);
-					var load = ptrLoad(curType, base, offset + (read >> 3));
-					if (curType != wordType) load = curBlock.opIntViewI0(curType, wordType, load);
-					if (read != 0) {
-						load = apply(i_old.source, wordType.opShl(), [load, context.graph.intConst(read)]);
-						load = apply(i_old.source, wordType.opOr(), [loads[last], load]);
+		var ai_results = Array<SsaInstr>.new(accesses.length);
+		for (i < accesses.length) {
+			var a = accesses[i];
+			match (a) {
+				Simple(t, offset) => {
+					var d = ptrLoad(t, base, offset);
+					ai_results[i] = d;
+				}
+				Compound(t, wordType, datums) => {
+					var d: SsaInstr, or = wordType.opOr(), shl = wordType.opShl();
+					for (datum in datums) {
+						var l = ptrLoad(datum.t, base, datum.offset);
+						if (datum.t != wordType) l = curBlock.pure(V3Op.newIntViewI(datum.t, wordType), [l]);
+						if (datum.shift > 0) l = curBlock.pure(shl, [l, context.graph.intConst(datum.shift)]);
+						if (d != null) d = curBlock.pure(or, [d, l]);
+						else d = l;
 					}
-					loads[last] = load;
-					read += curWidth;
+					var op = getAccessViewOp(t, wordType);
+					if (op != null) d = curBlock.pure(op, [d]);
+					ai_results[i] = d;
 				}
 			}
-			// sign-extend or mask off fractional upper bits if necessary
-			if (et.signed || (et.width & 7) != 0 ) loads[last] = curBlock.opIntViewI0(wordType, et, loads[last]);
 		}
-		mapN(i_old, loads);
+		if (tn != null && tn.newType != fieldType) {
+			var op = getAccessViewOp(fieldType, tn.newType);
+			if (op != null) ai_results = [wideInputs(op, if(tn.size > 1, tn), ai_results, Fact.O_PURE)];
+		}
+		return mapN(i_old, ai_results);
 	}
-	def getMinimumArithSize(width: int) -> IntType {
-		if (config.Int8Arith && width <= 8) return Int.getType(false, 8);
-		if (config.Int16Arith && width <= 16) return Int.getType(false, 16);
-		if (config.Int32Arith && width <= 32) return Int.getType(false, 32);
-		return Int.getType(false, 64);
+	def getAccessViewOp(fieldType: Type, wordType: Type) -> Operator {
+		if (fieldType == wordType) return null;
+		match (fieldType) {
+			x: IntType => match (wordType) {
+				y: IntType => return V3Op.newIntViewI(wordType, x);
+				y: FloatType => return if(y.is64, V3Op.opIntViewF64, V3Op.opIntViewF32);
+				_ => return null; // TODO
+			}
+			x: FloatType => return if(x.is64, V3Op.newFloat64ViewI(wordType), V3Op.newFloat32ViewI(wordType));
+			_ => return null; // TODO
+		}
 	}
-	def genByteArraySetField(i_old: SsaApplyOp, offset: int) {
+	def genByteArraySetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) { // TODO: byte order
 		var inputs = normRefs(i_old.inputs);
-		var narr = inputs[0], ni_start = inputs[1], nvalue = inputs[2];
+		var ni_arr = inputs[0], ni_start = inputs[1], vals = Arrays.range(inputs, 2, inputs.length);
 		var fieldType = i_old.op.typeArgs[0];
-		var narr_start = ptrAdd(narr, ni_start);
-		var nullity = context.compiler.nullity(i_old, narr_start);
-		if (!nullity.O_NO_NULL_CHECK && !config.ImplicitNullChecks) genNullCheck0(i_old.source, narr_start);
-		var arrayRep = mach.arrayRep(V3.arrayByteType);
-		var offsetConst = context.graph.intConst(offset);
-		var arrayElemOffset = if(i_old.op.typeArgs[1] == V3Range.START_TYPE, offsetConst, genArrayElemOffset(arrayRep.getElemElemOffset(0), 1, offsetConst));
-		var machType = mach.machType(fieldType);
-		var base = ptrAdd(narr_start, arrayElemOffset), offset = 0, vals = inputs[2 ...];
+		var base = ptrAdd(ni_arr, ni_start);
+		var nullity = context.compiler.nullity(i_old, base);
+		if (!nullity.O_NO_NULL_CHECK && !config.ImplicitNullChecks) genNullCheck0(i_old.source, base);
+		if (i_old.op.typeArgs[1] != V3Range.START_TYPE) offset += mach.arrayRep(V3.arrayByteType).getElemElemOffset(0);
 
-		if (!IntType.?(machType)) {
-			ptrStore(machType, base, offset, vals[0]);
-			i_old.kill();
-			i_old.remove();
-			return;
+		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
+		var t = decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder), tn = t.0, accesses = t.1;
+
+		var ai_results = Array<SsaInstr>.new(accesses.length);
+		if (tn != null && tn.newType != fieldType) {
+			var op = getAccessViewOp(tn.oldType, fieldType);
+			var atn = if(tn.size > 1, tn);
+			if (op != null) vals = wideOutputs(op, atn, vals, Fact.O_PURE);
 		}
-
-		var tn = mach.intNorm.makeType(IntType.!(machType)), last = tn.size - 1;
-		// Generate full-word stores for all but the last word; TODO: little/big endian
-		for (i < last) {
-			var et = tn.sub[i];
-			ptrStore(et, base, offset, vals[i]);
-			offset = offset + mach.sizeOf(et);
-		}
-
-		var et = IntType.!(tn.sub[last]), val = vals[last], op_shr = if(et.signed, et.opSar(), et.opShr());
-		var etWidth = et.packedByteSize() * 8;
-		var stored = 0;
-		for (curWidth = mach.intNorm.width; curWidth >= 8; curWidth >>= 1) {
-			// generate multiple power-of-2 byte stores
-			if ((etWidth & curWidth) != 0) {
-				var valTruncated = val;
-				if (stored > 0) valTruncated = apply(i_old.source, op_shr, [val, context.graph.intConst(stored)]);
-				var curType = Int.getType(et.signed, curWidth);
-				ptrStore(curType, base, offset + (stored >> 3), valTruncated);
-				stored += curWidth;
+		for (i < accesses.length) {
+			var a = accesses[i], i_val = vals[i];
+			match (a) {
+				Simple(t, offset) => {
+					ptrStore(t, base, offset, i_val);
+				}
+				Compound(t, wordType, datums) => {
+					var shr = wordType.opShr();
+					if (t != wordType) match (t) {
+						x: FloatType => i_val = curBlock.pure(if(x.is64, V3Op.opIntViewF64, V3Op.opIntViewF32), [i_val]);
+					}
+					for (datum in datums) {
+						var v = if(datum.shift == 0, i_val, curBlock.pure(shr, [i_val, context.graph.intConst(datum.shift)]));
+						ptrStore(datum.t, base, datum.offset, v);
+					}
+				}
 			}
 		}
 		i_old.kill();
@@ -2081,3 +2078,78 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return ssa.add(op, [context.graph.nullReceiver(), p_size, i_caller_ip, i_caller_sp], Facts.NONE);
 	}
 }
+
+def decomposeByteArrayAccess(mach: MachProgram, config: MachLoweringConfig, fieldType: Type, offset: int, fieldOrder: ByteOrder, memoryOrder: ByteOrder) -> (TypeNorm, Array<Access>) {
+	var machType = mach.machType(fieldType);
+
+	if (fieldOrder == memoryOrder) {
+		// Common case: byte order match.
+		if (!IntType.?(machType)) return (null, [Access.Simple(fieldType, offset)]); // non-integer type
+
+		var tn = mach.intNorm.makeType(IntType.!(machType)), sub = tn.sub;
+		var accesses = Array<Access>.new(sub.length);
+		// Generate full-word loads for all but the last word; TODO: little/big endian normalization
+		var loads = Array<SsaInstr>.new(tn.size), last = sub.length - 1;
+		for (i < last) {
+			var et = sub[i];
+			accesses[i] = Access.Simple(et, offset); // XXX: should not need recursive decomposition
+			offset = offset + mach.packedSizeOf(et);
+		}
+
+		var et = IntType.!(sub[last]);
+		if (et.width >= 8 && (et.width & et.width - 1) == 0) {
+			// common case; last load is a power of two and at least a full byte
+			accesses[last] = Access.Simple(et, offset);
+		} else {
+			// generate multiple power-of-2 accesses
+			var vec = Vector<AccessDatum>.new();
+			var wordType = config.getMinimumArithSize(et.width);
+			var etWidth = et.packedByteSize() * 8, bitPos = 0;
+			for (curWidth = mach.intNorm.width; curWidth >= 8; curWidth >>= 1) {
+				if ((etWidth & curWidth) != 0) {
+					var curType = Int.getType(false, curWidth);
+					vec.put(AccessDatum(curType, offset + (bitPos >> 3), byte.!(bitPos)));
+					bitPos += curWidth;
+				}
+			}
+			accesses[last] = Access.Compound(et, wordType, vec.extract());
+		}
+		return (null, accesses);
+	} else {
+		// Byte order mismatch. Generate individual byte loads and assemble scalars.
+		var size = mach.packedSizeOf(machType), width = size * 8;
+		var intType = Int.getType(false, width);
+		var tn = mach.intNorm.makeType(intType), sub = tn.sub;
+		var accesses = Array<Access>.new(sub.length);
+		if (mach.intNorm.bigEndian != (fieldOrder == ByteOrder.BIG_ENDIAN)) {
+			for (i = sub.length - 1; i >= 0; i--) {
+				var compound = compoundAccess(mach, sub[i], fieldOrder, offset);
+				accesses[i] = compound;
+				offset += compound.wordType.packedByteSize();
+			}
+		} else {
+			for (i < sub.length) {
+				var compound = compoundAccess(mach, sub[i], fieldOrder, offset);
+				accesses[i] = compound;
+				offset += compound.wordType.packedByteSize();
+			}
+		}
+		return (tn, accesses);
+	}
+}
+def compoundAccess(mach: MachProgram, et: Type, fieldOrder: ByteOrder, offset: int) -> Access.Compound {
+	var size = mach.packedSizeOf(et), width = size * 8;
+	var bytes = Array<AccessDatum>.new(size);
+	var wordType = Int.getType(false, width);
+	for (j < size) {
+		var shift = if(fieldOrder == ByteOrder.LITTLE_ENDIAN, j * 8, width - 8 - j * 8);
+		bytes[j] = AccessDatum(Byte.TYPE, j + offset, byte.!(shift));
+	}
+	return Access.Compound(et, wordType, bytes);
+}
+
+type Access {
+	case Simple(t: Type, offset: int);
+	case Compound(t: Type, wordType: IntType, datums: Array<AccessDatum>);
+}
+type AccessDatum(t: Type, offset: int, shift: byte);
