@@ -174,7 +174,9 @@ function run_io_test() {
 	return 0
     fi
 
-    local P=$T/$(basename $test)
+    R=$(basename $runner)
+    mkdir -p $T/$R/
+    local P=$T/$R/$(basename $test)
 
     infile=${test##*/}.in
     if [ -f $infile ]; then
