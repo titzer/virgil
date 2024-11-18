@@ -7,6 +7,7 @@ class JvmHeap(jprog: JvmProgram) {
 	var jvmRecords: Array<JvmHI_Record>;
 	var heapBuilder: JvmClassfileBuilder;
 	var fieldID: int;
+	var recursionDepth = 0;
 
 	new() {
 		var name = jprog.mangleTypeName("V3H_", jprog.prog.getMain().receiver);
@@ -14,23 +15,52 @@ class JvmHeap(jprog: JvmProgram) {
 		heapBuilder = JvmClassfileBuilder.new(jprog, heapClass);
 		jvmRecords = Array<JvmHI_Record>.new(jprog.prog.recordCount);
 	}
-	def emitFunctionValue(code: JvmCodeBuilder, etype: Type, fval: FuncVal) {
-		if (fval != null) {
-			var jclass = jprog.newClosure(fval.memberRef);
-			code.getstatic(jclass, "instance", jclass);
-			var exactType = fval.memberRef.getFuncType();
-			if (exactType != etype) emitFunctionConversion(code, exactType, etype);
+	def emitValue(code: JvmCodeBuilder, etype: Type, val: Val) {
+		if (FuncVal.?(val)) return emitFunctionValue(code, etype, FuncVal.!(val));
+		match (etype.typeCon.kind) {
+			BOOL =>		code.iconst(Bool.toInt(Bool.unbox(val)));
+			ENUM_SET =>	emitIntValue(code, V3.getEnumSetType(etype), val);
+			ENUM =>		emitIntValue(code, V3.getVariantTagType(etype), val);
+			INT =>		emitIntValue(code, IntType.!(etype), val);
+			FLOAT =>	emitFloatValue(code, FloatType.!(etype), val);
+			ARRAY,
+			VARIANT,
+			CLASS =>	emitRecordValue(code, Record.!(val));
+			ANYFUNC,
+			FUNCREF =>	emitFunctionValue(code, etype, FuncVal.!(val));
+			VOID,
+			COMPONENT =>	; // emit nothing
 		} else {
-			code.aconst_null();
+			var buf = StringBuilder.new().puts("unexpected value: ");
+			V3.renderResult(val, etype, buf);
+			buf.puts(" of type ");
+			etype.render(buf);
+			jprog.context.fail(buf.toString());
 		}
 	}
-	def emitRecordValue(code: JvmCodeBuilder, rval: Record) {
-		if (rval != Values.BOTTOM) {
-			var instr = visitRecord(rval, rval.rtype, null, 0);
-			code.getstatic(heapBuilder.jclass, instr.fname, instr.jtype);
+	private def emitIntValue(code: JvmCodeBuilder, tt: IntType, val: Val) {
+		if (tt.size <= 4) code.iconst(V3.unboxI32(val));
+		else code.lconst(Long.unboxSU(val, tt.signed));
+	}
+	private def emitFloatValue(code: JvmCodeBuilder, ft: FloatType, val: Val) {
+		if (ft.is64) {
+			code.dconst(if(val == null, 0, Float64Val.!(val).bits));
 		} else {
-			code.aconst_null();
+			code.fconst(if(val == null, 0, Float32Val.!(val).bits));
 		}
+	}
+	private def emitFunctionValue(code: JvmCodeBuilder, etype: Type, fval: FuncVal) {
+		if (fval == null) return code.aconst_null();
+		var jclass = jprog.newClosure(fval.memberRef);
+		code.getstatic(jclass, "instance", jclass);
+		var exactType = fval.memberRef.getFuncType();
+		if (exactType != etype) emitFunctionConversion(code, exactType, etype);
+	}
+	private def emitRecordValue(code: JvmCodeBuilder, rval: Record) {
+		if (rval == null) return code.aconst_null();
+		var jrec = makeRecord(rval, ROOT);
+		makeField(jrec);
+		jrec.emitGetField(this, code);
 	}
 	def emitJvmTypeConversion(code: JvmCodeBuilder, exactType: Type, implicitType: Type) {
 		if (implicitType != exactType) {
@@ -67,6 +97,8 @@ class JvmHeap(jprog: JvmProgram) {
 		code.invokestatic(ic.name, "$new", jprog.jvmSig(ftype));
 	}
 	def emitFunctionConversion(code: JvmCodeBuilder, exactType: Type, implicitType: Type) {
+		if (implicitType == AnyRef.TYPE) return;
+		if (implicitType == AnyFunction.TYPE) return;
 		var adapter = jprog.newClosureAdapter(exactType, implicitType);
 		code.invokestatic(adapter.builder.jclass.name, "$new", adapter.initSig);
 	}
@@ -74,180 +106,161 @@ class JvmHeap(jprog: JvmProgram) {
 		var clinit_method = heapBuilder.newMethod("<clinit>", "()V");
 		var clinit_code = heapBuilder.newCodeBuilder();
 		clinit_method.setFlag(true, JvmConstant.ACC_STATIC);
+		var ovf_count = 0;
 
+		var last_split_pos = -1; // the last position at which a split could occur
+		var max_size = CLOptions.JVM_HEAP_INIT_METH_SIZE.val;
 		for (j < instrs.length) {
-			instrs[j].emitInit(this, clinit_code);
+			var pos = clinit_code.cur_pos;
+			var i = instrs[j];
+			if (i == null) { // null is used to signal a possible split point
+				last_split_pos = pos;
+				continue;
+			}
+			i.emitInit(this, clinit_code);
+
+			// Check if the code exceeds the maximum size and split the method if so.
+			if (clinit_code.cur_pos > max_size) {
+				// create an overflow method
+				var name = StringBuilder.new().put1("clinit%d", ovf_count++).toString();
+				var ovf_method = heapBuilder.newMethod(name, "()V");
+				ovf_method.setFlag(true, JvmConstant.ACC_STATIC);
+
+				// Split previous method at last split point
+				var ovf_code = clinit_code.splitAt(last_split_pos);
+
+				// Finish previous method
+				clinit_code.invokestatic(heapBuilder.jclass.name, name, JvmTypes.SIG_VOID);
+				clinit_code.retvoid();
+				clinit_code.attach(clinit_method);
+
+				// Switch to new method
+				clinit_method = ovf_method;
+				clinit_code = ovf_code;
+			}
 		}
 
 		clinit_code.retvoid();
 		clinit_code.attach(clinit_method);
 		jprog.emitJvmClassfile(heapBuilder.file);
 	}
-	def newField(prefix: string, ref: JvmHI_Ref, jtype: JvmType) {
-		if (ref.fname == null) {
-			ref.fname = Strings.format2("%s%d", prefix, fieldID++);
-			var fld = heapBuilder.newField(ref.fname, jtype.descriptor());
+	private def nameOf(i: JvmHI) -> string {
+		match (i) {
+			x: JvmHI_Value => return "val";
+			x: JvmHI_NewArray => return "newarray";
+			x: JvmHI_String => return "string";
+			x: JvmHI_ArrayIndex => return "arrayindex";
+			x: JvmHI_ArrayStore => return "arraystore";
+			x: JvmHI_UselessArray => return "uselessarray";
+			x: JvmHI_InitObject => return "initobject";
+			x: JvmHI_Load => return "load";
+		}
+		return "unknown";
+	}
+	private def makeField(jrec: JvmHI_Record) {
+		if (jrec.fname == null) {
+			jrec.fname = Strings.format1("r%d", fieldID++);
+			var fld = heapBuilder.newField(jrec.fname, jrec.jtype.descriptor());
 			fld.setFlag(true, JvmConstant.ACC_STATIC);
 		}
 	}
-	def visitValue(val: Val, etype: Type, ref: JvmHI_Ref, index: int) {
-		if (val == null) {
-			instrs.put(JvmHI_Value.new(val, etype));
-			return;
-		}
-		match (etype.typeCon.kind) {
-			CLOSURE => jprog.context.fail("normalization should remove all closure values");
-			TUPLE => jprog.context.fail("normalization should remove all tuple values");
-			VARIANT,
-			CLASS,
-			ARRAY => visitRecord(Record.!(val), etype, ref, index);
-			_ => instrs.put(JvmHI_Value.new(val, etype));
-		}
-	}
-	def visitRecord(rval: Record, etype: Type, ref: JvmHI_Ref, index: int) -> JvmHI_Record {
-		if (rval.id >= jvmRecords.length) {
-			jvmRecords = Arrays.grow(jvmRecords, rval.id + rval.id + 1);
-		}
-		var instr = jvmRecords[rval.id];
-		if (instr != null) {
-			if (instr.onstack) {
-				// this reference created a cycle; record it; break the cycle with null
-				addCycle(instr, ref, index);
-				instrs.put(JvmHI_Value.new(Values.BOTTOM, etype));
-			} else {
-				// this is a reference to a previously initialized record; load it
-				var load = JvmHI_Load.new(rval, jprog.jvmType(rval.rtype));
-				newField("r", instr, instr.jtype);
-				load.fname = instr.fname;
-				instrs.put(load);
-			}
-		} else {
-			instr = newRecord(rval);
-			if (etype == AnyRef.TYPE) etype = rval.rtype;
-			if (jprog.isUselessArray(etype)) visitUselessArray(instr, ref, index);
-			else if (V3.isString(etype)) visitString(instr, ref, index);
-			else if (V3.isArray(etype)) visitArray(instr, ref, index);
-			else visitObject(instr, ref, index);
-		}
-		return instr;
-	}
-	def addCycle(instr: JvmHI_Record, ref: JvmHI_Ref, index: int) {
-		newField("c", ref, ref.jtype);
-		instr.inner = true;
-		instr.cycles = List.new(JvmHI_CycleRef.new(ref, index), instr.cycles);
-	}
-	def visitUselessArray(instr: JvmHI_Record, ref: JvmHI_Ref, index: int) {
-		instrs.put(JvmHI_UselessArray.new(instr, instr.rval.values.length));
-		if (ref == null) newField("a", instr, instr.jtype);
-		else instr.inner = true;
-	}
-	def visitArray(instr: JvmHI_Record, ref: JvmHI_Ref, index: int) {
-		var etype = V3Array.elementType(instr.rval.rtype);
-		var jetype = jprog.jvmType(etype);
-		var narray = JvmHI_NewArray.new(instr, jetype, instr.rval.values.length);
-		instrs.put(narray);
-		var values = instr.rval.values;
-		for (i < values.length) {
-			if (!Values.equal(values[i], Values.BOTTOM)) {
-				// only initialize non-default array elements.
-				instrs.put(JvmHI_ArrayIndex.new(i));
-				visitValue(values[i], etype, instr, i);
-				instrs.put(JvmHI_ArrayStore.new(jetype));
-				instr.inner = true;
-			}
-		}
-		if (ref == null) newField("a", instr, instr.jtype);
-		else instr.inner = true;
-	}
-	def visitString(instr: JvmHI_Record, ref: JvmHI_Ref, index: int) {
-		// first check whether the string has any negative characters
-		var values = instr.rval.values, str = Array<byte>.new(values.length);
+	private def isSimpleString(rval: Record) -> bool {
+		var values = rval.values, str = Array<byte>.new(values.length);
 		for (i < values.length) {
 			var ch = Byte.unbox(values[i]);
-			str[i] = ch;
-			if (ch <= '\x00' || ch > '~') {
-				// character out of range, cannot use string constant
-				return visitArray(instr, ref, index);
+			if (ch <= '\x00' || ch > '~') return false;
+		}
+		return true;
+	}
+	private def makeRecord(rval: Record, link: JvmHI_Link) -> JvmHI_Record {
+		if (rval.id >= jvmRecords.length) jvmRecords = Arrays.grow(jvmRecords, rval.id + 1);
+		var jrec = jvmRecords[rval.id];
+		if (jrec == null) {
+			// Not seen yet. Recurse on the contents of the record if necessary.
+			var jtype = jprog.jvmType(rval.rtype);
+			jrec = JvmHI_Record.new(rval, jtype);
+			jvmRecords[rval.id] = jrec;
+			jrec.onstack = true;
+			var t = rval.rtype;
+			if (jprog.isUselessArray(t)) {
+				// Allocate a useless array as an integer box.
+				instrs.put(JvmHI_UselessArray.new(jrec, jrec.rval.values.length));
+			} else if (V3.isString(t) && isSimpleString(rval)) {
+				// Emit the bytes as a string constant instead of a byte-by-byte init.
+				var str = Arrays.map(rval.values, Byte.unbox);
+				instrs.put(JvmHI_String.new(jrec, str));
+			} else if (V3.isArray(t)) {
+				// Emit the array allocation, then recurse on elements.
+				var etype = V3Array.elementType(rval.rtype);
+				var jetype = jprog.jvmType(etype);
+				var narray = JvmHI_NewArray.new(jrec, jetype, rval.values.length);
+				instrs.put(narray);
+				var values = rval.values;
+				for (i < values.length) {
+					var val = values[i];
+					if (!Values.equal(val, Values.BOTTOM)) {
+						// initialize non-default array elements.
+						instrs.put(JvmHI_ArrayIndex.new(i));
+						makeValue(val, etype, JvmHI_Link(jrec, i));
+						instrs.put(JvmHI_ArrayStore.new(jetype));
+						jrec.inner = true;
+					}
+				}
+			} else {
+				// Recurse on the fields of an object, then emit the object allocation.
+				var ctype = rval.rtype;
+				var ic = jprog.prog.ir.getIrClass(ctype);
+				var values = rval.values;
+				for (i < values.length) {
+					makeValue(values[i], ic.fields[i].fieldType, JvmHI_Link(jrec, i));
+				}
+				instrs.put(JvmHI_InitObject.new(jrec, "$heap", jprog.makeHeapSig(ctype)));
 			}
+			if (link.referrer == null) instrs.put(null); // mark as possible split point
+			else jrec.inner = true;
+			jrec.onstack = false;
+		} else if (jrec.onstack) {
+			// this reference created a cycle; record it; break the cycle with null
+			makeField(link.referrer);
+			jrec.inner = true;
+			jrec.cycles = List.new(link, jrec.cycles);
+			instrs.put(JvmHI_Value.new(Values.BOTTOM, rval.rtype));
+		} else if (link.referrer != null) {
+			// Load onto the stack if a link is present
+			makeField(jrec);
+			instrs.put(JvmHI_Load.new(jrec));
 		}
-		// emit the bytes as a string constant instead of a byte by byte init
-		instrs.put(JvmHI_String.new(instr, str));
-		if (ref == null) newField("s", instr, instr.jtype);
-		else instr.inner = true;
+
+		return jrec;
 	}
-	def visitObject(instr: JvmHI_Record, ref: JvmHI_Ref, index: int) {
-		var ctype = instr.rval.rtype;
-		var ic = jprog.prog.ir.getIrClass(ctype);
-		var values = instr.rval.values;
-		instr.onstack = true;
-		for (i < values.length) {
-			visitValue(values[i], ic.fields[i].fieldType, instr, i);
+	private def makeValue(val: Val, vtype: Type, link: JvmHI_Link) {
+		match (val) {
+			rval: Record => makeRecord(rval, link);
+			_ => instrs.put(JvmHI_Value.new(val, vtype));
 		}
-		instr.onstack = false;
-		instrs.put(JvmHI_InitObject.new(instr, "$heap", jprog.makeHeapSig(ctype)));
-		if (ref == null) newField("o", instr, instr.jtype);
-		else instr.inner = true;
-	}
-	def newRecord(rval: Record) -> JvmHI_Record {
-		var jtype = jprog.jvmType(rval.rtype);
-		var jrecord = JvmHI_Record.new(rval, jtype);
-		if (rval.id >= jvmRecords.length) {
-			jvmRecords = Arrays.grow(jvmRecords, rval.id + 1);
-		}
-		jvmRecords[rval.id] = jrecord;
-		return jrecord;
 	}
 }
+
+// Tracks the incoming link for the recursive exploration of the object graph
+type JvmHI_Link(referrer: JvmHI_Record, index: int) #unboxed;
+
+def ROOT: JvmHI_Link;
 
 class JvmHI {
-	var fname: string;
-	var inner: bool;
 	def emitInit(heap: JvmHeap, code: JvmCodeBuilder);
-	def writeField(heap: JvmHeap, code: JvmCodeBuilder, jtype: JvmType) {
-		if (fname != null) {
-			if (inner) code.dup();
-			code.putstatic(heap.heapBuilder.jclass, fname, jtype);
-		}
-	}
-}
-
-class JvmHI_Ref(jtype: JvmType) extends JvmHI {
-	def emitRef(heap: JvmHeap, code: JvmCodeBuilder) {
-		code.getstatic(heap.heapBuilder.jclass, fname, jtype);
-	}
-	def finishCycle(heap: JvmHeap, code: JvmCodeBuilder, index: int);
 }
 
 class JvmHI_Value(val: Val, vtype: Type) extends JvmHI {
 	def emitInit(heap: JvmHeap, code: JvmCodeBuilder) {
-		heap.heapBuilder.emitValue(code, vtype, val);
-		code.pushN(1);
+		heap.emitValue(code, vtype, val);
 	}
 }
 
-class JvmHI_NewArray extends JvmHI_Ref {
-	def rec: JvmHI_Record;
-	def length: int;
-	var elements: int;
-	new(rec, jtype: JvmType, length) super(jtype) { }
-	def emitInit(heap: JvmHeap, code: JvmCodeBuilder) {
-		code.iconst(length);
-		code.newarray(jtype);
-		rec.writeField(heap, code, rec.jtype);
-	}
-	def finishCycle(heap: JvmHeap, code: JvmCodeBuilder, index: int) {
-		// arrays don't form cycles because they can be allocated before their elements.
-	}
-}
-
-class JvmHI_String(rec: JvmHI_Record, str: Array<byte>) extends JvmHI_Ref(JvmTypes.CHAR) {
+class JvmHI_String(rec: JvmHI_Record, str: Array<byte>) extends JvmHI {
 	def emitInit(heap: JvmHeap, code: JvmCodeBuilder) {
 		code.ldc(heap.heapBuilder.newString(str));
 		code.invokevirtual(JvmTypes.java_lang_String.name, "getBytes", JvmTypes.SIG_VOID_BYTE_ARRAY);
-		rec.writeField(heap, code, rec.jtype);
-	}
-	def finishCycle(heap: JvmHeap, code: JvmCodeBuilder, index: int) {
-		// strings can't form cycles.
+		rec.emitPutField(heap, code, rec.jtype);
 	}
 }
 
@@ -270,36 +283,51 @@ class JvmHI_UselessArray(rec: JvmHI_Record, length: int) extends JvmHI {
 		code.dup();
 		code.iconst(length);
 		code.invokespecial(JvmTypes.java_lang_Integer.name, "<init>", JvmTypes.SIG_INT_VOID);
-		rec.writeField(heap, code, rec.jtype);
+		rec.emitPutField(heap, code, rec.jtype);
 	}
 }
 
 class JvmHI_InitObject(rec: JvmHI_Record, mname: string, sig: JvmSig) extends JvmHI {
 	def emitInit(heap: JvmHeap, code: JvmCodeBuilder) {
 		code.invokestatic(rec.jtype.name, mname, sig);
-		rec.writeField(heap, code, rec.jtype);
-		for (cycles = rec.cycles; cycles != null; cycles = cycles.tail) {
-			cycles.head.instr.finishCycle(heap, code, cycles.head.index);
-		}
+		rec.emitPutField(heap, code, rec.jtype);
+		rec.emitFinishCycles(heap, code);
 	}
 }
 
-class JvmHI_Load(rval: Record, jtype: JvmType) extends JvmHI {
+class JvmHI_Load(jrec: JvmHI_Record) extends JvmHI {
 	def emitInit(heap: JvmHeap, code: JvmCodeBuilder) {
-		code.getstatic(heap.heapBuilder.jclass, fname, jtype);
+		code.getstatic(heap.heapBuilder.jclass, jrec.fname, jrec.jtype);
 	}
 }
 
-class JvmHI_Record extends JvmHI_Ref {
-	def rval: Record;
+class JvmHI_NewArray(rec: JvmHI_Record, jtype: JvmType, length: int) extends JvmHI {
+	def emitInit(heap: JvmHeap, code: JvmCodeBuilder) {
+		code.iconst(length);
+		code.newarray(jtype);
+		rec.emitPutField(heap, code, rec.jtype);
+		rec.emitFinishCycles(heap, code);
+	}
+}
+
+class JvmHI_Record(rval: Record, jtype: JvmType) {
+	var fname: string;
+	var inner: bool;
 	var onstack: bool;
-	var cycles: List<JvmHI_CycleRef>;
-	new(rval, jtype: JvmType) super(jtype) { }
-	def finishCycle(heap: JvmHeap, code: JvmCodeBuilder, index: int) {
-		code.dup();
+	var cycles: List<JvmHI_Link>;
+
+	def emitFinishCycles(heap: JvmHeap, code: JvmCodeBuilder) {
+		for (l = cycles; l != null; l = l.tail) {
+			var link = l.head;
+			code.dup();
+			link.referrer.emitFinishCycle(heap, code, link.index);
+		}
+		cycles = null;
+	}
+	def emitFinishCycle(heap: JvmHeap, code: JvmCodeBuilder, index: int) {
 		if (V3.isClass(rval.rtype)) {
 			// an object; emit a write to the appropriate field
-			emitRef(heap, code);
+			emitGetField(heap, code);
 			var ic = heap.jprog.prog.ir.getIrClass(rval.rtype);
 			var f = ic.fields[index];
 			var ftype = heap.jprog.jvmClass(f.fieldType);
@@ -307,13 +335,20 @@ class JvmHI_Record extends JvmHI_Ref {
 			code.putfield(JvmClass.!(jtype), V3.mangleIrMember(f), ftype);
 		} else {
 			// an array; emit a write to the appropriate array element
-			emitRef(heap, code);
+			emitGetField(heap, code);
 			code.swap();
 			code.iconst(index);
 			code.swap();
 			code.astore(JvmTypes.KIND_OBJECT);
 		}
 	}
+	def emitGetField(heap: JvmHeap, code: JvmCodeBuilder) {
+		code.getstatic(heap.heapBuilder.jclass, fname, jtype);
+	}
+	def emitPutField(heap: JvmHeap, code: JvmCodeBuilder, jtype: JvmType) {
+		if (fname != null) {
+			if (inner) code.dup();
+			code.putstatic(heap.heapBuilder.jclass, fname, jtype);
+		}
+	}
 }
-
-class JvmHI_CycleRef(instr: JvmHI_Ref, index: int) { }

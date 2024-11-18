@@ -1,5 +1,5 @@
 (defvar virgil-decls
-  '("class" "component" "def" "enum" "extends" "export" "in" "import" "layout" "new" "packing" "private" "struct" "super" "type" "var" )
+  '("class" "component" "def" "enum" "extends" "export" "fun" "in" "import" "layout" "new" "packing" "private" "struct" "super" "type" "var" )
   "Virgil declaration keywords.")
 
 (defvar virgil-stmts
@@ -19,6 +19,7 @@
     (,"#unboxed" . font-lock-type-face)
     (,"#boxed" . font-lock-type-face)
     (,"#packing" . font-lock-type-face)
+    (,"#big-endian" . font-lock-type-face)
     (,virgil-decls-regexp . font-lock-keyword-face)
     (,virgil-stmts-regexp . font-lock-constant-face)
     (,virgil-builtins-regexp . font-lock-type-face)

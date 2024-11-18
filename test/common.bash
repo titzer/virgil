@@ -26,8 +26,6 @@ RT_LOC=$VIRGIL_LOC/rt
 GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
-NATIVE_SOURCES="$RT_LOC/native/*.v3"
-GC_SOURCES="${GC_LOC}/*.v3"
 V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
@@ -38,7 +36,7 @@ PROGRESS="${VIRGIL_LOC}/test/config/progress $PROGRESS_ARGS"
 XARGS=${XARGS:=0}
 
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
-TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm-js x86-linux x86-64-linux x86-darwin x86-64-darwin"}
+TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm x86-linux x86-64-linux x86-darwin x86-64-darwin"}
 
 if [[ ! -x "$AENEAS_TEST" && "$AENEAS_TEST" != auto ]]; then
     echo $AENEAS_TEST: not found or not executable
@@ -176,7 +174,9 @@ function run_io_test() {
 	return 0
     fi
 
-    local P=$T/$(basename $test)
+    R=$(basename $runner)
+    mkdir -p $T/$R/
+    local P=$T/$R/$(basename $test)
 
     infile=${test##*/}.in
     if [ -f $infile ]; then
@@ -343,10 +343,7 @@ function execute_target_tests() {
     if [ -d "$TEST_CACHE/$SUITE/$target" ]; then
 	print_status "   cached" ""
 	ext=""
-	if [ "$target" = "wasm-js" ]; then
-	   ext=".wasm"
-	fi
-	if [ "$target" = "wasm-spec" ]; then
+	if [ "$target" = "wasm" ]; then
 	   ext=".wasm"
 	fi
 	check_cached_target_tests $ext | tee $OUT/$target/cached.out | $PROGRESS
@@ -380,9 +377,12 @@ function execute_target_tests() {
 function execute_tests() {
     for target in $TEST_TARGETS; do
 	if [ "$target" = "v3i" ]; then
-            (execute_v3i_tests "v3i" "") || exit $?
-            (execute_v3i_tests "v3i-ra" "-ra -ma=false") || exit $?
-            (execute_v3i_tests "v3i-ra-ma" "-ra -ma=true") || exit $?
+            (execute_v3i_tests "v3i" "-ssa-int=false") || exit $?
+            (execute_v3i_tests "v3i-ra" "-ssa-int=false -ra -ma=false") || exit $?
+            (execute_v3i_tests "v3i-ra-ma" "-ssa-int=false -ra -ma=true") || exit $?
+            (execute_v3i_tests "v3i" "-ssa-int=true") || exit $?
+            (execute_v3i_tests "v3i-ra" "-ssa-int=true -ra -ma=false") || exit $?
+            (execute_v3i_tests "v3i-ra-ma" "-ssa-int=true -ra -ma=true") || exit $?
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             (compile_target_tests jvm -jvm.script=false) || exit $?
             (execute_target_tests jvm) || exit $?
@@ -392,19 +392,6 @@ function execute_tests() {
             (execute_target_tests $target) || exit $?
 	fi
     done
-}
-
-function set_os_sources() {
-    target=$1
-    if [ "$target" = "x86-darwin" ]; then
-	export OS_SOURCES="$RT_LOC/x86-darwin/*.v3"
-    elif [ "$target" = "x86-64-darwin" ]; then
-	export OS_SOURCES="$RT_LOC/x86-64-darwin/*.v3"
-    elif [ "$target" = "x86-linux" ]; then
-	export OS_SOURCES="$RT_LOC/x86-linux/*.v3"
-    elif [ "$target" = "x86-64-linux" ]; then
-	export OS_SOURCES="$RT_LOC/x86-64-linux/*.v3"
-    fi
 }
 
 function compile_aeneas() {
@@ -433,16 +420,21 @@ function compile_aeneas() {
     fi
 }
 
-function convert_to_io_target() {
-    target=$1
-    if [ "$target" = "jvm" ]; then
-	target=jar
-    elif [ "$target" = "wasm-js" ]; then
-	target=wave
-    elif [ "$target" = "wasm-spec" ]; then
-	target=wave
-    fi
-    echo $target
+function get_io_targets() {
+    result=""
+    for target in $TEST_TARGETS; do
+	case $target in
+	    jvm)
+		result="$result jar"
+		;;
+	    wasm)
+		result="$result wasm-wave" #TODO: wasm-linux
+		;;
+	    *)
+		result="$result $target"
+	esac
+    done
+    echo $result
 }
 
 function is_gc_target() {
@@ -454,6 +446,8 @@ function is_gc_target() {
 	return 0
     elif [ "$target" = "x86-64-linux" ]; then
 	return 0
+#TODO    elif [ "$target" = "wasm" ]; then
+#	return 0
     fi
     return 1
 }

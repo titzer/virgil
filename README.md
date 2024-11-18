@@ -71,9 +71,11 @@ Learn how to [get started](start/README.md) using Virgil and browse the [tutoria
 
 ### Research Papers
 
-Five research papers have been published on Virgil.
+Six research papers have been published on Virgil.
 
-* Ben L. Titzer. [Harmonizing Classes, Functions, Tuples and Type Parameters in Virgil III](https://dl.acm.org/doi/10.1145/2491956.2491962) \[[pdf](https://research.google/pubs/pub41446.pdf)\]. In
+* Bradley Wei Jie Teo and Ben L. Titzer. [Unboxing Virgil ADTs for Fun and Profit](https://dl.acm.org/doi/10.1145/3694848.3694857). In Proceedings of the Workshop Dedicated to Jens Palsberg on Occasion of of His 60th Birthday (JENSFEST 24). Pasadena, CA. October 2024.
+
+* Ben L. Titzer. [Harmonizing Classes, Functions, Tuples and Type Parameters in Virgil III](https://dl.acm.org/doi/10.1145/2491956.2491962) \[[pdf](https://static.googleusercontent.com/media/research.google.com/sv//pubs/archive/41446.pdf)\]. In
 Proceedings of the ACM Conference on Programming Language Design and Implementation
 (PLDI '13). San Diego, CA. June 2013.
 

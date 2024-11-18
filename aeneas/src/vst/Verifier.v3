@@ -12,9 +12,6 @@ class Verifier(compiler: Compiler, prog: Program) {
 	def ir = prog.ir = IrModule.new();
 	var exportMap: PartialMap<string, ExportDecl>;
 
-	private def unboxVariantsOpt = CLOptions.UNBOX_VARIANTS.get();
-	private def variantUnboxMatcher = if(unboxVariantsOpt != null, GlobMatcher.new(unboxVariantsOpt));
-
 	def forAll<T>(vec: Vector<T>, do: T -> void) {
 		for (i < vec.length) {
 			if (!ERROR.notTooMany) break;
@@ -30,6 +27,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 		forAll(vst.enums, verifyEnum);
 		forAll(vst.layouts, verifyLayout);
 		forAll(vst.exports, verifyExport);
+		forAll(vst.packings, verifyPacking);
 		forAll<VstComponent>(vst.components, typeCheckVstCompound);
 		forAll<VstClass>(vst.classes, typeCheckVstCompound);
 		forAll<VstEnum>(vst.enums, typeCheckVstCompound);
@@ -59,39 +57,49 @@ class Verifier(compiler: Compiler, prog: Program) {
 			var componentDecl = file.components[i];
 			componentDecl.recordIndex = prog.vst.numComponents++;
 			componentDecl.typeCon = V3Component_TypeCon.new(componentDecl, prog.typeCache);
-			makeVerifier(componentDecl, componentDecl.getDeclaredType(), file);
-			if (!componentDecl.isSynthetic) bindTypeCon(componentDecl, file);
-			buildMembers(componentDecl, false);
+			var cv = makeVerifier(componentDecl, componentDecl.getDeclaredType(), file);
+			if (!componentDecl.isSynthetic) cv.bindTypeCon();
+			cv.buildMembers();
 		}
 		prog.vst.classes.putv(file.classes);
 		for (i < file.classes.length) {
 			var classDecl = file.classes[i];
 			classDecl.typeCon = V3Class_TypeCon.new(classDecl, prog.typeCache);
-			makeVerifier(classDecl, classDecl.getDeclaredType(), file);
-			if (!classDecl.isSynthetic) bindTypeCon(classDecl, file);
-			buildMembers(classDecl, classDecl.superclass != null);
+			var cv = makeVerifier(classDecl, classDecl.getDeclaredType(), file);
+			if (!classDecl.isSynthetic) cv.bindTypeCon();
+			cv.buildMembers();
 		}
 		prog.vst.enums.putv(file.enums);
 		for (i < file.enums.length) {
 			var enumDecl = file.enums[i];
-			makeVerifier(enumDecl, enumDecl.getDeclaredType(), file);
-			bindTypeCon(enumDecl, file);
-			buildMembers(enumDecl, false);
+			var cv = makeVerifier(enumDecl, enumDecl.getDeclaredType(), file);
+			cv.bindTypeCon();
+			cv.buildMembers();
 		}
 		prog.vst.layouts.putv(file.layouts);
 		for (i < file.layouts.length) {
 			var layoutDecl = file.layouts[i];
 			layoutDecl.typeCon = V3Ref_TypeCon.new(layoutDecl, true, prog.typeCache);
 			layoutDecl.readonlyType = V3Ref_TypeCon.new(layoutDecl, false, prog.typeCache).create0();
-			makeVerifier(layoutDecl, layoutDecl.getDeclaredType(), file);
-			buildMembers(layoutDecl, false);
+			var cv = makeVerifier(layoutDecl, layoutDecl.getDeclaredType(), file);
+			cv.buildMembers();
 			if (prog.layouts == null) prog.layouts = Strings.newMap();
 			var name = layoutDecl.name();
 			var prev = prog.layouts[name];
-			if (prev != null) layoutDecl.verifier.TypeRedefined(layoutDecl.token);
+			if (prev != null) cv.errAtDecl(layoutDecl).TypeRedefined(layoutDecl.token);
 			prog.layouts[name] = layoutDecl;
 		}
 		prog.vst.packings.putv(file.packings);
+		if (prog.packings == null && file.packings.length > 0) prog.packings = Strings.newMap();
+		for (i < file.packings.length) {
+			var packingDecl = file.packings[i];
+			var cv = makeVerifier(packingDecl, null, file);
+			var name = packingDecl.name();
+			var prev = prog.packings[name];
+			if (prev != null) cv.errAtDecl(packingDecl).PackingRedefined(packingDecl.token);
+			prog.packings[name] = packingDecl;
+			cv.packings = prog.packings;
+		}
 		prog.vst.exports.putv(file.exports);
 	}
 	def addInitFor(decl: VstCompound) {
@@ -117,97 +125,19 @@ class Verifier(compiler: Compiler, prog: Program) {
 		decl.initIndex = ir.init.length;
 		ir.init.put(meth);
 	}
-	def makeVerifier(decl: VstCompound, thisType: Type, file: VstFile) {
+	def makeVerifier(decl: VstCompound, thisType: Type, file: VstFile) -> VstCompoundVerifier {
 		var cv = decl.verifier = VstCompoundVerifier.new(decl, thisType, this, file);
 		if (decl.typeParams != null) decl.typeEnv = cv.buildTypeEnv(file.typeEnv, decl.typeParams);
 		else decl.typeEnv = file.typeEnv;
-	}
-	def bindTypeCon(decl: VstCompound, file: VstFile) {
-		var typeEnv = if (decl.isPrivate, file.typeEnv, prog.typeEnv);
-		var prev = typeEnv.lookup(decl.name());
-		if (prev != null) decl.verifier.TypeRedefined(decl.token);
-		typeEnv.add(decl.typeCon);
-	}
-	def buildMembers(decl: VstCompound, hasSuper: bool) {
-		decl.memberMap = Strings.newMap();
-		for (list = Lists.reverse(decl.getParams()); list != null; list = list.tail) {
-			// add synthetic fields for each parameter (classes only)
-			var p = list.head;
-			var writability = if(p.isReadOnly, Writability.READ_ONLY, Writability.WRITEABLE);
-			var field = VstField.new(false, writability, p.token, p.tref, null, null);
-			field.synthetic = true;
-			p.member = field;
-			decl.members = List.new(field, decl.members);
-		}
-		for (list = decl.members; list != null; list = list.tail) {
-			// process each member, checking for duplicates
-			var mdecl = list.head;
-			if (VstNew.?(mdecl)) {
-				// do not put new in the member map, check the constructor field
-				var newDecl = VstNew.!(mdecl);
-				if (decl.constructor != null) decl.verifier.MemberRedefined(mdecl.token);
-				else decl.constructor = newDecl;
-				mdecl.receiver = decl;
-				continue;
-			}
-			// look for a previous definition of the member in the map
-			var prev = decl.memberMap[mdecl.token.image];
-			if (prev != null) decl.verifier.MemberRedefined(mdecl.token);
-			else decl.memberMap[mdecl.token.image] = mdecl;
-			mdecl.receiver = decl;
-		}
-		var constructor = decl.constructor;
-		if (constructor == null && !VstLayout.?(decl)) {
-			// fill in a default constructor if one wasn't declared
-			var name = Token.new(decl.token.fileName, "new", decl.token.beginLine, decl.token.beginColumn);
-			var superclause = decl.superclause;
-			if(hasSuper && superclause == null) superclause = newSuperClause(name.rangeOf(0));
-			var params = VstList.new(name.range(), decl.getParams());
-			constructor = VstNew.new(decl.isPrivate, name, params, superclause, BlockStmt.new(VstList<Stmt>.new(name.rangeOf(0), null)));
-			constructor.isSynthetic = true;
-			constructor.typeEnv = decl.typeEnv;
-			constructor.receiver = decl;
-			decl.constructor = constructor;
-			decl.members = List.new(constructor, decl.members);
-			return;
-		}
-		if (decl.params != null) {
-			// class has parameters; copy them to the constructor
-			if (constructor.params.length() > 0) decl.verifier.ConstructorError(decl.token, "additional constructor cannot have parameters");
-			else constructor.params = decl.params;
-		}
-		if (decl.superclause != null) {
-			// class has superclause; copy it to constructor
-			if (constructor.superclause != null) decl.verifier.ConstructorError(decl.token, "super clause already defined");
-			else constructor.superclause = decl.superclause;
-		}
-	}
-	def newSuperClause(where: FileRange) -> SuperClause {
-		return SuperClause.new(where, TupleExpr.new(VstList<Expr>.new(where, null)));
+		return cv;
 	}
 	def resolveSuperClass(decl: VstClass) {
-		var cv = decl.verifier;
-		if (cv.onstack) {
-			// if this class is on the stack, then there is circular inheritance.
-			cv.InheritanceError(cv.compound.token, "cyclic inheritance detected");
-		} else {
-			// the class has not been verified yet.
-			if (decl.superclass != null) {
-				// bind the super class first.
-				var stype = cv.resolveType(decl.superclass, decl.typeEnv);
-				if (stype != null) {
-					cv.onstack = true;
-					if (stype.typeCon.kind == decl.typeCon.kind) resolveSuperClass(ClassType.!(stype).classDecl);
-					else cv.InheritanceError(decl.superclass.range(), "cannot extend non-class type");
-					cv.onstack = false;
-				}
-			}
-		}
+		decl.verifier.resolveSuperClass();
 	}
-	def checkLayoutCycle(decl: VstLayout){
+	def checkLayoutCycle(decl: VstLayout) {
 		var cv = decl.verifier;
 		if (cv.onstack) {
-			cv.FieldDeclError2(decl.token.range(), "cyclic field declaration detected");
+			cv.errAtDecl(decl).FieldDeclError("cyclic field declaration detected");
 		} else {
 			cv.onstack = true;
 			for (l = decl.members; l != null; l = l.tail) {
@@ -219,12 +149,13 @@ class Verifier(compiler: Compiler, prog: Program) {
 		}
 	}
 	def verifyComponent(decl: VstComponent) {
-		decl.verifier.verify();
+		var cv = decl.verifier;
+		cv.verify();
 		// look for the main method
 		var main = decl.memberMap["main"];
 		if (VstMethod.?(main) && mainMethod == null) {
 			mainMethod = VstMethod.!(main);
-			if (compiler.target != null) compiler.target.verifyMain(mainMethod, decl.verifier.MainMethodError);
+			if (compiler.target != null) compiler.target.verifyMain(mainMethod, cv.MainMethodError);
 		}
 	}
 	def verifyClass(decl: VstClass) {
@@ -246,10 +177,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 			}
 		} else if (decl.kind == Kind.VARIANT) {
 			// top-level variant class
-			if (variantUnboxMatcher != null && (
-				Strings.equal(unboxVariantsOpt, "") || variantUnboxMatcher.matches(decl.token.image))) {
-				decl.repHints = List.new(VstRepHint.Unboxed, decl.repHints);
-			}
+			if (compiler.unboxVariantEarly(decl)) decl.repHints = List.new(VstRepHint.Unboxed, decl.repHints);
 		}
 		cv.verify();
 	}
@@ -260,25 +188,30 @@ class Verifier(compiler: Compiler, prog: Program) {
 	def verifyLayout(decl: VstLayout) {
 		var cv = decl.verifier;
 		var size = tryUnboxPositiveInt(decl.size, -1);
-		if (size < 0) cv.error(decl.size.range(), "LayoutDeclError", Strings.format1("invalid layout size %q", decl.size.token.image));
+		if (size < 0) cv.errAtExpr(decl.size).set("LayoutDeclError", Strings.format1("invalid layout size %q", decl.size.token.image));
 		decl.byteSize = size;
 		cv.verify();
-		verifyFieldOverlapping(decl);
-		checkLayoutCycle(decl);
-	}
-	def verifyFieldOverlapping(decl: VstLayout) {
+		// check for overlapping fields and propagate big-endian hint from decl to fields
 		var fields = Vector<VstLayoutField>.new();
+		var bigEndian = false;
+		for (l = decl.repHints; l != null; l = l.tail) {
+			if (VstRepHint.BigEndian.?(l.head)) bigEndian = true;
+		}
 		for (l = decl.members; l != null; l = l.tail) {
 			match (l.head) {
-				x: VstLayoutField => if (x.byteOffset >= 0 && x.mtref.byteSize >= 0) fields.put(x);
+				x: VstLayoutField => {
+					if (x.byteOffset >= 0 && x.mtref.byteSize >= 0) fields.put(x);
+					if (bigEndian) x.order = ByteOrder.BIG_ENDIAN;
+				}
 			}
 		}
 		var length = fields.length;
 		var a = Arrays.sort(fields.extract(), 0, length, compareFieldOffset);
 		for (i < a.length - 1) {
 			var f = a[i], g = a[i + 1];
-			if ((f.byteOffset + f.mtref.byteSize) > g.byteOffset) decl.verifier.FieldDeclError(f, Strings.format2("field %q overlaps field %q", f.render, g.render));
+			if ((f.byteOffset + f.mtref.byteSize) > g.byteOffset) cv.errAtDecl(f).FieldDeclError(Strings.format2("field %q overlaps field %q", f.render, g.render));
 		}
+		checkLayoutCycle(decl);
 	}
 	def compareFieldOffset(a: VstLayoutField, b: VstLayoutField) -> bool {
 		return a.byteOffset < b.byteOffset;
@@ -290,7 +223,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 		} else {
 			var prev = exportMap[decl.token.image];
 			if (prev != null) {
-				cv.ExportDeclError(decl, formatPrev("export redefined", prev.token));
+				cv.errAtDecl(decl).ExportDeclError(formatPrev("export redefined", prev.token));
 				return;
 			}
 		}
@@ -300,13 +233,42 @@ class Verifier(compiler: Compiler, prog: Program) {
 		tc.enterMethod(methodEnv);
 		tc.visitVar(decl.expr, null);
 		if (!VarBinding.ComponentMethod.?(decl.expr.varbind)) {
-			cv.ExportDeclError(decl, "export must be a component or top-level method");
+			cv.errAtDecl(decl).ExportDeclError("export must be a component or top-level method");
 		}
 	}
 	def addExport(decl: ExportDecl) {
 		var binding = VarBinding.ComponentMethod.!(decl.expr.varbind);
 		var spec = VstIr.specOf(ir, binding.member.receiver.getDeclaredType(), binding.member, binding.typeArgs);
 		ir.addRoot(decl.expname, spec);
+	}
+	def verifyPacking(decl: VstPacking) {
+		var cv = decl.verifier;
+		decl.bitWidth = verifyPackingSize(cv, decl.size);
+		// check param uniqueness
+		env.reset();
+		env.enterScope();
+		for (p = decl.pparams.list; p != null; p = p.tail) {
+			var param = p.head, name = param.token.image;
+			var prev = env.lookupVar(name, 0);
+			if (prev != null) {
+				cv.errAtDecl(param).ParamDeclError(Strings.format1("param \"%s\" redefined", name));
+			}
+			env.bindVar(name, param);
+			param.bitWidth = verifyPackingSize(cv, param.size);
+		}
+		// check packing pattern for all bits present for all params
+		cv.checkPackingExpr(env, decl.expr, decl.bitWidth);
+		// TODO: pad the packing pattern to the bitwidth of the declaration if necessary
+		// Check that all fields have all bits used.
+		for (p = decl.pparams.list; p != null; p = p.tail) {
+			var param = p.head;
+			if (param.bitPos < param.bitWidth) cv.errAtDecl(param).PackingBitsMissing(param.token.image, param.bitWidth, param.bitPos);
+		}
+	}
+	def verifyPackingSize(cv: VstCompoundVerifier, lit: Literal) -> byte {
+		var size = tryUnboxPositiveInt(lit, -1);
+		if (size <= 0 || size > MAX_PACKING_WIDTH) cv.errAtExpr(lit).set("PackingDeclError", Strings.format1("expected packing size >= 0 and <= %d", MAX_PACKING_WIDTH));
+		return byte.view(size);
 	}
 	def typeCheckVstCompound(decl: VstCompound) {
 		var tc = TypeChecker.new(ERROR, decl.verifier.file);
@@ -340,7 +302,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 			initEnv = MethodEnv.new(decl, null, thisParam, cv, env);
 		} else {
 			initEnv = MethodEnv.new(decl, cdecl, thisParam, cv, env);
-			if (cdecl.params.length() > 0) cv.ParamDeclError(cdecl.params.first().token, "components cannot have constructor parameters");
+			if (cdecl.params.length() > 0) cv.errAtDecl(cdecl.params.first()).ParamDeclError("components cannot have constructor parameters");
 		}
 		// check parameters
 		tc.enterMethod(initEnv);
@@ -351,8 +313,9 @@ class Verifier(compiler: Compiler, prog: Program) {
 				var from = params.head.vtype;
 				if (dest == null) dest = ERROR.getErrorType();
 				if (!tc.isAssignable(from, dest)) {
-					cv.TypeError(params.head.token.range(), dest, from, "implicit field initialization");
+					cv.errAtDecl(params.head).TypeError(dest, from, "implicit field initialization");
 				}
+				f.paramInit = true;
 			}
 		}
 		// check field initializers
@@ -387,6 +350,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 		tc.typeCheckBody(cdecl.body);
 	}
 	def typeCheckEnumCase(decl: VstEnum, c: VstEnumCase, tc: TypeChecker) {
+		var cv = decl.verifier;
 		var paramTypes: List<Type>;
 		if (decl.params != null) {
 			// extract parameter types.
@@ -403,14 +367,14 @@ class Verifier(compiler: Compiler, prog: Program) {
 				if (paramTypes != null) {
 					tc.typeCheckExpr(args.head, paramTypes.head, what);
 				} else {
-					tc.ArityMismatch(args.head.range(), what, decl.params.length(), c.args.length());
+					cv.errAtExpr(args.head).ArityMismatch(what, decl.params.length(), c.args.length());
 					return;
 				}
 			}
-			if (paramTypes != null) tc.ArityMismatch(c.token.range(), what, decl.params.length(), c.args.length());
+			if (paramTypes != null) cv.errAtDecl(c).ArityMismatch(what, decl.params.length(), c.args.length());
 		} else {
 			// expected parameters, but none were provided.
-			if (paramTypes != null) decl.verifier.CaseDeclError(c, "expected case arguments, but none provided");
+			if (paramTypes != null) cv.errAtDecl(c).CaseDeclError("expected case arguments, but none provided");
 		}
 	}
 	def redefineField(r: VstRedefField, tc: TypeChecker) {
@@ -457,6 +421,9 @@ class Verifier(compiler: Compiler, prog: Program) {
 		return false;
 	}
 }
+def newSuperClause(where: FileRange) -> SuperClause {
+	return SuperClause.new(where, TupleExpr.new(VstList<Expr>.new(where, null)));
+}
 def formatPrev(msg: string, prev: FilePoint) -> string {
 	return if (prev != null, Strings.format3("%s (previous at %d:%d)", msg, prev.beginLine, prev.beginColumn), msg);
 }
@@ -470,6 +437,7 @@ class VstCompoundVerifier {
 	var classDecl: VstClass;
 	var classType: ClassType;
 	var superType: ClassType;
+	var packings: HashMap<string, VstPacking>;
 
 	var memberinits: List<VstField>;
 	var fields: List<VstField>;
@@ -490,10 +458,92 @@ class VstCompoundVerifier {
 			isImport = VstComponent.!(compound).importName != null;
 		}
 	}
+	def resolveSuperClass() {
+		var decl = classDecl; // XXX: rename for consistency
+		if (this.onstack) {
+			// if this class is on the stack, then there is circular inheritance.
+			errAtDecl(decl).InheritanceError("cyclic inheritance detected");
+		} else {
+			// the class has not been verified yet.
+			if (decl.superclass != null) {
+				// bind the super class first.
+				var stype = resolveType(decl.superclass, decl.typeEnv);
+				if (stype != null) {
+					this.onstack = true;
+					if (stype.typeCon.kind == decl.typeCon.kind) verifier.resolveSuperClass(ClassType.!(stype).classDecl);
+					else errAtRange(decl.superclass.range()).InheritanceError("cannot extend non-class type");
+					this.onstack = false;
+				}
+			}
+		}
+	}
+	def buildMembers() {
+		var decl = compound; // XXX: rename for consistency
+		decl.memberMap = Strings.newMap();
+		for (list = Lists.reverse(decl.getParams()); list != null; list = list.tail) {
+			// add synthetic fields for each parameter (classes only)
+			var p = list.head;
+			var writability = if(p.isReadOnly, Writability.READ_ONLY, Writability.WRITEABLE);
+			var field = VstField.new(false, writability, p.token, p.tref, null, null);
+			field.synthetic = true;
+			p.member = field;
+			decl.members = List.new(field, decl.members);
+		}
+		for (list = decl.members; list != null; list = list.tail) {
+			// process each member, checking for duplicates
+			var mdecl = list.head;
+			if (VstNew.?(mdecl)) {
+				// do not put new in the member map, check the constructor field
+				var newDecl = VstNew.!(mdecl);
+				if (decl.constructor != null) errAtDecl(mdecl).MemberRedefined(mdecl.token);
+				else decl.constructor = newDecl;
+				mdecl.receiver = decl;
+				continue;
+			}
+			// look for a previous definition of the member in the map
+			var prev = decl.memberMap[mdecl.token.image];
+			if (prev != null) errAtDecl(mdecl).MemberRedefined(mdecl.token);
+			else decl.memberMap[mdecl.token.image] = mdecl;
+			mdecl.receiver = decl;
+		}
+		var constructor = decl.constructor;
+		if (constructor == null && !VstLayout.?(decl)) {
+			// fill in a default constructor if one wasn't declared
+			var name = Token.new(decl.token.fileName, "new", decl.token.beginLine, decl.token.beginColumn);
+			var superclause = decl.superclause;
+			var hasSuper = classDecl != null && classDecl.superclass != null;
+			if(hasSuper && superclause == null) superclause = newSuperClause(name.rangeOf(0));
+			var params = VstList.new(name.range(), decl.getParams());
+			constructor = VstNew.new(decl.isPrivate, name, params, superclause, BlockStmt.new(VstList<Stmt>.new(name.rangeOf(0), null)));
+			constructor.isSynthetic = true;
+			constructor.typeEnv = decl.typeEnv;
+			constructor.receiver = decl;
+			decl.constructor = constructor;
+			decl.members = List.new(constructor, decl.members);
+			return;
+		}
+		if (decl.params != null) {
+			// class has parameters; copy them to the constructor
+			if (constructor.params.length() > 0) errAtDecl(decl).ConstructorError("additional constructor cannot have parameters");
+			else constructor.params = decl.params;
+		}
+		if (decl.superclause != null) {
+			// class has superclause; copy it to constructor
+			if (constructor.superclause != null) errAtDecl(decl).ConstructorError("super clause already defined");
+			else constructor.superclause = decl.superclause;
+		}
+	}
+	def bindTypeCon() {
+		var decl = compound; // XXX: rename for consistency
+		var typeEnv = if (decl.isPrivate, file.typeEnv, verifier.prog.typeEnv);
+		var prev = typeEnv.lookup(decl.name());
+		if (prev != null) errAtDecl(decl).TypeRedefined(decl.token);
+		typeEnv.add(decl.typeCon);
+	}
 	def verify() {
 		if (VstEnum.?(compound)) {
 			if (VstEnum.!(compound).cases.length == 0) {
-				error(compound.token.range(), "EnumDeclError", "enum requires at least 1 case");
+				errAtDecl(compound).set("EnumDeclError", "enum requires at least 1 case");
 			}
 		}
 		for (l = compound.members; l != null; l = l.tail) {
@@ -523,23 +573,23 @@ class VstCompoundVerifier {
 		var typeEnv = TypeEnv.new(parent, typeParams, null);
 		for (plist = typeParams; plist != null; plist = plist.tail) {
 			var tparam = plist.head;
-			if (typeEnv.typecons[tparam.token.image] != null) TypeParamRedefined(tparam);
+			if (typeEnv.typecons[tparam.token.image] != null) errAtToken(tparam.token).TypeParamRedefined(tparam);
 			typeEnv.add(tparam.typeCon);
 		}
 		return typeEnv;
 	}
 	def checkField(decl: VstField) {
-		if (isImport) ImportError(decl, "imported components cannot contain field declarations");
+		if (isImport) errAtDecl(decl).ImportError("imported components cannot contain field declarations");
 		if (decl.tref != null) {
 			decl.vtype = resolveType(decl.tref, compound.typeEnv);
 		} else if (decl.init == null) {
-			FieldDeclError(decl, "must have a declared type or an initializer");
+			errAtDecl(decl).FieldDeclError("must have a declared type or an initializer");
 			decl.vtype = getErrorType();
 		}
 		decl.index = compound.numFields++;
 		if (classDecl != null) {
 			var binding = lookupSuperMember(decl.name());
-			if (binding != null && canAccessMember(binding.member)) MemberRedefined(decl.token);
+			if (binding != null && canAccessMember(binding.member)) errAtDecl(decl).MemberRedefined(decl.token);
 		}
 		fields = List.new(decl, fields);
 		if (decl.init != null) {
@@ -547,8 +597,11 @@ class VstCompoundVerifier {
 			if (verifier.isNonTrivialInitializer(decl)) {
 				if (compound.constructor != null) compound.constructor.markNontrivial();
 			}
+		} else if (!verifier.prog.hasTrivialDefaultValue(decl.vtype)) {
+			memberinits = List.new(decl, memberinits);
+			if (compound.constructor != null) compound.constructor.markNontrivial();
 		}
-		if (compound.isVariant() && !decl.synthetic) FieldDeclError(decl, "type cannot have an explicit field");
+		if (compound.isVariant() && !decl.synthetic) errAtDecl(decl).FieldDeclError("type cannot have an explicit field");
 	}
 	def checkNew(decl: VstNew) {
 		typeEnv = compound.typeEnv;
@@ -556,27 +609,27 @@ class VstCompoundVerifier {
 		Lists.apply(decl.params.list, checkNewParam(_, decl, map));
 		if (classDecl != null) {
 			if (superType != null) {
-				if (decl.superclause == null) decl.superclause = verifier.newSuperClause(decl.params.range());
+				if (decl.superclause == null) decl.superclause = newSuperClause(decl.params.range());
 				var superCons = superType.classDecl.constructor;
 				decl.superclause.constructor = superCons;
 				if (superCons.nontrivial()) decl.markNontrivial();
 			} else if (decl.superclause != null) {
-				InheritanceError(decl.superclause.point, "class has no super class");
+				errAtPoint(decl.superclause.point).InheritanceError("class has no super class");
 			}
 		} else if (decl.superclause != null) {
-			InheritanceError(decl.superclause.point, "component constructor cannot have super() call");
+			errAtPoint(decl.superclause.point).InheritanceError("component constructor cannot have super() call");
 		}
 		decl.root = decl;
 		if (BlockStmt.!(decl.body).stmts.list != null || verifier.isNonTrivialSuperclause(decl.superclause)) {
 			decl.markNontrivial();
 		}
-		if (compound.isVariant() && !decl.isSynthetic) ConstructorError(decl.token, "type cannot have a constructor");
+		if (compound.isVariant() && !decl.isSynthetic) errAtDecl(decl).ConstructorError("type cannot have a constructor");
 	}
 	def checkMethod(decl: VstMethod) {
 		if (isImport) {
 			if (EmptyStmt.?(decl.body)) {
 				if (decl.importName == null) decl.importName = decl.token;
-				if (decl.typeParams != null) ImportError(decl, "imported methods cannot have type parameters");
+				if (decl.typeParams != null) errAtDecl(decl).ImportError("imported methods cannot have type parameters");
 			}
 		}
 		typeEnv = compound.typeEnv;
@@ -584,10 +637,10 @@ class VstCompoundVerifier {
 			var msg = if (compound.isFileScope,
 				"index operation cannot be declared at top level",
 				"index operation cannot be declared in component");
-			IndexDeclError(decl, msg);
+			errAtDecl(decl).IndexDeclError(msg);
 		}
 		if (compound.isVariantCase() && EmptyStmt.?(decl.body)) {
-			UnimplementedError(decl.body, "variant method must have a body");
+			errAtStmt(decl.body).UnimplementedError("variant method must have a body");
 		}
 		if (decl.typeParams != null) typeEnv = decl.typeEnv = buildTypeEnv(typeEnv, decl.typeParams);
 		if (decl.params.list != null) {
@@ -605,11 +658,11 @@ class VstCompoundVerifier {
 		decl.index = compound.numMethods++;
 	}
 	def checkLayoutField(decl: VstLayoutField) {
-		if (isImport) ImportError(decl, "imported layouts cannot contain field declarations");
+		if (isImport) errAtDecl(decl).ImportError("imported layouts cannot contain field declarations");
 
 		var mtref = decl.mtref;
 		mtref.repeatCount = tryUnboxPositiveInt(decl.mtref.repeat, 1);
-		if (mtref.repeatCount <= 0) FieldDeclError2(decl.mtref.repeat.range(), "expected integer repeat count > 0");
+		if (mtref.repeatCount <= 0) errAtRange(decl.mtref.repeat.range()).FieldDeclError("expected integer repeat count > 0");
 		var map = verifier.prog.layouts;
 		var st = if(map != null, map[decl.mtref.tname.name.image]);
 		var scale = 1;
@@ -624,17 +677,20 @@ class VstCompoundVerifier {
 				x: FloatType => scale = x.byteSize();
 				x: EnumType => scale = x.packedByteSize();
 				x: BoolType => scale = 1;
-				_ => FieldDeclError2(decl.mtref.tname.range(), Strings.format1("expected primitive layout field type, found \"%q\"", t.render));
+				_ => errAtToken(decl.mtref.tname.name).FieldDeclError(Strings.format1("expected primitive layout field type, found \"%q\"", t.render));
 			}
+		}
+		for (l = decl.repHints; l != null; l = l.tail) {
+			if (VstRepHint.BigEndian.?(l.head)) decl.order = ByteOrder.BIG_ENDIAN;
 		}
 		mtref.scale = scale;
 		var size64 = mtref.repeatCount * long.view(scale);
-		if (size64 > int.max) FieldDeclError2(decl.mtref.range(), Strings.format2("layout field size of %d exceeds internal limitation of %d", size64, int.max));
+		if (size64 > int.max) errAtRange(decl.mtref.range()).FieldDeclError(Strings.format2("layout field size of %d exceeds internal limitation of %d", size64, int.max));
 		mtref.byteSize = mtref.repeatCount * scale;
 		var offset = decl.byteOffset = tryUnboxPositiveInt(decl.offset, 0);
 		var layoutSize = VstLayout.!(compound).byteSize;
-		if (offset > layoutSize) FieldDeclError2(decl.offset.range(), Strings.format2("layout field \"%s\" offset out-of-bounds for layout size %d", decl.name(), layoutSize));
-		else if ((offset + long.view(mtref.byteSize)) > layoutSize) FieldDeclError2(decl.offset.range(), Strings.format2("layout field \"%s\" reaches out-of-bounds for layout size %d", decl.name(), layoutSize));
+		if (offset > layoutSize) errAtRange(decl.offset.range()).FieldDeclError(Strings.format2("layout field \"%s\" offset out-of-bounds for layout size %d", decl.name(), layoutSize));
+		else if ((offset + long.view(mtref.byteSize)) > layoutSize) errAtRange(decl.offset.range()).FieldDeclError(Strings.format2("layout field \"%s\" reaches out-of-bounds for layout size %d", decl.name(), layoutSize));
 		// TODO: check overlapping of fields, build IrField?
 		decl.index = compound.numFields++;
 	}
@@ -666,34 +722,34 @@ class VstCompoundVerifier {
 			if (superDecl.typeEnv != null) {
 				// substitute super method's type parameters with overriden method's
 				if (decl.typeEnv == null || decl.typeEnv.paramArray.length != superDecl.typeEnv.paramArray.length) {
-					return InheritanceError(decl.token, "cannot override method type parameters");
+					return errAtDecl(decl).InheritanceError("cannot override method type parameters");
 				}
 				var typeArgs = TypeArgs.new(superDecl.typeEnv, decl.typeEnv.paramArray);
 				superMethodType = superMethodType.substitute(typeArgs);
 				// the overriden method's complete type must be subtype of the super
 				// use the same vtable index as the parent.
 			} else if (decl.typeEnv != null) {
-				return InheritanceError(decl.token, "cannot override method type parameters");
+				return errAtDecl(decl).InheritanceError("cannot override method type parameters");
 			}
 			if (superDecl.returnThis) {
-				if (!decl.returnThis) return InheritanceError(decl.token, "super method returns this");
+				if (!decl.returnThis) return errAtDecl(decl).InheritanceError("super method returns this");
 			} else {
-				if (decl.returnThis) return InheritanceError(decl.token, "super method does not return this");
+				if (decl.returnThis) return errAtDecl(decl).InheritanceError("super method does not return this");
 			}
 			if (false && !superDecl.isPrivate && decl.isPrivate) { // TODO
-				return InheritanceError(decl.token, "cannot override super method with private method");
+				return errAtDecl(decl).InheritanceError("cannot override super method with private method");
 			}
 
 			if (!TypeSystem.isSubtype(methodType, superMethodType)) {
-				InheritanceError2(decl.token, "method signature %s cannot override %s", methodType, superMethodType);
+				errAtDecl(decl).InheritanceError2("method signature %s cannot override %s", methodType, superMethodType);
 			}
 		} else {
-			InheritanceError(decl.token, "cannot override non-method member");
+			errAtDecl(decl).InheritanceError("cannot override non-method member");
 			decl.root = decl;
 		}
 	}
 	def checkParam(param: ParamDecl, map: Map<string, Decl>) {
-		if (map[param.name()] != null) ParamDeclError(param.token, Strings.format1("parameter \"%s\" redefined", param.name()));
+		if (map[param.name()] != null) errAtDecl(param).ParamDeclError(Strings.format1("parameter \"%s\" redefined", param.name()));
 		map[param.name()] = param;
 	}
 	def checkNewParam(param: ParamDecl, mdecl: VstNew, map: Map<string, Decl>) {
@@ -706,15 +762,15 @@ class VstCompoundVerifier {
 				var decl = VstField.!(member);
 				if (decl.tref != null) param.vtype = resolveType(decl.tref, compound.typeEnv);
 				else {
-					FieldDeclError(decl, "parameter must refer to a field with a declared type");
+					errAtDecl(decl).FieldDeclError("parameter must refer to a field with a declared type");
 					param.vtype = getErrorType();
 				}
-				if (decl.init != null) FieldDeclError(decl, "parameter cannot refer to a field with an initializer");
+				if (decl.init != null) errAtDecl(decl).FieldDeclError("parameter cannot refer to a field with an initializer");
 			}
 		}
 		if (param.vtype == null) {
 			if (param.tref == null) {
-				ParamDeclError(param.token, "parameter must have a declared type or refer to a field");
+				errAtDecl(param).ParamDeclError("parameter must have a declared type or refer to a field");
 				param.vtype = getErrorType();
 			}
 			else param.vtype = resolveType(param.tref, compound.typeEnv);
@@ -744,7 +800,7 @@ class VstCompoundVerifier {
 					if (VstCaseMember.?(member)) {
 						var typeCon = VstCaseMember.!(member).decl.typeCon;
 						if (x.nested != null) {
-							TypeParamArityError(x.name.range(), "variant case type",
+							errAtRange(x.name.range()).TypeParamArityError("variant case type",
 								x.name.image, 0, x.nested.length());
 						}
 						return x.binding = typeCon.create(leftType.nested);
@@ -754,19 +810,19 @@ class VstCompoundVerifier {
 					var enumType = EnumType.!(leftType);
 					if (Strings.equal(x.name.image, "set")) {
 						if (x.nested != null) {
-							TypeParamArityError(x.name.range(), "enum set type",
+							errAtRange(x.name.range()).TypeParamArityError("enum set type",
 								x.name.image, 0, x.nested.length());
 						}
 						return getEnumSetType(x, enumType);
 					}
 				}
 				if (x.left != null) {
-					error(x.name.range(), "UnresolvedType", Strings.format2("type \"%q\" has no member type \"%s\"", x.left.render, x.name.image));
+					errAtRange(x.name.range()).set("UnresolvedType", Strings.format2("type \"%q\" has no member type \"%s\"", x.left.render, x.name.image));
 					return x.binding = getErrorType();
 				}
 				var typeCon = typeEnv.lookup(x.name.image);
 				if (typeCon == null) {
-					UnresolvedType(x);
+					errAtRange(x.range()).UnresolvedType(x);
 					return x.binding = ERROR.getErrorTypeNamed(x.name.image);
 				}
 				if (typeCon.kind == Kind.REF) return resolveRefType(V3Ref_TypeCon.!(typeCon), x);
@@ -774,8 +830,7 @@ class VstCompoundVerifier {
 				var nested = if(x.nested != null, Lists.map(x.nested.list, resolveType(_, typeEnv)));
 				var arity = typeCon.arity;
 				if (arity >= 0 && arity != Lists.length(nested)) {
-					var range = x.range().end();
-					TypeParamArityError(range, "type", x.name.image, arity, Lists.length(nested));
+					errAtPoint(x.range().end()).TypeParamArityError("type", x.name.image, arity, Lists.length(nested));
 					nested = Lists.pad(nested, getErrorType(), arity);
 				}
 				return x.binding = typeCon.create(nested);
@@ -786,7 +841,7 @@ class VstCompoundVerifier {
 	def resolveRefType(typeCon: V3Ref_TypeCon, tref: NamedTypeRef) -> Type {
 		var arity = if(tref.nested != null, tref.nested.length());
 		if (arity != 1) {
-			TypeParamArityError(tref.range().end(), "type", tref.name.image, 1, arity);
+			errAtPoint(tref.range().end()).TypeParamArityError("type", tref.name.image, 1, arity);
 			return tref.binding = getErrorType();
 		}
 		var arg = tref.nested.list.head;
@@ -798,17 +853,17 @@ class VstCompoundVerifier {
 						if (typeCon.writeable) return tref.binding = st.getDeclaredType();
 						return tref.binding = st.readonlyType;
 					}
-					error(arg.range(), "UnresolvedLayout", Strings.format1("layout \"%s\" cannot be found", x.name.image));
+					errAtRange(arg.range()).set("UnresolvedLayout", Strings.format1("layout \"%s\" cannot be found", x.name.image));
 					return tref.binding = getErrorType();
 				}
 			}
 			_ => ; // fall through
 		}
-		error(arg.range(), "TypeError", Strings.format2("%s expects a layout name, found \"%q\"", tref.name.image, arg.render));
+		errAtRange(arg.range()).set("TypeError", Strings.format2("%s expects a layout name, found \"%q\"", tref.name.image, arg.render));
 		return tref.binding = getErrorType();
 	}
 	def getEnumSetType(tref: TypeRef, enumType: EnumType) -> Type {
-		if (enumType.setType == null) EnumSetTooLarge(enumType, tref, enumType.enumDecl.cases.length);
+		if (enumType.setType == null) errAtRange(tref.range()).EnumSetTooLarge(enumType, tref, enumType.enumDecl.cases.length);
 		return tref.binding = enumType.setType;
 	}
 	def newThisParam() -> ParamDecl {
@@ -826,100 +881,126 @@ class VstCompoundVerifier {
 	def canAccessMember(decl: VstMember) -> bool {
 		return !decl.isPrivate || decl.receiver.verifier.file == this.file;
 	}
-	// -- Utility methods to generate errors -----------------------------------
-	def TypeError(range: FileRange, t1: Type, t2: Type, op: string) {
-		// TODO: this method is duplicated in both verifier and type checker
-		if (ERROR.numErrors == 0 || (t1 != ERROR.errorType && t2 != ERROR.errorType)) {
-			error(range, "TypeError", Strings.format3("%s requires type %q and found %q", op, t1.render, t2.render));
+	def inferPackingExpr(env: VarEnvironment, expr: VstPackingExpr) -> byte {
+		var decl = VstPacking.!(compound);
+		match (expr) {
+			Bits(token, rep) => {
+				var pl = decl.pparams.list;
+				for (i < rep.length) {
+					var t = rep[i], offset = t.0, bit = t.1;
+					match (bit) {
+						Assigned(ch) => {
+							var param: PackingParamDecl;
+							for (p = pl; p != null; p = p.tail) { // XXX: linear search
+								if (p.head.token.image[0] == ch) { param = p.head; break; }
+							}
+							if (param == null) {
+								errInsideToken(token, offset).UnresolvedPackingBit(ch);
+							} else {
+								var pos = param.bitPos++;
+								if (pos >= param.bitWidth) errInsideToken(token, offset).ExtraPackingBit(param.name(), param.bitWidth);
+							}
+						}
+						_ => ;
+					}
+				}
+				return byte.view(rep.length);
+			}
+			Concat(l) => {
+				var total: byte = 0;
+				for (e = l.list; e != null; e = e.tail) {
+					var s = inferPackingExpr(env, e.head);
+					if (total + s >= MAX_PACKING_WIDTH) {
+						total = MAX_PACKING_WIDTH;
+						errAtRange(l.range()).PackingExprTooLong(MAX_PACKING_WIDTH, total + s);
+					} else {
+						total += s;
+					}
+				}
+				return total; 
+			}
+			Field(f) => {
+				var decl = env.lookupVar(f.ident.name.image, 0);
+				match (decl) {
+					x: PackingParamDecl => {
+						if (x.bitPos > 0) errAtToken(f.ident.name).PackingParamReused(f.ident.name.image);
+						else x.bitPos = x.bitWidth;
+						return x.bitWidth;
+					}
+					_ => errAtToken(f.ident.name).UnresolvedIdentifier(f.ident.name); // XXX: better error message
+				}
+			}
+			App(p, args) => { // TODO
+				var packingFn = packings[p.ident.name.image];
+				if (packingFn.pparams.length() != args.length()) {
+					errAtRange(args.range()).ArityMismatch(p.ident.name.image, packingFn.pparams.length(), args.length());
+				} else {
+					var pp = packingFn.pparams.list;
+					for (l = args.list; l != null; l = l.tail) {
+						var param = pp.head, paramSize = byte.view(tryUnboxPositiveInt(param.size, -1));
+						checkPackingExpr(env, l.head, paramSize); // TODO: proper size
+						pp = pp.tail;
+					}
+				}
+				return byte.view(tryUnboxPositiveInt(packingFn.size, -1));
+			}
+			_ => ;
+		}
+		return MAX_PACKING_WIDTH;
+	}
+	def checkPackingExpr(env: VarEnvironment, expr: VstPackingExpr, bitWidth: byte) {
+		var decl = VstPacking.!(compound);
+
+		var len = inferPackingExpr(env, expr);
+		match (expr) {
+			Bits(token, rep) => if (len > bitWidth) errAtToken(token).BitPatternTooLong(bitWidth, len);
+			Concat(l) => if (len > bitWidth) errAtRange(l.range()).PackingExprTooLong(bitWidth, len);
+			Solve(list) => {
+				// unreachable for declarations
+				for (l = list.list; l != null; l = l.tail) {
+					checkPackingExpr(env, l.head, MAX_PACKING_WIDTH); // TODO: proper size
+				}
+			}
+			App(p, args) => if (len > bitWidth) errAtRange(FileRanges.add(p.range(), args.range())).PackingExprTooLong(bitWidth, len);
+			Field(f) => if (len > bitWidth) errAtToken(f.ident.name).PackingExprTooLong(bitWidth, len);
+			Literal(lit) => { // TODO: enforce maximum packing size
+			}
 		}
 	}
-	def EnumSetTooLarge(t: Type, tref: TypeRef, size: int) {
-		error(tref.range(), "EnumSetTooLarge", Strings.format2("enum \"%q\" has too many cases to build a set (%d)", t.render, size));
-	}
-	def UnresolvedType(tref: TypeRef) {
-		error(tref.range(), "UnresolvedType", Strings.format1("type \"%q\" cannot be found", tref.render));
-	}
-	def MainMethodError(range: FileRange, msg: string) {
-		error(range, "MainMethodError", msg);
-	}
-	def TypeRedefined(tref: Token) {
-		error(tref.range(), "TypeRedefined", Strings.format1("type \"%s\" redefined", tref.image));
-	}
-	def ParamDeclError(name: Token, msg: string) {
-		error(name.rangeOf(0), "ParamDeclError", msg);
-	}
-	def VarDeclError(vdecl: VarDecl, msg: string) {
-		error(vdecl.token.range(), "VarDeclError", msg);
-	}
-	def FieldDeclError(f: VstMember, msg: string) {
-		error(f.token.range(), "FieldDeclError", msg);
-	}
-	def FieldDeclError2(r: FileRange, msg: string) {
-		error(r, "FieldDeclError", msg);
-	}
-	def ExportDeclError(e: ExportDecl, msg: string) {
-		error(e.token.range(), "ExportDeclError", msg);
-	}
-	def ImportError(m: VstMember, msg: string) {
-		error(m.token.range(), "ImportError", msg);
-	}
-	def IndexDeclError(m: VstMethod, msg: string) {
-		error(m.token.rangeOf(0), "IndexDeclError", msg);
-	}
-	def CaseDeclError(f: VstEnumCase, msg: string) {
-		error(f.token.range(), "CaseDeclError", msg);
-	}
-	def UnimplementedError(body: Stmt, msg: string) {
-		error(body.range(), "UnimplementedError", msg);
-	}
-	def TypeParamArityError(point: FilePoint, kind: string, name: string, expect: int, got: int) {
-		var decl = Strings.format2("%s \"%s\"", kind, name), msg: string;
-		if (expect == 0) msg = Strings.format1("%s cannot have type arguments", decl);
-		else msg = Strings.format3("%s expects %d type arguments and found %d", decl, expect, got);
-		error(point.rangeOf(0), "TypeError", msg);
-	}
-	def InheritanceError(point: FilePoint, msg: string) {
-		error(point.rangeOf(0), "InheritanceError", msg);
-	}
-	def InheritanceError2(point: FilePoint, msg: string, t1: Type, t2: Type) {
-		error(point.rangeOf(0), "InheritanceError", Strings.format2(msg, TYPE(t1), TYPE(t2)));
-	}
-	def MemberRedefined(decl: Token) {
-		error(decl.range(), "MemberRedefined", Strings.format1("member \"%s\" redefined", decl.image));
-	}
-	def ConstructorError(decl: Token, msg: string) {
-		error(decl.range(), "ConstructorError", msg);
-	}
-	def TypeParamRedefined(tparam: TypeParamType) {
-		error(tparam.token.range(), "TypeParamRedefined", Strings.format1("type parameter \"%s\" redefined", tparam.token.image));
-	}
-	def TypeExprError(range: FileRange, t1: Type) {
-		error(range, "TypeError", Strings.format1("type \"%q\" cannot be used as an expression", t1.render));
-	}
-	def PtrAtFieldError(range: FileRange) {
-		error(range, "TypeError",
-				"operator \"Pointer.atField\" must be applied to a class or component field reference");
-	}
-	def MemberNotInitialized(range: FileRange, msg: string) {
-		error(range, "MemberNotInitialized", msg);
-	}
-	def InvalidThisUse(range: FileRange) {
-		error(range, "InvalidThisUse", "\"this\" cannot be used in a field initializer");
-	}
-	def TypeCastError(range: FileRange, fromType: Type, toType: Type, msg: string) {
-		error(range, "TypeError", Strings.format3("type cast %q.!(%q) %s", toType.render, fromType.render, msg));
-	}
-	def TypeQueryError(range: FileRange, fromType: Type, toType: Type, msg: string) {
-		error(range, "TypeError", Strings.format3("type query %q.?(%q) %s", toType.render, fromType.render, msg));
-	}
-	def error(range: FileRange, error: string, msg: string) {
-		ERROR.addError(range, file.extractLine(range.beginLine), error, msg);
-	}
+	// -- Utility methods to generate errors -----------------------------------
 	def getErrorType() -> Type {
 		return ERROR.getErrorType();
 	}
+	def MainMethodError(range: FileRange, msg: string) {
+		errAtRange(range).MainMethodError(msg);
+	}
+	def errAtRange(range: FileRange) -> SourceCodeError {
+		var sourceLine = file.extractLine(range.beginLine);
+		var obj = SourceCodeError.new(range, sourceLine);
+		ERROR.addErrorObj(obj);
+		return obj;
+	}
+	def errAtPoint(point: FilePoint) -> SourceCodeError {
+		return errAtRange(point.rangeOf(0));
+	}
+	def errAtDecl(decl: Decl) -> SourceCodeError {
+		return errAtRange(decl.token.range());
+	}
+	def errAtToken(token: Token) -> SourceCodeError {
+		return errAtRange(token.range());
+	}
+	def errInsideToken(token: Token, offset: int) -> SourceCodeError {
+		return errAtPoint(token.rangeOf(offset).end());
+	}
+	def errAtExpr(expr: Expr) -> SourceCodeError {
+		return errAtRange(expr.range());
+	}
+	def errAtStmt(stmt: Stmt) -> SourceCodeError {
+		return errAtRange(stmt.range());
+	}
 }
 
+def MAX_PACKING_WIDTH = byte.!(Int.MAX_WIDTH);
 def FLOW_THRU = 0;
 def FLOW_END  = 1;
 def FLOW_RET  = 2;
@@ -985,7 +1066,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	def visitForeach(stmt: ForeachStmt, outer: Type) -> Type {
 		var prev = methodEnv.env.enterScope();
 		var varDecl = stmt.varDecl;
-		if (varDecl.init != null) VarDeclError(stmt.varDecl, "foreach variable cannot have an initializer");
+		if (varDecl.init != null) errAtDecl(stmt.varDecl).VarDeclError("foreach variable cannot have an initializer");
 		if (varDecl.tref != null) varDecl.vtype = methodEnv.resolveType(varDecl.tref);
 		methodEnv.bindVar(varDecl);
 		stmt.loopNum = pushLoop();
@@ -993,7 +1074,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		setAssigned(stmt.loopVar);
 		var elemType = getForeachElemType(stmt.expr);
 		if (varDecl.tref == null) varDecl.vtype = elemType;
-		else if (!isAssignable(elemType, varDecl.vtype)) TypeError(stmt.expr.range(), varDecl.vtype, elemType, "foreach");
+		else if (!isAssignable(elemType, varDecl.vtype)) errAtExpr(stmt.expr).TypeError(varDecl.vtype, elemType, "foreach");
 		typeCheckStmtWithNewScope(stmt.body);
 		popLoop();
 		flow = FLOW_THRU;
@@ -1008,7 +1089,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 				match (methodEnv.lookupVar(VarExpr.!(expr))) {
 					Type(t) => {
 						if (EnumType.?(t)) return elim(t);
-						error(expr.range(), "TypeError", Strings.format1("foreach requires iterable expression and found %s", TYPE(elim(t))));
+						errAtExpr(expr).set("TypeError", Strings.format1("foreach requires iterable expression and found %s", TYPE(elim(t))));
 						return getErrorType();
 					}
 					_ => ;
@@ -1024,14 +1105,14 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			return EnumSetType.!(exprType).enumDecl.getDeclaredType();
 		} else {
 			// an unknown type.
-			error(expr.range(), "TypeError", Strings.format1("foreach requires iterable expression and found %s", TYPE(exprType)));
+			errAtExpr(expr).set("TypeError", Strings.format1("foreach requires iterable expression and found %s", TYPE(exprType)));
 			return getErrorType();
 		}
 	}
 	def visitForLess(stmt: ForLessStmt, outer: Type) -> Type {
 		var prev = methodEnv.env.enterScope();
 		var varDecl = stmt.varDecl;
-		if (varDecl.init != null) VarDeclError(stmt.varDecl, "foreach variable cannot have an initializer");
+		if (varDecl.init != null) errAtDecl(stmt.varDecl).VarDeclError("foreach variable cannot have an initializer");
 		if (varDecl.tref != null) varDecl.vtype = methodEnv.resolveType(varDecl.tref);
 		stmt.loopNum = pushLoop();
 		var exprType = varDecl.vtype;
@@ -1041,7 +1122,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			varDecl.vtype = exprType = inferClosedType(stmt.expr);
 		}
 		if (!IntType.?(exprType)) {
-			error(stmt.expr.range(), "TypeError", Strings.format1("foreach requires integral expression and found %s", TYPE(exprType)));
+			errAtExpr(stmt.expr).set("TypeError", Strings.format1("foreach requires integral expression and found %s", TYPE(exprType)));
 		}
 		methodEnv.bindVar(varDecl);
 		setAssigned(varDecl.ssa);
@@ -1071,7 +1152,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			}
 		} else {
 			if (varDecl.init == null) {
-				VarDeclError(varDecl, "must have a declared type or an initializer");
+				errAtDecl(varDecl).VarDeclError("must have a declared type or an initializer");
 				varDecl.vtype = getErrorType();
 			} else {
 				varDecl.vtype = inferClosedType(varDecl.init);
@@ -1080,12 +1161,12 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		methodEnv.bindVar(varDecl);
 	}
 	def visitBreak(stmt: BreakStmt, outer: Type) -> Type {
-		if (loopStack == null) LoopError(stmt.range(), "break must be in loop");
+		if (loopStack == null) errAtStmt(stmt).LoopError("break must be in loop");
 		flow = FLOW_END;
 		return Void.TYPE;
 	}
 	def visitContinue(stmt: ContinueStmt, outer: Type) -> Type {
-		if (loopStack == null) LoopError(stmt.range(), "continue must be in loop");
+		if (loopStack == null) errAtStmt(stmt).LoopError("continue must be in loop");
 		flow = FLOW_END;
 		return Void.TYPE;
 	}
@@ -1095,7 +1176,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		if (AppExpr.?(e)) return Void.TYPE;
 		if (AssignExpr.?(e)) return Void.TYPE;
 		if (AutoExpr.?(e)) return Void.TYPE;
-		StatementError(e.range());
+		errAtExpr(e).StatementError();
 		return Void.TYPE;
 	}
 	def visitMatch(stmt: MatchStmt, outer: Type) -> Type {
@@ -1137,7 +1218,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	}
 	def visitMatchPattern(mv: MatchStmtVerifier, pat: MatchPattern) {
 		if (pat.vdecl != null) {
-			if (pat.params != null) MatchError(pat.params.range(), "match type cannot have parameters");
+			if (pat.params != null) errAtRange(pat.params.range()).MatchError("match type cannot have parameters");
 			var ttype = methodEnv.resolveType(pat.vdecl.tref);
 			pat.vdecl.vtype = ttype;
 			return mv.addTypePattern(pat, ttype);
@@ -1149,9 +1230,9 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 		if (mv.variantType != null) return checkVariantPattern(mv, pat);
 		if (mv.enumType != null) return checkEnumPattern(mv, pat);
-		if (pat.params != null) return MatchError(pat.params.range(), "match pattern cannot have parameters");
+		if (pat.params != null) return errAtRange(pat.params.range()).MatchError(Strings.format1("match on type %s cannot have parameters", TYPE(mv.etype)));
 		typeCheckExpr(e, mv.etype, "match case");
-		if (!VarExpr.?(e)) return MatchError(e.range(), "match expression is not a constant");
+		if (!VarExpr.?(e)) return errAtExpr(e).MatchError("match expression is not a constant");
 		var ve = VarExpr.!(e);
 		match (ve.varbind) {
 			ComponentField(field) => {
@@ -1164,7 +1245,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			}
 			_ => ;
 		}
-		MatchError(ve.range(), "match expression is not a value");
+		errAtExpr(ve).MatchError("match expression is not a value");
 	}
 	def assignPatternVal(mv: MatchStmtVerifier, pat: MatchPattern, val: Val) {
 		if (pat.expr.implicitType != null) {
@@ -1180,36 +1261,39 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var vt = mv.variantType;
 		if (vt == null) return;
 		if (pat.decl().params == null) {
-			MatchError(pat.params.range(), Strings.format2("case %q.%s has no declared parameters", vt.render, pat.decl().name()));
+			errAtRange(pat.params.range()).MatchError(Strings.format2("case %q.%s has no declared parameters", vt.render, pat.decl().name()));
 			return;
 		}
 		var ll = pat.params.list, pl = pat.decl().params.list;
 		var typeArgs = vt.getTypeArgs();
 		while (ll != null) {
+			var vdecl = ll.head;
 			if (pl == null) {
 				var msg = Strings.format2("case %q.%s", vt.render, pat.decl().name());
-				ArityMismatch(ll.head.token.range(), msg, Lists.length(pat.decl().params.list), Lists.length(pat.params.list));
+				errAtToken(ll.head.token).ArityMismatch(msg, Lists.length(pat.decl().params.list), Lists.length(pat.params.list));
 				return;
 			}
-			ll.head.vtype = pl.head.vtype.substitute(typeArgs);
-			methodEnv.bindVar(ll.head);
+			if (!vdecl.isUnderscore()) {
+				vdecl.vtype = pl.head.vtype.substitute(typeArgs);
+				methodEnv.bindVar(vdecl);
+			}
 			ll = ll.tail;
 			pl = pl.tail;
 		}
 		if (pl != null) {
 			var msg = Strings.format2("case %q.%s", vt.render, pat.decl().name());
-			ArityMismatch(pat.params.range().lastByte(), msg, Lists.length(pat.decl().params.list), Lists.length(pat.params.list));
+			errAtPoint(pat.params.range().lastByte()).ArityMismatch(msg, Lists.length(pat.decl().params.list), Lists.length(pat.params.list));
 		}
 	}
 	def checkVariantPattern(mv: MatchStmtVerifier, pat: MatchPattern) {
 		if (!VarExpr.?(pat.expr)) return;
 		var ve = VarExpr.!(pat.expr), vt = mv.variantType;
 		if (ve.expr != null) {
-			return MatchError(ve.range(), Strings.format1("match on type %q requires unqualified case", vt.render));
+			return errAtExpr(ve).MatchError(Strings.format1("match on type %q requires unqualified case", vt.render));
 		}
 		var vc = pat.variantCase = vt.lookupCase(ve.ident.name.image);
 		if (vc == null) {
-			return MatchError(ve.range(), Strings.format2("unresolved case %q.%s", vt.render, ve.ident.name.image));
+			return errAtExpr(ve).MatchError(Strings.format2("unresolved case %q.%s", vt.render, ve.ident.name.image));
 		}
 		mv.addVariantPattern(pat, vc);
 	}
@@ -1217,11 +1301,11 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		if (!VarExpr.?(pat.expr)) return;
 		var ve = VarExpr.!(pat.expr), vt = mv.enumType;
 		if (ve.expr != null) {
-			return MatchError(ve.range(), Strings.format1("match on type %q requires unqualified case", vt.render));
+			return errAtExpr(ve).MatchError(Strings.format1("match on type %q requires unqualified case", vt.render));
 		}
 		var vc = vt.lookupCase(ve.ident.name.image);
 		if (vc == null) {
-			return MatchError(ve.range(), Strings.format2("unresolved case %q.%s", vt.render, ve.ident.name.image));
+			return errAtExpr(ve).MatchError(Strings.format2("unresolved case %q.%s", vt.render, ve.ident.name.image));
 		}
 		mv.addEnumPattern(pat, vc);
 	}
@@ -1240,7 +1324,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			Explicit(tref) => returnType = tref.getType();
 		}
 		if (stmt.expr != null) typeCheckExpr(stmt.expr, returnType, "return statement");
-		else if (returnType != Void.TYPE) TypeError(stmt.src, returnType, Void.TYPE, "return statement");
+		else if (returnType != Void.TYPE) errAtRange(stmt.src).TypeError(returnType, Void.TYPE, "return statement");
 		flow = FLOW_RET;
 		return Void.TYPE;
 	}
@@ -1263,7 +1347,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return e.exactType;
 	}
 	def visitParamExpr(expr: ParamExpr, outer: Type) -> Type {
-		ParamExprError(expr.range(), "param expression can only be function call argument");
+		errAtExpr(expr).ParamExprError("param expression can only be function call argument");
 		return if(outer == null, getErrorType(), outer);
 	}
 	def visitAutoExpr(expr: AutoExpr, outer: Type) -> Type {
@@ -1272,7 +1356,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var op = expr.op;
 		if (op == null) op = methodEnv.lookupInfix(expr.infix, t, t);
 		if (op == null) {
-			UnresolvedOp(expr.token, t, null);
+			errAtToken(expr.token).UnresolvedOp(expr.token, t, null);
 			return t;
 		}
 		expr.op = op;
@@ -1286,13 +1370,13 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			etype = outer.nested.head; // element type is first type parameter to array type
 		} else {
 			if (se == null) {
-				TypeInferError(expr.range(), "cannot infer empty array type");
+				errAtExpr(expr).TypeInferError("cannot infer empty array type");
 			} else {
 				etype = inferClosedType(se.head);
 				for (rest = se.tail; rest != null; rest = rest.tail) {
 					etype = TypeSystem.widen(etype, inferClosedType(rest.head));
 					if (etype == null) {
-						TypeInferError(rest.head.range(), "cannot infer type of array");
+						errAtExpr(rest.head).TypeInferError("cannot infer type of array");
 						return getErrorType();
 					}
 				}
@@ -1307,10 +1391,10 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var binding = lookupBinding(expr, outer);
 		match (binding) { // some bindings are not allowed as standalone expressions
 			None => return if(outer == null, getErrorType(), outer);
-			PtrAtField(t) => methodEnv.verifier.PtrAtFieldError(expr.range());
+			PtrAtField(t) => errAtExpr(expr).set("ExprError", "Pointer.atField used as an expression");
 			RefLayoutRepeatedField,
-			RefLayoutRepeatedNested => methodEnv.verifier.error(expr.range(), "ExprError", "repeated field used as an expression");
-			Type(t) => methodEnv.verifier.TypeExprError(expr.range(), t);
+			RefLayoutRepeatedNested => errAtExpr(expr).set("ExprError", "repeated field used as an expression");
+			Type(t) => errAtExpr(expr).TypeExprError(t);
 			_ => ;
 		}
 		if (outer != null) TypeSystem.unifyWiden(expr.exactType, outer);
@@ -1325,7 +1409,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		if (expr.expr == null) {
 			// "var" -- top level variable
 			binding = methodEnv.lookupVar(expr);
-			if (binding.none()) UnresolvedIdentifier(expr.ident.name);
+			if (binding.none()) errAtToken(expr.ident.name).UnresolvedIdentifier(expr.ident.name);
 			return binding;
 		}
 		// "expr.var" -- a member expression
@@ -1368,7 +1452,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			etype = inferClosedType(expr.expr);
 			binding = methodEnv.lookupExprMember(expr, etype, false);
 		}
-		if (binding.none()) UnresolvedMember(expr.ident.name, inType, etype);
+		if (binding.none()) errAtToken(expr.ident.name).UnresolvedMember(expr.ident.name, inType, etype);
 		return binding;
 	}
 	def visitString(expr: StringExpr, outer: Type) -> Type {
@@ -1387,7 +1471,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 					return expr.exactType = Void.TYPE;
 				}
 				PtrAtField(t) => return visitPtrAtField(expr, t, outer);
-				Type(t) => methodEnv.verifier.TypeExprError(expr.range(), t);
+				Type(t) => errAtExpr(expr).TypeExprError(t);
 				_ => funcType = x.exactType;
 			}
 			_ => {
@@ -1396,7 +1480,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 
 		if (!V3.isFunction(funcType)) {
-			TypeError(expr.func.range(), getErrorFunctionType(), funcType, "call");
+			errAtExpr(expr.func).set("TypeError", Strings.format1("expected function for call, got %s", TYPE(funcType)));
 			return getErrorType();
 		}
 		var partialParamTypes = typeCheckArgs("call", expr.args.exprs, funcType, outer);
@@ -1467,7 +1551,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	}
 	def visitPtrAtField(expr: AppExpr, ptrType: Type, outer: Type) -> Type {
 		if (expr.args.exprs.length() != 1) {
-			methodEnv.verifier.PtrAtFieldError(expr.args.range());
+			errAtRange(expr.args.range()).PtrAtFieldError();
 			return getErrorType();
 		}
 		var arg = expr.args.exprs.first();
@@ -1494,11 +1578,11 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 					return expr.exactType = ptrType;
 				}
 				_ => {
-					methodEnv.verifier.PtrAtFieldError(arg.range());
+					errAtExpr(arg).PtrAtFieldError();
 				}
 			}
 			_ => {
-				methodEnv.verifier.PtrAtFieldError(arg.range());
+				errAtExpr(arg).PtrAtFieldError();
 			}
 		}
 		return getErrorType();
@@ -1516,7 +1600,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			expr.expr.implicitType = exprType;
 		}
 		if (!V3.isRange(exprType)) {
-			error(expr.expr.range(), "RangeError", Strings.format1("type %s has no range [...] operator", TYPE(exprType)));
+			errAtExpr(expr.expr).set("RangeError", Strings.format1("type %s has no range [...] operator", TYPE(exprType)));
 			return getErrorType();
 		}
 		return exprType;
@@ -1551,7 +1635,8 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 						var mtref = member.mtref;
 						expr.receiver = x.expr;
 						expr.read = AppBinding.Apply(V3Op.newRefLayoutGetRepeatedField(
-							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),
+							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType(),
+							member.order),
 							Facts.NONE);
 						visitRepeatedIndex(expr.exprs);
 						return mtref.getType();
@@ -1579,7 +1664,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 				}
 			}
 		}
-		error(expr.exprs.range(), "TypeError", Strings.format1("type %s has no [] operator", TYPE(exprType)));
+		errAtRange(expr.exprs.range()).set("TypeError", Strings.format1("type %s has no [] operator", TYPE(exprType)));
 		return getErrorType();
 	}
 	def checkIndexedWrite(expr: IndexExpr, outer: Type) -> Type {
@@ -1593,7 +1678,8 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 						var mtref = member.mtref;
 						expr.receiver = x.expr;
 						expr.write = AppBinding.Apply(V3Op.newRefLayoutSetRepeatedField(
-							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType()),	
+							receiver, member.byteOffset, mtref.scale, mtref.repeatCount, mtref.getType(),
+							member.order),
 							Facts.NONE);
 						visitRepeatedIndex(expr.exprs);
 						return mtref.getType();
@@ -1622,12 +1708,12 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 				}
 			}
 		}
-		error(expr.exprs.range(), "AssignError", Strings.format1("type %s has no [] assignment operator", TYPE(exprType)));
+		errAtRange(expr.exprs.range()).set("AssignError", Strings.format1("type %s has no [] assignment operator", TYPE(exprType)));
 		return getErrorType();
 	}
 	def visitArrayIndex(expr: IndexExpr, arrayType: Type) -> Type {
 		if (expr.exprs.length() != 1) {
-			error(expr.exprs.range(), "TypeError",
+			errAtRange(expr.exprs.range()).set("TypeError",
 				Strings.format1("indexing requires 1 expression, found %d", expr.exprs.length()));
 		} else {
 			inferIntegralType(expr.exprs.first(), "indexing");
@@ -1639,14 +1725,14 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var it = inferClosedType(expr);
 		match (it) {
 			x: IntType => return x;
-			_ => error(expr.range(), "TypeError",
+			_ => errAtExpr(expr).set("TypeError",
 				Strings.format2("%s requires integral type, found %s", op, TYPE(it)));
 		}
 		return Int.TYPE;
 	}
 	def visitRepeatedIndex(exprs: VstList<Expr>) {
 		if (exprs.length() != 1) {
-			error(exprs.range(), "TypeError",
+			errAtRange(exprs.range()).set("TypeError",
 				Strings.format1("indexing requires 1 expression, found %d", exprs.length()));
 		} else {
 			typeCheckExpr(exprs.first(), Int.TYPE, "indexing"); // TODO: allow any integral type?
@@ -1666,7 +1752,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			if (tl == null) {
 				// too many parameters
 				inferClosedType(arg);
-				ArityMismatch(arg.range(), op, Lists.length(ptlist), args.length());
+				errAtExpr(arg).ArityMismatch(op, Lists.length(ptlist), args.length());
 				continue;
 			}
 			var paramType = tl.head;
@@ -1685,7 +1771,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		}
 		if (tl != null) {
 			// too few parameters
-			ArityMismatch(args.range().lastByte(), op, Lists.length(ptlist), args.length());
+			errAtPoint(args.range().lastByte()).ArityMismatch(op, Lists.length(ptlist), args.length());
 		}
 		// Unify the return type with the expected type
 		if (partialParamTypes == null && outer != null) {
@@ -1709,7 +1795,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		if (t != null) expr.op = methodEnv.lookupInfix(V3Infix.Sub, t, null);
 
 		if (expr.op == null) {
-			error(expr.expr.range(), "TypeError", Strings.format1("unary negate requires numeric type, found %s", TYPE(t)));
+			errAtExpr(expr.expr).set("TypeError", Strings.format1("unary negate requires numeric type, found %s", TYPE(t)));
 			return Int.TYPE;
 		}
 		return t;
@@ -1719,7 +1805,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		else inferClosedType(expr.expr);
 		var t = expr.expr.exactType;
 		if (t.typeCon.kind != Kind.INT) {
-			error(expr.expr.range(), "TypeError", Strings.format1("bitwise negate requires integral type, found %s", TYPE(t)));
+			errAtExpr(expr.expr).set("TypeError", Strings.format1("bitwise negate requires integral type, found %s", TYPE(t)));
 			return Int.TYPE;
 		}
 		return t;
@@ -1748,7 +1834,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 				result = inferClosedType(left);
 			}
 		}
-		AssignError(left.range());
+		errAtExpr(left).AssignError();
 		return result;
 	}
 	def visitAssign(expr: AssignExpr, outer: Type) -> Type {
@@ -1759,7 +1845,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			if (IndexExpr.?(left)) ltype = checkIndexedRead(IndexExpr.!(left), outer);
 			if (infix.op == null) infix.op = methodEnv.lookupInfix(infix.infix, ltype, null);
 			if (infix.op == null) {
-				UnresolvedOp(infix.token, ltype, null);
+				errAtToken(infix.token).UnresolvedOp(infix.token, ltype, null);
 				return getErrorType();
 			}
 			typeCheckExpr(expr.expr, infix.op.sig.paramTypes[1], "compound assignment");
@@ -1781,7 +1867,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var op = methodEnv.lookupInfix(expr.op.infix, ltype, rtype);
 		if (op == null) {
 			if (expr.op.infix == V3Infix.EqEq || expr.op.infix == V3Infix.NotEq) ComparisonError(expr.range(), ltype, rtype);
-			else UnresolvedOp(expr.op.token, ltype, null);
+			else errAtToken(expr.op.token).UnresolvedOp(expr.op.token, ltype, null);
 			return getErrorType();
 		}
 		expr.set(op);
@@ -1795,7 +1881,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var args = expr.exprs.asArray(), what = "if expression", len = args.length;
 		// 2 or 3 expressions required
 		if (len < 2 || len > 3) {
-			ArityMismatch(expr.range(), what, 3, len);
+			errAtExpr(expr).ArityMismatch(what, 3, len);
 			return getErrorType();
 		}
 		typeCheckExpr(args[0], Bool.TYPE, what);
@@ -1821,18 +1907,18 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			if (b.exactType != wtype) typeCheckExpr(b, wtype, what);
 			return wtype;
 		} else {
-			TypeError(expr.range(), atype, btype, what);
+			errAtExpr(expr).TypeError(atype, btype, what);
 			return atype;
 		}
 	}
-	def visitFuncExpr(expr: FuncExpr, outer: Type) -> Type {
+	def visitFunExpr(expr: FunExpr, outer: Type) -> Type {
 		var pl: List<Type>;
 		if (FuncType.?(outer)) {
 			var el = Function.getParamTypeList(outer);
 			for (l = expr.params.list; l != null; l = l.tail) {
 				var p = l.head;
 				if (p.tref == null) {
-					if (el == null) error(p.token.range(), "ParamDeclError", "cannot infer parameter type");
+					if (el == null) errAtDecl(p).set("ParamDeclError", "cannot infer parameter type");
 					else p.vtype = el.head;
 					pl = List.new(el.head, pl);
 				} else {
@@ -1843,7 +1929,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			for (l = expr.params.list; l != null; l = l.tail) {
 				var p = l.head;
 				if (p.tref == null) {
-					error(p.token.range(), "ParamDeclError", "cannot infer parameter type");
+					errAtDecl(p).set("ParamDeclError", "cannot infer parameter type");
 					pl = List.new(getErrorType(), pl);
 				} else {
 					pl = List.new(p.vtype = methodEnv.resolveType(p.tref), pl);
@@ -1853,25 +1939,25 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var rt: Type;
 		match (expr.rettype) {
 			Void => {
-				rt = typeCheckFuncExprBody(expr.body, Void.TYPE);
+				rt = typeCheckFunExprBody(expr.body, Void.TYPE);
 			}
 			This => {
-				rt = typeCheckFuncExprBody(expr.body, methodEnv.compound.getDeclaredType());
+				rt = typeCheckFunExprBody(expr.body, methodEnv.compound.getDeclaredType());
 			}
 			Implicit(expr) => {
 				var expected = if(FuncType.?(outer), Function.getReturnType(outer));
-				rt = inferFuncExprBodyType(expr, expected);
+				rt = inferFunExprBodyType(expr, expected);
 			}
 			Explicit(tref) => {
-				rt = typeCheckFuncExprBody(expr.body, methodEnv.resolveType(tref));
+				rt = typeCheckFunExprBody(expr.body, methodEnv.resolveType(tref));
 			}
 		}
 		return expr.exactType = Function.newType(Tuple.newType(Lists.reverse(pl)), rt);
 	}
-	def inferFuncExprBodyType(expr: Expr, expected: Type) -> Type {  // TODO
+	def inferFunExprBodyType(expr: Expr, expected: Type) -> Type {  // TODO
 		return if(expected == null, getErrorType(), expected);
 	}
-	def typeCheckFuncExprBody(stmt: Stmt, expected: Type) -> Type { // TODO
+	def typeCheckFunExprBody(stmt: Stmt, expected: Type) -> Type { // TODO
 		return expected;
 	}
 	def typeCheckExpr(expr: Expr, outerType: Type, op: string) {
@@ -1888,7 +1974,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 				if (rtype == null) return;  // error already reported
 			}
 			if (TypeSystem.isPromotable(exactType, outerType)) expr.implicitType = outerType;
-			else TypeError(expr.range(), outerType, exactType, op);
+			else errAtExpr(expr).TypeError(outerType, exactType, op);
 		}
 	}
 	// Try representation changes of integer literals.
@@ -1904,7 +1990,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			// If the literal is short enough, check whether it is properly sign or zero extended as written.
 			// Sign extend the upper bits if necessary.
 			var rt = Int.getType(tt.signed, (tt.width + 3) & (-1 ^ 3));  // round up
-			if (hex.width * 4 > rt.width) {
+			if (hex.digits * 4 > rt.width) {
 				error = "too many hex digits";
 			} else {
 				var fail: bool;
@@ -1923,7 +2009,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		} else if (BinLiteral.?(lit)) {
 			// Check the binary literal is short enough to fit in the outer type.
 			var bin = BinLiteral.!(lit);
-			if (bin.width <= tt.width) {
+			if (bin.digits <= tt.width) {
 				// sign extend or change Box representation
 				bin.val = Eval.doIntView(IntType.!(bin.exactType), tt, bin.val);
 			} else {
@@ -1956,7 +2042,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			}
 		}
 		if (error == null) return outer;
-		this.error(lit.token.range(), "TypeError", Strings.format3("\"%s\" cannot be %s (%s)", lit.token.image, TYPE(outer), error));
+		errAtExpr(lit).set("TypeError", Strings.format3("\"%s\" cannot be %s (%s)", lit.token.image, TYPE(outer), error));
 		return null;
 	}
 	def TryRepresentationChangeToFloat(lit: IntLiteral, outer: Type) -> Type {
@@ -1971,7 +2057,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			nv = tt.tryPromoteU(0, u64.view(v));
 		}
 		if (nv == null) {
-			this.error(lit.token.range(), "TypeError",
+			errAtExpr(lit).set("TypeError",
 				Strings.format2("\"%s\" cannot be represented in type %s due to rounding",
 					lit.token.image, TYPE(outer)));
 			return null;
@@ -1985,14 +2071,14 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		var tl = types;
 		for (el = args.exprs.list; el != null; el = el.tail) {
 			if (tl == null) {
-				ArityMismatch(el.head.range(), op, Lists.length(types), args.exprs.length());
+				errAtExpr(el.head).ArityMismatch(op, Lists.length(types), args.exprs.length());
 				break;
 			} else {
 				typeCheckExpr(el.head, tl.head, op);
 				tl = tl.tail;
 			}
 		}
-		if (tl != null) ArityMismatch(args.exprs.range().lastByte(), op, Lists.length(types), args.exprs.length());
+		if (tl != null) errAtPoint(args.exprs.range().lastByte()).ArityMismatch(op, Lists.length(types), args.exprs.length());
 	}
 	def inferClosedType(expr: Expr) -> Type {
 		if (expr.exactType != null) return expr.exactType;
@@ -2014,7 +2100,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	def typeCheckStmt(stmt: Stmt) -> int {
 		if (stmt != null) {
 			if (flow == FLOW_THRU) stmt.accept(this, Void.TYPE);
-			else UnreachableCode(stmt.range());
+			else errAtStmt(stmt).UnreachableCode();
 		}
 		return flow;
 	}
@@ -2022,7 +2108,7 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		if (typeCheckStmt(stmt) != FLOW_RET) {
 			match (methodEnv.mdecl.rettype) {
 				Void, This, Implicit => ; // do nothing
-				Explicit(tref) => if (tref.getType() != Void.TYPE) MissingReturn(stmt.range());
+				Explicit(tref) => if (tref.getType() != Void.TYPE) errAtStmt(stmt).MissingReturn();
 			}
 		}
 	}
@@ -2034,14 +2120,9 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		return src == dest || TypeSystem.isPromotable(src, dest);
 	}
 	// -- Utility methods to generate errors ----------------------------------
-	def TypeError(range: FileRange, t1: Type, t2: Type, op: string) {
-		if (ERROR.numErrors == 0 || (t1 != ERROR.errorType && t2 != ERROR.errorType)) {
-			error(range, "TypeError", Strings.format3("%s requires type %s and found %s", op, TYPE(t1), TYPE(t2)));
-		}
-	}
 	def ComparisonError(range: FileRange, t1: Type, t2: Type) {
 		if (ERROR.numErrors == 0 || (t1 != ERROR.errorType && t2 != ERROR.errorType)) {
-			error(range, "ComparisonError", Strings.format2("%s cannot be compared to %s", TYPE(t1), TYPE(t2)));
+			errAtRange(range).set("ComparisonError", Strings.format2("%s cannot be compared to %s", TYPE(t1), TYPE(t2)));
 		}
 	}
 	def TypeParamInferError(tvar: TypeVarType) -> Type {
@@ -2052,62 +2133,32 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			msg = Strings.format2("cannot infer type parameter %s of \"%s\"",
 				tvar.typeParam.token.image, tvar.token.image);
 		}
-		error(tvar.token.range().end().rangeOf(0), "TypeError", msg);
+		errAtRange(tvar.token.range().end().rangeOf(0)).set("TypeError", msg);
 		return getErrorType();
 	}
-	def TypeInferError(range: FileRange, reason: string) {
-		error(range, "TypeInferError", reason);
-	}
-	def VarDeclError(vdecl: VarDecl, msg: string) {
-		error(vdecl.token.range(), "VarDeclError", msg);
-	}
-	def UnresolvedIdentifier(token: Token) {
-		error(token.range(), "UnresolvedIdentifier", Strings.format1("identifier \"%s\" cannot be found", token.image));
-	}
-	def UnresolvedOp(token: Token, t1: Type, t2: Type) {
-		var buf = StringBuilder.new().put1("operator \"%s\" cannot be found", token.image);
-		if (t1 != null) buf.put1(" for type \"%q\"", t1.render);
-		if (t2 != null && t2 != t1) buf.put1(" or type \"%q\"", t2.render);
-		error(token.range(), "UnresolvedOp", buf.toString());
-	}
-	def UnresolvedMember(token: Token, inType: bool, tref: Type) {
-		var msg = "expression of type %s has no such member \"%s\"";
-		if (inType) msg = "type %s has no such member \"%s\"";
-		error(token.range(), "UnresolvedMember", Strings.format2(msg, TYPE(tref), token.image));
-	}
-	def StatementError(range: FileRange) {
-		error(range, "StatementError", "not a statement");
-	}
-	def UnreachableCode(point: FilePoint) {
-		error(point.rangeOf(0), "UnreachableCode", "unreachable code");
-	}
-	def MissingReturn(point: FilePoint) {
-		error(point.rangeOf(0), "MissingReturn", "method does not end in a return statement");
-	}
-	def AssignError(range: FileRange) {
-		error(range, "AssignError", "expression is not assignable");
-	}
-	def MatchError(point: FilePoint, msg: string) {
-		error(point.rangeOf(0), "MatchError", msg);
-	}
-	def LoopError(point: FilePoint, msg: string) {
-		error(point.rangeOf(0), "LoopError", msg);
-	}
-	def ParamExprError(point: FilePoint, msg: string) {
-		error(point.rangeOf(0), "ParamExprError", msg);
-	}
-	def ArityMismatch(range: FileRange, op: string, expect: int, found: int) {
-		if (expect == 1) error(range, "TypeError", Strings.format2("%s requires 1 argument and found %d", op, found));
-		else error(range, "TypeError", Strings.format3("%s requires %d arguments and found %d", op, expect, found));
-	}
 	def getErrorType() -> Type {
-		return ERROR.getErrorType();
+		return methodEnv.verifier.getErrorType();
 	}
-	def getErrorFunctionType() -> Type {
-		return TypeCon.new("function", Kind.CLOSURE, 0, methodEnv.verifier.verifier.prog.typeCache).create0();
+	def errAtRange(range: FileRange) -> SourceCodeError {
+		var sourceLine = file.extractLine(range.beginLine); // XXX: duplication due to differing file
+		var obj = SourceCodeError.new(range, sourceLine);
+		ERROR.addErrorObj(obj);
+		return obj;
 	}
-	def error(range: FileRange, error: string, msg: string) {
-		ERROR.addError(range, file.extractLine(range.beginLine), error, msg);
+	def errAtPoint(point: FilePoint) -> SourceCodeError {
+		return errAtRange(point.rangeOf(0));
+	}
+	def errAtDecl(decl: Decl) -> SourceCodeError {
+		return errAtRange(decl.token.range());
+	}
+	def errAtToken(token: Token) -> SourceCodeError {
+		return errAtRange(token.range());
+	}
+	def errAtExpr(expr: Expr) -> SourceCodeError {
+		return errAtRange(expr.range());
+	}
+	def errAtStmt(stmt: Stmt) -> SourceCodeError {
+		return errAtRange(stmt.range());
 	}
 }
 def TYPE(tref: Type) -> string {
@@ -2129,8 +2180,13 @@ class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
 	var default: MatchCase;
 	new() {
 		if (V3.isVariant(etype)) {
+			// TODO: improve variant case matches by not going to supertype
 			var vt = ClassType.!(etype);
-			while (vt.classDecl.isVariantCase()) vt = vt.getSuperType();
+			while (vt.classDecl.isVariantCase()) {
+				var st = vt.getSuperType();
+				if (st == null) break;
+				vt = st;
+			}
 			variantType = vt;
 			covered = Array.new(variantType.classDecl.cases.length);
 		} else if (EnumType.?(etype)) {
@@ -2182,7 +2238,7 @@ class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
 	}
 	def addDefaultCase(c: MatchCase) {
 		if (default != null && default != c) {
-			MatchError(c.range(), "duplicate default case", c.range());
+			MatchError(c.range(), "duplicate default case", default.range());
 		}
 		default = c;
 	}
@@ -2192,7 +2248,7 @@ class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
 			for (p in covered) {
 				if (p == null) return;
 			}
-			tc.error(default.range(), "UnreachableCode", "unreachable default case");
+			tc.errAtRange(default.range()).set("UnreachableCode", "unreachable default case");
 			return;
 		}
 		var buf: StringBuilder;
@@ -2221,7 +2277,7 @@ class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
 	}
 	def MatchError(range: FileRange, msg: string, prev: FilePoint) {
 		msg = formatPrev(msg, prev);
-		tc.error(range, "MatchError", msg);
+		tc.errAtRange(range).set("MatchError", msg);
 	}
 }
 def tryUnboxPositiveInt(lit: Literal, nullVal: int) -> int {

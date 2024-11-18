@@ -12,7 +12,10 @@ class LinuxTarget extends Target {
 	def DEFAULT_VADDR_START = 0x08000000;
 	def elf_machine: int;
 
-	new(name: string, space, intNorm, machLoweringConfig, newBackend, elf_machine, kernelCallReturnType) super(name) { }
+	new(name: string, space, intNorm, machLoweringConfig, newBackend, elf_machine, kernelCallReturnType) super(name) {
+		if (space.addressWidth == 64) refPatterns = ScalarPatterns.TAGGED_PTR_64;
+		else refPatterns = ScalarPatterns.TAGGED_PTR_32;
+	}
 
 	def configureCompiler(compiler: Compiler) {
 		compiler.Reachability = true;
@@ -21,7 +24,33 @@ class LinuxTarget extends Target {
 			compiler.NormConfig.RangeStartType = it; // XXX: use unsigned for range start type?
 			compiler.NormConfig.ArrayIndexType = it;
 		}
-		compiler.NormConfig.UnifyRepresentations = UnboxingUtil.makeMachUnifyRepresentations(getRuntime);
+		compiler.NormConfig.GetScalar = getScalar;
+		compiler.NormConfig.GetBitWidth = getBitWidth;
+	}
+	private def getScalar(compiler: Compiler, prog: Program, t: Type) -> Scalar.set {
+		if (space.addressWidth == 32) {
+			match (t) {
+				x: BoolType => return Scalar.B32 | Scalar.B64;
+				x: IntType => return if(x.width <= 32, Scalar.B32 | Scalar.B64, Scalar.B64); // XXX: Scalar.R64, once packed refs
+				x: FloatType => return if(x.is64, Scalar.F64 | Scalar.B64, Scalar.F32 | Scalar.B32);
+				_ => return Scalar.R32;
+			}
+		} else {
+			match (t) {
+				x: BoolType => return Scalar.B64;
+				x: IntType => return Scalar.B64; // XXX: Scalar.R64, once packed refs
+				x: FloatType => return Scalar.F64 | Scalar.B64;
+				_ => return Scalar.R64;
+			}
+		}
+	}
+	private def getBitWidth(compiler: Compiler, prog: Program, t: Type) -> byte {
+		match (t) {
+			x: BoolType => return 1;
+			x: IntType => return x.width;
+			x: FloatType => return x.total_width;
+			_ => return space.addressWidth;
+		}
 	}
 	def configureProgram(prog: Program) {
 		var mach = MachProgram.new(prog, space, space, intNorm);
@@ -31,9 +60,6 @@ class LinuxTarget extends Target {
 		MachModule.install(prog, mach); // installs "Pointer" typecon
 		prog.typeEnv.add(linuxComponent);
 		prog.typeEnv.add(rt.typeCon); // installs "CiRuntime" component (for RiRuntime code)
-	}
-	def computeFieldOffsets(prog: Program, b: Vector<IrField>, start: int) {
-		getRuntime(prog).mach.computeFieldOffsets(prog, b, start);
 	}
 	def addRoots(compiler: Compiler, prog: Program) {
 		getRuntime(prog).addRoots();
@@ -93,6 +119,11 @@ class LinuxTarget extends Target {
 		data.p_memsz = pageAlign.size;
 		data.p_flags = ElfConst.PF_RW;
 
+		// reserve a region for runtime code if necessary.
+		var runtimeCodeSize = pageAlign.alignUp(int.!(CLOptions.RUNTIME_CODE_SIZE.get())); // runtime code region size
+		var rtexe = if(runtimeCodeSize > 0, elf.addProgramHeader());
+
+		// skip over ELF header
 		w.skipN(int.!(elf.size()));
 
 		// emit code
@@ -102,6 +133,24 @@ class LinuxTarget extends Target {
 		rt.recordCodeStart(mach.entryStub.absolute);
 		elf.e_entry = mach.entryStub.absolute;
 		rt.recordCodeEnd(w.endAddr());
+
+		mach.reserveSupplementalCode(w); // TODO: add .reserved_code symbol
+
+		if (rtexe != null) {
+			// TODO: add .runtime_code symbol
+			var startAddr = pageAlign.alignUp(w.endAddr());
+			rt.recordRuntimeCode(startAddr, runtimeCodeSize);
+			rtexe.p_type = ElfConst.PT_LOAD;
+			rtexe.p_filesz = 1; // file size cannot be zero, apparently
+			rtexe.p_vaddr = startAddr;
+			rtexe.p_memsz = runtimeCodeSize;
+			rtexe.p_flags = ElfConst.PF_RWX;
+			w.skipN(1);
+			w.startAddr += runtimeCodeSize;
+		} else {
+			rt.recordRuntimeCode(0, 0);
+		}
+
 		mach.layoutMeta(w);
 		mach.layoutRuntime(w);
 		code.p_filesz = w.end();
@@ -113,7 +162,7 @@ class LinuxTarget extends Target {
 			w.skipPage();
 			var exStart = w.endPageAddr();
 			var exSize = pageAlign.alignUp(rt.src.layoutExRegion(exStart));
-			w.startAddr = w.startAddr + exSize;
+			w.startAddr += exSize;
 			ex.p_vaddr = exStart;
 			ex.p_memsz = exSize;
 			ex.p_filesz = 0;
@@ -133,7 +182,10 @@ class LinuxTarget extends Target {
 		data.p_memsz = pageAlign.alignUp64(data.p_filesz + int.view(rt.heapSize));
 
 		// patch all addresses in the binary
-		w.patch(backend.patchCodeAddr);
+		match (backend) {
+			b: Arm64LinuxBackend => w.patchArm64(backend.patchCodeAddrArm64);
+			_ => w.patch(backend.patchCodeAddr);
+		}
 
 		if (sections != null) {
 			sections.data.sh_addr = data.p_vaddr;
@@ -178,7 +230,7 @@ class LinuxTarget extends Target {
 		var fd = System.fileOpen(file, false);
 		if (fd < 0) return prog.ERROR.OutputError(file);
 		// write the entire file from the buffer array
-		System.fileWriteK(fd, w.data, 0, w.end());
+		System.write(fd, w.alias());
 		System.fileClose(fd);
 		// change permissions to make binary executable
 		compiler.makeExecutable(file);
@@ -217,7 +269,7 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		elf.sheaders.put(text);
 		data.index = elf.sheaders.length;
 		elf.sheaders.put(data);
-		
+
 		if (debugSymbol) {
 			for (e in DebugSection) {
 				var section = ElfSectionHeader.new();

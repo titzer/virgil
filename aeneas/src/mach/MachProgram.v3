@@ -51,36 +51,27 @@ class MachProgram extends TargetProgram {
 		}
 		numMethods = methods.length;
 	}
-	def computeFieldOffsets(p: Program, b: Vector<IrField>, start: int) {
+	def processIrClass(ic: IrClass) {
+		if (ic.machSize >= 0) return;
+		var t = ic.ctype;
+		if (V3.isComponent(t)) return processComponent(ic);
+		if (ic.parent != null) processIrClass(ic.parent);
 		var mlayout = MachLayout.new(this);
-		if (start == 0) { // add type tag as first field
+		var start = 0;
+		if (ic.parent != null) {
+			mlayout.size = ic.parent.machSize;
+			start = ic.parent.fields.length;
+		} else {
 			mlayout.addType(tagType);
-		} else { // skip to end of previous fields
-			var last = b[start - 1];
-			mlayout.size = last.machOffset + sizeOf(last.fieldType);
 		}
+		var b = ic.fields;
 		for (i = start; i < b.length; i++) {
 			var f = b[i];
 			f.machOffset = mlayout.addType(f.fieldType);
 		}
-	}
-	def processIrClass(ic: IrClass) {
-		var t = ic.ctype;
-		if (V3.isComponent(t)) return processComponent(ic);
-		// compute size of heap objects if necessary
-		if (ic.minClassId < 0) return;
-		if (!Facts.isLive(ic)) return;
-		if (ic.fields.length == 0) {
-			// no fields
-			ic.machSize = data.addrAlign.alignUp(sizeOf(tagType));
-		} else {
-			// find field at maximum offset; assume no overlapping fields
-			var maxf = ic.fields[0];
-			for (f in ic.fields) if (f.machOffset > maxf.machOffset) maxf = f;
-			ic.machSize = data.addrAlign.alignUp(maxf.machOffset + sizeOf(maxf.fieldType));
-		}
+		ic.machSize = mlayout.size;
 		// create GC maps for object if necessary
-		if (runtime != null && runtime.gc != null) runtime.gc.recordTypeRefMap(ic);
+		if (runtime != null && runtime.gc != null && Facts.isLive(ic)) runtime.gc.recordTypeRefMap(ic);
 	}
 	def processComponent(ic: IrClass) {
 		// queue component record for processing
@@ -243,9 +234,17 @@ class MachProgram extends TargetProgram {
 		return ar.headerSize;
 	}
 	def getObjectSize(t: Type, r: Record) -> int {
-		if (V3.isClass(t)) return prog.ir.getIrClass(t).machSize; // return the size of the object
-		if (V3.isArray(t)) return data.addrAlign.alignUp(arrayRep(t).getObjectSize(r)); // return the size of the header only
-		return unexpectedType(t, 0);
+		var size: int;
+		match (t) {
+			x: ClassType => {
+				var ic = prog.ir.getIrClass(t);
+				if (ic == null) fail(Strings.format2("getObjectSize(#%d): class %q has no IrClass", r.id, t.render));
+				else size = ic.machSize;
+			}
+			x: ArrayType => size = arrayRep(t).getObjectSize(r);
+			_ => return unexpectedType(t, 0);
+		}
+		return data.addrAlign.alignUp(size);
 	}
 	def alignTo(i: int, a: int) -> int {
 		// XXX: use masks for powers of two
@@ -317,6 +316,28 @@ class MachProgram extends TargetProgram {
 		}
 		return unexpectedType(t, 0);
 	}
+	def packedSizeOf(t: Type) -> int {
+		match(t.typeCon.kind) {
+			COMPONENT,
+			VOID => return 0;
+			INT => return IntType.!(t).packedByteSize();
+			BOOL => return 1;
+			CLASS,
+			ARRAY => return refSize;
+			FLOAT => return FloatType.!(t).total_width >>> 3;
+			ENUM => return V3.getVariantTagType(t).packedByteSize();
+			ENUM_SET => return V3.getEnumSetType(t).packedByteSize();
+			VARIANT => {
+				return if (prog.ir.isEnum(t), V3.getVariantTagType(t).packedByteSize(), refSize);
+			}
+			ANYFUNC,
+			FUNCREF => return code.addressSize;
+			RANGE_START,
+			POINTER => return data.addressSize;
+			_ => ; // TODO
+		}
+		return unexpectedType(t, 0);
+	}
 	def sizeOfRegClass(rcl: RegClass) -> int {
 		match (rcl) {
 			I32, F32 => return 4;
@@ -354,7 +375,7 @@ class MachProgram extends TargetProgram {
 				// mixed array
 				var et = V3Array.elementType(r.rtype), ets = Tuple.toTypeArray(et);
 				for (i < v.length) {
-					var tv = TupleVal.!(v[i]), elemBegin = start + i * rep.elemScale + rep.headerSize;
+					var tv = BoxVal.!(v[i]), elemBegin = start + i * rep.elemScale + rep.headerSize;
 					for (j < ets.length) {
 						// XXX: special case Array<byte>, Array<Record>, Array<int> for performance
 						encodeVal(w.at(elemBegin + rep.offsets[j]), if(tv == null, null, tv.values[j]), ets[j]);
@@ -542,6 +563,15 @@ class MachProgram extends TargetProgram {
 		// encode all records into the buffer
 		encodeRegion(dataRegion, w);
 	}
+	// reserve supplemental code, if any
+	def reserveSupplementalCode(w: MachDataWriter) {
+		var reservedCodeSize = CLOptions.RESERVED_CODE_SIZE.get();
+		if (reservedCodeSize > 0) {
+			var size = int.!(reservedCodeSize);
+			runtime.recordReservedCode(w.posAddr(), size, w.pos);
+			w.skipN(int.!(size));
+		}
+	}
 	private def recordDataRefs(a: Addr, off: int, size: int) {
 		if (a.is<IrField>()) {
 			// a global field in the data section
@@ -565,7 +595,7 @@ class MachProgram extends TargetProgram {
 			x: Record => addrOfRecord(x);
 			x: FuncVal => addrOfMethod(x.memberRef.asMethod());
 			x: Closure => { layoutVal(x.val); addrOfMethod(x.memberRef.asMethod()); }
-			x: TupleVal => for (e in x.values) layoutVal(e);
+			x: BoxVal => for (e in x.values) layoutVal(e);
 		}
 	}
 	def encodeRegion(region: Region, w: MachDataWriter) {
