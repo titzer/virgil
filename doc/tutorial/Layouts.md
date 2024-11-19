@@ -4,7 +4,7 @@ Virgil is a language for writing systems software at the lowest level.
 Such software often has to manipulate data in formats that are specified by software and hardware that cannot be changed.
 For example, bootstrapping the language, implementing high-performance (zero-copying) I/O, and interacting with memory-mapped I/O devices requires reading and writing data in specific formats.
 Prior to the introduction of layouts in Virgil, such interactions were done with byte-by-byte encoding or direct pointers.
-With the addition of layouts, this code because easier and safer to write, making it a breeze to deal with data in binary formats.
+With the addition of layouts, this code becomes easier and safer to write, making it a breeze to deal with data in binary formats.
 
 ## Specifying a memory layout
 
@@ -37,7 +37,7 @@ Every field must have an explicit offset[^1].
 While being a little more work to write, this allows for the most general descriptions, including skipping padding and choosing exact alignment.
 The compiler will check that fields do not overlap or overflow the specified layout size.
 
-[^1] The offset of a field can be written in hexadecimal, which makes it easy to align, e.g. to powers of two.
+[^1]: The offset of a field can be written in hexadecimal, which makes it easy to align, e.g. to powers of two.
 
 ## Allowable layout field types
 
@@ -74,6 +74,25 @@ var last = str.name[str.length - 1];     // access is dynamically bounds-checked
 Repeated fields allow expressing fixed-size arrays inside a layout.
 Accesses to repeated fields are indexed with `[]` and the index is bounds-checked against the statically-declared number of elements in the field.
 
+## Field Overlapping and Memory Skipping in Layouts
+In Virgil layouts, field overlapping within a layout is strictly prohibited to prevent data corruption and ensure data integrity. Each field must have a unique, non-overlapping byte offset. 
+
+```
+layout DeviceRegister {
+       +0    command:   u16;    
+       +1    status:    u16;    // Overlaps, illegal
+       =3;                    
+}
+```
+However, Virgil layouts allow skipping regions of memory within the layout.
+```
+layout DeviceRegister {
+       +0    command:   u16;    // Command field, 2 bytes
+       // skipped 2 bytes
+       +4    status:    u16;    // Status field, 2 bytes
+       =6;                       // Total size = 6 bytes
+}
+```
 ## Overlaying layouts on byte arrays (`Ref.at` and `Ref.of`)
 
 A layout in Virgil is not a data structure, but instead a view on underlying storage.
@@ -149,11 +168,11 @@ Some file and network formats, or layouts specified by a kernel on a big-endian 
 To support this, Virgil has a `#big-endian` modifier for both layouts and fields that overrides the default.
 The Virgil compiler will transparently perform endianness conversion when reading and writing these fields.
 
-## Future extensions: off-heap layouts
+## Off-heap layouts
 
 Layouts allow a Virgil program to specify an exact layout of a data structure that uses primitive data.
 As we saw, layouts are used with `Ref<L>` to overlay a view on an underlying byte array (or range).
 They are particularly useful for dealing with hardware and software that have binary data structures, like an underlying OS kernel.
 Often, these data structures are not, and can't be, in the Virgil heap or Virgil byte arrays, which may be moved at any time by the Virgil GC.
-In the future, Virgil will support using `Ref<L>` to refer to data that is stored off-heap.
-Thus, the same ergonomic usage applies, and most code can be written to be entirely agnostic of whether the data they manipulate through references is stored in the heap or off of the heap!
+With off-heap `Range` types, Virgil now supports using `Ref<L>` to refer to data that is stored off-heap, e.g. in the execution stack or memory-mapped files, shared memory, etc.
+This allows Virgil code to be written agnostic of whether the data they manipulate through references is stored in the heap or off of the heap!

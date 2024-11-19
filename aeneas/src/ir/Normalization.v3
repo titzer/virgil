@@ -15,31 +15,30 @@ class NormalizerConfig {
 	var AnyRefOverflow: bool;
 	var NormalizeRange: bool;
 
-	var UnifyRepresentations: (Compiler, Program, Type, Type) -> Type = UnboxingUtil.defaultUnifyRepresentations;
+	var GetScalar: (Compiler, Program, Type) -> Scalar.set = defaultGetScalar;
+	var GetBitWidth: (Compiler, Program, Type) -> byte = defaultGetBitWidth;
+	var MaxScalarWidth: byte = 64;
 
 	def setSignatureLimits(maxp: int, maxr: int) {
 		if (maxp < MaxParams) MaxParams = maxp;
 		if (maxr < MaxReturnValues) MaxReturnValues = maxr;
 	}
 }
-
-component UnboxingUtil {
-	def defaultUnifyRepresentations(compiler: Compiler, prog: Program, a: Type, b: Type) -> Type {
-		if (IntType.?(a) && IntType.?(b)) {
-			return if(IntType.!(a).width > IntType.!(b).width, a, b);
-		}
-		return if(a == b, a, null);
+def defaultGetScalar(compiler: Compiler, prog: Program, t: Type) -> Scalar.set {
+	match (t) {
+		x: IntType => return if(x.width <= 32, Scalar.B32 | Scalar.B64, Scalar.B64); // XXX: Scalar.R32, once packed refs
+		x: FloatType => return if(x.is64, Scalar.F64, Scalar.F32);
+		x: BoolType => return Scalar.B32 | Scalar.B64;
+		_ => return Scalar.Ref;
 	}
-	def defaultMachUnifyRepresentations(getRuntime: Program -> MachRuntime, compiler: Compiler, prog: Program, a: Type, b: Type) -> Type {
-		var mach = getRuntime(prog).mach;
-		if (a == b) return a;
-		if (IntType.?(a) && IntType.?(b))
-			return if(IntType.!(a).width > IntType.!(b).width, a, b);
-		if (mach.isRefType(a) && mach.isRefType(b)) return AnyRef.TYPE;
-		return null;
-	}
-	def makeMachUnifyRepresentations(getRuntime: Program -> MachRuntime) -> (Compiler, Program, Type, Type) -> Type {
-		return defaultMachUnifyRepresentations(getRuntime, _, _, _, _);
+}
+def defaultGetBitWidth(compiler: Compiler, prog: Program, t: Type) -> byte {
+	var target = compiler.target;
+	match (t) {
+		x: IntType => return x.width;
+		x: FloatType => return x.total_width;
+		x: BoolType => return 1;
+		_ => return 64;
 	}
 }
 
@@ -55,9 +54,12 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	var specializer: Specializer;
 	var virtuals: List<RaVirtual>;
 	var ovfAlloc: OverflowFieldAllocator;
-	var vs: VariantSolver;
 
-	new() { vs = VariantSolver.new(config, this, CLOptions.PRINT_RA.get()); }
+	var vn: VariantNormalizer;
+	var variantInterp = SsaInterpreter.new(ra.prog, null).setTrace(CLOptions.TRACE.get()); // interpreter to normalize records
+	var constructors = TypeUtil.newTypeMap<IrMethod>();
+
+	new() { vn = VariantNormalizer.new(config, this, CLOptions.PRINT_RA.get()); }
 
 	def normalize() {
 		if (CLOptions.PRINT_DEAD_CODE.get()) DeadCodeAnalyzer.new(ra).report();
@@ -103,17 +105,17 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			if (rc.instances != null) {
 				// normalize component record
 				var oldRecord = rc.instances.head;
-				newRecord = ra.prog.newRecord(tn.newType, rc.normFields.length);
+				newRecord = ra.prog.newRecord(tn.newType, rc.liveFields.length);
 				complexRecordMap[oldRecord] = NO_VALUES;
-				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord.values));
+				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
 			}
 			ra.prog.setComponentRecord(comp, newRecord);
 		} else if (!rc.isUnboxed()) {
 			// create and map new records to be normalized
 			for (l = rc.instances; l != null; l = l.tail) {
-				var oldRecord = l.head, newRecord = ra.prog.newRecord(tn.newType, rc.normFields.length);
+				var oldRecord = l.head, newRecord = ra.prog.newRecord(tn.newType, rc.liveFields.length);
 				recordMap[oldRecord] = newRecord;
-				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord.values));
+				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord));
 			}
 		} else {
 			// synthesize a component type for flattened data types and variants
@@ -144,28 +146,39 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	}
 	def visitArrayType(rt: RaArray) {
 		var tn = ArrayNorm.!(norm(rt.oldType));
-		if (tn.oldType != tn.newType) {
-			if (tn.enorm != null) {
-				// normalize elements of mixed arrays
-				for (l = rt.instances; l != null; l = l.tail) {
-					var newRecord = ra.prog.newRecord(tn.newType, l.head.values.length);
-					recordMap[l.head] = newRecord;
-					ra.queue.add(normMixedArrayRecord, (tn, l.head, newRecord));
-				}
-			} else {
-				// map complex arrays to arrays of records
-				for (l = rt.instances; l != null; l = l.tail) {
-					var newRecords = createComplexArrayRecord(l.head, tn);
-					ra.queue.add(normComplexArrayRecord, (tn, l.head, newRecords));
-				}
-			}
-		} else if (!rt.primitive) {
-			// normalize simple arrays that are not primitive
+		if (tn.enorm != null) {
+			// normalize elements of mixed arrays
 			for (l = rt.instances; l != null; l = l.tail) {
-				ra.queue.add(normSimpleArrayRecord, l.head);
+				var newRecord = ra.prog.newRecord(tn.newType, l.head.values.length);
+				recordMap[l.head] = newRecord;
+				ra.queue.add(normMixedArrayRecord, (tn, l.head, newRecord));
 			}
+			return;
+		}
+		if (rt.primitive) return;
+		// map complex arrays to arrays of records
+		for (l = rt.instances; l != null; l = l.tail) {
+			var newRecords = createComplexArrayRecord(l.head, tn);
+			ra.queue.add(normComplexArrayRecord, (tn, l.head, newRecords));
 		}
 	}
+	def createComplexArrayRecord(r: Record, rt: ArrayNorm) -> Array<Record> {
+		var sub = rt.sub;
+		if (sub == null) {
+			var result = ra.prog.newRecord(rt.newType, r.values.length);
+			recordMap[r] = result;
+			return [result];
+		} else {
+			var complex = Array<Record>.new(sub.length);
+			for (i < complex.length) {
+				complex[i] = ra.prog.newRecord(sub[i], r.values.length);
+			}
+			if (complex.length == 1) recordMap[r] = complex[0];
+			else complexRecordMap[r] = Arrays.map(complex, Val.!<Record>);
+			return complex;
+		}
+	}
+
 	def norm(t: Type) -> TypeNorm {
 		if (t.open()) return V3.fail1("is open %q", t.render);
 		var tn = typeMap[t];
@@ -230,7 +243,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			VARIANT => {
 				// try flattening variants and data types
 				var rc = ra.getClass(t);
-				if (rc != null) tn = vs.normVariant(t, rc);
+				if (rc != null) tn = vn.normVariant(t, rc);
 				else tn = TypeNorm.new(t, t, null);
 			}
 			ENUM => {
@@ -294,108 +307,127 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	def mapSimple(t: Type) -> TypeNorm {
 		return typeMap[t] = TypeNorm.new(t, t, null);
 	}
-	// map a complex array to an array of records
-	def createComplexArrayRecord(r: Record, rt: ArrayNorm) -> Array<Record> {
-		var sub = rt.sub;
-		if (sub == null) {
-			var result = ra.prog.newRecord(rt.newType, r.values.length);
-			recordMap[r] = result;
-			return [result];
-		} else {
-			var complex = Array<Record>.new(sub.length);
-			for (i < complex.length) {
-				complex[i] = ra.prog.newRecord(sub[i], r.values.length);
-			}
-			if (complex.length == 1) recordMap[r] = complex[0];
-			else complexRecordMap[r] = Arrays.map(complex, Val.!<Record>);
-			return complex;
-		}
-	}
 	// layout fields for classes and components
 	def makeNormFields(rc: RaClass) {
-		if (rc.normFields != null) return;
-		var fields = Vector<IrField>.new().grow(rc.fields.length);  // gather fields into vector
+		if (rc.liveFields != null) return;
+		var fields = Vector<IrSpec>.new().grow(rc.fields.length);  // gather fields into vector
+		var receiver_array: Array<Type>;
+		if (rc.parent != null) fields.putr(rc.parent.liveFields);
 		for (rf in rc.fields) {
 			if (rf == null) continue;
-			if (rf.norm != null) {
-				// inherited this field from superclass
-				for (f in rf.norm) fields.put(IrField.!(f.member));
-				continue;
-			}
+			if (rc.inheritedField(rf)) continue;
 			if (rf.isConst()) continue;
 			if (rf.typeNorm == null && rf.fieldType != null) rf.typeNorm = norm(rf.fieldType);
 			if (!rf.raFacts.RF_READ) continue;
+			if (receiver_array == null) receiver_array = [rc.oldType];
 			// add normalized field(s)
-			rf.normIndex = fields.length;
+			var startIndex = fields.length;
 			if (rf.fieldType == null) {
 				// add single monomorphic field to the vector
-				fields.put(rf.orig);
-				rf.norm = [IrSpec.new(rc.oldType, [rc.oldType], rf.orig)];
+				fields.put(IrSpec.new(rc.oldType, receiver_array, rf.orig));
 			} else {
 				// add normalized field(s) to the vector
 				var tn = rf.typeNorm;
-				var norms = Array<IrSpec>.new(tn.size);
 				var facts = if(tn.size > 1, Fact.F_NORM, Facts.NONE);
 				if (!rf.raFacts.RF_WRITTEN) facts |= (Fact.F_VALUE | Fact.O_FOLDABLE);
-				for (i < norms.length) {
+				for (i < tn.size) {
 					var ft = if(tn.sub == null, tn.newType, tn.sub[i]);
 					var nf = IrField.new(rc.oldType, ft);
 					nf.setFact(facts);
 					nf.source = rf.orig.source;
-					norms[i] = IrSpec.new(rc.oldType, [rc.oldType], nf);
-					fields.put(nf);
-				}
-				rf.norm = norms;
-			}
-		}
-		if (ra.compiler.target != null) {
-			var start = if(rc.parent != null, rc.parent.normFields.length);
-			ra.compiler.target.computeFieldOffsets(ra.prog, fields, start);
-		}
-		rc.normFields = fields.extract();
-	}
-	// normalize a live instance of a class
-	def normClassRecord(rc: RaClass, oldRecord: Record, array: Array<Val>) {
-		var vrc = ra.getClass(oldRecord.rtype), vn = vrc.variantNorm;
-		if (vn == null) {
-			var rfs = rc.fields;
-			for (i < rfs.length) {
-				var rf = rfs[i];
-				if (rf != null && rf.normIndex >= 0) {
-					var v = oldRecord.values[i];
-					if (rf.fieldType == null) array[rf.normIndex] = normSimpleVal(null, v);
-					else normValIntoArray(v, rf.typeNorm, array, rf.normIndex);
+					fields.put(IrSpec.new(rc.oldType, receiver_array, nf));
 				}
 			}
-			return;
+			rf.normIndices = (startIndex, fields.length);
 		}
+		rc.liveFields = fields.extract();
+	}
+	private def normRecordAsArray(rc: RaClass, oldRecord: Record, array: Array<Val>) {
+	}
+	private def getClassAllocIr(vn: VariantNorm) -> IrMethod {
+		if (constructors[vn.oldType] != null) return constructors[vn.oldType];
+		var context = SsaContext.new(ra.compiler, ra.prog);
+		var meth = IrMethod.new(vn.oldType, null, Function.siga(vn.vecO, vn.newType));
 
-		if (!vn.isTagless()) array[vn.tagIndex()] = Int.box(vn.tagValue);
-		if (vn.isEnum()) return;
+		var params = Array<SsaParam>.new(meth.sig.paramTypes.length + 1);
+		var inputs = Array<SsaInstr>.new(meth.sig.paramTypes.length);
+		params[0] = SsaParam.new(0, vn.oldType);
+		for (i < inputs.length) inputs[i] = params[i + 1] = SsaParam.new(i + 1, meth.sig.paramTypes[i]);
 
-		var rfs = vrc.fields;
-		for (i < vrc.fields.length) {
-			var rf = vrc.fields[i];
-			if (rf != null && rf.normIndex >= 0) {
-				var v = oldRecord.values[i];
-				var indexes = vn.fields[i].indexes;
-				// XXX: get rid of fieldArray or reuse
-				var fieldArray = Array<Val>.new(indexes.length);
-				if (rf.fieldType == null) fieldArray[0] = normSimpleVal(null, v);
-				else normValIntoArray(v, rf.typeNorm, fieldArray, 0);
-				for (j < indexes.length) array[indexes[j]] = fieldArray[j];
+		meth.ssa = SsaGraph.new(params, meth.sig.returnType());
+		context.enterMethod(meth);
+
+		var s = SsaRaNormalizer.new(context, this);
+		s.newGraph = meth.ssa;
+		s.curBlock = SsaBuilder.new(context, meth.ssa, meth.ssa.startBlock);
+
+		var r = s.genVariantClassAlloc(vn, inputs);
+		s.curBlock.addReturn(r);
+		context.printSsa("ClassAlloc");
+
+		return constructors[vn.oldType] = meth;
+	}
+	// normalize an old record of a class into a new record of a class
+	def normClassRecord(rc: RaClass, oldRecord: Record, newRecord: Record) {
+		normalizeFields(rc.fields, oldRecord.values, newRecord.values);
+	}
+	// normalize an old record of a variant into a (potentially unboxed) array of values
+	def normVariantRecord(vn: VariantNorm, oldRecord: Record) -> Array<Val> {
+		var result = complexRecordMap[oldRecord];
+		if (result != null) return result;
+		result = Array<Val>.new(vn.size);
+
+		var rc = ra.getClass(oldRecord.rtype);
+		vn = VariantNorm.!(norm(oldRecord.rtype));
+		if (vn.isEnum()) {
+			return complexRecordMap[oldRecord] = [Int.box(vn.tagValue)];
+		} else if (rc.isUnboxed()) {
+			var inputs = Vector<Val>.new().grow(rc.liveFields.length); // XXX: cache cumulative normalized size
+			var ofs = rc.orig.fields;
+			for (i < ofs.length) {
+				var rf = rc.fields[i];
+				if (rf != null && rf.normIndices.0 >= 0) { // live field
+					var pos = inputs.length, size = rf.normIndices.1 - rf.normIndices.0;
+					inputs.resize(pos + size);
+					normValIntoArray(oldRecord.values[i], rf.typeNorm, inputs.array, pos);
+				} else { // dead field, supply bottoms
+					var ft = ofs[i].fieldType;
+					if (ft.open()) ft = ft.substitute(V3.getTypeArgs(vn.oldType));
+					var tn = norm(ft);
+					inputs.putn(Values.BOTTOM, tn.size);
+				}
+			}
+
+			// Unboxed variants might require some type conversions; generate and run the constructor to do so.
+			// XXX: Cache constructor; we can't put the constructor in the first slot of rc.orig.methods, since multiple RaClasses could map to the same IrClass
+			var constructor = getClassAllocIr(vn);
+			var r = variantInterp.invoke(Closure.new(Values.BOTTOM, IrSpec.new(vn.oldType, TypeUtil.NO_TYPES, constructor)), inputs.extract());
+			match (r) {
+				x: BoxVal => for (i < x.values.length) result[i] = x.values[i];
+				x: Val => result[0] = x;
+			}
+		} else {
+			var newRecord = ra.prog.newRecord(vn.newType, rc.liveFields.length);
+			normalizeFields(rc.fields, oldRecord.values, newRecord.values);
+			recordMap[oldRecord] = newRecord;
+			result[0] = newRecord;
+		}
+		return complexRecordMap[oldRecord] = result;
+	}
+	def normalizeFields(rfs: Array<RaField>, oldVals: Array<Val>, newVals: Array<Val>) {
+		for (i < rfs.length) {
+			var rf = rfs[i];
+			if (rf != null && rf.normIndices.0 >= 0) {
+				var v = oldVals[i];
+				if (rf.fieldType == null) newVals[rf.normIndices.0] = normSimpleVal(null, v);
+				else normValIntoArray(v, rf.typeNorm, newVals, rf.normIndices.0);
 			}
 		}
-	}
-	// normalize the live instances of a simple (i.e. size-1 element) array type
-	def normSimpleArrayRecord(record: Record) {
-		def v = record.values;
-		for (i < v.length) v[i] = normSimpleVal(null, v[i]);
 	}
 	// normalize the live instances of a mixed array type
 	def normMixedArrayRecord(rt: ArrayNorm, oldRecord: Record, newRecord: Record) {
 		def v = oldRecord.values;
-		for (i < v.length) newRecord.values[i] = normAsTupleVal(v[i], rt.enorm);
+		for (i < v.length) newRecord.values[i] = normAsBoxVal(v[i], rt.enorm);
 	}
 	// normalize the live instances of a complex (i.e. size-N element) array type
 	def normComplexArrayRecord(rt: ArrayNorm, oldRecord: Record, newRecords: Array<Record>) {
@@ -414,19 +446,20 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	def normSimpleVal(tn: TypeNorm, v: Val) -> Val {
 		match (v) {
 			x: Record => {
-				if (VariantNorm.?(tn) && VariantNorm.!(tn).isEnum()) return normVariantVal(VariantNorm.!(tn), x)[0];
 				var r = recordMap[x];
-				return if(r == null, x, r);
+				if (r != null) return r;
+				if (VariantNorm.?(tn)) return normVariantRecord(VariantNorm.!(tn), x)[0];
+				return x;
 			}
 			_ => return v;
 		}
 	}
-	def normAsTupleVal(v: Val, tn: TypeNorm) -> Val {
+	def normAsBoxVal(v: Val, tn: TypeNorm) -> Val {
 		if (v == null) return v;
 		var values = Array<Val>.new(tn.size);
 		normValIntoArray(v, tn, values, 0);
 		if (tn.size == 1) return values[0];
-		return TupleVal.new(values);
+		return BoxVal.new(null, values);
 	}
 	def layoutVtable(rc: RaClass) {
 		var vtable = Vector<IrMethod>.new();
@@ -469,7 +502,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		if (rv.mtable != null) return;
 		var rm = rv.raMethod, rc = ra.getClass(rm.receiver);
 		var size = rc.maxClassId - rc.minClassId;
-		if (ra.compiler.RaDevirtualize && size < 2) return; // no need for an mtable
+		if (ra.compiler.RaDevirtualize && size == 1) return; // no need for an mtable
 		var table = Array<IrMethod>.new(size), mtable = IrMtable.new(rm.norm, rc.minClassId, table);
 		rv.mtable = mtable;
 
@@ -514,8 +547,8 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				var simple = recordMap[x];
 				if (simple != null) return (array[index] = simple, ()).1;
 				if (VariantNorm.?(tn)) {
-					// flattened data type
-					var result = normVariantVal(VariantNorm.!(tn), x);
+					// potentially flattened data type
+					var result = normVariantRecord(VariantNorm.!(tn), x);
 					for (i < result.length) array[index + i] = result[i];
 				} else {
 					var result = complexRecordMap[x];
@@ -529,7 +562,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				array[index] = FuncVal.new(ref);
 				normValIntoArray(x.val, norm(ref.receiver), array, index + 1);
 			}
-			x: TupleVal => {
+			x: BoxVal => {
 				// tuple: recursively normalize all of the sub
 				var tnn = TupleNorm.!(tn).nested;
 				for (i < tnn.length) {
@@ -551,14 +584,6 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			_ => if (index < array.length) array[index] = v;
 		}
 	}
-	def normVariantVal(vn: VariantNorm, x: Record) -> Array<Val> {
-		var result = complexRecordMap[x];
-		if (result != null) return result;
-		result = Array.new(vn.size);
-		complexRecordMap[x] = result; // skip this work next time
-		normClassRecord(ra.getClass(vn.oldType), x, result);
-		return result;
-	}
 	def normalizeMethodRef(spec: IrSpec) -> (RaMethod, IrSpec) {
 		// XXX: canonicalize normalized IrSpecs
 		var rm = spec.asMethod().raMethod;
@@ -573,8 +598,8 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	}
 	def createIrClass(rc: RaClass) {
 		var sc = if(rc.parent != null, rc.parent.normClass);
-		var normFields = if(rc.isUnboxed(), NO_FIELDS, rc.normFields);
-		var ic = IrClass.new(rc.newIrType, null, sc, normFields, rc.normMethods);
+		var liveFields = if(rc.isUnboxed(), NO_FIELDS, Arrays.map(rc.liveFields, IrSpec.asField));
+		var ic = IrClass.new(rc.newIrType, null, sc, liveFields, rc.normMethods);
 		ic.minClassId = rc.minClassId;
 		ic.maxClassId = rc.maxClassId;
 		rc.normClass = ic;

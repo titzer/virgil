@@ -9,14 +9,13 @@
 // Install targets into registry for the compiler
 component WasmComponent {
 	new() {
-		Aeneas.registerTarget(WasmTarget.new("wasm-js-test", true, false));
-		Aeneas.registerTarget(WasmTarget.new("wasm-spec-test", true, false));
-		Aeneas.registerTarget(WasmTarget.new("wasm", false, false));
-		Aeneas.registerTarget(WasmTarget.new("wave", false, true)); // TODO: remove this target
+		Aeneas.registerTarget(WasmTarget.new("wasm-test", true));
+		Aeneas.registerTarget(WasmTarget.new("wasm", false));
 	}
 }
-def WASM_PAGE_SIZE = 65536;
 def WASM_MAGIC = 0x6d736100;
+def MINIMUM_DATA_START_ADDR = 8u;
+def MAXIMUM_DATA_START_ADDR = 0x8000_0000u;
 def WASM_VERSION = 0x1;
 def XXX: Terminal;
 
@@ -80,16 +79,25 @@ def SPACE = AddressSpace.new("mem", false, 32, 4, Alignment.new(65536), Alignmen
 // Common code for all WASM targets
 class WasmTarget extends Target {
 	def test: bool;
-        def script: bool;
 
-	new(name: string, test, script) super(name) {
+	new(name: string, test) super(name) {
 		typedMain = !test;
+		requireMain = false;
 	}
 
 	def configureCompiler(compiler: Compiler) {
 		compiler.Reachability = true;
 		compiler.NormConfig.setSignatureLimits(10000, if(CLOptions.WASM_MULTI_VALUE.val, 1000, 1));
-		compiler.NormConfig.UnifyRepresentations = UnboxingUtil.makeMachUnifyRepresentations(getRuntime);
+		compiler.NormConfig.GetScalar = getScalar;
+	}
+	private def getScalar(compiler: Compiler, prog: Program, t: Type) -> Scalar.set {
+		var none: Scalar.set;
+		match (t) {
+			x: BoolType => return Scalar.B32 | Scalar.B64;
+			x: IntType => return if(x.width <= 32, Scalar.B32 | Scalar.B64, Scalar.B64); // XXX: Scalar.R64, once packed refs
+			x: FloatType => return if(x.is64, Scalar.F64 | Scalar.B64, Scalar.F32 | Scalar.B32);
+			_ => return Scalar.R64;
+		}
 	}
 	def configureProgram(prog: Program) {
 		def intNorm = IntNormalizers.I64LE;
@@ -112,11 +120,17 @@ class WasmTarget extends Target {
 		var w = emitWasmModule(context, rt);
 		if (test) emitTestWrappers(context, rt, w, e);
 		if (CLOptions.WASM_RUN_COMMAND.val != null) emitEngineScript(CLOptions.WASM_RUN_COMMAND.val, compiler, prog);
-		else if (script) emitEngineScript("wizeng", compiler, prog);
 	}
 	def processIrClass(ic: IrClass) {
 	}
 	def emitWasmModule(context: SsaContext, rt: MachRuntime) -> DataWriter {
+		def pageSize = CLOptions.WASM_PAGE_SIZE.get();
+		if (!Ints.isPowerOf2(pageSize)) context.fail1("expected -wasm.page-size option to be a power of 2, got %d", pageSize);
+
+		var dataStartAddrOption = CLOptions.DATA_START_ADDR.get();
+		if (dataStartAddrOption > MAXIMUM_DATA_START_ADDR) context.fail1("-data-start-addr too large for Wasm target, got 0x%x", dataStartAddrOption);
+		def dataStartAddr = if(dataStartAddrOption < MINIMUM_DATA_START_ADDR, MINIMUM_DATA_START_ADDR, u32.view(dataStartAddrOption));
+
 		def prog = context.prog;
 		// Lower to machine level from V3 level
 		def config = MachLoweringConfig.new();
@@ -141,7 +155,7 @@ class WasmTarget extends Target {
 		var sizepos: int, start: int;
 
 		// Add the allocation stub if the program might dynamically allocate memory.
-		def wasm = WasmProgram.new(rt.mach, CLOptions.WASM_GC.val, context), m = rt.mach;
+		def wasm = WasmProgram.new(rt.mach, CLOptions.WASM_GC.val, context, test), m = rt.mach;
 		// Add all the method signatures to the signatures vector
 		def methods = wasm.addIrMethods();
 		// Add all the indirect adapter methods and their signatures
@@ -162,7 +176,7 @@ class WasmTarget extends Target {
 			funcNum++;
 		}
 		if (wasm.entryStubFuncIndex >= 0) {
-			codegen.emitEntryStub();
+			codegen.emitEntryStub(test);
 			funcNum++;
 		}
 		for (i = wasm.numImports; i < methods.length; i++) {
@@ -234,26 +248,39 @@ class WasmTarget extends Target {
 		//--------------------------------------------------------------------------------
 		out.startSection(WasmSection.MEMORY);
 		out.putb(1);	// 1 memory
-		// add the size of initialized memory and runtime to the heap size
-		var initSize = u32.view(m.metaRegion.mark + m.dataRegion.mark);
-		var pages = 2u + u32.!((rt.heapSize + rt.shadowStackSize
-			+ initSize + u32.view(WASM_PAGE_SIZE - 1)) /
-				u32.view(WASM_PAGE_SIZE));
-		out.putb(1);	// flags = contains maximum
-		out.put_uleb32(pages); // initial memory size
-		out.put_uleb32(pages); // maximum memory size
+		// Compute the maximum accessible data address
+		var maxDataAddr = dataStartAddr
+			+ u32.!(m.metaRegion.mark)
+			+ u32.!(m.dataRegion.mark)
+			+ u32.!(rt.heapSize + rt.shadowStackSize);
+
+		var pages = (maxDataAddr + pageSize - 1u) / pageSize;
+		var flags = 1;
+		if (pageSize != 65536) flags |= 1 << 3;		// custom page size
+		out.putb(flags);				// flags = contains maximum
+		out.put_uleb32(pages);				// initial memory size
+		out.put_uleb32(pages);				// maximum memory size
+		if (pageSize != 65536) {
+			out.put_uleb32(u32.!(Ints.log(pageSize))); // page size log
+		}
 		out.endSection();
 
 		// (7) Emit the export section
 		//--------------------------------------------------------------------------------
-		var mainIndex = prog.getMain().asMethod().machIndex;
-		var mainName = CLOptions.MAIN_EXPORT.get();
+		var mainMeth = prog.getMain();
+		var numExports = 0;		  // default exports: main and maybe memory
+		var mainIndex: int;
+		var mainName: string;
+		if (mainMeth != null) {
+			mainIndex = mainMeth.asMethod().machIndex;
+			mainName = CLOptions.MAIN_EXPORT.get();
 
-		if (wasm.entryStubFuncIndex >= 0) {
-			mainIndex = wasm.entryStubFuncIndex;
-			mainName = CLOptions.ENTRY_EXPORT.get();
+			if (wasm.entryStubFuncIndex >= 0) {
+				mainIndex = wasm.entryStubFuncIndex;
+				mainName = if(test, mainName, CLOptions.ENTRY_EXPORT.get());
+			}
+			numExports = 1;
 		}
-		var numExports = 1;		  // default exports: main and maybe memory
 		if (CLOptions.WASM_EXPORT_MEM.val) numExports++;
 		for (i < prog.ir.roots.length) {
 			var r = prog.ir.roots[i];
@@ -262,10 +289,12 @@ class WasmTarget extends Target {
 
 		out.startSection(WasmSection.EXPORT);
 		out.putb(numExports);
-		// export main
-		out.str(mainName);
-		out.putb(WasmExternal.FUNCTION);
-		out.put_sleb32(mainIndex);
+		if (mainMeth != null) {
+			// export main
+			out.str(mainName);
+			out.putb(WasmExternal.FUNCTION);
+			out.put_sleb32(mainIndex);
+		}
 		// export memory
 		if (CLOptions.WASM_EXPORT_MEM.val) {
 			out.str("memory");
@@ -315,11 +344,11 @@ class WasmTarget extends Target {
 		out.putb(1); // 1 data entry
 		out.putb(0); // linear memory #0
 		out.putb(WasmOp.I32_CONST.opcode);
-		out.put_sleb32(WASM_PAGE_SIZE);  // linear memory offset
+		out.put_sleb32(int.view(dataStartAddr));  // linear memory offset
 		out.putb(WasmOp.END.opcode);
 		var data_sizepos = out.skip_leb32(); // data size
 		var data_start = out.pos;
-		out.startAddr = WASM_PAGE_SIZE - out.end();
+		out.startAddr = int.view(dataStartAddr) - out.end();
 		// Encode meta region
                 m.layoutMeta(out);
                 // Encode runtime region
@@ -375,7 +404,7 @@ class WasmTarget extends Target {
 			prog.ERROR.OutputError(fileName);
 			return null;
 		}
-		System.fileWriteK(fd, out.data, 0, out.end());
+		System.write(fd, out.alias());
 		System.fileClose(fd);
 		return out;
 	}
@@ -391,7 +420,8 @@ class WasmTarget extends Target {
 				.putx(abs)
 				.outln();
 		}
-		w.overwrite_uleb32(abs);
+		// TODO,XXX: address immediates are in i32.const, which is a signed LEB.
+		w.overwrite_sleb32(abs);
 	}
 	def emitTestWrappers(context: SsaContext, rt: MachRuntime, w: DataWriter, e: ExecuteTestCase) {
 		var prog = context.prog;
@@ -471,9 +501,6 @@ class WasmTarget extends Target {
 		}
 		return buf;
 	}
-	def computeFieldOffsets(prog: Program, b: Vector<IrField>, start: int) {
-		getRuntime(prog).mach.computeFieldOffsets(prog, b, start);
-	}
 	def addRoots(compiler: Compiler, prog: Program) {
 		getRuntime(prog).addRoots();
 	}
@@ -501,7 +528,7 @@ class WasmTarget extends Target {
 		compiler.makeExecutable(fileName);
         }
 }
-class WasmProgram(mach: MachProgram, gcTypes: bool, context: SsaContext) {
+class WasmProgram(mach: MachProgram, gcTypes: bool, context: SsaContext, test: bool) {
 	var typeTable: WasmTypeTable;
 	def functionTable = Vector<(IrMethod, u32)>.new();
 	def indirectAdapters = Vector<(Signature, u32, IrMethod)>.new();
@@ -586,10 +613,18 @@ class WasmProgram(mach: MachProgram, gcTypes: bool, context: SsaContext) {
 		var ri_init = mach.runtime.getRiInit();
 		var ri_exit = mach.runtime.getRiExit();
 		if (ri_init != null || ri_exit != null) {
-			var params: Array<Type> = if(ri_init != null, ri_init.sig.paramTypes, TypeUtil.NO_TYPES);
-			var results: Array<Type> = if(ri_exit != null, ri_exit.sig.returnTypes, [Int.TYPE]);
-			var sig = Signature.new(null, params, results);
-			sigIndex_entryStub = int.!(addSig(Void.TYPE, sig));
+			var main = mach.prog.getMain();
+			var mainMeth = if(main != null, main.asMethod());
+			var mainSig = if(mainMeth != null, mainMeth.sig);
+
+			if (test) {
+				sigIndex_entryStub = int.!(addSig(Void.TYPE, mainSig));
+			} else {
+				var params: Array<Type> = if(ri_init != null, ri_init.sig.paramTypes, TypeUtil.NO_TYPES);
+				var results: Array<Type> = if(ri_exit != null, ri_exit.sig.returnTypes, [Int.TYPE]);
+				var sig = Signature.new(null, params, results);
+				sigIndex_entryStub = int.!(addSig(Void.TYPE, sig));
+			}
 			entryStubFuncIndex = numFunctions++;
 		}
 

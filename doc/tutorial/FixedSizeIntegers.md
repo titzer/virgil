@@ -172,7 +172,7 @@ The reverse operation must handle values that are not representable in the narro
 
 Virgil has two operations to convert a possibly wider and/or opposite sign integer type to a narrower integer type.
 
-  * An integer `cast` operation from type `iW` to `iN` performs a value range check and throws an exception for integer values in `iW` that are not representable in `iN`.
+  * An integer cast operation from type `iW` to `iN` performs a value range check and throws an exception for integer values in `iW` that are not representable in `iN`.
   * An integer `view` operation from type `iW` to `iN` reinterprets the lower `N` bits of the integer value as type `iN`.
 
 Both operations are available for all pairs of integer types, including mixed signs.
@@ -182,36 +182,38 @@ Casts and views are available as members on the *target* type.
 
 ```
 var x = i8.view(87384); // reinterpret lower 8 bits as signed integer type i8
-var y = i8.cast(87384); // exception; value range check will fail
+var y = i8.!(87384);    // exception; value range check will fail
 ```
 
-Like most other operators in Virgil, the `cast` and `view` operations can be used as first-class functions.
+Like most other operators in Virgil, the cast and `view` operations can be used as first-class functions.
 However, they each have a type parameter which represents the type of their argument, so, like other polymorphic functions, they need a type argument when used as a first-class value.
 Virgil enforces that this type argument must be an integral type.
 As always, the compiler will infer type arguments when possible.
 
 ```
 var x = byte.view<int>;          // of type int -> byte
-var y: int -> byte = byte.cast;  // type argument inferred
+var y: int -> byte = byte.!;     // type argument inferred
 ```
+
+## Explicit widths on literals
+
+Recently, Virgil added support for explicitly specifying the bit-width of an integer directly as a suffix to the literal.
+Thus the suffix allows a program to specify a value of arbitrary integer type, not just the common prefixes `u` (which means `u32`), `L` (which means `long`), and `uL` (which means `u64`).
+The Virgil compiler will now accept `uN` and `iN` suffixes, where `N` denotes the bit-width (and must be between `1` and `64`, inclusive).
+
+```
+var x = 1u1;            // value is 1, type is u1
+var y = -3i17;          // value is -3, type is i17
+var z = 0x89AAu16;      // value is 35242, type is u16
+var w = 0b1001_0101u8;  // value is 149, type is byte
+```
+
 
 ## Legacy casts and the `!` operator
 
 Before 2020, Virgil had only the integer `view` operation (though not named as such), and the syntactic cast operation `!` mapped to this operation.
 However, this operation is not the best default for most situations, since it silently converts negative integers to (large) positive integers, which is often a logical bug.
-Instead, the `view` and `cast` operations were introduced.
-
-```
-var x = byte.!(-999); // == byte.view or byte.cast?
-```
-
-For now, the syntactic cast operator `!` still maps to `view`, but a compiler switch exists to change its meaning to the `cast` operation.
-This represents a change to Virgil's language semantics and therefore changes the meaning of some programs.
-Since the compiler, runtime, and lots of tests are written in Virgil, a migration is underway.
-When the migration is complete, this compiler flag will be flipped in an upcoming release and `cast` will be the default in the future.
-
-Programs that explicitly use either `view` or `cast` will not change meaning.
-It is recommended to use the explicit operations when brevity is not paramount.
+Today, the integer cast operations `!` in Virgil performs a cast that checks representability.
 
 ## A wider future
 

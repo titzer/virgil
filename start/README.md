@@ -36,14 +36,13 @@ right away, before we've even selected a compile target.
 
 ```
 % cd virgil/apps/HelloWorld
-% v3c -run HelloWorld.v3
+% v3i HelloWorld.v3
 Hello World!
 ```
 
 ## Step 4 - Compile your first program ##
 
-Of course, we are usually interested in writing programs that run lean and fast on a
-particular platform.
+Of course, we are usually interested in writing programs that run lean and fast on a particular platform.
 Suppose we are running on `x86-linux`, then we could compile and run our program like so:
 
 ```
@@ -52,10 +51,8 @@ Suppose we are running on `x86-linux`, then we could compile and run our program
 Hello World!
 ```
 
-Here, the `v3c-x86-linux` command is a script in the `virgil/bin` directory that marshals
-up the runtime code for this target and passes the right compiler options. There's one
-for each platform, so targeting another platform is (usually) as easy as changing the
-command!
+Here, the `v3c-x86-linux` command is a script in the `virgil/bin` directory that passes the right compiler options to `v3c`, including the implementation of the runtime system, garbage collector, and `System` API.
+There's one script for each platform, so targeting another platform is (usually) as easy as changing the command!
 
 ```
 % v3c-jar HelloWorld.v3
@@ -63,20 +60,16 @@ command!
 Hello World!
 ```
 
-Note that in the `jar` target, the Virgil compiler generates a little shell script that
-will invoke the `java` command as a convenience for you. Pretty neat!
+Note that in the `jar` target, the Virgil compiler generates a small shell script that will invoke the `java` command as a convenience for you.
+Pretty neat!
 
 ## Step 5 - Bootstrap for update-to-date features ##
 
-The Virgil repository includes binaries of the compiler to get started on any of the
-supported platforms, but these binaries are updated only periodically.
-These so-called "stable" binaries may lag behind the implemented features that are
-in the bleeding-edge compiler (whose source is controlled in this repository).
-To build the latest version of the compiler for your platform, use the `aeneas bootstrap`
-development command, which compiles the current compiler with the stable compiler, and
-then compiles the current compiler with itself.
+The Virgil repository includes binaries of the compiler to get started on any of the supported platforms, but these binaries are updated only periodically.
+These so-called "stable" binaries may lag behind the implemented features that are in the bleeding-edge compiler (whose source is controlled in this repository).
+To build the latest version of the compiler for your platform, use the `aeneas bootstrap` development command, which compiles the current compiler with the stable compiler, and then compiles the current compiler with itself.
 
-This step is necessary if you want to use bleeding-edge features or bugfixes.
+This step is necessary if you want to use unstable features that are not yet supported in the stable compiler.
 
 ```
 % export PATH=$PATH:$(pwd)/bin/dev

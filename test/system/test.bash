@@ -8,9 +8,7 @@ else
   TESTS="$(ls *.v3)"
 fi
 
-for target in $TEST_TARGETS; do
-    target=$(convert_to_io_target $target)
-
+for target in $(get_io_targets); do
     T=$OUT/$target
     mkdir -p $T
 

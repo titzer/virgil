@@ -10,7 +10,7 @@ var c: string = null;
 
 ## Escapes ##
 
-Strings can use the '\' character to escape some characters, such as carriage return, newline, tab, and quotes within strings.
+Strings can use the '\\' character to escape some characters, such as carriage return, newline, tab, and quotes within strings.
 
 ```
 // newline, tab, carriage-return, backslash, single-quote and double-quote

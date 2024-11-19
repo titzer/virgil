@@ -39,11 +39,10 @@ function run_benchmarks() {
     done
 }
 
-for target in $TEST_TARGETS; do
+for target in $(get_io_targets); do
     if [ "$target" = v3i ]; then
 	continue # TODO: too slow
     fi
-    target=$(convert_to_io_target $target)
 
     T=$OUT/$target
     mkdir -p $T

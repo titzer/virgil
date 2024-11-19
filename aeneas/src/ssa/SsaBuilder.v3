@@ -63,6 +63,12 @@ class SsaBuilder extends SsaBlockState {
 			NotEqual => return opBoolNot(opEqual(pt[0], args[0], args[1]));
 			BoolAndAnd => return opBoolAnd0(args[0], args[1]); // laziness handled in VstSsaGen
 			BoolOrOr => return opBoolOr0(args[0], args[1]); // laziness handled in VstSsaGen
+			ArrayAllocDefault => {
+				var arrayType = op.typeArgs[0], elemType = V3Array.elementType(arrayType);
+				var alloc = addApply(source, V3Op.newArrayAlloc(arrayType), args);
+				var dval = addDefaultValue(elemType);
+				return addApply(source, V3Op.newArrayFill(arrayType), [alloc, dval]);
+			}
 			Commute(op) => return addApply(source, op, [args[1], args[0]]);
 			IntMixedEqual => return opIntCompare(true, IntType.opEq, pt[0], pt[1], args[0], args[1]);
 			IntMixedNotEqual => return opBoolNot(opIntCompare(true, IntType.opEq, pt[0], pt[1], args[0], args[1]));
@@ -263,6 +269,33 @@ class SsaBuilder extends SsaBlockState {
 		for (i < paramTypes.length) args[i] = opTupleGetElem(tt, i, arg0);
 		return args;
 	}
+	def split() -> SsaBuilder {
+		var mergeBuilder = SsaBuilder.new(context, graph, SsaBlock.new());
+		mergeBuilder.source = this.source;
+		var start = this.block, end = start.prev;
+		var last = pt;
+		if (last == null && SsaEnd.?(end))  last = end.prev;
+
+		if (last != null) {
+			var first = last.next;
+			last.next = start;
+			start.prev = last;
+			var nb = mergeBuilder.block;
+			first.prev = nb;
+			nb.next = first;
+			mergeBuilder.pt = first;
+			this.end = false;
+			end.next = nb;
+			nb.prev = end;
+			this.pt = null;
+		}
+
+		return mergeBuilder;
+	}
+	def splitForIfCascade(t: Type) -> SsaIfCascade {
+		var merge = split();
+		return SsaIfCascade.new(this, t, merge.block);
+	}
 	def addThrow(source: Source, ex: string) -> SsaInstr {
 		if (end) return block.end();
 		end = true;
@@ -309,9 +342,19 @@ class SsaBuilder extends SsaBlockState {
 		block.append(instr);
 		return instr;
 	}
+	def addDefaultValue(t: Type) -> SsaInstr {
+		if (end || context.prog.hasTrivialDefaultValue(t)) return graph.nullConst(t);
+		if (!t.open()) return graph.valConst(t, context.prog.getDefaultValue(t));
+		return add(V3Op.newDefaultValue(t), Ssa.NO_INSTRS, Fact.O_PURE);
+	}
 	def append(i: SsaInstr) {
 		if (pt != null) i.insertBefore(pt);
 		else block.append(i);
+	}
+	def set(block: SsaBlock) -> this {
+		this.end = false;
+		this.block = block;
+		this.pt = null;
 	}
 
 	// sets the source position that will apply to subsequent instructions
@@ -334,6 +377,29 @@ class SsaBuilder extends SsaBlockState {
 		var i = SsaIf.new(cond, tblock, fblock);
 		append(i);
 		if (NEW_OPTIMIZER && opt != null) opt.reduceIf(this, i);
+	}
+	def addSelect(t: Type, cond: SsaInstr, tval: SsaInstr, fval: SsaInstr) -> SsaInstr {
+		if (Debug.PARANOID) { checkInputs([cond, tval, fval]); }
+		if (end) return graph.nullConst(t);
+		if (SsaConst.?(cond)) {
+			// fold if(#k)
+			return if(cond.unbox<bool>(), tval, fval);
+		}
+		if (SsaApplyOp.?(cond)) {
+			// if(!op) t else f => if(op) f else t
+			if (SsaApplyOp.!(cond).op.opcode == Opcode.BoolNot) return addSelect(t, cond.input0(), fval, tval);
+			// XXX: optimize if(x == true|false) and if(x != true|false)
+		}
+		var merge = split();
+		var tblock = context.newBuilder(), fblock = context.newBuilder();
+		tblock.source = fblock.source = source;
+		var i = SsaIf.new(cond, tblock.block, fblock.block);
+		append(i);
+		tblock.addGoto(merge.block);
+		fblock.addGoto(merge.block);
+		var phi = merge.addPhi(t, [tval, fval]);
+		block = merge.block;
+		return phi;
 	}
 	def addIfNull(x: SsaInstr, tblock: SsaBlock, fblock: SsaBlock) {
 		if (end) return;
@@ -542,11 +608,11 @@ class SsaBuilder extends SsaBlockState {
 	def opNormRangeSetElemElem(rangeType: Type, indexType: IntType, elem: int, facts: Fact.set, x: SsaInstr, y: SsaInstr, z: SsaInstr, w: SsaInstr) -> SsaInstr {
 		return add(V3Op.newNormRangeSetElemElem(rangeType, indexType, elem), [x, y, z, w], facts);
 	}
-	def opByteArrayGetField(fieldType: Type, startType: Type, offset: int, facts: Fact.set, x: SsaInstr, y: SsaInstr) -> SsaInstr {
-		return add(V3Op.newByteArrayGetField(offset, fieldType, startType), [x, y], facts);
+	def opByteArrayGetField(fieldType: Type, startType: Type, offset: int, order: ByteOrder, facts: Fact.set, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+		return add(V3Op.newByteArrayGetField(offset, fieldType, order, startType), [x, y], facts);
 	}
-	def opByteArraySetField(fieldType: Type, startType: Type, offset: int, facts: Fact.set, x: SsaInstr, y: SsaInstr, z: SsaInstr) -> SsaInstr {
-		return add(V3Op.newByteArraySetField(offset, fieldType, startType), [x, y, z], facts);
+	def opByteArraySetField(fieldType: Type, startType: Type, offset: int, order: ByteOrder, facts: Fact.set, x: SsaInstr, y: SsaInstr, z: SsaInstr) -> SsaInstr {
+		return add(V3Op.newByteArraySetField(offset, fieldType, order, startType), [x, y, z], facts);
 	}
 	private def tryElimBoundsCheck(x: SsaInstr, y: SsaInstr) -> Fact.set {
 		if (SsaConst.?(y)) {
@@ -737,6 +803,7 @@ class SsaBlockSplit {
 			// split after last: start ... last={pt} | | (new block)
 			// nothing to do
 		}
+		mergeBuilder.source = curBlock.source;
 	}
 	private def doSplit(start: SsaBlock, last: SsaLink, end: SsaLink) {
 		var first = last.next;
@@ -755,6 +822,7 @@ class SsaBlockSplit {
 	def addIf(cond: SsaInstr) -> SsaBuilder {
 		if (falseBlock != null) System.error("SsaBlockSplitError", "cannot add if to true block");
 		var tblock = context.newBuilder(), fblock = context.newBuilder();
+		tblock.source = fblock.source = curBlock.source;
 		curBlock.addIf(cond, tblock.block, fblock.block);
 		curBlock = tblock;
 		falseBlock = fblock;
@@ -763,6 +831,7 @@ class SsaBlockSplit {
 	def addIfNot(cond: SsaInstr) -> SsaBuilder {
 		if (falseBlock != null) System.error("SsaBlockSplitError", "cannot add if to true block");
 		var tblock = context.newBuilder(), fblock = context.newBuilder();
+		tblock.source = fblock.source = curBlock.source;
 		curBlock.addIf(cond, fblock.block, tblock.block);
 		curBlock = tblock;
 		falseBlock = fblock;
@@ -785,5 +854,69 @@ class SsaBlockSplit {
 		context.block = mergeBuilder.block;
 		mergeBuilder.pt = null;
 		return mergeBuilder;
+	}
+}
+
+// A helper class for building a cascade of SSA if's that can also output a value as a phi.
+class SsaIfCascade {
+	def varType: Type;
+	def builder: SsaBuilder;
+	def merge: SsaBlock;
+	private var fblock: SsaBlock;
+	private def phiInputs = if(varType != null, Vector<SsaInstr>.new().grow(2));
+
+	private new(builder, varType, merge) { }
+
+	def addCase(cond: SsaInstr) {
+		addIf0(cond, false);
+	}
+	def addNotCase(cond: SsaInstr) {
+		addIf0(cond, true);
+	}
+	def addElse() {
+		at(fblock);
+		fblock = null;
+	}
+	def endCase(val: SsaInstr) {
+		if (builder.end) return;
+		if (varType != null) {
+			if (val == null) builder.context.fail("SsaIfCascade variable must be non-null on this path");
+			phiInputs.put(val);
+		}
+		builder.addGoto(merge);
+		at(fblock);
+	}
+	private def addIf0(cond: SsaInstr, not: bool) {
+		if (builder.end) return;
+		var tb = SsaBlock.new(), fb = SsaBlock.new();
+		if (not) builder.addIf(cond, fb, tb);
+		else builder.addIf(cond, tb, fb);
+		if (tb.preds.length == 0) { // true case eliminated
+			at(fb);
+			fblock = null;
+		} else if (fb.preds.length == 0) { // false case eliminated
+			at(tb);
+			fblock = null;
+		} else {
+			at(tb);
+			fblock = fb;
+		}
+	}
+	def finish() -> SsaInstr {
+		if (fblock != null) builder.context.fail("SsaIfCascade: ended before else clause");
+		at(merge);
+		if (varType == null) return null;
+		if (phiInputs.length != merge.preds.length) builder.context.fail("SsaIfCascade: mismatch in phi input count");
+		return builder.addPhi(varType, phiInputs.extract());
+	}
+	private def at(b: SsaBlock) {
+		if (b == null) {
+			builder.block = SsaBlock.new(); // XXX: not reachable, collects junk
+			builder.end = true;
+		} else {
+			builder.block = b;
+			builder.end = b.preds.length == 0;
+		}
+		builder.pt = null;
 	}
 }

@@ -514,6 +514,86 @@ public class V3S_System {
         return Double.longBitsToDouble(bits);
     }
 
+    public static short readBytes2_be(byte[] bytes, int offset, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        int byte0 = ((int)bytes[fullOffset + 1] & 0xFF);
+        int byte1 = ((int)bytes[fullOffset + 0] & 0xFF) << 8;
+        return ((short)(byte0 | byte1));
+    }
+
+    public static int readBytes3_be(byte[] bytes, int offset, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        int byte0 = ((int)bytes[fullOffset + 2] & 0xFF);
+        int byte1 = ((int)bytes[fullOffset + 1] & 0xFF) << 8;
+        int byte2 = ((int)bytes[fullOffset + 0] & 0xFF) << 16;
+        return byte0 | byte1 | byte2;
+    }
+
+    public static int readBytes4_be(byte[] bytes, int offset, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        int byte0 = ((int)bytes[fullOffset + 3] & 0xFF);
+        int byte1 = ((int)bytes[fullOffset + 2] & 0xFF) << 8;
+        int byte2 = ((int)bytes[fullOffset + 1] & 0xFF) << 16;
+        int byte3 = ((int)bytes[fullOffset + 0] & 0xFF) << 24;
+        return byte0 | byte1 | byte2 | byte3;
+    }
+
+    public static long readBytes5_be(byte[] bytes, int offset, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        long byte0 = ((long)bytes[fullOffset + 4] & 0xFF);
+        long byte1 = ((long)bytes[fullOffset + 3] & 0xFF) << 8;
+        long byte2 = ((long)bytes[fullOffset + 2] & 0xFF) << 16;
+        long byte3 = ((long)bytes[fullOffset + 1] & 0xFF) << 24;
+        long byte4 = ((long)bytes[fullOffset + 0] & 0xFF) << 32;
+        return byte0 | byte1 | byte2 | byte3 | byte4;
+    }
+
+    public static long readBytes6_be(byte[] bytes, int offset, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        long byte0 = ((long)bytes[fullOffset + 5] & 0xFF);
+        long byte1 = ((long)bytes[fullOffset + 4] & 0xFF) << 8;
+        long byte2 = ((long)bytes[fullOffset + 3] & 0xFF) << 16;
+        long byte3 = ((long)bytes[fullOffset + 2] & 0xFF) << 24;
+        long byte4 = ((long)bytes[fullOffset + 1] & 0xFF) << 32;
+        long byte5 = ((long)bytes[fullOffset + 0] & 0xFF) << 40;
+        return byte0 | byte1 | byte2 | byte3 | byte4 | byte5;
+    }
+
+    public static long readBytes7_be(byte[] bytes, int offset, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        long byte0 = ((long)bytes[fullOffset + 6] & 0xFF);
+        long byte1 = ((long)bytes[fullOffset + 5] & 0xFF) << 8;
+        long byte2 = ((long)bytes[fullOffset + 4] & 0xFF) << 16;
+        long byte3 = ((long)bytes[fullOffset + 3] & 0xFF) << 24;
+        long byte4 = ((long)bytes[fullOffset + 2] & 0xFF) << 32;
+        long byte5 = ((long)bytes[fullOffset + 1] & 0xFF) << 40;
+        long byte6 = ((long)bytes[fullOffset + 0] & 0xFF) << 48;
+        return byte0 | byte1 | byte2 | byte3 | byte4 | byte5 | byte6;
+    }
+
+    public static long readBytes8_be(byte[] bytes, int offset, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        long byte0 = ((long)bytes[fullOffset + 7] & 0xFF);
+        long byte1 = ((long)bytes[fullOffset + 6] & 0xFF) << 8;
+        long byte2 = ((long)bytes[fullOffset + 5] & 0xFF) << 16;
+        long byte3 = ((long)bytes[fullOffset + 4] & 0xFF) << 24;
+        long byte4 = ((long)bytes[fullOffset + 3] & 0xFF) << 32;
+        long byte5 = ((long)bytes[fullOffset + 2] & 0xFF) << 40;
+        long byte6 = ((long)bytes[fullOffset + 1] & 0xFF) << 48;
+        long byte7 = ((long)bytes[fullOffset + 0] & 0xFF) << 56;
+        return byte0 | byte1 | byte2 | byte3 | byte4 | byte5 | byte6 | byte7;
+    }
+
+    public static float readBytesFloat_be(byte[] bytes, int offset, int staticOffset) {
+        int bits = V3S_System.readBytes4_be(bytes, offset, staticOffset);
+        return Float.intBitsToFloat(bits);
+    }
+
+    public static double readBytesDouble_be(byte[] bytes, int offset, int staticOffset) {
+        long bits = V3S_System.readBytes8(bytes, offset, staticOffset);
+        return Double.longBitsToDouble(bits);
+    }
+
     public static void setBytes1(byte[] bytes, int offset, byte value, int staticOffset) {
         bytes[offset + staticOffset] = value;
     }
@@ -589,5 +669,78 @@ public class V3S_System {
     public static void setBytesDouble(byte[] bytes, int offset, double value, int staticOffset) {
         long bits = Double.doubleToRawLongBits(value);
         V3S_System.setBytes8(bytes, offset, bits, staticOffset);
+    }
+
+    public static void setBytes2_be(byte[] bytes, int offset, short value, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset + 1] = (byte)value;
+        bytes[fullOffset + 0] = (byte)(value >> 8);
+    }
+
+    public static void setBytes3_be(byte[] bytes, int offset, int value, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset + 2] = (byte)value;
+        bytes[fullOffset + 1] = (byte)(value >> 8);
+        bytes[fullOffset + 0] = (byte)(value >> 16);
+    }
+
+    public static void setBytes4_be(byte[] bytes, int offset, int value, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset + 3] = (byte)value;
+        bytes[fullOffset + 2] = (byte)(value >> 8);
+        bytes[fullOffset + 1] = (byte)(value >> 16);
+        bytes[fullOffset + 0] = (byte)(value >> 24);
+    }
+
+    public static void setBytes5_be(byte[] bytes, int offset, long value, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset + 4] = (byte)value;
+        bytes[fullOffset + 3] = (byte)(value >> 8);
+        bytes[fullOffset + 2] = (byte)(value >> 16);
+        bytes[fullOffset + 1] = (byte)(value >> 24);
+        bytes[fullOffset + 0] = (byte)(value >> 32);
+    }
+
+    public static void setBytes6_be(byte[] bytes, int offset, long value, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset + 5] = (byte)value;
+        bytes[fullOffset + 4] = (byte)(value >> 8);
+        bytes[fullOffset + 2] = (byte)(value >> 16);
+        bytes[fullOffset + 2] = (byte)(value >> 24);
+        bytes[fullOffset + 1] = (byte)(value >> 32);
+        bytes[fullOffset + 0] = (byte)(value >> 40);
+    }
+
+    public static void setBytes7_be(byte[] bytes, int offset, long value, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset + 6] = (byte)value;
+        bytes[fullOffset + 5] = (byte)(value >> 8);
+        bytes[fullOffset + 4] = (byte)(value >> 16);
+        bytes[fullOffset + 3] = (byte)(value >> 24);
+        bytes[fullOffset + 2] = (byte)(value >> 32);
+        bytes[fullOffset + 1] = (byte)(value >> 40);
+        bytes[fullOffset + 0] = (byte)(value >> 48);
+    }
+
+    public static void setBytes8_be(byte[] bytes, int offset, long value, int staticOffset) {
+        int fullOffset = offset + staticOffset;
+        bytes[fullOffset + 7] = (byte)value;
+        bytes[fullOffset + 6] = (byte)(value >> 8);
+        bytes[fullOffset + 5] = (byte)(value >> 16);
+        bytes[fullOffset + 4] = (byte)(value >> 24);
+        bytes[fullOffset + 3] = (byte)(value >> 32);
+        bytes[fullOffset + 2] = (byte)(value >> 40);
+        bytes[fullOffset + 1] = (byte)(value >> 48);
+        bytes[fullOffset + 0] = (byte)(value >> 56);
+    }
+
+    public static void setBytesFloat_be(byte[] bytes, int offset, float value, int staticOffset) {
+        int bits = Float.floatToRawIntBits(value);
+        V3S_System.setBytes4_be(bytes, offset, bits, staticOffset);
+    }
+
+    public static void setBytesDouble_be(byte[] bytes, int offset, double value, int staticOffset) {
+        long bits = Double.doubleToRawLongBits(value);
+        V3S_System.setBytes8_be(bytes, offset, bits, staticOffset);
     }
 }

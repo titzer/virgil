@@ -45,6 +45,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def queue = WorkQueue.new();
 	def classes = Vector<RaClass>.new();
 	def arrays = Vector<RaArray>.new();
+	var defaultValues: HashMap<Type, Val>;
 	var liveMethods = Vector<RaMethod>.new();
 
 	// perform the analysis, starting from the roots
@@ -127,7 +128,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			null => ;
 			x: Record => queue.add(analyzeRecord, x);
 			x: Closure => queue.add(analyzeValue, x);
-			x: TupleVal => queue.add(analyzeValue, x);
+			x: BoxVal => queue.add(analyzeValue, x);
 			x: ArrayRangeVal => queue.add(analyzeRecord, x.array);
 		}
 	}
@@ -148,7 +149,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 				getMethod(null, rm);
 				if (x.val != null) analyzeValue(x.val);
 			}
-			x: TupleVal => for(e in x.values) analyzeValue(e);
+			x: BoxVal => for(e in x.values) analyzeValue(e);
 		}
 	}
 	// analyze a record
@@ -299,6 +300,13 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			OverloadedEq,
 			RefEq,
 			VariantEq => getEquality(mono(op.op.typeArgs[0], context), context);
+			DefaultValue => {
+				var t = mono(op.op.typeArgs[0], context);
+				var v = prog.getDefaultValue(t);
+				analyzeValue(v);
+				if (defaultValues == null) defaultValues = TypeUtil.newTypeMap();
+				defaultValues[t] = v;
+			}
 			ArrayAlloc,
 			ArrayInit => allocation(makeType(mono(op.op.typeArgs[0], context)));
 			ClassAlloc(method) => {
@@ -583,12 +591,17 @@ class RaClass extends RaType {
 	var children: List<RaClass>;		// list of all child classes
 	var subtypes: List<RaClass>;		// list of live subtypes
 	var normClass: IrClass;			// normalized class
-	var normFields: Array<IrField>;		// normalized fields
+	var liveFields: Array<IrSpec>;		// normalized fields
 	var normMethods: Array<IrMethod>;	// normalized methods
 	var minClassId = -1;			// minimum class ID
 	var maxClassId = -1;			// maximum class ID
-	var variantNorm: VariantNorm;			// non-null for flattened variants
 	var newIrType: Type;
+
+	var variantNorm: VariantNorm;		// non-null for flattened variants
+	var fieldRangesO: Array<(int, int)>;
+	var fieldRangesT: Array<(int, int)>;	// mapping of unnormalized field index to normalized range
+	var variantFields: Array<VariantField>;
+	var vecO: Array<Type>;
 
 	new(oldType: Type, orig, parent) super(oldType) {
 		newIrType = oldType;
@@ -610,6 +623,11 @@ class RaClass extends RaType {
 	}
 	def fieldStart() -> int {
 		return if(parent != null, parent.fields.length);
+	}
+	def inheritedField(rf: RaField) -> bool {
+		if (parent == null) return false;
+		var i = rf.orig.index;
+		return i < parent.fields.length && parent.fields[i] == rf;
 	}
 	def makeMethod(m: IrMethod, spec: IrSpec) -> RaMethod {
 		if (m.index >= methods.length) methods = Arrays.grow(methods, methods.length + m.index + 1);
@@ -658,8 +676,9 @@ class RaField(receiver: Type, orig: IrField, fieldType: Type) extends RaItem {
 	var initFacts = Facts.V_DEFAULT;
 	var writeFacts = Facts.V_FACTS;
 	var typeNorm: TypeNorm;
-	var norm: Array<IrSpec>;
-	var normIndex = -1;
+	var origIndices: (int, int) = (-1, -1);
+	var normIndices: (int, int) = (-1, -1);
+
 	def facts() -> Fact.set {
 		return initFacts & writeFacts;
 	}
@@ -690,6 +709,14 @@ class RaField(receiver: Type, orig: IrField, fieldType: Type) extends RaItem {
 			return true; // neither written nor initialized, nor any values
 		}
 		return false;
+	}
+	def normOf<T>(r: Range<T>) -> Range<T> {
+		if (normIndices.0 == normIndices.1) return null;
+		return r[normIndices.0 ... normIndices.1];
+	}
+	def liveFields(ra: ReachabilityAnalyzer) -> Range<IrSpec> {
+		var rc = ra.getClass(receiver);
+		return normOf(rc.liveFields);
 	}
 }
 // Information about a method, including any specialization, whether it is reusable
@@ -777,37 +804,21 @@ class VariantComparatorGen(context: SsaContext, root: IrClass, receiver: IrClass
 	}
 	def genCompareFields(tag: int) {
 		var b = newBuilder(graph.startBlock);
+
+		var tblock = SsaBlock.new(), fblock = SsaBlock.new();
+		b.addIf(b.pure(V3Op.newRefEq(root.ctype), [p0, p1]), tblock, fblock);
+		addReturnBool(tblock, true);
+		b = newBuilder(fblock);
+
 		var falseBlock = SsaBlock.new();
 		addReturnBool(falseBlock, false);
 
 		var fieldCompare: SsaBlock;
-		if (tag == 0) {
-			// check p1 for null
-			var eqNull1 = SsaBlock.new(), neNull1 = SsaBlock.new();
-			b.addIfNull(p1, eqNull1, neNull1);
-			b = newBuilder(eqNull1);
-			// check p0 for null
-			var neNull0a = SsaBlock.new();
-			var trueBlock = SsaBlock.new();
-			b.addIfNull(p0, trueBlock, neNull0a);
-			addReturnBool(trueBlock, true);
-			b = newBuilder(neNull0a);
-			// if p0 is null, compare p1 fields with default
-			genFieldComparisonsWithDefault(false, b, p0, falseBlock);
+		// check p1 for null, TODO: is this necessary?
+		var neNull1 = SsaBlock.new();
+		b.addIfNull(p1, falseBlock, neNull1);
+		fieldCompare = neNull1;
 
-			b = newBuilder(neNull1);
-			var eqNull0b = SsaBlock.new(), neNull0b = SsaBlock.new();
-			b.addIfNull(p0, eqNull0b, neNull0b);
-			b = newBuilder(eqNull0b);
-			genFieldComparisonsWithDefault(true, b, p1, falseBlock);
-
-			fieldCompare = neNull0b;
-		} else {
-			// check p1 for null
-			var neNull1 = SsaBlock.new();
-			b.addIfNull(p1, falseBlock, neNull1);
-			fieldCompare = neNull1;
-		}
 		b = newBuilder(fieldCompare);
 
 		if (numCases > 1) { // tag comparison only necessary if more than 1 case
@@ -844,40 +855,6 @@ class VariantComparatorGen(context: SsaContext, root: IrClass, receiver: IrClass
 		}
 		b.addReturn([graph.trueConst()]);
 	}
-	def genFieldComparisonsWithDefault(compareTag: bool, b: SsaBuilder, p0: SsaInstr, falseBlock: SsaBlock) {
-		if (compareTag) {
-			var cont = SsaBlock.new();
-			var t0 = V3Op.newVariantGetTag(root.ctype);
-			var get = b.addApply(null, t0, [p0]);
-			get.facts |= Fact.O_NO_NULL_CHECK;
-			var cmp = b.opEqual(t0.sig.returnType(), get, graph.nullConst(t0.sig.returnType()));
-			if (receiver.fields.length > 0) {
-				b.addIf(cmp, cont, falseBlock);
-				b = newBuilder(cont);
-				p0 = b.opTypeSubsume(root.ctype, receiver.ctype, p0);
-			} else {
-				b.addReturn([cmp]);
-				return;
-			}
-		}
-		// compare each field with the default value
-		for (f in receiver.fields) {
-			var spec = IrSpec.new(receiver.ctype, [receiver.ctype], f);
-			var f0 = b.opGetField(spec, p0);
-			var f1 = graph.nullConst(f.fieldType);
-			f0.facts |= Fact.O_NO_NULL_CHECK;
-			var cmp = b.opEqual(f.fieldType, f0, f1);
-			if (f.index == receiver.fields.length - 1) {
-				// last field
-				b.addReturn([cmp]);
-				return;
-			}
-			var cont = SsaBlock.new();
-			b.addIf(cmp, cont, falseBlock);
-			b = newBuilder(cont);
-		}
-		b.addReturn([graph.trueConst()]);
-	}
 	def newBuilder(block: SsaBlock) -> SsaBuilder {
 		return SsaBuilder.new(context, graph, block);
 	}
@@ -887,8 +864,8 @@ class VariantComparatorGen(context: SsaContext, root: IrClass, receiver: IrClass
 }
 // Globally shareable normalizers.
 component IntNormalizers {
-	def I32LE = IntNormalizer.new(32, false);
-	def I64LE = IntNormalizer.new(64, false);
+	def I32LE = IntNormalizer.new(32);
+	def I64LE = IntNormalizer.new(64);
 }
 // Reports code that is neither used during initialization nor reachable from main().
 class DeadCodeAnalyzer(ra: ReachabilityAnalyzer) {
@@ -910,7 +887,7 @@ class DeadCodeAnalyzer(ra: ReachabilityAnalyzer) {
 			// report dead fields if any
 			for (f in ic.fields) {
 				if (ic.inherits(f)) continue;
-				if (!f.facts.X_LIVE) {
+				if (reportDead(f)) {
 					if (buf.length == 0) addLine("within ", ic);
 					buf.puts("  dead field: ");
 					f.render(buf.red());
@@ -922,7 +899,7 @@ class DeadCodeAnalyzer(ra: ReachabilityAnalyzer) {
 				if (m == null) continue;
 				if (ic.inherits(m)) continue;
 				if (m.facts.M_EMPTY) continue;
-				if (!m.facts.X_LIVE) {
+				if (reportDead(m)) {
 					if (buf.length == 0) addLine("within ", ic);
 					buf.puts("  dead method: ");
 					m.render(buf.red());
@@ -931,6 +908,15 @@ class DeadCodeAnalyzer(ra: ReachabilityAnalyzer) {
 			}
 		}
 		buf.outt();
+	}
+	def reportDead(m: IrMember) -> bool {
+		if (m.facts.X_LIVE) return false;
+		// Don't report dead fields or methods whose names end with "_".
+		match (m) {
+			x: IrField => return x.source != null && !Strings.endsWith(x.source.name(), "_");
+			x: IrMethod => return x.source != null && !Strings.endsWith(x.source.name(), "_");
+		}
+		return true;
 	}
 	def addLine(p: string, ic: IrClass) {
 		buf.puts(p);

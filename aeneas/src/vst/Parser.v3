@@ -29,6 +29,7 @@ component Keywords {
 			("extends",	KC_OTHER),
 			("false",	KC_FALSE),
 			("for",		KC_OTHER),
+			("fun",		KC_OTHER),
 			("if",		KC_OTHER),
 			("import",	KC_OTHER),
 			("in",		KC_OTHER),
@@ -98,6 +99,9 @@ component Parser {
 	def parseFile(fileName: string, input: Array<byte>, ERROR: ErrorGen, typeCache: TypeCache) -> VstFile {
 		var file = VstFile.new(fileName, input);
 		var p = ParserState.new(file, ERROR, skipToNextToken, typeCache);
+		p.enableFunExprs = CLOptions.FUN_EXPRS.get();
+		p.enableSimpleBodies = CLOptions.SIMPLE_BODIES.get();
+
 		file.input = input;
 		file.lineEnds = p.lineEnds;
 		// parse class, component, var, and def declarations
@@ -158,9 +162,9 @@ component Parser {
 					if (optKeyword(p, "component") != null) return parseComponent(p, file, true);
 					if (optKeyword(p, "type") != null) return parseVariant(p, file, true);
 					if (optKeyword(p, "enum") != null) return parseEnum(p, file, true);
-					if (optKeyword(p, "packing") != null) return parsePackingDecl(p, file, true);
+					if (optKeyword(p, "packing") != null) return parsePacking(p, file, true);
 				}
-				if (optKeyword(p, "packing") != null) return parsePackingDecl(p, file, false);
+				if (optKeyword(p, "packing") != null) return parsePacking(p, file, false);
 			}
 			'l' => {
 				if (optKeyword(p, "layout") != null) return parseLayout(p, file);
@@ -178,8 +182,10 @@ component Parser {
 			var args = parseTupleExpr(p);
 			superclause = SuperClause.new(args.point(), args);
 		}
+		var repHints = parseRepHints(p);
 		var members = parseMembers(p, false);
 		var decl = VstClass.new(isPrivate, id.name, id.list(), params, parent, superclause, members);
+		decl.repHints = repHints;
 		file.classes.put(decl);
 		return true;
 	}
@@ -204,57 +210,75 @@ component Parser {
 		}
 		return true;
 	}
-	def parsePackingParam(p: ParserState) -> (Token, Literal) {
+	def parsePackingParam(p: ParserState) -> PackingParamDecl {
 		var param = parseIdentVoid(p).name;
 		p.req1(':');
 
 		var sizeLiteral = parseIntLiteral(p);
-		return (param, sizeLiteral);
+		return PackingParamDecl.new(param, sizeLiteral);
 	}
-	def parsePackingExpr(p: ParserState) -> VstPackingExpr {
+	def parsePackingExprs(p: ParserState) -> VstList<VstPackingExpr> {
+		if (p.curByte == '(') {
+			return Parser.parseList<VstPackingExpr>(0, p, '(', Parser.COMMA, ')', parsePackingExpr(_, false, true));
+		} else {
+			var start = p.point();
+			var expr = parsePackingExpr(p, false, true);
+			return VstList<VstPackingExpr>.new(p.end(start), List<VstPackingExpr>.new(expr, null));
+		}
+	}
+	def parsePackingExpr(p: ParserState, inDecl: bool, allowSolve: bool) -> VstPackingExpr {
 		var s = p.curPos, q = p.curPos;
-		var isBitPattern = false; // is a bit pattern, not an ordinary binary literal
+		var isPattern = false; // is a bit pattern, not an ordinary binary literal
+		
+		var result: VstPackingExpr;
 		if (p.peek(0) == '0' && (p.peek(1) == 'b' || p.peek(1) == 'B')) {
 			// could be a bit pattern, try parsing it
 			q += 2;
-			var bits = Vector<PackingBit>.new();
+			var bits = Vector<(int, PackingBit)>.new();
 			while (q < p.input.length) {
 				var c = p.input[q];
-				if (c == '0') bits.put(PackingBit.Literal(0));
-				else if (c == '1') bits.put(PackingBit.Literal(1));
-				else if (c == '?') bits.put(PackingBit.Wildcard);
-				else if (Char.isIdentStart(c)) bits.put(PackingBit.Char(c));
+				var offset = q - s;
+				if (c == '0') bits.put(offset, PackingBit.Fixed(0));
+				else if (c == '1') bits.put(offset, PackingBit.Fixed(1));
+				else if (c == '?') { isPattern = true; bits.put(offset, PackingBit.Unassigned); }
+				else if (Char.isIdentStart(c)) { isPattern = true; bits.put(offset, PackingBit.Assigned(c)); }
 				else if (c != '_') break;
-
-				if (c == '?' || Char.isIdentStart(c)) isBitPattern = true;
 				q++;
 			}
 
-			if (isBitPattern) {
-				p.advance(q - s);
-				return VstPackingExpr.Bits(bits.extract());
+			if (isPattern) {
+				var token = p.token(q - s);
+				return VstPackingExpr.Bits(token, bits.reverse().extract());
 			}
-		} else if (p.curByte == '(') {
-			// Tuple
-			return VstPackingExpr.Tuple(parseList(0, p, '(', COMMA, ')', parsePackingExpr));
+		} else if (p.curByte == '#') {
+			p.eat1();
+			if (optKeyword(p, "solve") != null) {
+				if (inDecl) p.error("solve expressions are not supported in packing declarations");
+				else if (!allowSolve) p.error("nested solve expressions are not supported");
+				return VstPackingExpr.Solve(parseList(0, p, '(', COMMA, ')', parsePackingExpr(_, inDecl, false)));
+			} else if (optKeyword(p, "concat") != null) {
+				return VstPackingExpr.Concat(parseList(0, p, '(', COMMA, ')', parsePackingExpr(_, inDecl, false)));
+			}
+			p.error("invalid function in packing expression");
 		} else if (Char.isIdentStart(p.curByte)) {
-			// Application or Field
-			var varExpr = VarExpr.!(parseVarExpr(p));
-			if (p.curByte == '(') return VstPackingExpr.App(varExpr, parseList(0, p, '(', COMMA, ')', parsePackingExpr));
+			// Application or Field or Concat
+			var id = parseIdent(p, parseTypeRef);
+			var varExpr = VarExpr.new(null, null, id);
+			if (p.curByte == '(') return VstPackingExpr.App(varExpr, parseList(0, p, '(', COMMA, ')', parsePackingExpr(_, inDecl, true)));
 			else return VstPackingExpr.Field(varExpr);
 		}
-		// Literal
+			
 		return VstPackingExpr.Literal(parseNumber(p));
 	}
-	def parsePackingDecl(p: ParserState, file: VstFile, isPrivate: bool) -> bool {
+	def parsePacking(p: ParserState, file: VstFile, isPrivate: bool) -> bool {
 		var id = parseIdentVoid(p).name;
 		var params = parseList(0, p, '(', COMMA, ')', parsePackingParam);
 		p.req1(':');
 		var size = parseIntLiteral(p);
 		p.req1('=');
-		var expr = parsePackingExpr(p);
+		var expr = parsePackingExpr(p, true, false);
 		p.req1(';');
-		var decl = VstPackingDecl.new(id, params, expr, size);
+		var decl = VstPacking.new(id, params, expr, size);
 		file.packings.put(decl);
 		return true;
 	}
@@ -266,7 +290,7 @@ component Parser {
 			var d = p.input, q = p.curPos + 1;
 			while (q < d.length) {
 				var c = d[q];
-				if (!Char.isIdentMiddle(c) && c != '-') break; // XXX: ugly difference with parseIdent
+				if (!Char.isIdentMiddle(c) && c != '-' && c != ':') break; // XXX: ugly difference with parseIdent
 				q++;
 			}
 			var id = extractIdent<void>(p, q);
@@ -274,12 +298,14 @@ component Parser {
 			var result: VstRepHint;
 			match (id.kwClass) {
 				Keywords.KC_PACKING => {
-					var e = parsePackingExpr(p);
+					var e = parsePackingExprs(p);
 					result = VstRepHint.Packing(e);
 				}
 				0 => {
 					if (Strings.equal(name, "boxed")) result = VstRepHint.Boxed;
 					else if (Strings.equal(name, "unboxed")) result = VstRepHint.Unboxed;
+					else if (Strings.equal(name, "packed")) result = VstRepHint.Packed;
+					else if (Strings.equal(name, "big-endian")) result = VstRepHint.BigEndian;
 					else result = VstRepHint.Other(name);
 				}
 				_ => kwError(p, id.name);
@@ -325,24 +351,31 @@ component Parser {
 		return null;
 	}
 	def parseExport(p: ParserState, file: VstFile) -> bool {
+		var expname = parseOptString(p);
 		if (optKeyword(p, "def") != null) {
 			// export def name...
 			var synthetic = file.getSyntheticComponent();
 			var before = synthetic.members;
 			var list = synthetic.members = PUBLIC_DEF.parseDef(p, synthetic.members, null);
-			var rev: List<Decl>;
+			var rev: List<Decl>, count = 0;
 			for (l = list; l != before; l = l.tail) {
 				rev = List.new(l.head, rev); // local reversal of newly added members
+				count++;
+			}
+			if (expname != null && count > 1) {
+				var second = rev.tail.head;
+				p.errorAt(second.token.range(), "export with explict name applied to multiple declarations");
 			}
 			// Add exports in the right order.
 			for (l = rev; l != null; l = l.tail) {
 				var expr = VarExpr.new(null, null, VstIdent<TypeRef>.new(l.head.token, 0, null));
-				file.exports.put(ExportDecl.new(l.head.token, l.head.token.image, synthetic, expr));
+				var n = if(expname != null, expname, l.head.token).image;
+				file.exports.put(ExportDecl.new(l.head.token, n, synthetic, expr));
 			}
 			return true;
 		}
 		var id: VstIdent<TypeRef>;
-		var token = parseOptString(p);
+		var token = expname;
 		if (token == null) {
 			id = parseIdent(p, parseTypeRef);
 			token = id.name;
@@ -478,7 +511,7 @@ component Parser {
 			if (pt != null) rettype = ReturnType.This(Token.new(p.fileName, str, loc.0, loc.1));
 			else rettype = ReturnType.Explicit(Parser.parseTypeRef(p));
 			body = if(p.curByte == ';', EmptyStmt.new(p.token(1)), Parser.parseBlockStmt(p));
-		} else if ((start = p.optN("=>")) >= 0) {
+		} else if (Debug.UNSTABLE && p.enableSimpleBodies && (start = p.optN("=>")) >= 0) {
 			var expr = parseExpr(p);
 			rettype = ReturnType.Implicit(expr);
 			if (isDef) p.req1(';');
@@ -633,8 +666,14 @@ component Parser {
 				p.req1(';');
 				var cond = parseExpr(p);
 				p.req1(';');
-				var update = parseExpr(p);
-				p.req1(')');
+				var update: Expr, line = p.curLine, col = p.curCol;
+				if (p.opt1(')') > 0) { // allow for missing update clause
+					var range = FileRange.new(p.fileName, line, col, line, col);
+					update = TupleExpr.new(VstList.new(range, null));
+				} else {
+					update = parseExpr(p);
+					p.req1(')');
+				}
 				var tblock = parseStmt(p);
 				return ForStmt.new(start, decl, cond, update, tblock);
 			}
@@ -747,8 +786,10 @@ component Parser {
 		return MatchPattern.new(expr, params);
 	}
 	def parseMatchParam(p: ParserState) -> VarDecl {
-		var id = parseIdentVoid(p);
-		var v = VarDecl.new(id.name, null, null);
+		var token: Token;
+		if (p.curByte == '_') token = p.token(1);
+		else token = parseIdentVoid(p).name;
+		var v = VarDecl.new(token, null, null);
 		v.isReadOnly = true;
 		return v;
 	}
@@ -762,7 +803,7 @@ component Parser {
 		if (p.curByte == '(') { // nested function
 			var params = parseTypedMethodParams(p);
 			var t = parseReturnTypeAndBody(p, true);
-			var init = FuncExpr.new(start, id.name, params, t.0, t.1);
+			var init = FunExpr.new(start, id.name, params, t.0, t.1);
 			var v = VarDecl.new(id.name, null, init);
 			return LocalStmt.new(start, List.new(v, null));
 		}
@@ -815,13 +856,13 @@ component Parser {
 			}
 			return parseVarExpr(p);
 		}
-		if (PARSE_FUNCEXPRS && ch == 'd') { // TODO: enable
-			var start = optKeyword(p, "def");
+		if (Debug.UNSTABLE && p.enableFunExprs && ch == 'f') {
+			var start = optKeyword(p, "fun");
 			if (start != null) {
 				var id = if(Char.isIdentStart(p.curByte), parseIdentVoid(p).name);
-				var params = parseMethodParams(p);
+				var params = parseMethodParams(p); // TODO: make parameters optional
 				var t = parseReturnTypeAndBody(p, false);
-				return FuncExpr.new(start, id, params, t.0, t.1);
+				return FunExpr.new(start, id, params, t.0, t.1);
 			}
 			return parseVarExpr(p);
 		}
@@ -920,30 +961,32 @@ component Parser {
 		return VstRedefField.new(receiver, ident, lit);
 	}
 	def parseNumber(p: ParserState) -> Literal {
-		var np = NumberParser.new(p.input, p.curPos);
+		var np = NumberParser.new(p.input[p.curPos ... ]);
+		np.accept_width = true;
 		if (np.parse()) {
-			var diff = np.pos - np.start;
+			var len = np.pos;
 			if (np.is_binary) {
-				return BinLiteral.new(p.token(diff), np.val, np.vtype, np.l_suffix, np.u_suffix, np.width);
+				return BinLiteral.new(p.token(len), np.val, np.vtype, np.l_suffix, np.u_suffix, np.digits);
 			} else if (np.is_hex) {
-				return HexLiteral.new(p.token(diff), np.val, np.vtype, np.l_suffix, np.u_suffix, np.width);
+				return HexLiteral.new(p.token(len), np.val, np.vtype, np.l_suffix, np.u_suffix, np.digits);
 			} else if (np.is_float) {
-				return FloatLiteral.new(p.token(diff), np.val, np.vtype);
+				return FloatLiteral.new(p.token(len), np.val, np.vtype);
 			} else {
-				return DecLiteral.new(p.token(diff), np.val, np.vtype, np.l_suffix, np.u_suffix, np.is_negative);
+				return DecLiteral.new(p.token(len), np.val, np.vtype, np.l_suffix, np.u_suffix, np.is_negative);
 			}
 		} else {
-			p.errorAtOffset(np.error_pos - np.start, np.error_msg);
-			p.advance(np.pos - np.start);
+			p.errorAtOffset(np.error_pos, np.error_msg);
+			p.advance(np.pos);
 			return null;
 		}
 	}
-	def parseIntLiteral(p: ParserState) -> Literal {
+	def parseIntLiteral(p: ParserState) -> IntLiteral {
 		var lit = parseNumber(p);
-		if (lit != null && !IntType.?(lit.exactType)) {
-			p.errorAt(lit.token.range(), "expected integer literal");
+		match (lit) {
+			x: IntLiteral => return x;
+			_ => if (lit != null) p.errorAt(lit.token.range(), "expected integer literal");
 		}
-		return lit;
+		return null;
 	}
 	def newLiteralFromIdent(p: ParserState, id: VstIdent<TypeRef>, val: Val, t: Type) -> Literal {
 		if (id.params != null) p.error1("value \'%s\' cannot be parameterized", id.name.image);
@@ -1414,25 +1457,24 @@ class VarDefParser(isPrivate: bool, writability: Writability) {
 	def parseIndexed(p: ParserState, prev: List<VstMember>) -> List<VstMember> {
 		if (writability == Writability.PRIVATE_WRITEABLE) p.error("invalid access modifiers for indexing method declaration");
 		var params = Parser.parseList(0, p, '[', Parser.COMMA, ']', Parser.parseTypedMethodParam);
-		var rtype: ReturnType;
-		var name: string;
-		if (p.curByte == '=') {
+		if (p.curByte == '=' && p.peek(1) != '>') {
 			p.req1('=');
 			var val = Parser.parseTypedMethodParam(p);
-			rtype = ReturnType.Void;
+			var rtype = ReturnType.Void;
 			var l = List.new(val, Lists.reverse(params.list));
 			params = VstList.new(params.src, Lists.reverse(l));
-			name = "[]=";
+			var r = params.range();
+			var token = Token.new(r.fileName, "[]=", r.beginLine, r.beginColumn);
+			var body = if(p.curByte == ';', EmptyStmt.new(p.token(1)), Parser.parseBlockStmt(p));
+			var m = VstMethod.new(isPrivate, token, null, params, rtype, body);
+			return List.new(m, prev);
 		} else {
-			p.reqN("->");
-			rtype = ReturnType.Explicit(Parser.parseTypeRef(p));
-			name = "[]";
+			var t = Parser.parseReturnTypeAndBody(p, true);
+			var r = params.range();
+			var token = Token.new(r.fileName, "[]", r.beginLine, r.beginColumn);
+			var m = VstMethod.new(isPrivate, token, null, params, t.0, t.1);
+			return List.new(m, prev);
 		}
-		var r = params.range();
-		var token = Token.new(r.fileName, name, r.beginLine, r.beginColumn);
-		var body = if(p.curByte == ';', EmptyStmt.new(p.token(1)), Parser.parseBlockStmt(p));
-		var m = VstMethod.new(isPrivate, token, null, params, rtype, body);
-		return List.new(m, prev);
 	}
 	def parseVar(p: ParserState, prev: List<VstMember>) -> List<VstMember> {
 		var id = Parser.parseIdentVoid(p);
@@ -1459,4 +1501,3 @@ class VarDefParser(isPrivate: bool, writability: Writability) {
 		return prev;
 	}
 }
-def PARSE_FUNCEXPRS = false;

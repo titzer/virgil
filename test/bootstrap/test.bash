@@ -9,8 +9,8 @@ TEST_HOST=jar
 for target in $TEST_TARGETS; do
     if [ "$target" = "v3i" ]; then
 	continue # skip
-    elif [ "$target" = "wasm-js" ]; then
-	continue # TODO: wasm-js bootstrap
+    elif [ "$target" = "wasm" ]; then
+	continue # TODO: wasm bootstrap
     elif [ "$target" = "jvm" ]; then
 	target=jar
     fi

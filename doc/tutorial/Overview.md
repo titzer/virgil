@@ -8,10 +8,17 @@ If you're already fairly skilled at *another* programming language, see [Coming 
 This tutorial is organized into a series of articles covered independent aspects of the language, from the basics to advanced concepts.
 That way, you can jump right into a topic.
 
+## Basic usability
+
 * Get started with your first program, the classic [Hello World](HelloWorld.md).
+* See how to develop for [WebAssembly with Virgil](wasm/DevelopingForWasm.md).
+
+## Language concepts
+
 * How to use [variables and definitions](Variables.md).
 * Add some structure to our code instead by using [components](Components.md).
 * [Primitive types](Primitives.md) are numbers, booleans, strings, characters.
+* [Numbers](Numbers.md) include both fixed-size integers and floating-point numbers.
 * [Methods](Methods.md) make up most of the logic of programs.
 * [Local Variables](Locals.md) are how we store data in methods.
 * [Arithmetic](Arith.md) on numbers in Virgil is a lot more general than other programming languages.
@@ -45,6 +52,9 @@ That way, you can jump right into a topic.
 * [Pointers](Pointers.md) are used in platform-specific parts of the runtime.
 * Type parameters don't have [variance](Variance.md) in Virgil; only subtyping on functions.
 * Putting it all together, [synthesis](Synthesis.md).
+
+## More advanced topics
+
 * Know enough of the language? Learn how to use some [libraries](LibUtil.md).
 * Virgil doesn't yet have [exceptions](Exceptions.md).
 * What kind of programming [style](Style.md) should I use?
