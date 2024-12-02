@@ -1,8 +1,15 @@
+component SubtypeUtil {
+	def newSpecializationMap<T>() -> HashMap<Array<RaClass>, T> {
+		return HashMap<Array<RaClass>, T>.new(Arrays.hash<RaClass>(0, _, RaClass.minClassId), Arrays.equal<RaClass>);
+	}
+}
+
 class SsaSpecializingRebuilder extends SsaRebuilder {
 	def ssaPrinter = SsaPrinter.new();
 	def irPrinter = IrPrinter.new(norm.ra.prog);
 	def norm: ReachabilityNormalizer;
-	def gen: VstSsaGen; // For recording direct calls
+	var optContext: SsaContext;
+	var gen: VstSsaGen;  // For recording direct calls
 	// Mutating array to perform specialization on all params
 	var allSpecs: Array<RaClass>;
 	// Current specializations. Map param indices to their subtype we specialize to.
@@ -10,8 +17,11 @@ class SsaSpecializingRebuilder extends SsaRebuilder {
 	var specializedMethods: Vector<IrMethod> = Vector.new();
 	var recordDirectCalls = true; // True the first time you call doSpecialization, then false
 
-	new(context: SsaContext, norm: ReachabilityNormalizer, gen: VstSsaGen) super(context) {
-		var numParams = context.graph.params.length;
+	new(context: SsaContext, norm: ReachabilityNormalizer) super(context) {
+		optContext = SsaContext.new(context.compiler, context.prog).enterMethod(context.method);
+		gen = VstSsaGen.new(optContext, context.prog.opBuilder);
+		
+		def numParams = context.graph.params.length;
 		allSpecs = Array.new(numParams);
 	}
 
@@ -25,7 +35,12 @@ class SsaSpecializingRebuilder extends SsaRebuilder {
 		var params = context.graph.params;
 		if (i == params.length) {
 			// All specialization choices have been made
-			if (have_specialized) doSpecialization(allSpecs);
+			if (have_specialized) {
+				var newMethod = doSpecialization(allSpecs);
+				if (newMethod != null) {
+					specializedMethods.put(newMethod);
+				}
+			}
 			return;
 		}
 
@@ -48,7 +63,7 @@ class SsaSpecializingRebuilder extends SsaRebuilder {
 			specializeParam(i + 1, have_specialized);
 		}
 	}
-	def doSpecialization(currSpec: Array<RaClass>) {
+	def doSpecialization(currSpec: Array<RaClass>) -> IrMethod {
 		specs = currSpec;
 		instrMap.reset(context.graph);
 		var oldParams = context.graph.params;
@@ -68,7 +83,7 @@ class SsaSpecializingRebuilder extends SsaRebuilder {
 			map1(oldParams[i], newParams[i]);
 		}
 		if (!specialized) {
-			return;
+			return null;
 		}
 		
 		// create new graph
@@ -99,9 +114,19 @@ class SsaSpecializingRebuilder extends SsaRebuilder {
 		newMethod.specialized = true;
 		newMethod.source = om.source;
 		newMethod.ssa = newGraph;
-		norm.newIr.methods.put(newMethod);
-		specializedMethods.put(newMethod);
 		ssaPrinter.printGraph("Subtype Specialization", newMethod.render, newMethod.ssa, newMethod.sig);
+
+		def newIrSpec = IrSpec.new(newMethod.receiver, [newMethod.receiver], newMethod);
+		optContext.enterSpec(newIrSpec);
+		SsaEarlyInliner.new(optContext, norm.ra.compilation, gen).inline(0);
+		ssaPrinter.printGraph("Post-Inlined Subtype Specialization", newMethod.render, newMethod.ssa, newMethod.sig);
+
+		optContext.enterSpec(newIrSpec);
+		SsaOptimizer.new(optContext).optGraph();
+		ssaPrinter.printGraph("Post-Optimized Subtype Specialization", newMethod.render, newMethod.ssa, newMethod.sig);
+
+		norm.newIr.methods.put(newMethod);
+		return newMethod;
 	}
 	// No normalization
 	def normType(t: Type) -> TypeNorm {
@@ -181,15 +206,15 @@ class SsaSpecializingRebuilder extends SsaRebuilder {
 class CallInfo {
 	def caller: IrMethod;
 	def callee: IrMethod;
-	def instr: SsaApplyOp;
+	var instr: SsaApplyOp;
 
 	new(caller: IrMethod, callee: IrMethod, instr: SsaApplyOp) { }
 }
 
 class CallGraph {
 	def ir: IrModule;
-	def calls: HashMap<IrItem, Vector<CallInfo>> = IrUtil.newIrItemMap<Vector<CallInfo>>();
-	def callers: HashMap<IrItem, Vector<CallInfo>> = IrUtil.newIrItemMap<Vector<CallInfo>>();
+	def callerToCallee: HashMap<IrItem, Vector<CallInfo>> = IrUtil.newIrItemMap<Vector<CallInfo>>();
+	def calleeToCaller: HashMap<IrItem, Vector<CallInfo>> = IrUtil.newIrItemMap<Vector<CallInfo>>();
 
 	new(ir: IrModule) {
 		for (i < ir.roots.length) {
@@ -203,12 +228,12 @@ class CallGraph {
 			return;
 		}
 
-		if (calls.has(m)) {
+		if (callerToCallee.has(m)) {
 			return;
 		}
 
 		def callees = Vector<CallInfo>.new();
-		calls[m] = callees;
+		callerToCallee[m] = callees;
 
 		for (block in m.ssa.bfBlocks(null)) {
 			for (instr = block.next; instr != null && instr != block; instr = instr.next) {
@@ -233,12 +258,13 @@ class CallGraph {
 	def addCall(caller: IrMethod, callee: IrMethod, instr: SsaApplyOp, callees: Vector<CallInfo>) {
 		def callInfo = CallInfo.new(caller, callee, instr);
 		callees.put(callInfo);
-		var callerVec = callers[callee];
-		if (callerVec == null) {
-			callerVec = Vector<CallInfo>.new();
+
+		var callers = calleeToCaller[callee];
+		if (callers == null) {
+			callers = Vector<CallInfo>.new();
+			calleeToCaller[callee] = callers;
 		}
-		callerVec.put(callInfo);
-		callers[callee] = callerVec;
+		callers.put(callInfo);
 		addCalls(callee);
 	}
 }
@@ -259,14 +285,14 @@ class SsaSubtypeSpecializer {
 	private def callGraph: CallGraph = CallGraph.new(norm.newIr);
 
 	new(norm: ReachabilityNormalizer) {
-		Terminal.put("Calls\n");
-		callGraph.calls.apply(printCallGraph);
-		Terminal.put("Callers\n");
-		callGraph.callers.apply(printCallGraph);
+		Terminal.put("callerToCallee\n");
+		callGraph.callerToCallee.apply(printCallGraph);
+		Terminal.put("calleeToCaller\n");
+		callGraph.calleeToCaller.apply(printCallGraph);
 	}
 
 	def specialize() {
-		callGraph.callers.apply(specializeMethod);
+		callGraph.calleeToCaller.apply(specializeMethod);
 	}
 
 	def specializeMethod(meth: IrItem, info: Vector<CallInfo>) {
@@ -281,22 +307,8 @@ class SsaSubtypeSpecializer {
 
 		context.enterMethod(m);
 
-		var optContext = SsaContext.new(context.compiler, context.prog).enterMethod(context.method);
-		var gen = VstSsaGen.new(optContext, context.prog.opBuilder);
-		var rebuilder = SsaSpecializingRebuilder.new(context, norm, gen);
+		var rebuilder = SsaSpecializingRebuilder.new(context, norm);
 		var specializedMethods = rebuilder.specializeAll();
-		if (specializedMethods.length > 0) {
-			var meth = specializedMethods[0];
-			optContext.enterSpec(IrSpec.new(meth.receiver, [meth.receiver], meth));
-			SsaEarlyInliner.new(optContext, norm.ra.compilation, gen).inline(0);
-		}
-		for (i < specializedMethods.length) {
-			var meth = specializedMethods[i];
-			optContext.enterSpec(IrSpec.new(meth.receiver, [meth.receiver], meth));
-			ssaPrinter.printGraph("Post-Inlined Subtype Specialization", meth.render, meth.ssa, meth.sig);
-			SsaOptimizer.new(optContext).optGraph();
-			ssaPrinter.printGraph("Post-Optimized Subtype Specialization", meth.render, meth.ssa, meth.sig);
-		}
 		specMap[context.method] = specializedMethods;
 	}
 	def getSpecializedMethods(m: IrMethod) -> Vector<IrMethod> {
