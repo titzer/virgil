@@ -178,32 +178,126 @@ class SsaSpecializingRebuilder extends SsaRebuilder {
 	}
 }
 
-class SsaSubtypeSpecializer {
-	def ssaPrinter = SsaPrinter.new();
-	def norm: ReachabilityNormalizer;
-	private def specMap : HashMap<IrItem, Vector<IrMethod>> = IrUtil.newIrItemMap<Vector<IrMethod>>();
+class CallInfo {
+	def caller: IrMethod;
+	def callee: IrMethod;
+	def instr: SsaApplyOp;
 
-	new(norm: ReachabilityNormalizer) {}	
+	new(caller: IrMethod, callee: IrMethod, instr: SsaApplyOp) { }
+}
 
-	def specializeMethod(context: SsaContext) {
-		if (specMap.has(context.method)) {
+class CallGraph {
+	def ir: IrModule;
+	def calls: HashMap<IrItem, Vector<CallInfo>> = IrUtil.newIrItemMap<Vector<CallInfo>>();
+	def callers: HashMap<IrItem, Vector<CallInfo>> = IrUtil.newIrItemMap<Vector<CallInfo>>();
+
+	new(ir: IrModule) {
+		for (i < ir.roots.length) {
+			var root = ir.roots[i].spec;
+			addCalls(root.asMethod());
+		}
+	}
+
+	def addCalls(m: IrMethod) {
+		if (m == null) {
+			Terminal.put("Method is null\n");
 			return;
 		}
 
-		var optContext = SsaContext.new(context.compiler, context.prog).enterMethod(context.method);
-		var gen = VstSsaGen.new(optContext, context.prog.opBuilder);
+		if (m.ssa == null) {
+			Terminal.put1("Method %q has no SSA\n", m.render);
+			return;
+		}
+
+		if (calls.has(m)) {
+			return;
+		}
+
+		def callees = Vector<CallInfo>.new();
+		calls[m] = callees;
+
+
+		for (block in m.ssa.bfBlocks(null)) {
+			for (instr = block.next; instr != null && instr != block; instr = instr.next) {
+				if (SsaApplyOp.?(instr)) {
+					var apply = SsaApplyOp.!(instr);
+					match (apply.op.opcode) {
+						CallMethod(m_target) => addCall(m, m_target, apply, callees);
+						CallClassMethod(m_target) => addCall(m, m_target, apply, callees);
+						CallVariantVirtual(m_target) => addCall(m, m_target, apply, callees);
+						ClassGetMethod(m_target) => addCall(m, m_target, apply, callees);
+						ClassGetVirtual(m_target) => addCall(m, m_target, apply, callees);
+						CallClassSelector(selector) => addCall(m, selector.method, apply, callees);
+						CallVariantSelector(selector) => addCall(m, selector.method, apply, callees);
+						ClassGetSelector(selector) => addCall(m, selector.method, apply, callees);
+						_ => ;
+					}
+				}
+			}
+		}
+	}
+
+	def addCall(caller: IrMethod, callee: IrMethod, instr: SsaApplyOp, callees: Vector<CallInfo>) {
+		def callInfo = CallInfo.new(caller, callee, instr);
+		callees.put(callInfo);
+		var callerVec = callers[callee];
+		if (callerVec == null) {
+			callerVec = Vector<CallInfo>.new();
+		}
+		callerVec.put(callInfo);
+		callers[callee] = callerVec;
+		addCalls(callee);
+	}
+}
+
+def printCallGraph(m: IrItem, info: Vector<CallInfo>) {
+	Terminal.put1("Key: %q\n", IrMethod.!(m).render);
+	for (i < info.length) {
+		var call = info[i];
+		Terminal.put2("\t%q calls %q\n", call.caller.render, call.callee.render);
+	}
+}
+
+class SsaSubtypeSpecializer {
+	def ssaPrinter = SsaPrinter.new();
+	def norm: ReachabilityNormalizer;
+	def context: SsaContext = SsaContext.new(norm.ra.compiler, norm.ra.prog);
+	private def specMap : HashMap<IrItem, Vector<IrMethod>> = IrUtil.newIrItemMap<Vector<IrMethod>>();
+	private def callGraph: CallGraph = CallGraph.new(norm.newIr);
+
+	new(norm: ReachabilityNormalizer) {
+		Terminal.put("Calls\n");
+		callGraph.calls.apply(printCallGraph);
+		Terminal.put("Callers\n");
+		callGraph.callers.apply(printCallGraph);
+	}
+
+	def specialize() {
+		callGraph.callers.apply(specializeMethod);
+	}
+
+	def specializeMethod(meth: IrItem, info: Vector<CallInfo>) {
+		def m = IrMethod.!(meth);
+
+		if (specMap.has(m)) {
+			return;
+		}
+
+		context.enterMethod(m);
+
+		var gen = VstSsaGen.new(context, context.prog.opBuilder);
 		var rebuilder = SsaSpecializingRebuilder.new(context, norm, gen);
 		var specializedMethods = rebuilder.specializeAll();
 		if (specializedMethods.length > 0) {
 			var meth = specializedMethods[0];
-			optContext.enterSpec(IrSpec.new(meth.receiver, [meth.receiver], meth));
-			SsaEarlyInliner.new(optContext, norm.ra.compilation, gen).inline(0);
+			context.enterSpec(IrSpec.new(meth.receiver, [meth.receiver], meth));
+			SsaEarlyInliner.new(context, norm.ra.compilation, gen).inline(0);
 		}
 		for (i < specializedMethods.length) {
 			var meth = specializedMethods[i];
-			optContext.enterSpec(IrSpec.new(meth.receiver, [meth.receiver], meth));
+			context.enterSpec(IrSpec.new(meth.receiver, [meth.receiver], meth));
 			ssaPrinter.printGraph("Post-Inlined Subtype Specialization", meth.render, meth.ssa, meth.sig);
-			SsaOptimizer.new(optContext).optGraph();
+			SsaOptimizer.new(context).optGraph();
 			ssaPrinter.printGraph("Post-Optimized Subtype Specialization", meth.render, meth.ssa, meth.sig);
 		}
 		specMap[context.method] = specializedMethods;
@@ -216,45 +310,40 @@ class SsaSubtypeSpecializer {
 	}
 	// Specialize method calls to specialized methods stored in specMap.
 	def specializeCalls(m: IrMethod) {
-		specializeBlockCalls(m.ssa.startBlock, Ssa.newBlockMap<void>());
-	}
-	def specializeBlockCalls(block: SsaBlock, visited: PartialMap<SsaBlock, void>) {
-		if (visited.has(block)) return;
-		visited[block] = ();
+		for (block in m.ssa.bfBlocks(null)) {
+			for (instr = block.next; instr != null && instr != block; instr = instr.next) {
+				if (SsaApplyOp.?(instr)) {
+					var apply = SsaApplyOp.!(instr);
+					match (apply.op.opcode) {
+						CallMethod(m) => {
+							// Terminal.put1("Found method: %q\n", m.renderLong);
+							var specializedMethods = getSpecializedMethods(m);
+							var sm: IrMethod = null;
+							for (i < specializedMethods.length) {
+								if (isSpecializedMatch(apply, specializedMethods[i])) {
+									sm = specializedMethods[i];
+									break;
+								}
+							}
+							if (sm != null) {
+								// Terminal.put1("Specializing Method: %q\n", sm.renderLong);
+								var inputs = Array<SsaInstr>.new(apply.inputs.length);
+								for (i < inputs.length) inputs[i] = apply.inputs[i].dest;
+								var newInstr = SsaApplyOp.new(apply.source, V3Op.newCallMethod(V3Op.extractIrSpec(apply.op, sm)), inputs);
+								newInstr.next = instr.next;
+								newInstr.prev = instr.prev;
+								instr.prev.next = newInstr;
+								instr.next.prev = newInstr;
 
-		for (instr = block.next; instr != block; instr = instr.next) {
-			if (SsaApplyOp.?(instr)) {
-				var apply = SsaApplyOp.!(instr);
-				match (apply.op.opcode) {
-					CallMethod(m) => {
-						// Terminal.put1("Found method: %q\n", m.renderLong);
-						var specializedMethods = getSpecializedMethods(m);
-						var sm: IrMethod = null;
-						for (i < specializedMethods.length) {
-							if (isSpecializedMatch(apply, specializedMethods[i])) {
-								sm = specializedMethods[i];
-								break;
+								apply.replace(newInstr);
+								apply.kill();
 							}
 						}
-						if (sm != null) {
-							// Terminal.put1("Specializing Method: %q\n", sm.renderLong);
-							var inputs = Array<SsaInstr>.new(apply.inputs.length);
-							for (i < inputs.length) inputs[i] = apply.inputs[i].dest;
-							var newInstr = SsaApplyOp.new(apply.source, V3Op.newCallMethod(V3Op.extractIrSpec(apply.op, sm)), inputs);
-							newInstr.next = instr.next;
-							newInstr.prev = instr.prev;
-							instr.prev.next = newInstr;
-							instr.next.prev = newInstr;
-
-							apply.replace(newInstr);
-							apply.kill();
-						}
+						_ =>;
 					}
-					_ =>;
 				}
 			}
 		}
-		for (succ in block.succs()) specializeBlockCalls(succ.dest, visited);
 	}
 	def isSpecializedMatch(apply: SsaApplyOp, m: IrMethod) -> bool {
 		// Terminal.put1("Checking method: %q\n", m.renderLong);
