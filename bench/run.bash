@@ -110,14 +110,14 @@ for p in $benchmarks; do
 		for aeneas in ${AENEAS_BINARY[@]}; do
 			PROG=$TMP/${marks[$i]}/$p-$target
 			echo -n "$aeneas: "
-			$BTIME -i $RUNS $PROG $args
+			$BTIME $RUNS $PROG $args
 			i=($i+1)
 		done
 	else
 		PROG=$TMP/$p-$target
 		args=$(cat $p/args-$size)
 		
-		echo "$p ($size): $PROG $args"
+		echo "$p($size): $PROG $args"
 		$BTIME $RUNS $PROG $args
 	fi
 done

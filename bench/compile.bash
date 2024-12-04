@@ -64,7 +64,7 @@ function do_compile() {
 		RT=$VIRGIL_LOC/rt
 		RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
 		CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
-		echo "$BTIME -i 1 $binary "${opts[@]}" $CONFIG"$RT_FILES" -output=$TMP -program-name=$PROG $files"
+		echo "$BTIME -i 1 $binary "${opts[@]}" $CONFIG\"$RT_FILES\" -output=$TMP -program-name=$PROG $files"
 		$BTIME -i 1 $binary "${opts[@]}" $CONFIG"$RT_FILES" -output=$TMP -program-name=$PROG $files
 		return $?
     elif [ "$target" = "v3i" ]; then
