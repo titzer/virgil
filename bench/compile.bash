@@ -46,6 +46,9 @@ function do_compile() {
     PROG=$p-$target
     EXE=$TMP/$PROG
 
+	echo $opts
+	echo $binary
+
     files="Common.v3 $p/*.v3"
     if [ -x "$p/$p.bash" ]; then
 	files=$($p/$p.bash $TMP)
@@ -56,14 +59,14 @@ function do_compile() {
     if [ -f "$p/v3c-opts-$target" ]; then
 	opts="$opts $(cat $p/v3c-opts-$target)"
     fi
-
-		if [ ! -z $binary ]; then
-			# compile with provided binary
-			RT=$VIRGIL_LOC/rt
-			RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
-			CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
-			$BTIME -i 1 $binary $CONFIG"$RT_FILES" -output=$TMP -program-name=$PROG "${opts[@]}" $files
-			return $?
+	if [ ! -z $binary ]; then
+		# compile with provided binary
+		RT=$VIRGIL_LOC/rt
+		RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
+		CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
+		echo "$BTIME -i 1 $binary "${opts[@]}" $CONFIG"$RT_FILES" -output=$TMP -program-name=$PROG $files"
+		$BTIME -i 1 $binary "${opts[@]}" $CONFIG"$RT_FILES" -output=$TMP -program-name=$PROG $files
+		return $?
     elif [ "$target" = "v3i" ]; then
 	# v3i is a special target that runs the V3C interpreter
 	echo "#!/bin/bash" > $EXE
@@ -78,6 +81,7 @@ function do_compile() {
 	return 0
     else
 	# compile to the given target architecture
+	echo "v3c-$target -output=$TMP -program-name=$PROG "${opts[@]}" $files"
 	v3c-$target -output=$TMP -program-name=$PROG "${opts[@]}" $files
 	return $?
     fi
