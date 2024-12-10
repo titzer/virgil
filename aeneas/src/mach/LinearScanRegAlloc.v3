@@ -100,6 +100,10 @@ class LinearScanRegAlloc {
 	}
 	def recordLive(index: int) {
 		for (l = activeList; l != null; l = l.next) {
+			if (l == l.next) {
+				gen.mach.prog.ERROR.fail(
+					Strings.format2("VReg %d from SSAInstr %d points to itself!", l.varNum, l.ssa.uid));
+			}
 			livemap[index, l.varNum] = true;
 		}
 	}
@@ -111,6 +115,12 @@ class LinearScanRegAlloc {
 		// add to the active list
 //		if (Debug.PARANOID && (vreg.next != null || vreg.prev != null)) fail("var %d should not be in list", vreg.varNum);
 		var prev = activeList;
+		if (prev == vreg) {
+			var b = StringBuilder.new();
+			b.put3("Making a circular linked list with VRegs %d and %d from SSAInstrs %d and ",
+					prev.varNum, vreg.varNum, prev.ssa.uid).put1("%d respectively", vreg.ssa.uid);
+			gen.mach.prog.ERROR.fail(b.toString());
+		}
 		vreg.next = prev;
 		activeList = vreg;
 		if (prev != null) prev.prev = vreg;
@@ -121,6 +131,12 @@ class LinearScanRegAlloc {
 		var vreg = p.vreg;
 		if (vreg == null) return;  // nothing to do
 		var pos = p.pos, p = vreg.prev, n = vreg.next;
+		if (p == n && p != null) {
+			var b = StringBuilder.new();
+			b.put3("Have a circular linked list with VRegs %d and %d from SSAInstrs %d and ",
+					p.varNum, vreg.varNum, p.ssa.uid).put1("%d respectively", vreg.ssa.uid);
+			gen.mach.prog.ERROR.fail(b.toString());
+		}
 		if (p != null) p.next = n;
 		if (n != null) n.prev = p;
 		vreg.prev = null;
@@ -448,7 +464,10 @@ class IntervalBuilder(gen: OldCodeGen, regSet: MachRegSet) {
 		for (i < brow.length) {
 			var vnum = i * 32, bb = brow[i], pb = prow[i];
 			for (bits = bb & (-1 ^ pb); bits != 0; bits = bits >>> 1) {
-				if ((bits & 1) != 0) insertHead(LsraStart.new(b.start * 2, vars[vnum]));
+				if ((bits & 1) != 0) {
+					insertHead(LsraStart.new(b.start * 2, vars[vnum]));
+					vars[vnum].activeInFuture = true;
+				}
 				vnum++;
 			}
 		}
@@ -457,7 +476,10 @@ class IntervalBuilder(gen: OldCodeGen, regSet: MachRegSet) {
 		for (i < brow.length) {
 			var vnum = i * 32, bb = brow[i], pb = prow[i];
 			for (bits = (-1 ^ bb) & pb; bits != 0; bits = bits >>> 1) {
-				if ((bits & 1) != 0) insertHead(LsraEnd.new(b.start * 2, vars[vnum]));
+				if ((bits & 1) != 0) {
+					insertHead(LsraEnd.new(b.start * 2, vars[vnum]));
+					vars[vnum].activeInFuture = false;
+				}
 				vnum++;
 			}
 		}
@@ -481,7 +503,10 @@ class IntervalBuilder(gen: OldCodeGen, regSet: MachRegSet) {
 				var vnum = u >>> gen.VAR_SHIFT, vreg = vars[vnum];
 				if (usePoint == null) insertHead(usePoint = LsraUse.new(pos, i));
 				if (!vreg.isConst()) {
-					if (!livein.set(blindex, vnum)) insertHead(LsraEnd.new(pos, vreg));
+					if (!livein.set(blindex, vnum)) {
+						insertHead(LsraEnd.new(pos, vreg));
+						vreg.activeInFuture = false;
+					}
 					if (vreg.hint == 0 && regSet.isReg(fixed)) vreg.hint = byte.!(fixed);
 					if (pos > vreg.endPos) vreg.endPos = pos;
 				}
@@ -527,8 +552,18 @@ class IntervalBuilder(gen: OldCodeGen, regSet: MachRegSet) {
 		while (l != null && l.pos < loopEndPos) {
 			if (l.vreg != null && livein[0, l.vreg.varNum]) {
 				// remove all starts and ends within the loop
-				if (LsraStart.?(l)) { l = removePoint(l); continue; }
-				if (LsraEnd.?(l)) { l = removePoint(l); continue; }
+				if (LsraStart.?(l)) {
+					// Since we're removing an LsraStart, the VReg will not be active in the future anymore
+					l.vreg.activeInFuture = false;
+					l = removePoint(l);
+					continue;
+				}
+				if (LsraEnd.?(l)) {
+					// Since we're removing an LsraEnd, the VReg will be active in the future
+					l.vreg.activeInFuture = true;
+					l = removePoint(l);
+					continue;
+				}
 			}
 			p = l;
 			l = l.next;
@@ -554,29 +589,60 @@ class IntervalBuilder(gen: OldCodeGen, regSet: MachRegSet) {
 			p = l;
 			l = l.next;
 		}
+
 		if (insertPoint == null) {
 			// if there are no points after the loop end, add a dummy one
 			insertPoint = LsraEnd.new(-1, null);
 			insertPoint.prev = p;
 			if (p != null) p.next = insertPoint;
 		}
+
+		var vregsActiveInFuture = Vector<VReg>.new();
 		// if the last block of the loop is a predecessor of the block after
 		// the loop, then a correct live range hole was already created
 		var order = gen.blocks.order, last = order[b.loop.end - 1].block;
 		if (b.loop.end < order.length) {
 			var next = order[b.loop.end].block;
+			var isPred = false;
 			for (s in last.succs()) {
-				if (s.dest == next) return;
+				if (s.dest == next) {
+					isPred = true;
+					break;
+				}
+			}
+
+			if (isPred) {
+				// XXX: If any variable will made active in the future, we need to
+				// ensure we insert LsraEnds to create live range holes
+				for (v < vars.length) {
+					if (livein[0, v] && vars[v].activeInFuture) {
+						vregsActiveInFuture.put(vars[v]);
+					}
+				}
+				if (vregsActiveInFuture.length == 0) {
+					return;
+				}
 			}
 		}
+
 		// create a live range hole by inserting ends for all remaining variables
-		livein.row(0).apply(insertEndVarAtLoopEnd, (loopEndPos, insertPoint));
+		if (vregsActiveInFuture.length > 0) {
+			// XXX: Use a Vector instead of calling `livein.row(0).apply` since there
+			// may be cases where only certain variables are made active in the
+			// future, instead of everything livein to the loop
+			for (vreg in vregsActiveInFuture.extract()) {
+				insertEndVarAtLoopEnd(vreg.varNum, (loopEndPos, insertPoint));
+			}
+		} else {
+			livein.row(0).apply(insertEndVarAtLoopEnd, (loopEndPos, insertPoint));
+		}
 		// remove dummy point
 		if (insertPoint.pos == -1) removePoint(insertPoint);
 	}
 	def insertEndVarAtLoopEnd(vnum: int, t: (int, LsraPoint)) {
 		var vreg = vars[vnum], loopEndPos = t.0, insertPoint = t.1;
 		insertBefore(LsraEnd.new(loopEndPos, vreg), insertPoint);
+		vreg.activeInFuture = false;
 		if (loopEndPos > vreg.endPos) vreg.endPos = loopEndPos;
 	}
 	def insertHead(n: LsraPoint) {
@@ -624,6 +690,7 @@ class IntervalPrinter(
 	var state = Array<byte>.new(1 + gen.vars.length);
 	var live  = Array<byte>.new(1 + gen.vars.length);
 	var map   = Array<int>.new(gen.vars.length);
+	var sb = StringBuilder.new();
 	var vnum: int;
 
 	new() {
@@ -724,8 +791,16 @@ class IntervalPrinter(
 	def pointType(l: LsraPoint) -> string {
 		if (LsraStart.?(l)) return ("start");
 		if (LsraEnd.?(l)) return ("end");
-		if (LsraLive.?(l)) return ("live");
-		if (LsraKill.?(l)) return ("kill");
+		if (LsraLive.?(l)) {
+			sb.reset();
+			sb.put1("live idx %d", LsraLive.!(l).index);
+			return (sb.toString());
+		}
+		if (LsraKill.?(l)) {
+			sb.reset();
+			sb.put1("kill regset 0x%x", LsraKill.!(l).regset);
+			return (sb.toString());
+		}
 		if (LsraUse.?(l)) return ("use");
 		if (LsraDef.?(l)) return ("def");
 		return "unknown";
