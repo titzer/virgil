@@ -47,7 +47,17 @@ function do_compiled() {
     R=$OUT/$target/run.out
 
     print_compiling $target
-    run_v3c $target -output=$T $TESTS $LIB_FILES &> $C
+    if [ -z "$target" ]; then
+	$AENEAS_TEST $V3C_OPTS -output=$T $TESTS $LIB_FILES &> $C
+    else
+        local F=$VIRGIL_LOC/bin/dev/v3c-$target
+        if [ ! -x "$F" ]; then
+            F=$VIRGIL_LOC/bin/v3c-$target
+        fi
+	V3C=$AENEAS_TEST $F $V3C_OPTS -output=$T $TESTS $LIB_FILES &> $C
+    fi
+
+    # run_v3c $target -output=$T $TESTS $LIB_FILES &> $C
     check_no_red $? $C
 
     print_status Running $target
