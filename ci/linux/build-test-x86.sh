@@ -11,4 +11,7 @@ sudo apt -y install nasm
 
 "${TEST_DIR}"/configure
 
+# XXX(kunals): Temporarily release aeneas to avoid infinte loop in CI
+${VIRGIL_LOC}/bin/dev/aeneas release
+
 V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="v3i x86-linux" "${TEST_DIR}"/all.bash
