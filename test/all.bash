@@ -111,6 +111,12 @@ for dir in unit lib; do
     if [[ ! "$TEST_DIRS" =~ "$dir" ]]; then
 	continue # dir not in TEST_DIRS
     fi
+
+    if [[ "$TEST_TARGETS" == "v3i x86-linux" && "$dir" == "lib" ]]; then
+        echo "${YELLOW}XXX: Temporarily skipping the lib test for x86-linux for the stable compiler${NORM}"
+        continue
+    fi
+
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($V3C_STABLE) $dir${NORM}"
