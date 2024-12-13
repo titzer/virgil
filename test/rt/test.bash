@@ -9,13 +9,13 @@ function compile_target_tests_with_flags() {
     for test in $@; do
         base=$(basename $test)
         C=$T/$base.compile.out
-
+    
         trace_test_start $test
         FLAGS=""
         if [ -f $test.flags ]; then
             FLAGS=$(cat $test.flags)
         fi
-        grep -sq 'def TARGET_' $test > /dev/null
+        grep -sq 'def\ TARGET_' $test > /dev/null
         if [ $? = 0 ]; then
             target_field="TARGET_${target//-/_}"
             FLAGS="$FLAGS -redef-field=${target_field}=true"
@@ -41,7 +41,7 @@ function run_reserved_code_test() {
 for target in $TEST_TARGETS; do
     T=$OUT/$target
     mkdir -p $T
-
+    
     if [ -d $target ]; then
         TESTS=$(ls *.v3 $target/*.v3)
         print_compiling $target
