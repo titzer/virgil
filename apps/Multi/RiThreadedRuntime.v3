@@ -1,6 +1,206 @@
 // Copyright 2012 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// Application interface to threads.
+component Threads {
+	// Spawn a new thread to run the function {func} with argument {p}.
+	// Returns a new {RiThread<R>} object that can be joined to get the return value.
+	def spawn<P, R>(f: P -> R, p: P) -> RiThread<R> { // optional arguments: stack size, heap size, time alotment
+		var thread = RiThread<R>.new(Functions.bind(f, p));
+		RiStacks.spawn0(thread);
+		return thread;
+	}
+	// Select at most one thread from {some} that has finished.
+	def select<R>(some: Range<RiThread<R>>) -> RiThread<R> {
+		// Implementation sketch 1:
+		// - lock + wait on thread table, i.e. listen for updates
+		// - scan thread table for changes
+		// Implementation sketch 2:
+		// - add listener for all threads
+		return null; // TODO
+	}
+	// Join all the threads in {some}. Blocks until all threads have finished.
+	def join<R>(some: Range<RiThread<R>>) {
+		// TODO
+	}
+}
+
+// All the user-visible states which can be reported for a thread.
+enum RiThreadStatus {
+	// Active states.
+	RUNNING,	// is currently running, though may be descheduled
+	WAITING,	// blocked on resource or I/O
+	PAUSED,		// has consumed alotted time resource or was explicitly paused
+	// Terminal states.
+	FINISHED,	// has finished executing and produced a result
+	CRASHED,	// failed with an exception
+	FAILED,		// failed to spawn
+	KILLED		// was explicitly killed
+}
+
+// The base of all thread classes, which has no specific return value.
+class RiBaseThread {
+	def id: u64;
+	private var status: RiThreadStatus;
+
+	private def run(pid: u32);	// called internally to run user closure
+	def join() -> RiThreadStatus;	// blocks until thread reaches a termination state
+	def poll() -> RiThreadStatus {	// returns current status
+		return status;
+	}
+	def kill();			// kills the thread if running
+	def pause();			// pauses the thread if running
+	def resume();			// resumes a thread if paused
+	def active() -> bool { return status.tag < RiThreadStatus.FINISHED.tag; }
+	def finished() -> bool { return status.tag >= RiThreadStatus.FINISHED.tag; }
+}
+
+// A thread with an expected return type <R>.
+class RiThread<R> extends RiBaseThread {
+	def func: void -> R;
+	def var result: R;
+
+	private new(func) { }
+
+	// First Virgil code run on new thread (via being passed to CiRuntime.spawn).
+	private def run(pid: u32) {
+		System.out.puts("current ").putp(CiRuntime.callerSp()).ln();
+		this.status = RiThreadStatus.RUNNING;
+		this.result = func();
+		this.status = RiThreadStatus.FINISHED;
+		RiStacks.releaseCurrent();
+	}
+}
+
+// A wrapper around a byte range that represents the storage for a stack.
+type RiStack(range: Range<byte>) #unboxed {
+	def stackNum() -> int {
+		return RiStacks.findStackNum(Pointer.atContents(range));
+	}
+	def spawnPointer() -> Pointer {
+		return Pointer.atElement(range, CiRuntime.STACK_SIZE - Pointer.SIZE);
+	}
+}
+
+// Internal stack manager.
+private component RiStacks {
+	def MAX_THREADS = 128;
+	def NO_STACK = RiStack(null);
+	var stack_region: Range<byte>;
+
+	// status flags for spawn pointer
+	def STACK_FREED = 0;
+	def STACK_ACQUIRED = 1;
+	def STACK_RUNNING = 2;
+	def STACK_RELEASED = 3;
+
+	def acquire(thread: RiBaseThread) -> RiStack {
+		if (stack_region.length == 0) {
+			def total_size = CiRuntime.STACK_SIZE * MAX_THREADS;
+			var flags = LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS;
+			var prot = LinuxConst.PROT_READ | LinuxConst.PROT_WRITE;
+			var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, total_size, prot, flags, 0, 0));
+			if (r.0 == -1) return NO_STACK;
+			stack_region = CiRuntime.forgeRange<byte>(Pointer.NULL + r.0, total_size);
+		}
+		var result = NO_STACK;
+		/*TODO: lock*/ { 
+			for (i = 0L; i < stack_region.length; i += CiRuntime.STACK_SIZE) {
+				var stack = RiStack(stack_region[i ..+ CiRuntime.STACK_SIZE]);
+				var ptr = stack.spawnPointer();
+				if (ptr.load<i64>() == STACK_FREED) {
+					ptr.store<i64>(STACK_ACQUIRED);
+					result = stack;
+					System.out.puts("acquired ").putp(ptr).ln();
+					break;
+				}
+			}
+		}
+		return result;
+	}
+	def spawn0(thread: RiBaseThread) {
+		System.out.puts("parent ").putp(CiRuntime.callerSp()).ln();
+		var stack = acquire(thread);
+		if (stack == NO_STACK) return void(thread.status = RiThreadStatus.FAILED); // failed to acquire a stack
+		thread.status = RiThreadStatus.WAITING;
+		var result = CiRuntime_spawn(thread.run, stack.spawnPointer());
+		if (result != 0) {
+			System.out.puts("clone failed = ").puti(result).ln();
+			thread.status = RiThreadStatus.FAILED; // failed to spawn, e.g. out of resources
+		}
+	}
+	def releaseCurrent() {
+		var stack = find(CiRuntime.callerSp());
+		if (stack == NO_STACK) System.puts("didnt find current\n");
+		stack.spawnPointer().store<i64>(STACK_RELEASED);
+	}
+	def find(ptr: Pointer) -> RiStack {
+		System.out.puts("find ").putp(ptr).ln();
+		var num = findStackNum(ptr);
+		if (num < 0) return NO_STACK;
+		return RiStack(stack_region[num * CiRuntime.STACK_SIZE ..+ CiRuntime.STACK_SIZE]);
+	}
+	def findStackNum(ptr: Pointer) -> int {
+		var region = Pointer.atContents(stack_region);
+		if (ptr < region) return -1;
+		var diff = ptr - region;
+		if (diff >= stack_region.length) return -1;
+		return int.!(diff / CiRuntime.STACK_SIZE);
+	}
+	def spawnPointer(num: int) -> Pointer {
+		var stack = stack_region[(num * CiRuntime.STACK_SIZE) ..+ CiRuntime.STACK_SIZE];
+		return Pointer.atElement(stack, CiRuntime.STACK_SIZE - Pointer.SIZE);
+	}
+}
+
+// A thin wrapper around the kernel mmap() and mprotect() operations.
+component Mmap {
+	def PROT_NONE = LinuxConst.PROT_NONE;
+	def PROT_READ = LinuxConst.PROT_READ;
+	def PROT_WRITE = LinuxConst.PROT_WRITE;
+	def PROT_EXEC = LinuxConst.PROT_EXEC;
+
+	def reserve(size: u64, prot: int) -> Mapping {
+		var flags = LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS;
+		var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, size, prot, flags, 0, 0));
+		if (r.0 == -1) return null;
+		var start = Pointer.NULL + r.0, end = start + i64.view(size);
+		var range = MemoryRange.new(start, end);
+		var mapping = Mapping.new(range);
+		RiGc.registerFinalizer(mapping, range.unmap);
+		return mapping;
+	}
+	def protect(start: Pointer, size: u64, prot: int) -> bool {
+		var r = Linux.syscall(LinuxConst.SYS_mprotect, (start, size, prot));
+		return r.0 == 0;
+	}
+}
+
+// The (root) handle for a memory region. Don't lose it!
+// When the mapping is garbage collected, the memory range will be unmapped automatically,
+// if the underlying range has not been manually unmapped.
+class Mapping(range: MemoryRange) { }
+
+class MemoryRange {
+	def var start: Pointer;
+	def var end: Pointer;
+
+	new(start, end) { }
+
+	def unmap() {
+		if (start == Pointer.NULL) return; // already deallocated
+		Linux.syscall(LinuxConst.SYS_munmap, (start, end - start));
+		start = end = Pointer.NULL;
+	}
+	def size() -> u64 {
+		return u64.view(end - start);
+	}
+	def contains(p: Pointer) -> bool {
+		return p >= start && p < end;
+	}
+}
+
+
 // RiRuntime provides the platform-dependent runtime hooks called by the compiler
 // to implement signal handling (and therefore exception handling), GC, and
 // initialization of the runtime environment.
@@ -136,15 +336,8 @@ component RiRuntime {
 		NativeStackPrinter.printStack(ip, sp);
 		RiOs.exit(255);
 	}
-	def registerThreadStart(pid: u32, thread: RiBaseThread) {
-	}
-	def unregisterThreadFinish(thread: RiBaseThread) {
-	}
-	def acquireStack(thread: RiBaseThread) -> Range<byte> {
-		return FAKE_STACK;
-	}
 }
-def FAKE_STACK = Array<byte>.new(1024000);
+
 
 // Runtime tables are exposed by the compiler as values in a "CiRuntime" component.
 // This component provides utilities to the rest of the runtime to traverse these
@@ -233,51 +426,6 @@ class RiUserCode(var start: Pointer, var end: Pointer) {
 	def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer, ip: Pointer, sp: Pointer) -> bool { return false; }
 }
 
-enum RiThreadStatus {
-	// Active states
-	RUNNING,	// is currently running, though may be descheduled
-	WAITING,	// blocked on resource or I/O
-	PAUSED,		// has consumed alotted time resource or was explicitly paused
-	// Terminated states
-	FINISHED,	// has finished executing and produced a result
-	CRASHED,	// failed with an exception
-	FAILED,		// failed to spawn
-	KILLED		// was explicitly killed
-}
-
-class RiBaseThread {
-	private def index: u32;	// index into thread table
-	def id: u64;
-	private var status: RiThreadStatus;
-
-	private def run(pid: u32);	// called internally to run user closure
-	def join() -> RiThreadStatus;	// blocks until thread reaches a termination state
-	def poll() -> RiThreadStatus {	// returns current status
-		return status;
-	}
-	def kill();			// kills the thread if running
-	def pause();			// pauses the thread if running
-	def resume();			// resumes a thread if paused
-}
-
-class RiGcThread extends RiBaseThread {
-	private def run(pid: u32);
-}
-
-class RiThread<R> extends RiBaseThread {
-	def func: void -> R;
-	def var result: R;
-
-	private new(func) { }
-
-	// First Virgil code run on new thread (via being passed to CiRuntime.spawn).
-	private def run(pid: u32) {
-		RiRuntime.registerThreadStart(pid, this);
-		this.result = func();
-		RiRuntime.unregisterThreadFinish(this); // recycles stack resource
-	}
-}
-
 // Run {func} on all inputs in parallel, returning the results.
 def ONE_BY_ONE = false;
 def JOIN_ALL = false;
@@ -307,34 +455,6 @@ def doN<P, R>(inputs: Range<P>, func: P -> R) -> Array<R> {
 	return results;
 }
 
-def doWork(p: int) -> int {
-	return p + 44;
-}
-
-component Threads {
-	def spawn<P, R>(f: P -> R, p: P) -> RiThread<R> { // optional arguments: stack size, heap size, time alotment
-		var thread = RiThread<R>.new(Functions.bind(f, p));
-		spawn0(thread);
-		return thread;
-	}
-	private def spawn0(thread: RiBaseThread) {
-		var stack = RiRuntime.acquireStack(thread);
-		var result = CiRuntime_spawn(thread.run, Pointer.atContents(stack) + stack.length);
-		if (result != 0) thread.status = RiThreadStatus.FAILED; // failed to spawn, e.g. out of resources
-	}
-	def select<R>(some: Range<RiThread<R>>) -> RiThread<R> {
-		// Implementation sketch 1:
-		// - lock + wait on thread table, i.e. listen for updates
-		// - scan thread table for changes
-		// Implementation sketch 2:
-		// - add listener for all threads
-		return null; // TODO
-	}
-	def join<R>(some: Range<RiThread<R>>) {
-		// TODO
-	}
-}
-
 var spawnFun: (u32 -> void, Pointer) -> int;
 
 def Regs: X86_64Regs;
@@ -346,66 +466,89 @@ def CLONE_SIGHAND = 0x00000800;
 def CLONE_PARENT = 0x00008000;
 def CLONE_THREAD = 0x00010000;
 
-def SYS_NUM = Regs.RAX;
-def SYS_PARAM0 = Regs.RDI;
-def SYS_PARAM1 = Regs.RSI;
-def SYS_PARAM2 = Regs.RDX;
-def SYS_PARAM3 = Regs.R10;
-def SYS_PARAM4 = Regs.R8;
-def SYS_PARAM5 = Regs.R9;
-def SYS_RET0 = Regs.RAX;
-
-def VIRGIL_PARAM0 = Regs.RDI;
-def VIRGIL_PARAM1 = Regs.RSI;
-def VIRGIL_PARAM2 = Regs.RDX;
-def VIRGIL_PARAM3 = Regs.RCX;
-def VIRGIL_RET0 = Regs.RAX;
-
 def CiRuntime_spawn(func: u32 -> void, stack: Pointer) -> int {
-	if (spawnFun == null) {
-		def asm = X86_64Assemblers.create64(DataWriter.new());
-		var in_caller = asm.newLabel();
-
-		// VIRGIL_PARAM0 = null receiver, because this is a component method
-		asm.pushq_r(VIRGIL_PARAM1);
-		asm.pushq_r(VIRGIL_PARAM2);
-		asm.pushq_r(VIRGIL_PARAM3);
-		asm.movq_r_i(SYS_NUM, SYS_clone);
-		asm.movq_r_i(SYS_PARAM0, CLONE_VM | CLONE_SIGHAND | CLONE_PARENT | CLONE_THREAD);
-		asm.popq_r(SYS_PARAM2); // pop stack pointer
-		asm.movq_r_i(SYS_PARAM2, 0);
-		asm.movq_r_i(SYS_PARAM3, 0);
-		asm.movq_r_i(SYS_PARAM4, 0);
-		asm.movq_r_i(SYS_PARAM5, 0);
-		asm.syscall();
-		asm.q.cmp_r_i(SYS_RET0, 0);
-		asm.jc_rel_near(X86_64Conds.NA, in_caller);
-		// --- in new thread, call user function, passing PID ----------------------
-		asm.popq_r(VIRGIL_PARAM0); // func.receiver
-		asm.movq_r_r(VIRGIL_PARAM1, SYS_RET0);
-		var r_tmp = Regs.R10;
-		asm.popq_r(r_tmp); // func.codeptr
-		asm.icall_r(r_tmp); // caller user function
-		asm.movq_r_i(SYS_NUM, SYS_exit);
-		asm.movq_r_i(SYS_PARAM0, 0);
-		asm.syscall();
-		// --- in calling thread, just return the result of the system call --------
-		asm.bind(in_caller);
-		asm.ret();
-		var region = CiRuntime.forgeRange<byte>(CiRuntime.RUNTIME_CODE_START,
-			int.!(CiRuntime.RUNTIME_CODE_END - CiRuntime.RUNTIME_CODE_START));
-		for (i = 0; i < asm.w.pos; i++) {
-			region[i] = asm.w.data[i];
-		}
-		spawnFun = CiRuntime.forgeClosure<void, ((u32 -> void), Pointer), int>(
-			Pointer.atContents(region),
-			());
-			
-	}
+	if (spawnFun == null) makeSpawnFun();
 	return spawnFun(func, stack);
+}
+def BUF = Array<u64>.new(10);
+def fake(i: int) -> int {
+	return int.!(Pointer.atElement(BUF, i) - Pointer.NULL);
+}
+def makeSpawnFun() {
+	// spawnFun doesn't exist yet; create an assembler and make it.
+	// Constants and registers used in this stub.
+	def SYS_NUM = Regs.RAX;
+	def SYS_PARAM0 = Regs.RDI;
+	def SYS_PARAM1 = Regs.RSI;
+	def SYS_PARAM2 = Regs.RDX;
+	def SYS_PARAM3 = Regs.R10;
+	def SYS_PARAM4 = Regs.R8;
+	def SYS_PARAM5 = Regs.R9;
+	def SYS_RET0 = Regs.RAX;
+
+	def VIRGIL_PARAM0 = Regs.RDI;
+	def VIRGIL_PARAM1 = Regs.RSI;
+	def VIRGIL_PARAM2 = Regs.RDX;
+	def VIRGIL_PARAM3 = Regs.RCX;
+	def VIRGIL_RET0 = Regs.RAX;
+
+	def asm = X86_64Assemblers.create64(DataWriter.new());
+	var in_caller = asm.newLabel();
+	def flags = CLONE_VM | CLONE_SIGHAND | CLONE_PARENT | CLONE_THREAD;
+	var r_tmp = Regs.R10;
+	var r_stack = VIRGIL_PARAM3;
+
+	// VIRGIL_PARAM0 = null receiver, because this is a component method
+	asm.q.sub_r_i(r_stack, Pointer.SIZE);
+	asm.movq_m_r(r_stack.indirect(), VIRGIL_PARAM1);   // save {func.receiver}
+	asm.q.sub_r_i(r_stack, Pointer.SIZE);
+	asm.movq_m_r(r_stack.indirect(), VIRGIL_PARAM2);   // save {func.codeptr}
+	asm.movq_r_r(SYS_PARAM1, r_stack);	// put {stack} into correct register
+	asm.movq_r_i(SYS_NUM, SYS_clone);	// pass system call number
+	asm.movq_r_i(SYS_PARAM0, flags);	// pass flags
+	asm.movq_r_i(SYS_PARAM2, fake(0));		// no parent TID pointer
+	asm.movq_r_i(SYS_PARAM3, fake(1));		// no child TID pointer
+	asm.movq_r_i(SYS_PARAM4, 0);		// non-zero for some reason, TLS?
+	asm.movq_r_i(SYS_PARAM5, 0);
+	asm.syscall();				// call kernel
+	asm.q.cmp_r_i(SYS_RET0, 0);		// result < 0  means failed, in caller
+						// result == 0 means success, in caller
+						// result > 0  is new thread's PID, in callee
+	asm.jc_rel_near(X86_64Conds.A, in_caller);
+	// --- in new thread, call user function, passing PID ----------------------
+	asm.popq_r(VIRGIL_PARAM0);		// load {func.receiver}
+	asm.movq_r_r(VIRGIL_PARAM1, SYS_RET0);	// pass the PID to the Virgil function
+	asm.popq_r(r_tmp); 			// load {func.codeptr}
+	asm.movq_m_i(Regs.RSP.indirect(), RiStacks.STACK_RUNNING);	// indicate new thread is using stack
+	asm.icall_r(r_tmp); 			// caller Virgil function {func}
+	asm.movq_m_i(Regs.RSP.indirect(), RiStacks.STACK_FREED);	// indicate new thread is not using stack
+	asm.movq_r_i(SYS_NUM, SYS_exit);
+	asm.movq_r_i(SYS_PARAM0, 0);
+	asm.syscall();				// call kernel to exit, doesn't return
+	// --- in calling thread, just return the result of the system call --------
+	asm.bind(in_caller);
+	if (SYS_RET0 != VIRGIL_RET0) asm.movq_r_r(VIRGIL_RET0, SYS_RET0);
+	asm.ret();				// simply return result to the system call
+
+	// Copy the assembly and forge a closure for {spawnFun}.
+	var region = CiRuntime.forgeRange<byte>(CiRuntime.RUNTIME_CODE_START,
+		int.!(CiRuntime.RUNTIME_CODE_END - CiRuntime.RUNTIME_CODE_START));
+	for (i = 0; i < asm.w.pos; i++) {
+		region[i] = asm.w.data[i];
+	}
+	spawnFun = CiRuntime.forgeClosure<void, ((u32 -> void), Pointer), int>(
+		Pointer.atContents(region),
+		());
 }
 
 def main() {
 	var t = Threads.spawn(System.puts, "Hello World!\n");
-	while (t.poll() != RiThreadStatus.FINISHED) ;
+
+	while (!t.finished()) ; // busy wait for thread to finish
+
+	if (t.poll() != RiThreadStatus.FINISHED) {
+		System.puts("status = ");
+		System.puts(t.poll().name);
+		System.ln();
+	}
 }
