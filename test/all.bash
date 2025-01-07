@@ -167,7 +167,7 @@ if [ "$TEST_CURRENT" != 0 ]; then
     if [ "$TEST_BOOTSTRAP" != 0 ]; then
 	# Already tested the bootstrap compiler.
 	# Check if recompiling current with bootstrap yields the same binary
-	compile_aeneas $BOOTSTRAP $VIRGIL_TEST_OUT/aeneas/current $TEST_HOST
+	compile_aeneas $BOOTSTRAP_V3C $VIRGIL_TEST_OUT/aeneas/current $TEST_HOST
 	CURRENT_V3C=$VIRGIL_TEST_OUT/aeneas/current/$TEST_HOST/Aeneas
 	diff -rq $VIRGIL_TEST_OUT/aeneas/bootstrap/ $VIRGIL_TEST_OUT/aeneas/current/ > $OUT/bootstrap.diff
 	if [ $? = 0 ]; then
