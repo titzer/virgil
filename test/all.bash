@@ -116,6 +116,7 @@ rm -rf /tmp/$USER/virgil-test
 
 # Echo all configurable variables
 if [ "$QUIET_SETUP" != 1 ]; then
+    echo "HOSTS=$HOSTS"
     echo "TEST_HOST=$TEST_HOST"
     echo "TEST_TARGETS=\"$TEST_TARGETS\""
     echo "TEST_CACHE=$TEST_CACHE"
