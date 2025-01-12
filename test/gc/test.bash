@@ -42,6 +42,8 @@ function compile_gc_tests() {
 }
 
 function do_int_test() {
+    target="$(get_io_targets $target)"
+    
     T=$OUT/$target
     mkdir -p $T
     ALL=$T/compile.all.out
@@ -54,7 +56,7 @@ function do_int_test() {
     fi
 
     BEFORE=$V3C_OPTS
-    V3C_OPTS="$V3C_OPTS $HEAP"
+    V3C_OPTS="$V3C_OPTS $HEAP -shadow-stack-size=1m"
     QUIET_COMPILE=1
     compile_aeneas $AENEAS_TEST $OUT $target
     V3C_OPTS="$BEFORE"
