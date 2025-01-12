@@ -36,7 +36,7 @@ function compile_gc_tests() {
     RT_OPT="-rt.files=$(echo $RT_FILES)"
     while [ $i -le $# ]; do
 	local args=${@:$i:$SHARDING}
-	run_v3c "" -symbols -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -heap-size=10k "$RT_OPT" -multiple $args
+	run_v3c "" -symbols -output=$T -target=$target-test -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=2k -heap-size=10k "$RT_OPT" -multiple $args
 	i=$(($i + $SHARDING))
     done
 }
