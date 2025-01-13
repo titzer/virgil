@@ -27,6 +27,7 @@ GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
 V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
+TEST_GC_WASM=${TEST_GC_WASM:=0}
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
 # it to character (c) mode
@@ -449,8 +450,12 @@ function is_gc_target() {
 	return 0
     elif [ "$target" = "x86-64-linux" ]; then
 	return 0
-#TODO    elif [ "$target" = "wasm" ]; then
-#	return 0
+    elif [[ "$target" = "wasm" && "$TEST_GC_WASM" != 0 ]]; then
+        return 0
     fi
     return 1
+}
+
+function do_nothing() {
+    return 0;
 }
