@@ -455,3 +455,7 @@ function is_gc_target() {
     fi
     return 1
 }
+
+function do_nothing() {
+    return 0;
+}

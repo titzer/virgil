@@ -62,6 +62,7 @@ function do_int_test() {
     print_status Testing "$target $HEAP" Aeneas
     if [ -x $CONFIG/run-$target ]; then
 	$T/Aeneas -test -ra $VIRGIL_LOC/test/core/*.v3 | tee $T/Aeneas-gc.test.out | $PROGRESS
+        fail_fast
     else
 	echo "${YELLOW}skipped${NORM}"
     fi
@@ -77,14 +78,16 @@ function do_exe_test() {
 
     print_compiling "$target" ""
     compile_gc_tests $target $TESTS | tee $T/compile.all.out | $PROGRESS
+    fail_fast
 
     execute_target_tests $target
+    fail_fast
 }
 
 for target in $TEST_TARGETS; do
-    is_gc_target $target && do_exe_test
+    is_gc_target $target && do_exe_test || do_nothing
 done
 
 for target in $(get_io_targets); do
-    is_gc_target $target && do_int_test
+    is_gc_target $target && do_int_test || do_nothing
 done
