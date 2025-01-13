@@ -42,8 +42,6 @@ function compile_gc_tests() {
 }
 
 function do_int_test() {
-    target="$(get_io_targets $target)"
-    
     T=$OUT/$target
     mkdir -p $T
     ALL=$T/compile.all.out
@@ -84,15 +82,9 @@ function do_exe_test() {
 }
 
 for target in $TEST_TARGETS; do
-    is_gc_target $target
-    if [ $? = 0 ]; then
-	do_exe_test
-    fi
+    is_gc_target $target && do_exe_test
 done
 
-for target in $TEST_TARGETS; do
-    is_gc_target $target
-    if [ $? = 0 ]; then
-	do_int_test
-    fi
+for target in $(get_io_targets); do
+    is_gc_target $target && do_int_test
 done
