@@ -1,0 +1,536 @@
+class SsaSpecializingRebuilder extends SsaRebuilder {
+	def ssaPrinter = SsaPrinter.new();
+	def irPrinter = IrPrinter.new(norm.ra.prog);
+	def norm: ReachabilityNormalizer;
+	var optContext: SsaContext;
+	var gen: VstSsaGen;  // For recording direct calls
+	// Current specializations. Map param indices to their subtype we specialize to.
+	var	specs: Array<RaClass>;
+
+	new(context: SsaContext, norm: ReachabilityNormalizer) super(context) {
+		optContext = SsaContext.new(context.compiler, context.prog).enterMethod(context.method);
+		gen = VstSsaGen.new(optContext, context.prog.opBuilder);
+
+		def numParams = context.graph.params.length;
+		specs = Array.new(numParams);
+	}
+
+	// Specializes the current function to the given classes
+	// specParams is an array with the same length as SssGraph.params,
+	// where any non-null ClassType denotes a subtype of the original class to specialize to
+	def specializeToParams(specParams: Array<ClassType>) -> IrMethod {
+		if (specParams.length != specs.length) {
+			Terminal.put2("specializeToParams: mismatched number of params: %d != %d\n", specParams.length, specs.length);
+			return null;
+		}
+
+		// Terminal.put("Specializing to params\n");
+
+		for (i < specParams.length) {
+			if (specParams[i] == null) {
+				specs[i] = null;
+			} else {
+				specs[i] = norm.ra.getClass(specParams[i]);
+				// Terminal.put2("Specializing param %d to %q\n", i, specParams[i].render);
+			}
+		}
+		specs[0] = null; // Receiver is not specialized
+		return doSpecialization();
+	}
+
+	// Performes the method specialization based on contents of `specs`
+	def doSpecialization() -> IrMethod {
+		instrMap.reset(context.graph);
+		var oldParams = context.graph.params;
+		var numParams = oldParams.length;
+		var newParams = Array<SsaParam>.new(numParams);
+		var specialized = false;
+		for (i < oldParams.length) {
+			if (specs[i] != null) {
+				// Specialize the parameter
+				var st = specs[i];
+				newParams[i] = SsaParam.new(numParams, st.normClass.ctype);
+				specialized = true;
+			}
+			else
+				// Common case, no change necessary
+				newParams[i] = SsaParam.new(numParams, oldParams[i].vtype);
+			map1(oldParams[i], newParams[i]);
+		}
+		if (!specialized) {
+			return null;
+		}
+		
+		// create new graph
+		newGraph = SsaGraph.new(newParams, context.graph.returnType);
+
+		// Visit and generate new normalized code
+		var oldStart = context.graph.startBlock;
+		if (oldStart.succs().length == 0) {
+			// common case of a single block that ends in return or throw
+			// no need for blockmaps, queueing, or phi handling
+			genBlock(oldStart, newGraph.startBlock);
+		} else {
+			// a method with multiple blocks
+			genMultiBlock(oldStart, newGraph.startBlock);
+		}
+		var om = context.method;
+		// TODO: Ugly indexing
+		var newParamTypes = Array<Type>.new(numParams - 1);
+		for (i < numParams - 1) {
+			if (specs[i + 1] != null) {
+				newParamTypes[i] = specs[i + 1].normClass.ctype;
+			} else {
+				newParamTypes[i] = om.sig.paramTypes[i];
+			}
+		}
+		var newMethod = IrMethod.new(om.receiver, om.typeArgs, Signature.new(null, newParamTypes, om.sig.returnTypes));
+		newMethod.specialized = true;
+		newMethod.source = om.source;
+		newMethod.ssa = newGraph;
+		if (CLOptions.PRINT_SUBTYPE_SPECIALIZATION.val)
+			ssaPrinter.printGraph("Subtype Specialization", newMethod.render, newMethod.ssa, newMethod.sig);
+
+		if (!norm.ra.compiler.SubtypeSpecializationNoOpt) {
+			def newIrSpec = IrSpec.new(newMethod.receiver, [newMethod.receiver], newMethod);
+			optContext.enterSpec(newIrSpec);
+			SsaEarlyInliner.new(optContext, norm.ra.compilation, gen).inline(0);
+			if (CLOptions.PRINT_SUBTYPE_SPECIALIZATION.val)
+				ssaPrinter.printGraph("Post-Inlined Subtype Specialization", newMethod.render, newMethod.ssa, newMethod.sig);
+
+			optContext.enterSpec(newIrSpec);
+			SsaOptimizer.new(optContext).optGraph();
+			if (CLOptions.PRINT_SUBTYPE_SPECIALIZATION.val)
+				ssaPrinter.printGraph("Post-Optimized Subtype Specialization", newMethod.render, newMethod.ssa, newMethod.sig);
+		}
+
+		if (V3.isClass(newMethod.receiver)) {
+			var ic = norm.ra.getClass(newMethod.receiver).orig;
+			Arrays.append(newMethod, ic.methods);
+		}
+		norm.newIr.methods.put(newMethod);
+		return newMethod;
+	}
+	// No normalization
+	def normType(t: Type) -> TypeNorm {
+		return null;
+	}
+	def canDevirtualize(m: IrMethod) -> bool {
+		if (!m.facts.M_OVERRIDDEN) {
+			return true;
+		}
+		if (m.raMethod != null && m.raMethod.virtual == null) {
+			return true;
+		}
+		if (m.raMethod != null && m.raMethod.virtual.devirtual != null) {
+			return true;
+		}
+		return false;
+	}
+
+	def genApplyOp(oi: SsaApplyOp) {
+		curBlock.at(oi.source);
+		var ni: SsaInstr;
+		var specClass = getSpecClass(oi);
+		if (specClass == null) {
+			ni = curBlock.addApplyF(oi.op, genRefs(oi.inputs), oi.facts);	
+			if (ni != null) {
+				map1(oi, ni);
+			} else {
+				return V3.fail("unimplemented");
+			}
+			return;
+		}
+		def receiver = specClass.newIrType;
+		match (oi.op.opcode) {
+			CallClassSelector(selector) => {
+				def specMeth = selector.mtable.table[specClass.minClassId - selector.mtable.rootId];
+				if (canDevirtualize(specMeth)) {
+					def irSpec = extractSpecializedIrSpec(oi.op, specMeth, receiver);
+					recordDirectCall(irSpec);
+					ni = curBlock.addApplyF(V3Op.newCallClassMethod(irSpec), genRefs(oi.inputs), oi.facts);
+				} else {
+					def irSpec = extractSpecializedIrSpec(oi.op, selector, receiver);
+					ni = curBlock.addApplyF(V3Op.newCallClassSelector(irSpec), genRefs(oi.inputs), oi.facts);
+				}
+
+			}
+			ClassGetSelector(selector) => {
+				var specMeth = selector.mtable.table[specClass.minClassId - selector.mtable.rootId];
+				if (canDevirtualize(specMeth)) {
+					var irSpec = extractSpecializedIrSpec(oi.op, specMeth, receiver);
+					ni = curBlock.addApplyF(V3Op.newClassGetMethod(irSpec), genRefs(oi.inputs), oi.facts);
+				} else {
+					def irSpec = extractSpecializedIrSpec(oi.op, selector, receiver);
+					ni = curBlock.addApplyF(V3Op.newClassGetSelector(irSpec), genRefs(oi.inputs), oi.facts);
+				}
+			}
+			ClassGetField(field) => {
+				var irSpec = extractSpecializedIrSpec(oi.op, field, receiver);
+				ni = curBlock.addApplyF(V3Op.newClassGetField(irSpec), genRefs(oi.inputs), oi.facts);
+			}
+			ClassSetField(field) => {
+				var irSpec = extractSpecializedIrSpec(oi.op, field, receiver);
+				ni = curBlock.addApplyF(V3Op.newClassSetField(irSpec), genRefs(oi.inputs), oi.facts);
+			}
+			TypeQuery => {
+				ni = curBlock.opTypeQuery(receiver, oi.op.typeArgs[1], genRef1(oi.inputs[0]));
+			}
+			NullCheck => ni = curBlock.opNullCheck(receiver, genRef1(oi.inputs[0]));
+			_ => ni = curBlock.addApplyF(oi.op, genRefs(oi.inputs), oi.facts);	
+		}
+		if (ni != null) {
+			map1(oi, ni);
+		} else {
+			// block is already ended
+			return V3.fail("unimplementeed");
+		}
+	}
+	// Get the class to specialize this operation to, if there is one
+	def getSpecClass(oi: SsaApplyOp) -> RaClass {
+		if (oi.inputs.length == 0) return null;
+		if (SsaParam.?(oi.input0())) {
+			var param = SsaParam.!(oi.input0());
+			if (specs[param.index] != null) {	
+				return specs[param.index];	
+			}
+		}
+		return null;
+	}
+	// An IrSpec that specializes a member to a more specific receiver
+	def extractSpecializedIrSpec(op: Operator, member: IrMember, receiver: Type) -> IrSpec {
+		var newTypeArgs = Arrays.replace(op.typeArgs, 0, receiver);
+		return IrSpec.new(receiver, newTypeArgs, member);	
+	}
+	def recordDirectCall(spec: IrSpec) {
+		gen.directCallTargets = List.new(spec, gen.directCallTargets);
+		if (gen.directCallBlocks == null || gen.directCallBlocks.head != curBlock.block) {
+			// record the block if not already recorded
+			gen.directCallBlocks = List.new(curBlock.block, gen.directCallBlocks);
+		}
+	}
+}
+
+class CallInfo {
+	def caller: IrMethod;
+	def callee: IrMethod;
+	var instr: SsaApplyOp;
+
+	new(caller: IrMethod, callee: IrMethod, instr: SsaApplyOp) { }
+}
+
+// Undirected call graph tracking every call site
+class CallGraph {
+	// The module this call graph represents
+	def ir: IrModule;
+	// "Forward" direction of the call graph, maps IrMethod to list of calls it makes
+	def callerToCallee: HashMap<IrItem, Vector<CallInfo>> = IrUtil.newIrItemMap<Vector<CallInfo>>();
+	// "Backward" direction of the call graph, maps IrMethod to list of its callers
+	def calleeToCaller: HashMap<IrItem, Vector<CallInfo>> = IrUtil.newIrItemMap<Vector<CallInfo>>();
+
+	new(ir: IrModule) {
+		for (i < ir.methods.length) {
+			var root = ir.methods[i];
+			addCalls(root);
+		}
+	}
+
+	// Adds all the calls made by a method, and performs DFS on each called function
+	def addCalls(m: IrMethod) {
+		if (m.ssa == null) {
+			return;
+		}
+
+		if (callerToCallee.has(m)) {
+			return;
+		}
+
+		callerToCallee[m] = Vector<CallInfo>.new();
+
+		for (block in m.ssa.bfBlocks(null)) {
+			for (instr = block.next; instr != null && instr != block; instr = instr.next) {
+				if (SsaApplyOp.?(instr)) {
+					var apply = SsaApplyOp.!(instr);
+					match (apply.op.opcode) {
+						CallMethod(m_target) => addCall(m, m_target, apply);
+						CallClassMethod(m_target) => addCall(m, m_target, apply);
+						CallVariantVirtual(m_target) => addCall(m, m_target, apply);
+						ClassGetMethod(m_target) => addCall(m, m_target, apply);
+						ClassGetVirtual(m_target) => addCall(m, m_target, apply);
+						CallClassSelector(selector) => addCall(m, selector.method, apply);
+						CallVariantSelector(selector) => addCall(m, selector.method, apply);
+						ClassGetSelector(selector) => addCall(m, selector.method, apply);
+						_ => ;
+					}
+				}
+			}
+		}
+	}
+
+	// Helper function to add an edge to the call graph
+	// Also continues to traverse the callee in the DFS
+	def addCall(caller: IrMethod, callee: IrMethod, instr: SsaApplyOp) {
+		def callInfo = CallInfo.new(caller, callee, instr);
+		var callees = callerToCallee[caller];
+		if (callees == null) {
+			callees = Vector<CallInfo>.new();
+			callerToCallee[caller] = callees;
+		}
+		callees.put(callInfo);
+
+		var callers = calleeToCaller[callee];
+		if (callers == null) {
+			callers = Vector<CallInfo>.new();
+			calleeToCaller[callee] = callers;
+		}
+		callers.put(callInfo);
+
+		// Traverse callee
+		addCalls(callee);
+	}
+}
+
+def printCallGraph(m: IrItem, info: Vector<CallInfo>) {
+	Terminal.put1("Key: %q\n", IrMethod.!(m).render);
+	for (i < info.length) {
+		var call = info[i];
+		Terminal.put2("\t%q calls %q\n", call.caller.render, call.callee.render);
+	}
+}
+
+// Utilities for subtypes 
+component SubtypeUtil {
+	def classTypeHash(t: ClassType) -> int {
+		if (t == null) {
+			return 0;
+		}
+		return t.hash;
+	}
+
+	def newSpecializationMap<T>() -> HashMap<Array<ClassType>, T> {
+		return HashMap<Array<ClassType>, T>.new(Arrays.hash<ClassType>(0, _, classTypeHash), Arrays.equal<ClassType>);
+	}
+	def mapInputToClass(edge: SsaDfEdge) -> ClassType {
+		def edgeType = edge.dest.getType();
+		if (ClassType.?(edgeType)) {
+			return ClassType.!(edgeType);
+		}
+		return null;
+	}
+	
+	def mapParamToClass(param: SsaParam) -> ClassType {
+		def paramType = param.getType();
+		if (ClassType.?(paramType)) {
+			return ClassType.!(paramType);
+		}
+		return null;
+	}
+
+	def checkSpecialization(orig: Array<ClassType>, spec: Array<ClassType>) -> bool {
+		if (orig.length != spec.length) {
+			return false;
+		}
+		var specialized = false;
+		for (i < orig.length) {
+			if (orig[i] == spec[i]) {
+				spec[i] = null;
+				continue;
+			}
+
+			if (TypeSystem.isSubtype(spec[i], orig[i])) {
+				specialized = true;
+				// Terminal.put2("Specializing %q to %q\n", orig[i].render, spec[i].render);
+			} else {
+				// Terminal.put2("Mismatched types orig [%q] spec [%q]\n", orig[i].render, spec[i].render);
+				return false;
+			}
+		}
+		return specialized;
+}
+}
+
+
+class SsaSubtypeSpecializer {
+	def ssaPrinter = SsaPrinter.new();
+	def norm: ReachabilityNormalizer;
+	def context: SsaContext = SsaContext.new(norm.ra.compiler, norm.ra.prog);
+	private def specMap : HashMap<IrItem, Vector<IrMethod>> = IrUtil.newIrItemMap<Vector<IrMethod>>();
+	private def callGraph: CallGraph = CallGraph.new(norm.newIr);
+	private var worklist: Vector<IrMethod> = Vector.new();
+
+	new(norm: ReachabilityNormalizer) {
+		// Terminal.put("callerToCallee\n");
+		// callGraph.callerToCallee.apply(printCallGraph);
+		// Terminal.put("calleeToCaller\n");
+		// callGraph.calleeToCaller.apply(printCallGraph);
+	}
+
+	def checkCanSpecialize(m: IrMethod, callers: Vector<CallInfo>) -> bool {
+		if (m.ssa == null || callers.length == 0) {
+			// Nothing to specialize
+			return false;
+		}
+
+		for (i < callers.length) {
+			if (callers[i].instr == null) 
+				continue;
+			match (callers[i].instr.op.opcode) {
+				CallMethod(m) => break;
+				CallClassMethod(m) => break;
+				_ => return false;
+			}
+		}
+		return true;
+	}
+
+	def addToWorklist(meth: IrItem, callers: Vector<CallInfo>) {
+		def m = IrMethod.!(meth);
+		if (!checkCanSpecialize(m, callers)) {
+			return;
+		}
+		worklist.put(m);
+	}
+
+	def specialize() {
+		callGraph.calleeToCaller.apply(addToWorklist);
+		for (i < worklist.length) {
+			specializeMethod(worklist[i]);
+		}
+	}
+
+	def specializeMethod(m: IrMethod) {
+		def callers = callGraph.calleeToCaller[m];
+		if (!checkCanSpecialize(m, callers)) {
+			return;
+		}
+
+		// We already specialized this method
+		if (specMap.has(m)) {
+			return;
+		}
+
+		// Determine potential specializations
+		def classParams = Arrays.map(m.ssa.params, SubtypeUtil.mapParamToClass);
+
+		// Iterate through callers and determine if any specialization is possible
+		def specializationMap = SubtypeUtil.newSpecializationMap<int>();
+		def specializationList = Vector<Array<ClassType>>.new();
+		for (i < callers.length) {
+			def call = callers[i];
+			if (call.instr == null) {
+				continue;
+			}
+
+			// Check if the specialization is possible
+			def classArgs = Arrays.map(call.instr.inputs, SubtypeUtil.mapInputToClass);
+			if (!SubtypeUtil.checkSpecialization(classParams, classArgs)) {
+				continue;
+			}
+
+			// Update specialization map
+			def count = specializationMap[classArgs];
+
+			if (count == 0) {
+				specializationList.put(classArgs);
+			}
+			specializationMap[classArgs] = count + 1;
+		}
+
+		if (specializationList.length == 0) {
+			return;
+		}
+
+		// Specialize the method
+		specMap[m] = Vector.new();
+		context.enterMethod(m);
+		var rebuilder = SsaSpecializingRebuilder.new(context, norm);
+		for (i < specializationList.length) {
+			def specMethod = rebuilder.specializeToParams(specializationList[i]);
+			if (specMethod == null) {
+				continue;
+			}
+			specMap[m].put(specMethod);
+
+			// Replace calls to the original method with calls to the specialized method
+			for (j < callers.length) {
+				def call = callers[j];
+				if (call.instr == null) {
+					continue;
+				}
+				match (call.instr.op.opcode) {
+						CallMethod(temp) => {
+							if (temp != m) {
+								Terminal.put2("Mismatched method %q != %q\n", temp.render, m.render);
+								continue;
+							}
+						}
+						CallClassMethod(temp) => {
+							if (temp != m) {
+								Terminal.put2("Mismatched method %q != %q\n", temp.render, m.render);
+								continue;
+							}
+						}
+						_ => continue;
+				}
+
+				if (!isSpecializedMatch(call.instr, specMethod)) {
+					continue;
+				}
+
+				// Rewrite the call
+				var inputs = Array<SsaInstr>.new(call.instr.inputs.length);
+				for (i < inputs.length) inputs[i] = call.instr.inputs[i].dest;
+				var newInstr: SsaApplyOp;
+				match (call.instr.op.opcode) {
+					CallMethod(x) => {
+						newInstr = SsaApplyOp.new(call.instr.source, V3Op.newCallMethod(
+							V3Op.extractIrSpec(call.instr.op, specMethod)), inputs);
+					}
+					CallClassMethod(x) => {
+						newInstr = SsaApplyOp.new(call.instr.source, V3Op.newCallClassMethod(
+							V3Op.extractIrSpec(call.instr.op, specMethod)), inputs);
+					}
+					_ => return context.fail("Invalid specialized method.");
+				}
+				newInstr.next = call.instr.next;
+				newInstr.prev = call.instr.prev;
+				call.instr.prev.next = newInstr;
+				call.instr.next.prev = newInstr;
+
+				call.instr.replace(newInstr);
+				call.instr.kill();
+				call.instr = null;
+				callGraph.addCall(call.caller, specMethod, newInstr);
+				// ssaPrinter.printGraph("Patched calls", call.caller.render, call.caller.ssa, call.caller.sig);
+			}
+
+			// Since we just specialized a method, we could've enabled more specializations
+			// Add all the callees of the specialized method to the worklist
+			def newCallees = callGraph.callerToCallee[specMethod];
+			if (newCallees == null) continue;
+			for (j < newCallees.length) {
+				def callee = newCallees[j].callee;
+				addToWorklist(callee, callGraph.calleeToCaller[callee]);
+			}
+		}
+	}
+	
+	def isSpecializedMatch(apply: SsaApplyOp, m: IrMethod) -> bool {
+		// Terminal.put1("Checking method: %q\n", m.renderLong);
+		var args = apply.inputs;
+		var params = m.ssa.params;
+		if (args.length != params.length) {
+			// Terminal.put2("Length mismatch: %d != %d\n", args.length, params.length);
+			return false;
+		}
+		for (i < args.length) {
+			var argType = args[i].dest.getType();
+			if (argType != params[i].getType() && !AnyRefType.?(argType)) {
+				// Terminal.put2("Type mismatch: %q != %q\n", argType.render, params[i].getType().render);
+				return false;
+				// TODO: handle subclassing
+			}
+		}
+		return true;
+	}
+}
