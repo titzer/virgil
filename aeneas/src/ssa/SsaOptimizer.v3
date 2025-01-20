@@ -253,6 +253,7 @@ class SsaBlockState {
 	var inits: List<IrMethod>;
 	def pure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
 	def impure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
+	def ptr_loads = Vector<(SsaInstr, Type, SsaInstr)>.new();
 
 	def clear() -> this {
 		nonnull = null;
@@ -261,9 +262,11 @@ class SsaBlockState {
 		end = false;
 		pure_loads.resize(0);
 		impure_loads.resize(0);
+		ptr_loads.resize(0);
 	}
 	def kill() -> this {
 		impure_loads.resize(0);
+		ptr_loads.resize(0);
 	}
 	def load(obj: SsaInstr, m: IrMember, apply: SsaApplyOp) -> SsaInstr {
 //TODO:dce	if (apply.useList == null && apply.facts.O_NO_NULL_CHECK) {
@@ -276,6 +279,12 @@ class SsaBlockState {
 		else impure_loads.put(obj, m, apply);
 		return apply;
 	}
+	def loadPtr(ptr: SsaInstr, valueType: Type, apply: SsaApplyOp) -> SsaInstr {
+		var prev = find0(ptr_loads, ptr, valueType);
+		if (prev != null) return prev;
+		ptr_loads.put(ptr, valueType, apply);
+		return apply;
+	}
 	def store(obj: SsaInstr, field: IrField, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
 		var prev = find(obj, field);
 		if (prev == val) { // redundant store of previous value to field
@@ -285,6 +294,17 @@ class SsaBlockState {
 		}
 		killField(field);
 		impure_loads.put(obj, field, val);
+		return apply;
+	}
+	def storePtr(ptr: SsaInstr, valueType: Type, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
+		var prev = find0(ptr_loads, ptr, valueType);
+		if (prev == val) { // redundant store of previous value to field
+			apply.remove();
+			apply.kill();
+			return null;
+		}
+		ptr_loads.resize(0); // XXX: improve pointer alias analysis, distinguish initializing stores
+		ptr_loads.put(ptr, valueType, val);
 		return apply;
 	}
 	def init(obj: SsaInstr, f: IrField, val: SsaInstr) {
@@ -299,6 +319,7 @@ class SsaBlockState {
 		that.inits = this.inits;
 		that.pure_loads.putv(this.pure_loads);
 		that.impure_loads.putv(this.impure_loads);
+		that.ptr_loads.putv(this.ptr_loads);
 		return that;
 	}
 	def find(obj: SsaInstr, m: IrMember) -> SsaInstr {
@@ -306,7 +327,7 @@ class SsaBlockState {
 		if (r == null) r = find0(impure_loads, obj, m);
 		return r;
 	}
-	def find0(v: Vector<(SsaInstr, IrMember, SsaInstr)>, obj: SsaInstr, m: IrMember) -> SsaInstr {
+	def find0<T>(v: Vector<(SsaInstr, T, SsaInstr)>, obj: SsaInstr, m: T) -> SsaInstr {
 		for (i < v.length) {
 			var t = v[i];
 			if (t.0 == obj && t.1 == m) return t.2;
@@ -334,6 +355,9 @@ class SsaBlockState {
 			}
 		}
 		v.resize(i);
+	}
+	def killArrayElems() {
+		ptr_loads.resize(0); // assume pointer loads could alias array elements.
 	}
 }
 
@@ -755,6 +779,10 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			ArraySetElem => {
 				var receiver = boundscheck(i);
 				if (state.end) return receiver;
+				if (optimize_loads) state.killArrayElems();
+			}
+			ArraySetElemElem, RangeSetElem, NormRangeSetElem, NormRangeSetElemElem => {
+				if (optimize_loads) state.killArrayElems();
 			}
 			ArrayGetLength => {
 				var receiver = nullcheck(i);
@@ -999,7 +1027,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					return add(i.source, V3Op.newCallMethod(d.memberRef), inputs).setFact(Fact.O_NO_NULL_CHECK);
 				}
 			}
-			CallAddress => {
+			CallVariantSelector, CallAddress, SystemCall, CallKernel => {
 				state.kill();
 			}
 			CreateClosure(method) => {
@@ -1025,8 +1053,30 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (Bool.unbox(xval)) return addThrow(i.source, exception);
 				else return killInstr(i);
 			}
-			PtrStore, PtrCmpSwp => {
-				if (optimize_loads) state.killPointedAt();
+			RefLayoutSetField,
+			RefLayoutSetRepeatedField,
+			ByteArraySetField => {
+				if (optimize_loads) state.killArrayElems();
+			}
+			PtrCmpSwp => {
+				nullcheck(i);
+				state.kill();
+			}
+			PtrLoad => {
+				var ptr = nullcheck(i);
+				// XXX: use Fact.O_FOLDABLE to indicate a load of an immutable value
+				if (optimize_loads) {
+					return state.loadPtr(ptr, i.op.typeArgs[1], i);
+				}
+			}
+			PtrStore => {
+				var ptr = nullcheck(i);
+				state.killArrayElems();
+				state.killPointedAt();
+				// XXX: use a fact to indicate an initializing store that cannot kill previous loads
+				if (optimize_loads) {
+					state.storePtr(ptr, i.op.typeArgs[1], i, i.input1());
+				}
 			}
 			_ => ;
 		}
