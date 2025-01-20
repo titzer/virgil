@@ -381,12 +381,9 @@ function execute_target_tests() {
 function execute_tests() {
     for target in $TEST_TARGETS; do
 	if [ "$target" = "v3i" ]; then
-            (execute_v3i_tests "v3i" "-ssa-int=false") || exit $?
-            (execute_v3i_tests "v3i-ra" "-ssa-int=false -ra -ma=false") || exit $?
-            (execute_v3i_tests "v3i-ra-ma" "-ssa-int=false -ra -ma=true") || exit $?
-            (execute_v3i_tests "v3i" "-ssa-int=true") || exit $?
-            (execute_v3i_tests "v3i-ra" "-ssa-int=true -ra -ma=false") || exit $?
-            (execute_v3i_tests "v3i-ra-ma" "-ssa-int=true -ra -ma=true") || exit $?
+            (execute_v3i_tests "v3i" "") || exit $?
+            (execute_v3i_tests "v3i-ra" "-ra -ma=false") || exit $?
+            (execute_v3i_tests "v3i-ra-ma" "-ra -ma=true") || exit $?
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             (compile_target_tests jvm -jvm.script=false) || exit $?
             (execute_target_tests jvm) || exit $?
