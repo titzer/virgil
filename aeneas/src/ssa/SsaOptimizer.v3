@@ -253,6 +253,7 @@ class SsaBlockState {
 	var inits: List<IrMethod>;
 	def pure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
 	def impure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
+	def ptr_loads = Vector<(SsaInstr, Type, SsaInstr)>.new();
 
 	def clear() -> this {
 		nonnull = null;
@@ -261,9 +262,11 @@ class SsaBlockState {
 		end = false;
 		pure_loads.resize(0);
 		impure_loads.resize(0);
+		ptr_loads.resize(0);
 	}
 	def kill() -> this {
 		impure_loads.resize(0);
+		ptr_loads.resize(0);
 	}
 	def load(obj: SsaInstr, m: IrMember, apply: SsaApplyOp) -> SsaInstr {
 //TODO:dce	if (apply.useList == null && apply.facts.O_NO_NULL_CHECK) {
@@ -276,6 +279,12 @@ class SsaBlockState {
 		else impure_loads.put(obj, m, apply);
 		return apply;
 	}
+	def loadPtr(ptr: SsaInstr, valueType: Type, apply: SsaApplyOp) -> SsaInstr {
+		var prev = find0(ptr_loads, ptr, valueType);
+		if (prev != null) return prev;
+		ptr_loads.put(ptr, valueType, apply);
+		return apply;
+	}
 	def store(obj: SsaInstr, field: IrField, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
 		var prev = find(obj, field);
 		if (prev == val) { // redundant store of previous value to field
@@ -285,6 +294,17 @@ class SsaBlockState {
 		}
 		killField(field);
 		impure_loads.put(obj, field, val);
+		return apply;
+	}
+	def storePtr(ptr: SsaInstr, valueType: Type, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
+		var prev = find0(ptr_loads, ptr, valueType);
+		if (prev == val) { // redundant store of previous value to field
+			apply.remove();
+			apply.kill();
+			return null;
+		}
+		ptr_loads.resize(0); // XXX: improve pointer alias analysis, distinguish initializing stores
+		ptr_loads.put(ptr, valueType, val);
 		return apply;
 	}
 	def init(obj: SsaInstr, f: IrField, val: SsaInstr) {
@@ -299,6 +319,7 @@ class SsaBlockState {
 		that.inits = this.inits;
 		that.pure_loads.putv(this.pure_loads);
 		that.impure_loads.putv(this.impure_loads);
+		that.ptr_loads.putv(this.ptr_loads);
 		return that;
 	}
 	def find(obj: SsaInstr, m: IrMember) -> SsaInstr {
@@ -306,7 +327,7 @@ class SsaBlockState {
 		if (r == null) r = find0(impure_loads, obj, m);
 		return r;
 	}
-	def find0(v: Vector<(SsaInstr, IrMember, SsaInstr)>, obj: SsaInstr, m: IrMember) -> SsaInstr {
+	def find0<T>(v: Vector<(SsaInstr, T, SsaInstr)>, obj: SsaInstr, m: T) -> SsaInstr {
 		for (i < v.length) {
 			var t = v[i];
 			if (t.0 == obj && t.1 == m) return t.2;
@@ -334,6 +355,9 @@ class SsaBlockState {
 			}
 		}
 		v.resize(i);
+	}
+	def killArrayElems() {
+		ptr_loads.resize(0); // assume pointer loads could alias array elements.
 	}
 }
 
@@ -367,22 +391,6 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			i = next;
 		}
 	}
-	def reducePhi(i: SsaPhi) -> bool {
-		var i0 = i.input0(), facts = i0.facts, same = true;
-		for (n = 1; n < i.inputs.length; n++) {
-			var iN = i.inputs[n].dest;
-			facts &= iN.facts;
-			if (iN != i0) same = false;
-		}
-		if (same) {
-			// phi(x, x, x...) => x
-			i.replace(i0);
-			return false;
-		}
-		i.facts |= facts;
-		return true;
-	}
-
 	def reduceInstr(i: SsaInstr) -> SsaInstr {
 		prev = i.prev;
 		match (i) {
@@ -755,6 +763,10 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			ArraySetElem => {
 				var receiver = boundscheck(i);
 				if (state.end) return receiver;
+				if (optimize_loads) state.killArrayElems();
+			}
+			ArraySetElemElem, RangeSetElem, NormRangeSetElem, NormRangeSetElemElem => {
+				if (optimize_loads) state.killArrayElems();
 			}
 			ArrayGetLength => {
 				var receiver = nullcheck(i);
@@ -838,11 +850,13 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			VariantGetField(field) => {
 				var receiver = i.input0();
 				if (state.end) return receiver;
-				var unboxed = ClassType.!(receiver.getType()).classDecl.isUnboxed();
 				if (SsaConst.?(receiver)) {
-					// ClassGetField(#K) => #K
-					return graph.valConst(getFieldType(i.op, field),
-						asRecord(receiver).values[field.index]);
+					// VariantGetField(#K) => #K
+					var record = asRecord(receiver);
+					var val = if(record != null, record.values[field.index]);
+//TODO: variants should not have null records, but this can currently happen in folding during normalization
+//TODO					if (record == null) context.fail1("VariantGetField @%d has null input record", i.uid);
+					return graph.valConst(getFieldType(i.op, field), val);
 				}
 				if (!i.facts.F_POINTED_AT) i.facts |= Fact.F_VALUE;
 				if (optimize_loads) return state.load(receiver, field, i);
@@ -1003,7 +1017,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (SsaThrow.?(target)) return target;
 				state.kill();
 				var xval = unop(i);
-				if (xconst) {
+				if (xconst && FuncVal.?(xval)) {
 					var d = FuncVal.!(xval);
 					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
 					// CallFunction(#K) => CallMethod
@@ -1011,7 +1025,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					return add(i.source, V3Op.newCallMethod(d.memberRef), inputs).setFact(Fact.O_NO_NULL_CHECK);
 				}
 			}
-			CallAddress => {
+			CallVariantSelector, CallAddress, SystemCall, CallKernel => {
 				state.kill();
 			}
 			CreateClosure(method) => {
@@ -1037,8 +1051,30 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (Bool.unbox(xval)) return addThrow(i.source, exception);
 				else return killInstr(i);
 			}
-			PtrStore, PtrCmpSwp => {
-				if (optimize_loads) state.killPointedAt();
+			RefLayoutSetField,
+			RefLayoutSetRepeatedField,
+			ByteArraySetField => {
+				if (optimize_loads) state.killArrayElems();
+			}
+			PtrCmpSwp => {
+				nullcheck(i);
+				state.kill();
+			}
+			PtrLoad => {
+				var ptr = nullcheck(i);
+				// XXX: use Fact.O_FOLDABLE to indicate a load of an immutable value
+				if (optimize_loads) {
+					return state.loadPtr(ptr, i.op.typeArgs[1], i);
+				}
+			}
+			PtrStore => {
+				var ptr = nullcheck(i);
+				state.killArrayElems();
+				state.killPointedAt();
+				// XXX: use a fact to indicate an initializing store that cannot kill previous loads
+				if (optimize_loads) {
+					state.storePtr(ptr, i.op.typeArgs[1], i, i.input1());
+				}
 			}
 			_ => ;
 		}
@@ -1378,22 +1414,7 @@ class SsaCfOptimizer(context: SsaContext) {
 			killInstr(phi);
 			return true;
 		}
-		var facts = i0.facts, reduce = true;
-		for (i in inputs) {
-			var d = i.dest;
-			if (d != phi) {
-				facts = facts & d.facts;
-				if (d != i0) reduce = false;
-			}
-		}
-		if (reduce) {
-			phi.replace(i0); // the phi can be replaced by its (one) input
-			phi.remove();
-			return true;
-		} else {
-			phi.setFact(facts); // phi facts are the intersection of all input facts
-			return false;
-		}
+		return reducePhi(phi);
 	}
 	def optIf(block: SsaBlock, sw: SsaIf) {
 		var e = sw.inputs[0], v = e.dest;
@@ -1796,6 +1817,22 @@ class SsaCfOptimizer(context: SsaContext) {
 }
 class SwitchCmp(val: int, cmp: SsaInstr, end: SsaIf, tSucc: SsaCfEdge, fSucc: SsaCfEdge) { }
 
+def reducePhi(i_phi: SsaPhi) -> bool {
+	var i0 = i_phi.input0(), facts = i0.facts, same = true;
+	for (n = 1; n < i_phi.inputs.length; n++) {
+		var iN = i_phi.inputs[n].dest;
+		facts &= iN.facts;
+		if (iN != i0 && iN != i_phi) same = false;
+	}
+	if (same) {
+		// phi(x, phi, x...) => x
+		i_phi.replace(i0);
+		i_phi.remove();
+		return false;
+	}
+	i_phi.facts |= facts;
+	return true;
+}
 
 // Performs optimizations on loops.
 // 1. eliminate rendundant bounds checks for induction variables.
