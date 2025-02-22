@@ -1,5 +1,5 @@
 (defvar virgil-decls
-  '("class" "component" "def" "enum" "extends" "export" "fun" "in" "import" "layout" "new" "packing" "private" "struct" "super" "type" "var" )
+  '("class" "component" "def" "enum" "extends" "export" "fun" "in" "import" "layout" "new" "packing" "private" "struct" "super" "thread" "type" "var" )
   "Virgil declaration keywords.")
 
 (defvar virgil-stmts
