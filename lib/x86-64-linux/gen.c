@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <linux/stat.h>
 
+#include <linux/sched.h>
 
 struct FooStruct {
   unsigned int my_field;
@@ -137,10 +138,21 @@ int main() {
     FIELD(stx_rdev_minor, u32);
     FIELD(stx_dev_major, u32);
     FIELD(stx_dev_minor, u32);
-    FIELD(stx_mnt_id, u64);
+    //    FIELD(stx_mnt_id, u64);
     //    FIELD(stx_dio_mem_align, u32);
     //FIELD(stx_dio_offset_align, u32);
   END_LAYOUT(statxf);
+
+  BEGIN(struct clone_args, clone_args);
+  FIELD(flags, u64); // Pointer
+  FIELD(pidfd, u32);
+  FIELD(child_tid, u64); // Pointer<iovec>
+  FIELD(parent_tid, u64); // size_t
+  FIELD(exit_signal, u64); // Pointer
+  FIELD(stack, u64);
+  FIELD(stack_size, u64);
+  FIELD(tls, u64);
+  END_LAYOUT(clone_args);
 
   return 0;
 }
