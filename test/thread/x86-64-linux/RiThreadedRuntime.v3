@@ -136,7 +136,7 @@ private component RiStacks {
 		var stack = acquire(thr);
 		if (stack == NO_STACK) return void(thr.status = RiThreadStatus.FAILED); // failed to acquire a stack
 		thr.status = RiThreadStatus.WAITING;
-		var result = CiRuntime_spawn(thr.run, stack.spawnPointer(), /*tls*/Pointer.NULL + 0xFACE);
+		var result = CiRuntime_spawn(thr.run, stack.spawnPointer(), Pointer.atContents(TLS_1));
 		if (result < 0) {
 			if (VERBOSE) System.out.puts("clone failed = ").puti(result).ln();
 			thr.status = RiThreadStatus.FAILED; // failed to spawn, e.g. out of resources
@@ -212,6 +212,9 @@ class MemoryRange {
 		return p >= start && p < end;
 	}
 }
+
+def TLS_1: Array<int> = [0xFACEFEED];
+def TLS_2: Array<int> = [0x1BADF00D];
 
 
 // RiRuntime provides the platform-dependent runtime hooks called by the compiler
@@ -559,13 +562,25 @@ def CLONE_VM = 0x00000100;
 def CLONE_SIGHAND = 0x00000800;
 def CLONE_PARENT = 0x00008000;
 def CLONE_THREAD = 0x00010000;
+def CLONE_SETTLS = 0x00080000;
+
+layout StackTransfer {
+	+0	syscall_args:		clone_args;
+	+64	func_receiver:	u64;
+	+72	func_codeptr:	u64;
+	+80	stack_running:	u64;
+	=88;
+}
 
 def CiRuntime_spawn(func: u32 -> void, stack: Pointer, tls: Pointer) -> int {
 	if (spawnFun == null) makeSpawnFun();
+	return invokeSpawnFun(func, stack, tls);
+}
+def invokeSpawnFun(func: u32 -> void, stack: Pointer, tls: Pointer) -> int {
 	return spawnFun(func, stack, tls);
 }
 def makeSpawnFun() {
-	def CLONE3 = false;
+	def CLONE3 = true;
 	// spawnFun doesn't exist yet; create an assembler and make it.
 	// Constants and registers used in this stub.
 	def SYS_NUM = Regs.RAX;
@@ -585,61 +600,52 @@ def makeSpawnFun() {
 	def VIRGIL_RET0 = Regs.RAX;
 
 	def asm = X86_64Assemblers.create64(DataWriter.new());
-	var in_caller = asm.newLabel();
-	def flags = CLONE_VM | CLONE_SIGHAND | CLONE_PARENT | CLONE_THREAD;
+	var in_parent = asm.newLabel();
+	def flags = CLONE_VM | CLONE_SIGHAND | CLONE_PARENT | CLONE_THREAD | CLONE_SETTLS;
 	var r_tmp = Regs.R10;
 	var r_stack = VIRGIL_PARAM3;
 	def r_rsp = X86_64Regs.RSP;
 
-	// VIRGIL_PARAM0 = null receiver, because this is a component method
-	asm.q.sub_r_i(r_stack, Pointer.SIZE);
-	asm.movq_m_r(r_stack.indirect(), VIRGIL_PARAM1);   // save {func.receiver}
-	asm.q.sub_r_i(r_stack, Pointer.SIZE);
-	asm.movq_m_r(r_stack.indirect(), VIRGIL_PARAM2);   // save {func.codeptr}
+	def ARGS = clone_args.size;
 
-	if (CLONE3) {
-		asm.q.sub_r_i(r_rsp, clone_args.size); // use parent stack for clone3 args
-		asm.movq_m_i(r_rsp.plus(clone_args.flags.offset), flags);
-		asm.movq_m_i(r_rsp.plus(clone_args.pidfd.offset), 0);
-		asm.movq_m_i(r_rsp.plus(clone_args.exit_signal.offset), 0);
-		asm.movq_m_r(r_rsp.plus(clone_args.stack.offset), r_stack);
-		asm.movq_m_i(r_rsp.plus(clone_args.flags.offset), 0); // TODO: stack size?
-		asm.movq_m_r(r_rsp.plus(clone_args.tls.offset), VIRGIL_PARAM4);
-		asm.movq_r_i(SYS_NUM, SYS_clone3);	// pass system call number
-		asm.movq_r_r(SYS_PARAM1, r_rsp);	// pass arguments
-	} else {
-		asm.movq_r_r(SYS_PARAM1, r_stack);	// put {stack} into correct register
-		asm.movq_r_i(SYS_NUM, SYS_clone);	// pass system call number
-		asm.movq_r_i(SYS_PARAM0, flags);	// pass flags
-		asm.movq_r_i(SYS_PARAM2, 0);		// no parent TID pointer
-		asm.movq_r_i(SYS_PARAM3, 0);		// no child TID pointer
-		asm.movq_r_i(SYS_PARAM4, 0);		// TLS?
-		asm.movq_r_i(SYS_PARAM5, 0);		// TLS?
-	}
+	// VIRGIL_PARAM0 = null receiver, because this is a component method
+	asm.q.sub_r_i(r_stack, StackTransfer.size);		// allocate space for clone_args and {func}
+	asm.movq_m_r(r_stack.plus(StackTransfer.func_codeptr.offset), VIRGIL_PARAM1);	// save {func.codeptr}
+	asm.movq_m_r(r_stack.plus(StackTransfer.func_receiver.offset), VIRGIL_PARAM2);	// save {func.receiver}
+
+	asm.movq_m_i(r_stack.plus(clone_args.flags.offset), flags);
+	asm.movq_m_i(r_stack.plus(clone_args.pidfd.offset), 0);
+	asm.movq_m_i(r_stack.plus(clone_args.exit_signal.offset), 0);
+	asm.movq_m_r(r_stack.plus(clone_args.stack.offset), r_stack);
+	asm.movq_m_i(r_stack.plus(clone_args.stack_size.offset), CiRuntime.STACK_SIZE); // TODO: stack size?
+	asm.q.sub_m_i(r_stack.plus(clone_args.stack.offset), CiRuntime.STACK_SIZE); // subtract stack size
+	asm.movq_m_r(r_stack.plus(clone_args.tls.offset), VIRGIL_PARAM4);
+	asm.movq_r_i(SYS_NUM, SYS_clone3);						// pass system call number
+	asm.movq_r_r(SYS_PARAM0, r_stack);						// pass arguments
+	asm.movq_r_i(SYS_PARAM1, clone_args.size);					// pass size of arguments
 	
 	asm.syscall();				// call kernel
-	asm.q.cmp_r_i(SYS_RET0, 0);		// result < 0  means failed, in caller
-						// result == 0 means success, in caller
-						// result > 0  is new thread's PID, in callee
-	asm.jc_rel_near(X86_64Conds.A, in_caller);
-	// --- in new thread, call user function, passing PID ----------------------
-	asm.popq_r(VIRGIL_PARAM0);		// load {func.receiver}
-	asm.movq_r_r(VIRGIL_PARAM1, SYS_RET0);	// pass the PID to the Virgil function
-	asm.popq_r(r_tmp); 			// load {func.codeptr}
-	asm.movq_m_i(Regs.RSP.indirect(), RiStacks.STACK_RUNNING);	// indicate new thread is using stack
-	asm.icall_r(r_tmp); 			// call Virgil function {func}
+	asm.q.cmp_r_i(SYS_RET0, 0);		// result < 0  means failed, in parent
+						// result == 0 means success, in child
+						// result > 0  is new thread's PID, in parent
+	asm.jc_rel_near(X86_64Conds.NZ, in_parent);
+	// --- in child thread, call user function, passing PID ----------------------
+	asm.fs_prefix().movq_r_m(VIRGIL_PARAM0, X86_64Addr.new(null, null, 1, 0));	// load from TLS
+	asm.movq_r_m(VIRGIL_PARAM0, r_rsp.plus(StackTransfer.func_receiver.offset));	// load {func.receiver}
+	asm.movq_r_m(VIRGIL_PARAM1, r_rsp.plus(clone_args.child_tid.offset));		// pass the PID to the Virgil function
+	asm.movq_r_m(r_tmp, r_rsp.plus(StackTransfer.func_codeptr.offset));		// load {func.codeptr}
+	asm.q.add_r_i(r_rsp, StackTransfer.stack_running.offset);			// deallocate stack transfer area
+	asm.movq_m_i(Regs.RSP.indirect(), RiStacks.STACK_RUNNING);			// indicate new thread is now running on stack
+	asm.icall_r(r_tmp);						 		// call Virgil function {func}
 	asm.mfence();
-	asm.movq_m_i(Regs.RSP.indirect(), RiStacks.STACK_FREED);	// indicate new thread is not using stack
+	asm.movq_m_i(Regs.RSP.indirect(), RiStacks.STACK_FREED);			// indicate new thread is not using stack
 	asm.movq_r_i(SYS_NUM, SYS_exit);
 	asm.movq_r_i(SYS_PARAM0, 0);
-	asm.syscall();				// call kernel to exit, doesn't return
-	// --- in calling thread, just return the result of the system call --------
-	asm.bind(in_caller);
-	if (CLONE3) {
-		asm.q.add_r_i(r_rsp, clone_args.size);
-	}
+	asm.syscall();									// call kernel to exit, doesn't return
+	// --- in parent thread, just return the result of the system call --------
+	asm.bind(in_parent);
 	if (SYS_RET0 != VIRGIL_RET0) asm.movq_r_r(VIRGIL_RET0, SYS_RET0);
-	asm.ret();				// simply return result to the system call
+	asm.ret();									// simply return result to the system call
 
 	// Copy the assembly and forge a closure for {spawnFun}.
 	var region = CiRuntime.forgeRange<byte>(CiRuntime.RUNTIME_CODE_START,
