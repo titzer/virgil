@@ -24,7 +24,6 @@ fi
 LIB_FILES="$VIRGIL_LOC/lib/util/*.v3 $VIRGIL_LOC/lib/math/*.v3"
 
 function do_v3i() {
-    print_status Running v3i
     P=$OUT/run.out
     run_v3c "" $TESTS $LIB_FILES
     if [ "$?" != 0 ]; then
@@ -33,9 +32,15 @@ function do_v3i() {
     fi
 
     if [ "$PROGRESS_PIPE" = 1 ]; then
+	print_status Running v3i
 	run_v3c "" -run $TESTS $LIB_FILES | tee $P | $PROGRESS
+	print_status Running "v3i -ra"
+	run_v3c "" -ra -run $TESTS $LIB_FILES | tee $P | $PROGRESS
     else
+	print_status Running v3i
 	run_v3c "" -run $TESTS $LIB_FILES | tee $P
+	print_status Running "v3i -ra"
+	run_v3c "" -ra -run $TESTS $LIB_FILES | tee $P
     fi
 }
 

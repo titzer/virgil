@@ -1,0 +1,671 @@
+// Copyright 2012 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def VERBOSE = false;
+
+// TODO(RiRuntime):
+// - RiRuntime.alloc(size: u64) // thread component and TLABs
+// - RiRuntime.safepoint() // stop for GC if not GC thread
+// - leaving safepoint context for blocking call
+// - enable/disable safepoint
+// - GC thread(s) should not trigger safepoints while in GC
+// - locks around acquiring / releasing stacks
+// TODO(Aeneas)
+// - insert safepoints into loops and calls
+// - CiRuntime.spawn
+
+// Application interface to threads.
+component Threads {
+	// Spawn a new thread to run the function {func} with argument {p}.
+	// Returns a new {RiThread<R>} object that can be joined to get the return value.
+	def spawn<P, R>(f: P -> R, p: P) -> RiThread<R> { // optional arguments: stack size, heap size, time alotment
+		var thr = RiThread<R>.new(Functions.bind(f, p));
+		RiStacks.spawn0(thr);
+		return thr;
+	}
+	// Select at most one thread from {some} that has finished.
+	def select<R>(some: Range<RiThread<R>>) -> RiThread<R> {
+		// Implementation sketch 1:
+		// - lock + wait on thread table, i.e. listen for updates
+		// - scan thread table for changes
+		// Implementation sketch 2:
+		// - add listener for all threads
+		return null; // TODO
+	}
+	// Join all the threads in {some}. Blocks until all threads have finished.
+	def join<R>(some: Range<RiThread<R>>) {
+		// TODO
+	}
+}
+
+// All the user-visible states which can be reported for a thread.
+enum RiThreadStatus {
+	// Active states.
+	RUNNING,	// is currently running, though may be descheduled
+	WAITING,	// blocked on resource or I/O
+	PAUSED,		// has consumed alotted time resource or was explicitly paused
+	// Terminal states.
+	FINISHED,	// has finished executing and produced a result
+	CRASHED,	// failed with an exception
+	FAILED,		// failed to spawn
+	KILLED		// was explicitly killed
+}
+
+// The base of all thread classes, which has no specific return value.
+class RiBaseThread {
+	def id: u64;
+	private var status: RiThreadStatus;
+
+	private def run(pid: u32);	// called internally to run user closure
+	def join() -> RiThreadStatus;	// blocks until thread reaches a termination state
+	def poll() -> RiThreadStatus {	// returns current status
+		return status;
+	}
+	def kill();			// kills the thread if running
+	def pause();			// pauses the thread if running
+	def resume();			// resumes a thread if paused
+	def active() -> bool { return status.tag < RiThreadStatus.FINISHED.tag; }
+	def finished() -> bool { return status.tag >= RiThreadStatus.FINISHED.tag; }
+}
+
+// A thread with an expected return type <R>.
+class RiThread<R> extends RiBaseThread {
+	private def func: void -> R;
+	def var result: R;
+
+	private new(func) { }
+
+	// First Virgil code run on new thread (via being passed to CiRuntime.spawn).
+	private def run(pid: u32) {
+		if (VERBOSE) System.out.puts("current ").putp(CiRuntime.callerSp()).ln();
+		this.status = RiThreadStatus.RUNNING;
+		this.result = func();
+		this.status = RiThreadStatus.FINISHED; // XXX: mfence
+		RiStacks.releaseCurrent();
+	}
+}
+
+// A wrapper around a byte range that represents the storage for a stack.
+type RiStack(range: Range<byte>) #unboxed {
+	def stackNum() -> int {
+		return RiStacks.findStackNum(Pointer.atContents(range));
+	}
+	def spawnPointer() -> Pointer {
+		return Pointer.atElement(range, CiRuntime.STACK_SIZE - Pointer.SIZE);
+	}
+}
+
+// Internal stack manager.
+private component RiStacks {
+	def MAX_THREADS = 128;
+	def NO_STACK = RiStack(null);
+	var stack_region: Range<byte>;
+
+	// status flags for spawn pointer
+	def STACK_FREED = 0;
+	def STACK_ACQUIRED = 1;
+	def STACK_RUNNING = 2;
+	def STACK_RELEASED = 3;
+
+	def acquire(thr: RiBaseThread) -> RiStack {
+		if (stack_region.length == 0) {
+			def total_size = CiRuntime.STACK_SIZE * MAX_THREADS;
+			var flags = LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS;
+			var prot = LinuxConst.PROT_READ | LinuxConst.PROT_WRITE;
+			var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, total_size, prot, flags, 0, 0));
+			if (r.0 == -1) return NO_STACK;
+			stack_region = CiRuntime.forgeRange<byte>(Pointer.NULL + r.0, total_size);
+		}
+		var result = NO_STACK;
+		/*TODO: lock*/ { 
+			for (i = 0L; i < stack_region.length; i += CiRuntime.STACK_SIZE) {
+				var stack = RiStack(stack_region[i ..+ CiRuntime.STACK_SIZE]);
+				var ptr = stack.spawnPointer();
+				if (ptr.load<i64>() == STACK_FREED) {
+					ptr.store<i64>(STACK_ACQUIRED);
+					result = stack;
+					if (VERBOSE) System.out.puts("acquired ").putp(ptr).ln();
+					break;
+				}
+			}
+		}
+		return result;
+	}
+	def spawn0(thr: RiBaseThread) {
+		if (VERBOSE) System.out.puts("parent ").putp(CiRuntime.callerSp()).ln();
+		var stack = acquire(thr);
+		if (stack == NO_STACK) return void(thr.status = RiThreadStatus.FAILED); // failed to acquire a stack
+		thr.status = RiThreadStatus.WAITING;
+		var result = CiRuntime_spawn(thr.run, stack.spawnPointer(), Pointer.atContents(TLS_1));
+		if (result < 0) {
+			if (VERBOSE) System.out.puts("clone failed = ").puti(result).ln();
+			thr.status = RiThreadStatus.FAILED; // failed to spawn, e.g. out of resources
+		}
+	}
+	def releaseCurrent() {
+		var stack = find(CiRuntime.callerSp());
+		if (stack == NO_STACK) if (VERBOSE) System.puts("didnt find current\n");
+		stack.spawnPointer().store<i64>(STACK_RELEASED);
+	}
+	def find(ptr: Pointer) -> RiStack {
+		if (VERBOSE) System.out.puts("find ").putp(ptr).ln();
+		var num = findStackNum(ptr);
+		if (num < 0) return NO_STACK;
+		return RiStack(stack_region[num * CiRuntime.STACK_SIZE ..+ CiRuntime.STACK_SIZE]);
+	}
+	def findStackNum(ptr: Pointer) -> int {
+		var region = Pointer.atContents(stack_region);
+		if (ptr < region) return -1;
+		var diff = ptr - region;
+		if (diff >= stack_region.length) return -1;
+		return int.!(diff / CiRuntime.STACK_SIZE);
+	}
+	def spawnPointer(num: int) -> Pointer {
+		var stack = stack_region[(num * CiRuntime.STACK_SIZE) ..+ CiRuntime.STACK_SIZE];
+		return Pointer.atElement(stack, CiRuntime.STACK_SIZE - Pointer.SIZE);
+	}
+}
+
+// A thin wrapper around the kernel mmap() and mprotect() operations.
+component Mmap {
+	def PROT_NONE = LinuxConst.PROT_NONE;
+	def PROT_READ = LinuxConst.PROT_READ;
+	def PROT_WRITE = LinuxConst.PROT_WRITE;
+	def PROT_EXEC = LinuxConst.PROT_EXEC;
+
+	def reserve(size: u64, prot: int) -> Mapping {
+		var flags = LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS;
+		var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, size, prot, flags, 0, 0));
+		if (r.0 == -1) return null;
+		var start = Pointer.NULL + r.0, end = start + i64.view(size);
+		var range = MemoryRange.new(start, end);
+		var mapping = Mapping.new(range);
+		RiGc.registerFinalizer(mapping, range.unmap);
+		return mapping;
+	}
+	def protect(start: Pointer, size: u64, prot: int) -> bool {
+		var r = Linux.syscall(LinuxConst.SYS_mprotect, (start, size, prot));
+		return r.0 == 0;
+	}
+}
+
+// The (root) handle for a memory region. Don't lose it!
+// When the mapping is garbage collected, the memory range will be unmapped automatically,
+// if the underlying range has not been manually unmapped.
+class Mapping(range: MemoryRange) { }
+
+class MemoryRange {
+	def var start: Pointer;
+	def var end: Pointer;
+
+	new(start, end) { }
+
+	def unmap() {
+		if (start == Pointer.NULL) return; // already deallocated
+		Linux.syscall(LinuxConst.SYS_munmap, (start, end - start));
+		start = end = Pointer.NULL;
+	}
+	def size() -> u64 {
+		return u64.view(end - start);
+	}
+	def contains(p: Pointer) -> bool {
+		return p >= start && p < end;
+	}
+}
+
+def TLS_1: Array<int> = [0xFACEFEED];
+def TLS_2: Array<int> = [0x1BADF00D];
+
+
+// RiRuntime provides the platform-dependent runtime hooks called by the compiler
+// to implement signal handling (and therefore exception handling), GC, and
+// initialization of the runtime environment.
+component RiRuntime {
+	def SIGFPE  = 8;
+	def SIGBUS  = 10;
+	def SIGSEGV = 11;
+	var gcInit: void -> void;
+	var gcCollect: (int, Pointer, Pointer) -> Pointer = noCollect;
+	var userSignalHandler: (int, Pointer, Pointer) -> bool;
+	var stackRedZoneStart: Pointer;
+	var stackRedZoneEnd: Pointer;
+	var userCodeList: RiUserCode;
+
+	// initialize runtime system from supplied arguments and return remaining args
+	def init(c: int, a: Pointer, envp: Pointer) -> Array<string> {
+		var argc = c, argp = a;
+		// set up stack red zone to catch stack overflow
+		var t = RiOs.initStackRedZone(CiRuntime.STACK_START, CiRuntime.STACK_END);
+		stackRedZoneStart = t.0;
+		stackRedZoneEnd = t.1;
+		// install handler for SIGFPE, SIGBUS, and SIGSEGV
+		RiOs.installHandler(SIGFPE);
+		RiOs.installHandler(SIGBUS);
+		RiOs.installHandler(SIGSEGV);
+
+		if (gcInit != null) gcInit();
+		if (argp == Pointer.NULL) return null;
+
+		// convert argc, argp into an Array<string> for main, ignoring first arg
+		argp = argp + Pointer.SIZE;
+		argc--;
+		var args = Array<string>.new(argc);
+		for (i < argc) {
+			args[i] = toString((argp + i * Pointer.SIZE).load<Pointer>());
+		}
+		return args;
+	}
+	// handle a signal generated by the program
+	def signal(signum: int, siginfo: Pointer, ucontext: Pointer) {
+		if (userSignalHandler != null && userSignalHandler(signum, siginfo, ucontext)) return;
+
+		var ip = RiOs.getIp(ucontext), sp = RiOs.getSp(ucontext);
+		var userCode = findUserCode(ip);
+		if (userCode != null) {
+			// call user signal handler first, if installed
+			var handled = userCode.handleSignal(signum, siginfo, ucontext, ip, sp);
+			if (handled) return;
+		}
+		match (signum) {
+			SIGFPE => return fatalException("DivideByZeroException", null, ip, sp);
+			SIGBUS, SIGSEGV => {
+				if (ip >= CiRuntime.EX_START && ip < CiRuntime.EX_END) {
+					// IP lies in exception region, use exception entry
+					var exEntry = CiRuntime.EX_TABLE + (ip - CiRuntime.EX_START);
+					var frameWords = NativeStackPrinter.printExEntry(exEntry, true);
+					NativeStackPrinter.printStack(RiOs.callerFrame(ip, sp, frameWords));
+					return RiOs.exit(255);
+				} else {
+					var addr = RiOs.getAccessAddress(siginfo, ucontext);
+					if (inStackRedZone(addr)) return fatalException("StackOverflow", null, ip, sp);
+					if (ip == Pointer.NULL) {
+						// assume an indirect call to null, generate NCE
+						ip = sp.load<Pointer>() + -1; // return address is on stack
+						sp = sp + Pointer.SIZE; // skip return address
+					}
+					// should be a source entry at this IP
+					return fatalException("NullCheckException", null, ip, sp);
+				}
+			}
+			// XXX: SIGILL -> *bad*
+			// XXX: SIGQUIT -> stacktrace + quit
+			// XXX: SIGKILL -> stacktrace + quit
+			// XXX: SIGPROF -> take profiling sample
+		}
+		System.err.puts("UnexpectedSignal: ").puti(signum).ln();
+		NativeStackPrinter.printStack(ip, sp);
+		RiOs.exit(255);
+	}
+	def alloc(size: u31) -> Pointer {
+		return ThreadLocalAllocationBuffer.alloc(size); //#inline
+	}
+	/*
+	TODO: allocation and safepoint sequences
+	def alloc(size: u31) -> Pointer {
+		var self = Threads.self_ref();
+		var obj = self.tlab_start;
+		var end = obj + size;
+		if (end <= self.tlab_end) { //#likely
+			self.tlab_start = end;
+			return Pointer.NULL + int.view(obj);
+		}
+		return Threads.self_alloc_fail(size);
+	}
+	def self_alloc_fail(size: u31) -> Pointer {
+		var rip = CiRuntime.callerIp();
+		var rsp = CiRuntime.callerSp();
+		// TODO: self_scan, call GC, deal with in-progress GC
+	}
+	def self_maybe_block<P, R>(f: P -> R, p: P) -> R {
+		var self = self_ref();
+		self.eip = CiRuntime.callerIp();
+		self.esp = CiRuntime.callerSp();
+		// Pre-block: transition to a blocked state
+		while (!(
+			check_exit() ||
+			transition(self, ThreadState.RUN, ThreadState.BLOCKED) ||
+			transition(self, ThreadState.REQSCAN, ThreadState.BLOCKED))
+		) { }
+		// Execute blocking call
+		var result = f(p);
+		// Post-block: transition from blocked to running
+		while (!(
+			check_exit() ||
+			transition(self, ThreadState.BLOCKED, ThreadState.RUN))
+		) { }
+		return result;
+	}
+	def self_safepoint() {
+		var self = Threads.self_ref();
+		match (self.state) {
+			RUN, BLOCKED, STOPPED, DONE, FREE => ;
+			REQSCAN => {
+				self.eip = u32.view(CiRuntime.callerIp() - Pointer.NULL);
+				self.esp = u32.view(CiRuntime.callerSp() - Pointer.NULL);
+				transition(self, ThreadState.REQSCAN, ThreadState.BLOCKED);
+				// TODO: call blocking kernel futex
+			}
+		}
+	}
+	private def transition(thread: Ref<ThreadEntry>, from: ThreadState, to: ThreadState) -> bool {
+		var ptr = Pointer.atRef(thread) + ThreadEntry.state.offset;
+		return ptr.cmpswp<ThreadState>(from, to);
+	}
+	private def check_exit() -> bool {
+		return false; // TODO
+	}
+	def self_ref() -> Ref<ThreadEntry> {
+		var rsp = CiRuntime.callerSp();
+		var rsp_align = Pointer.NULL + ((rsp - Pointer.NULL) & ~THREAD_ALIGN);
+		var range = CiRuntime.forgeRange<byte>(rsp_align, ThreadEntry.size);
+		return Ref<ThreadEntry>.of(range);
+	}
+	*/
+	// Called from the generated allocation stub upon allocation failure.
+	def gc(size: int, ip: Pointer, sp: Pointer) -> Pointer {
+		return gcCollect(size, ip + -1, sp); // adjust caller IP for gc map search
+	}
+	private def noCollect(size: int, ip: Pointer, sp: Pointer) -> Pointer {
+		System.error("HeapOverflow", "no garbage collector installed");
+		return Pointer.NULL; // unreachable
+	}
+	// register new (machine) code with the runtime system
+	def registerUserCode(code: RiUserCode) {
+		code.next = userCodeList;
+		userCodeList = code;
+	}
+	// un-register code from the runtime system
+	def unregisterUserCode(code: RiUserCode) {
+		var l = userCodeList, p: RiUserCode;
+		while (l != null) {
+			if (l == userCodeList) {
+				if (p != null) p.next = l.next;
+				else userCodeList = l.next;
+				code.next = null;
+				return;
+			}
+			p = l;
+			l = l.next;
+		}
+	}
+	// find the user code containing {ip}, if any
+	def findUserCode(ip: Pointer) -> RiUserCode {
+		for (l = userCodeList; l != null; l = l.next) {
+			if (ip >= l.start && ip < l.end) return l;
+		}
+		return null;
+	}
+	// checks if the given pointer is in the stack red zone
+	def inStackRedZone(p: Pointer) -> bool {
+		return (p >= stackRedZoneStart && p < stackRedZoneEnd);
+	}
+	// convert a null-terminated string pointer to a byte array
+	private def toString(p: Pointer) -> string {
+		for (e = p; true; e = e + 1) {
+			if (e.load<byte>() == '\x00') {
+				var len = int.!(e - p), str = Array<byte>.new(len);
+				for (i < len) str[i] = (p + i).load<byte>();
+				return str;
+			}
+		}
+		return null; // unreachable
+	}
+	def fatalException(ex: string, msg: string, ip: Pointer, sp: Pointer) {
+		System.err.putc('!').puts(ex);
+		if (msg != null) System.err.puts(": ").puts(msg).ln();
+		else System.err.ln();
+		NativeStackPrinter.printStack(ip, sp);
+		RiOs.exit(255);
+	}
+}
+
+private thread component ThreadLocalAllocationBuffer {
+	var start: Pointer;
+	var current: Pointer;
+	var end: Pointer;
+
+	def alloc(size: u31) -> Pointer { //#inline
+		var obj = current;
+		var obj_end = obj + size;
+		if (obj_end <= end) { //#likely
+			current = obj_end;
+			return obj;
+		}
+		return RiRuntime.gc(size, CiRuntime.callerIp(), CiRuntime.callerSp());
+	}
+}
+
+// Runtime tables are exposed by the compiler as values in a "CiRuntime" component.
+// This component provides utilities to the rest of the runtime to traverse these
+// tables and serves to separate them from encoding details.
+component RiTables {
+	def REF_SIZE	  = 4;	  // XXX: platform-dependent reference size
+	def INT_SIZE	  = 4;
+	def PAGE_SIZE	  = 4096; // XXX: page size from compiler
+	def PAGE_SHIFT	  = '\x0c';  // 12
+	def PAGE_MASK	  = 0xFFF;
+	def EX_ENTRY_SIZE = 6;	  // XXX: ex entry size from compiler
+
+	def findSource(ip: Pointer) -> Pointer {
+		return exactMatch(searchTable(CiRuntime.SRC_POINTS_PAGES, CiRuntime.SRC_POINTS_TABLE, ip));
+	}
+	def findMethod(ip: Pointer) -> Pointer {
+		var r = searchTable(CiRuntime.SRC_METHODS_PAGES, CiRuntime.SRC_METHODS_TABLE, ip);
+		if (r.0 < CiRuntime.SRC_METHODS_TABLE) return Pointer.NULL;
+		return r.0;
+	}
+	def exactMatch(p: Pointer, q: Pointer) -> Pointer {
+		return if(p == q, p, Pointer.NULL);
+	}
+	// perform a binary search on a table, returning pointers (p, q) to adjacent entries
+	// with p.ip <= ip <= q.ip || p == null && q == null
+	// assumes 4-byte entries with lower #PAGE_SHIFT bits indicating the page offset
+	def searchTable(pageTable: Pointer, table: Pointer, ip: Pointer) -> (Pointer, Pointer) {
+		var none = (Pointer.NULL, Pointer.NULL);
+		if (ip < CiRuntime.CODE_START) return none; // out of code range
+		if (ip >= CiRuntime.CODE_END) return none; // out of code range
+
+		var code_offset = ip - CiRuntime.CODE_START;
+		var key_offset = code_offset & PAGE_MASK;
+		var code_page = int.!(code_offset >>> PAGE_SHIFT);
+		var start_p = loadPage(pageTable, code_page);
+		var end_p = loadPage(pageTable, code_page + 1);
+		// binary search for the entry
+		while (start_p < end_p) {
+			var diff = ((end_p - start_p) >> 1) & 0xFFFFFFFC;
+			var mid_p = start_p + diff;
+			var offset = mid_p.load<int>() & PAGE_MASK;
+			if (offset < key_offset) {
+				if (start_p == mid_p) return (start_p, end_p);
+				else start_p = mid_p;
+			} else if (offset == key_offset) {
+				return (mid_p, mid_p);
+			} else {
+				end_p = mid_p;
+			}
+		}
+		return (start_p + -4, end_p); // start_p == end_p
+	}
+	def loadPage(pageTable: Pointer, num: int) -> Pointer {
+		if (Pointer.SIZE == 8) {
+			return Pointer.NULL + (pageTable + num * 4).load<int>();
+		} else {
+			return (pageTable + num * Pointer.SIZE).load<Pointer>();
+		}
+	}
+	def codePages() -> int {
+		return int.!((CiRuntime.CODE_END - CiRuntime.CODE_START + (PAGE_SIZE - 1)) >>> PAGE_SHIFT);
+	}
+}
+// Extension point for dynamic code. User applications can extend the runtime system
+// by creating subclasses of this class and registering instances with the {RiRuntime}.
+class RiUserCode(var start: Pointer, var end: Pointer) {
+	var next: RiUserCode; // used internally in RiRuntime for list management
+
+	// Called by the runtime when a fatal error occurs. Should write a description
+	// of the frame (typically a single line) to the provided output function,
+	// e.g. to print a helpful stack trace.
+	def describeFrame(ip: Pointer, sp: Pointer, out: Range<byte> -> void) { }
+
+	// Called when the runtime walks the stack. Should advance the instruction pointer
+	// and stack pointer past this frame to the caller frame, returning the instruction
+	// and stack pointers for the caller.
+	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer);
+
+	// Called when the garbage collector finds a frame on the stack. Should notify
+	// the garbage collector via {RiGc} of the location of any roots in the frame.
+	def scanFrame(ip: Pointer, sp: Pointer) { }
+
+	// Called when a signal occurs in this code. Should attempt to handle the signal,
+	// e.g. by patching the platform-specific {ucontext}. If the signal could not be
+	// handled, return {false}.
+	def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer, ip: Pointer, sp: Pointer) -> bool { return false; }
+}
+
+// Run {func} on all inputs in parallel, returning the results.
+def ONE_BY_ONE = false;
+def JOIN_ALL = false;
+def doN<P, R>(inputs: Range<P>, func: P -> R) -> Array<R> {
+	var threads = Array<RiThread<R>>.new(inputs.length);
+	var results = Array<R>.new(inputs.length);
+	for (i < threads.length) threads[i] = Threads.spawn(func, inputs[i]);
+
+	if (ONE_BY_ONE) {
+		for (i < threads.length) {
+			var done = Threads.select(threads);
+			for (i < threads.length) {
+				if (threads[i] == done) {
+					threads[i] = null;
+					if (done.poll() == RiThreadStatus.FINISHED) results[i] = done.result;
+				}
+			}
+		}
+	}
+	if (JOIN_ALL) {
+		Threads.join(threads);
+		for (i < threads.length) {
+			var t = threads[i];
+			if (t.poll() == RiThreadStatus.FINISHED) results[i] = t.result;
+		}
+	}
+	return results;
+}
+
+var spawnFun: (u32 -> void, Pointer, Pointer) -> int;
+
+def Regs: X86_64Regs;
+
+def SYS_clone = 56;
+def SYS_clone3 = 435;
+def SYS_exit = 60;
+def CLONE_VM = 0x00000100;
+def CLONE_SIGHAND = 0x00000800;
+def CLONE_PARENT = 0x00008000;
+def CLONE_THREAD = 0x00010000;
+def CLONE_SETTLS = 0x00080000;
+
+layout StackTransfer {
+	+0	syscall_args:		clone_args;
+	+64	func_receiver:	u64;
+	+72	func_codeptr:	u64;
+	+80	stack_running:	u64;
+	=88;
+}
+
+def CiRuntime_spawn(func: u32 -> void, stack: Pointer, tls: Pointer) -> int {
+	if (spawnFun == null) makeSpawnFun();
+	return invokeSpawnFun(func, stack, tls);
+}
+def invokeSpawnFun(func: u32 -> void, stack: Pointer, tls: Pointer) -> int {
+	return spawnFun(func, stack, tls);
+}
+def makeSpawnFun() {
+	def CLONE3 = true;
+	// spawnFun doesn't exist yet; create an assembler and make it.
+	// Constants and registers used in this stub.
+	def SYS_NUM = Regs.RAX;
+	def SYS_PARAM0 = Regs.RDI;
+	def SYS_PARAM1 = Regs.RSI;
+	def SYS_PARAM2 = Regs.RDX;
+	def SYS_PARAM3 = Regs.R10;
+	def SYS_PARAM4 = Regs.R8;
+	def SYS_PARAM5 = Regs.R9;
+	def SYS_RET0 = Regs.RAX;
+
+	def VIRGIL_PARAM0 = Regs.RDI;
+	def VIRGIL_PARAM1 = Regs.RSI;
+	def VIRGIL_PARAM2 = Regs.RDX;
+	def VIRGIL_PARAM3 = Regs.RCX;
+	def VIRGIL_PARAM4 = Regs.R8;
+	def VIRGIL_RET0 = Regs.RAX;
+
+	def asm = X86_64Assemblers.create64(DataWriter.new());
+	var in_parent = asm.newLabel();
+	def flags = CLONE_VM | CLONE_SIGHAND | CLONE_PARENT | CLONE_THREAD | CLONE_SETTLS;
+	var r_tmp = Regs.R10;
+	var r_stack = VIRGIL_PARAM3;
+	def r_rsp = X86_64Regs.RSP;
+
+	def ARGS = clone_args.size;
+
+	// VIRGIL_PARAM0 = null receiver, because this is a component method
+	asm.q.sub_r_i(r_stack, StackTransfer.size);		// allocate space for clone_args and {func}
+	asm.movq_m_r(r_stack.plus(StackTransfer.func_codeptr.offset), VIRGIL_PARAM1);	// save {func.codeptr}
+	asm.movq_m_r(r_stack.plus(StackTransfer.func_receiver.offset), VIRGIL_PARAM2);	// save {func.receiver}
+
+	asm.movq_m_i(r_stack.plus(clone_args.flags.offset), flags);
+	asm.movq_m_i(r_stack.plus(clone_args.pidfd.offset), 0);
+	asm.movq_m_i(r_stack.plus(clone_args.exit_signal.offset), 0);
+	asm.movq_m_r(r_stack.plus(clone_args.stack.offset), r_stack);
+	asm.movq_m_i(r_stack.plus(clone_args.stack_size.offset), CiRuntime.STACK_SIZE); // TODO: stack size?
+	asm.q.sub_m_i(r_stack.plus(clone_args.stack.offset), CiRuntime.STACK_SIZE); // subtract stack size
+	asm.movq_m_r(r_stack.plus(clone_args.tls.offset), VIRGIL_PARAM4);
+	asm.movq_r_i(SYS_NUM, SYS_clone3);						// pass system call number
+	asm.movq_r_r(SYS_PARAM0, r_stack);						// pass arguments
+	asm.movq_r_i(SYS_PARAM1, clone_args.size);					// pass size of arguments
+	
+	asm.syscall();				// call kernel
+	asm.q.cmp_r_i(SYS_RET0, 0);		// result < 0  means failed, in parent
+						// result == 0 means success, in child
+						// result > 0  is new thread's PID, in parent
+	asm.jc_rel_near(X86_64Conds.NZ, in_parent);
+	// --- in child thread, call user function, passing PID ----------------------
+	asm.fs_prefix().movq_r_m(VIRGIL_PARAM0, X86_64Addr.new(null, null, 1, 0));	// load from TLS
+	asm.movq_r_m(VIRGIL_PARAM0, r_rsp.plus(StackTransfer.func_receiver.offset));	// load {func.receiver}
+	asm.movq_r_m(VIRGIL_PARAM1, r_rsp.plus(clone_args.child_tid.offset));		// pass the PID to the Virgil function
+	asm.movq_r_m(r_tmp, r_rsp.plus(StackTransfer.func_codeptr.offset));		// load {func.codeptr}
+	asm.q.add_r_i(r_rsp, StackTransfer.stack_running.offset);			// deallocate stack transfer area
+	asm.movq_m_i(Regs.RSP.indirect(), RiStacks.STACK_RUNNING);			// indicate new thread is now running on stack
+	asm.icall_r(r_tmp);						 		// call Virgil function {func}
+	asm.mfence();
+	asm.movq_m_i(Regs.RSP.indirect(), RiStacks.STACK_FREED);			// indicate new thread is not using stack
+	asm.movq_r_i(SYS_NUM, SYS_exit);
+	asm.movq_r_i(SYS_PARAM0, 0);
+	asm.syscall();									// call kernel to exit, doesn't return
+	// --- in parent thread, just return the result of the system call --------
+	asm.bind(in_parent);
+	if (SYS_RET0 != VIRGIL_RET0) asm.movq_r_r(VIRGIL_RET0, SYS_RET0);
+	asm.ret();									// simply return result to the system call
+
+	// Copy the assembly and forge a closure for {spawnFun}.
+	var region = CiRuntime.forgeRange<byte>(CiRuntime.RUNTIME_CODE_START,
+		int.!(CiRuntime.RUNTIME_CODE_END - CiRuntime.RUNTIME_CODE_START));
+	for (i = 0; i < asm.w.pos; i++) {
+		region[i] = asm.w.data[i];
+	}
+	spawnFun = CiRuntime.forgeClosure<void, ((u32 -> void), Pointer, Pointer), int>(
+		Pointer.atContents(region),
+		());
+}
+
+def main() {
+	var t = Threads.spawn(System.puts, "Hello World!\n");
+
+	while (!t.finished()) ; // busy wait for thread to finish
+
+	if (t.poll() != RiThreadStatus.FINISHED) {
+		System.puts("status = ");
+		System.puts(t.poll().name);
+		System.ln();
+	}
+}

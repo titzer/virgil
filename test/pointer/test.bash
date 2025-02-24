@@ -5,6 +5,8 @@
 if [ $# -gt 0 ]; then
     TEST_LIST="$@"
 else
+    do_seman_tests
+
     TEST_LIST=*.v3
 fi
 
