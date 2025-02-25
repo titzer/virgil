@@ -7,7 +7,7 @@
   "Virgil statement keywords.")
 
 (defvar virgil-builtins
-  '("void" "int" "byte" "bool" "short" "long" "Array" "Ref" "ref" "Range" "true" "false" "this" "null" "string" "float" "double")
+  '("void" "int" "byte" "bool" "short" "long" "Array" "array" "Ref" "ref" "Range" "range" "true" "false" "this" "null" "string" "float" "double")
   "Virgil builtin types and values.")
 
 (defvar virgil-decls-regexp (regexp-opt virgil-decls 'words))
