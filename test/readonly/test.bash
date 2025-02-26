@@ -13,4 +13,4 @@ else
 	TESTS=*.v3
 fi
 
-# execute_tests
+execute_tests
