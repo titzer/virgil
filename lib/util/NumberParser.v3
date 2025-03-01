@@ -1,0 +1,456 @@
+type NumberParserVType {
+	case Int(signed: bool, width: int);
+	case Float32;
+	case Float64;
+}
+
+type NumberParserValue {
+	case Int(v: u64);
+	case Float(sign: int, exp: int, mantissa: u64);
+}
+
+def VTYPE_NULL = NumberParserVType.Int(false, 0);
+def VALUE_NULL = NumberParserValue.Int(0);
+def U31_MAX_1: u32 = 0x80000000;
+def U63_MAX_1: u64 = 0x8000000000000000;
+def U32_CHAR_ZERO: u32 = '0';
+def U32_MAX_DIV_10: u32 = 429496729;
+def U32_MAX_MOD_10: u32 = 6;
+def U64_MAX_DIV_10: u64 = 0x1999999999999999; // (18,446,744,073,709,551,616 / 10)
+def U64_MAX_MOD_10: u32 = 6; // (18,446,744,073,709,551,616 % 10)
+def U32_TYPE = NumberParserVType.Int(false, 32);
+def I32_TYPE = NumberParserVType.Int(true, 32);
+def U64_TYPE = NumberParserVType.Int(false, 64);
+def I64_TYPE = NumberParserVType.Int(true, 64);
+def EMPTY = "";
+
+// extracted from {Float.v3}
+// TODO: should constants like this be in a util file instead?
+def FLOAT32_FRACTION_WIDTH = 23;
+def FLOAT64_FRACTION_WIDTH = 52;
+def INT_MAX_WIDTH = 64;
+
+// zero is universal for F32 and F64
+def FLOAT_ZERO = NumberParserValue.Float(0, 0, 0);
+def FLOAT_MINUS_ZERO = NumberParserValue.Float(1, 0, 0);
+def FLOAT32_INF = NumberParserValue.Float(0, 0xFF, 0);
+def FLOAT64_INF = NumberParserValue.Float(0, 0x7FF, 0);
+def FLOAT32_MINUS_INF = NumberParserValue.Float(1, 0xFF, 0);
+def FLOAT64_MINUS_INF = NumberParserValue.Float(1, 0x7FF, 0);
+
+class NumberParser(input: Range<byte>) {
+	var pos = 0;
+	var curByte: byte;
+	var digits: byte;
+	var is_negative: bool;
+	var is_float: bool;
+	var is_hex: bool;
+	var is_binary: bool;
+	var is_octal: bool;
+	var u_suffix: bool;
+	var l_suffix: bool;
+	var f_suffix: bool;
+	var d_suffix: bool;
+	var error_msg: string;
+	var error_pos: int;
+	var skip_underscore: bool = true;
+	var accept_width: bool;
+	var width: byte;
+	var vtype: NumberParserVType;
+	var val: NumberParserValue;
+
+	new() {
+		if (0 < input.length) curByte = input[0];
+	}
+	def parse() -> bool {
+		vtype = I32_TYPE;
+		if (curByte == '-') {
+			next();
+			is_negative = true;
+		}
+		if (curByte == '0') {
+			match (next()) {
+				'x', 'X' => {
+					next();
+					is_hex = true;
+					return parseHex();
+				}
+				'.' => {
+					next();
+					return parseFractional(pos-2, pos-1);
+				}
+				'e', 'E' => {
+					next();
+					return parseExponent(pos-2, pos-1, 0, 0);
+				}
+				'b', 'B' => {
+					next();
+					is_binary = true;
+					return parseBin();
+				}
+				'0', '1', '2', '3', '4', '5', '6', '7' => {
+					is_octal = true;
+					return parseOct();
+				}
+				'8', '9' => return error("octal digit");
+			} else {
+				if (acceptFD()) {
+					return finishFloat(input[pos-2 ... pos-1], EMPTY, false, EMPTY);
+				}
+				if (is_negative) {
+					is_float = true;
+					vtype = NumberParserVType.Float64;
+					return finishFloat(input[pos-2 ... pos-1], EMPTY, false, EMPTY);
+				}
+				acceptUIL();
+				val = setIntVal(0);
+				return true;
+			}
+		}
+		return parseDec();
+	}
+	private def parseDec() -> bool {
+		var s = pos;
+		if (!Chars.isDecimal(curByte)) return error("decimal digit");
+		var count = 1;
+		for (ch = next(); ch != 0; ch = next()) {
+			if (Chars.isDecimal(ch)) count++;
+			else if (skip_underscore && ch == '_') ;
+			else break;
+		}
+		digits = byte.!(count);
+		var end = pos;
+		match (curByte) {
+			'.' => { next(); return parseFractional(s, end); }
+			'e', 'E' => { next(); return parseExponent(s, end, 0, 0); }
+		}
+		var r = input[s ... end];
+		if (acceptFD()) return finishFloat(r, EMPTY, false, EMPTY);
+		acceptUIL();
+		if (l_suffix || count > 10) val = evalDecLong(r);
+		else val = evalDecInt(r);
+		return error_msg == null;
+	}
+	private def parseHex() -> bool {
+		var s = pos;
+		var count = 0;
+		for (ch = curByte; ch != 0; ch = next()) {
+			if (Chars.isHex(ch)) count++;
+			else if (skip_underscore && ch == '_') ;
+			else break;
+		}
+		var end = pos;
+		digits = byte.!(count);
+		if (count == 0) return error("expected hexadecimal digit(s)");
+		if (count > 16) return error("hexadecimal too large");
+		acceptUIL();
+		var r = input[s ... end];
+		if (count <= 8 && !l_suffix) { // optimized for 32-bit hex literals
+			var ival: int;
+			for (ch in r) if (ch != '_') ival = (ival << 4) | Chars.hexValue(ch);
+			if (is_negative) ival = 0 - ival;
+			setIntVal(ival);
+		} else { // handle 64-bit hex literals
+			var lval: long;
+			for (ch in r) if (ch != '_') lval = (lval << 4) | Chars.hexValue(ch);
+			if (is_negative) lval = 0 - lval;
+			setLongVal(lval);
+		}
+		return true;
+	}
+	private def parseBin() -> bool {
+		var s = pos;
+		var count = 0;
+		for (ch = curByte; ch != 0; ch = next()) {
+			if (Chars.isBinary(ch)) count++;
+			else if (skip_underscore && ch == '_') ;
+			else break;
+		}
+		var end = pos;
+		digits = byte.!(count);
+		if (count == 0) return error("expected binary digit(s)");
+		if (count > 64) return error("binary too large");
+		acceptUIL();
+		var r = input[s ... end];
+		if (count <= 32 && !l_suffix) { // optimized for 32-bit binary literals
+			var ival: int;
+			for (ch in r) if (ch != '_') ival = (ival << 1) | (ch - '0');
+			if (is_negative) ival = 0 - ival;
+			setIntVal(ival);
+		} else { // handle 64-bit binary literals
+			var lval: long;
+			for (ch in r) if (ch != '_') lval = (lval << 1) | (ch - '0');
+			if (is_negative) lval = 0 - lval;
+			setLongVal(lval);
+		}
+		return true;
+	}
+	private def parseFractional(wstart: int, wend: int) -> bool {
+		is_float = true;
+		vtype = NumberParserVType.Float64;
+		var fstart = pos;
+		while (Chars.isDecimal(curByte) || (skip_underscore && curByte == '_')) next();
+		var fend = pos;
+		match (curByte) {
+			'e', 'E' => { next(); return parseExponent(wstart, wend, fstart, fend); }
+		}
+		acceptFD();
+		return finishFloat(input[wstart ... wend], input[fstart ... fend], false, EMPTY);
+	}
+	private def parseExponent(wstart: int, wend: int, fstart: int, fend: int) -> bool {
+		is_float = true;
+		vtype = NumberParserVType.Float64;
+		var negexp = false;
+		if (curByte == '+') next();
+		else if (curByte == '-') {
+			negexp = true;
+			next();
+		}
+		var estart = pos;
+		match (curByte) {
+			'0' => next();
+			'1', '2', '3', '4', '5', '6', '7', '8', '9' => while(Chars.isDecimal(next()));
+			_ => {
+				error("expected decimal exponent");
+				return false;
+			}
+		}
+		var eend = pos;
+		acceptFD();
+		return finishFloat(input[wstart ... wend], input[fstart ... fend], negexp, input[estart ... eend]);
+	}
+	private def acceptUIL() -> bool {
+		var suffix = curByte;
+		match (suffix) {
+			'u', 'U' => {
+				if (is_negative) error("negative unsigned literal");
+				u_suffix = true;
+				var c = next();
+				if (suffix == 'u' && acceptExplicitWidth(c)) return true;
+				if (c == 'l' || c == 'L') {
+					l_suffix = true;
+					c = next();
+					return true;
+				}
+				return true;
+			}
+			'i' => {
+				var c = next();
+				var ok = acceptExplicitWidth(c);
+				if (!ok) error("expected explicit bit-width");
+				return ok;
+			}
+			'l', 'L' => {
+				l_suffix = true;
+				var c = next();
+				return true;
+			}
+		}
+		return false;
+	}
+	private def acceptExplicitWidth(c: byte) -> bool {
+		if (!accept_width || c < '1' || c > '9') return false;
+		var val = u32.view(c) - '0';
+		while (Chars.isDecimal(c = next())) { // XXX: factor out parsing of exponents and widths
+			val = val * 10 + (c - '0');
+			if (val > INT_MAX_WIDTH) error("explicit bit-width too large");
+		}
+		width = byte.view(val);
+		vtype = NumberParserVType.Int(l_suffix, width);
+		return true;
+	}
+	private def acceptFD() -> bool {
+		match (curByte) {
+			'f', 'F' => {
+				is_float = true;
+				f_suffix = true;
+				vtype = NumberParserVType.Float32;
+				next();
+				return true;
+			}
+			'd', 'D' => {
+				is_float = true;
+				d_suffix = true;
+				vtype = NumberParserVType.Float64;
+				next();
+				return true;
+			}
+		}
+		return false;
+	}
+	private def setIntVal(ival: int) -> NumberParserValue {
+		var it = VTYPE_NULL;
+		if (width > 0) it = NumberParserVType.Int(!u_suffix, width); // TODO: check zero/sign extension
+		else if (l_suffix) it = if(u_suffix, U64_TYPE, I64_TYPE);
+		else it = if(u_suffix, U32_TYPE, I32_TYPE);
+		vtype = it;
+		return val = NumberParserValue.Int(u64.view(ival));
+	}
+	private def setLongVal(lval: long) -> NumberParserValue {
+		var it = VTYPE_NULL;
+		if (width > 0) it = NumberParserVType.Int(!u_suffix, width); // TODO: check zero/sign extension
+		else it = if(u_suffix, U64_TYPE, I64_TYPE);
+		vtype = it;
+		return val = NumberParserValue.Int(u64.view(lval));
+	}
+	private def evalDecInt(r: Range<byte>) -> NumberParserValue {
+		var s = 0, end = r.length;
+		var ival = r[s++] - U32_CHAR_ZERO;
+		if (end <= s + 8) {
+			// fast case of 9 or fewer digits; cannot overflow
+			while (s < end) {
+				var ch = r[s++];
+				if (ch != '_') ival = ival * 10 + (ch - U32_CHAR_ZERO);
+			}
+		} else {
+			// 10 digits => could overflow
+			var max = end - 1;
+			while (s < max) {
+				var ch = r[s++];
+				if (ch != '_') ival = ival * 10 + (ch - U32_CHAR_ZERO);
+			}
+			// check last digit for potential overflow
+			var ch = r[s];
+			if (ch != '_') {
+				var d = ch - U32_CHAR_ZERO;
+				if (ival >= U32_MAX_DIV_10) {
+					if (ival > U32_MAX_DIV_10) return evalDecLong(r);
+					if (d >= U32_MAX_MOD_10) return evalDecLong(r);
+				}
+				ival = ival * 10 + d;
+			}
+		}
+		if (is_negative) {
+			// negate result if necessary; may overflow to long
+			if (ival <= U31_MAX_1) return setIntVal(0 - int.view(ival));
+			else return setLongVal(0 - long.view(ival));
+		}
+		if (!u_suffix && ival >= U31_MAX_1) {
+			// overflow to long if a large positive number
+			return setLongVal(long.view(ival));
+		}
+		return setIntVal(int.view(ival));
+	}
+	private def evalDecLong(r: Range<byte>) -> NumberParserValue {
+		var s = 0, end = r.length;
+		var lval = u64.view(r[s++] - U32_CHAR_ZERO);
+		if (end <= s + 18) {
+			// fast case of 19 or fewer digits; cannot overflow
+			while (s < end) {
+				var ch = r[s++];
+				if (ch != '_') lval = lval * 10 + (ch - U32_CHAR_ZERO);
+			}
+		} else {
+			// 20 digits => could overflow
+			var max = end - 1;
+			while (s < max) {
+				var ch = r[s++];
+				if (ch != '_') lval = lval * 10 + (ch - U32_CHAR_ZERO);
+			}
+			// check last digit for potential overflow
+			var ch = r[s];
+			if (ch != '_') {
+				var d = ch - U32_CHAR_ZERO;
+				if (lval >= U64_MAX_DIV_10) {
+					if (lval > U64_MAX_DIV_10) return overflowDecimal();
+					if (d >= U64_MAX_MOD_10) return overflowDecimal();
+				}
+				lval = lval * 10 + d;
+			}
+		}
+		if (is_negative) {
+			// negate result if necessary; may overflow
+			if (lval > U63_MAX_1) return overflowDecimal();
+			return setLongVal(0 - long.view(lval));
+		} else if (!u_suffix) {
+			// check overflow of positive long
+			if (lval >= U63_MAX_1) return overflowDecimal();
+		}
+		return setLongVal(long.view(lval));
+	}
+	private def finishFloat(w: Range<byte>, f: Range<byte>, negexp: bool, e: Range<byte>) -> bool {
+		val = evalFloat(w, f, negexp, e);
+		return true;
+	}
+	private def evalFloat(w: Range<byte>, f: Range<byte>, negexp: bool, e: Range<byte>) -> NumberParserValue {
+		// compute the exponent
+		var exp = 0;
+		for (ch in e) {
+			exp = exp * 10 + (ch - '0');
+			if (exp > 1000000) return if(negexp, evalUnderflowExponent(), evalOverflowExponent());
+		}
+		if (negexp) exp = 0 - exp;
+		// add digits from whole part
+		var bi = FpSketch.new();
+		for (ch in w) {
+			if (ch != '_') bi.addDecDigit(ch - '0');
+		}
+		// add digits from fractional part
+		for (ch in f) {
+			if (ch != '_') {
+				bi.addDecDigit(ch - '0');
+				exp--;
+			}
+		}
+
+		if (exp > 380) return evalOverflowExponent();
+		if (exp < -380) return evalUnderflowExponent();
+
+		var guard = false;;
+		if (exp > 0) {
+			// multiply the number by the base-10 exponent
+			bi.mulPow10(u32.view(exp));
+		} else if (exp < 0) {
+			// divide the number by the base-10 exponent, careful
+			// to generate at least 3 words of quotient
+			// (minimum 65 bits precision).
+			guard = !bi.divPow10(u32.view(0 - exp), 3);
+		}
+		// round and construct final floating point number
+		var sign = if(is_negative, 1, 0);
+		if (vtype == NumberParserVType.Float32) {
+			bi.roundg(1 + FLOAT32_FRACTION_WIDTH, guard);
+			var m = bi.mantissa32();
+			return NumberParserValue.Float(sign, m.1, m.0);
+		} else {
+			bi.roundg(1 + FLOAT64_FRACTION_WIDTH, guard);
+			var m = bi.mantissa64();
+			return NumberParserValue.Float(sign, m.1, m.0);
+		}
+	}
+	private def evalUnderflowExponent() -> NumberParserValue {
+		return if(is_negative, FLOAT_MINUS_ZERO, FLOAT_ZERO);
+	}
+	private def evalOverflowExponent() -> NumberParserValue {
+		if (is_negative) {
+			return if(vtype == NumberParserVType.Float32, FLOAT32_MINUS_INF, FLOAT64_MINUS_INF);
+		} else {
+			return if(vtype == NumberParserVType.Float32, FLOAT32_INF, FLOAT64_INF);
+		}
+	}
+	private def overflowDecimal() -> NumberParserValue {
+		error("decimal too large");
+		return VALUE_NULL;
+	}
+	private def parseOct() -> bool {
+		error("invalid octal literal");
+		while (Chars.isOctal(curByte)) next();
+		return false;
+	}
+	private def next() -> byte {
+		if (pos < (input.length - 1)) return curByte = input[++pos];
+		pos = input.length;
+		return curByte = '\x00';
+	}
+	private def error(msg: string) -> bool {
+		if (error_msg == null) {
+			error_msg = msg;
+			error_pos = pos;
+		}
+		return false;
+	}
+	def hasSuffix() -> bool {
+		return u_suffix || l_suffix;
+	}
+}
+

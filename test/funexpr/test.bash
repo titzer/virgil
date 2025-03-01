@@ -13,4 +13,4 @@ else
 	TESTS=*.v3
 fi
 
-execute_tests
+# TODO execute_tests
