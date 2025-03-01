@@ -1,1 +1,1 @@
-/home/moss/local/projects/virgil.github/funcs.bash
+../../funcs.bash

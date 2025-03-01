@@ -1,5 +1,5 @@
 #!/bin/bash
-. funcs.bash
+. $(command dirname ${BASH_SOURCE[0]})/funcs.bash
 BS=$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)
 VIRGIL=$(cd $BS/../../ && pwd)
 
