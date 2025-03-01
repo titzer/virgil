@@ -1,12 +1,12 @@
 #!/bin/bash
-. funcs.bash
+. $(command dirname ${BASH_SOURCE[0]})/funcs.bash
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  DIR="$(cd -P "$( dirname "$SOURCE")" && pwd)"
   SOURCE="$(readlink "$SOURCE")"
   [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 CONFIG=$DIR/config
 
 CYAN='[0;36m'
