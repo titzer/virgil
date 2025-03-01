@@ -1,5 +1,5 @@
 #!/bin/bash
-
+. funcs.bash
 if [ $# = 0 ]; then
 	echo "Usage: compile.bash <target> [benchmarks]"
 	exit 1
