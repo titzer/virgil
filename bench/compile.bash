@@ -5,13 +5,11 @@ if [ $# = 0 ]; then
 	exit 1
 fi
 
-SOURCE="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
-done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+SOURCE=${BASH_SOURCE[0]}
+HERE=$(command dirname $SOURCE)
+. $HERE/funcs.bash
+# set DIR to true directory containing this file
+follow_links $SOURCE
 
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $DIR/.. && pwd)}
 

@@ -1,12 +1,9 @@
 #!/bin/bash
-
-SOURCE="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
-done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+SOURCE=${BASH_SOURCE[0]}
+HERE=$(command dirname $SOURCE)
+. $HERE/funcs.bash
+# set DIR to true directory containing this file
+follow_links $SOURCE
 
 function usage() {
     echo "Usage: run.bash [aeneas...] <tiny|small|large|huge> [target [benchmarks]]"
@@ -98,7 +95,7 @@ for p in $benchmarks; do
 done
 
 for p in $benchmarks; do
-	if [ ! -f "$p/args-$size" ]; then
+	if [ ! -f $p/args-$size ]; then
 		continue
 	fi
 
