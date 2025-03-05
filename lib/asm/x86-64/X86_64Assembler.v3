@@ -228,6 +228,20 @@ def X86_64OP_rm_r	= "\x01\x09\x11\x19\x21\x29\x31\x39";
 def X86_64OP_r_rm	= "\x03\x0B\x13\x1B\x23\x2B\x33\x3B";
 def X86_64OP_rax_i	= "\x05\x0D\x15\x1D\x25\x2D\x35\x3D";
 
+def X86_64OP_name(code: int) -> string {
+	match (code) {
+		0 => return "add";
+		1 => return "or";
+		2 => return "adc";
+		3 => return "sbb";
+		4 => return "and";
+		5 => return "sub";
+		6 => return "xor";
+		7 => return "cmp";
+		_ => return "??";
+	}
+}
+
 def MOD_DISP0: byte	= 0b00000000;
 def MOD_DISP8: byte	= 0b01000000;
 def MOD_DISP32: byte	= 0b10000000;
@@ -246,9 +260,19 @@ class X86_64Label {
 	var pos = -1;
 	var near_uses: List<int>;
 	var far_uses: List<int>;
-
+	var num: int;
+	new() {
+		num = ++X86_64Labels.last_num;
+	}
 	def bound() -> bool { return pos >= 0; }
 }
+component X86_64Labels {
+	var last_num: int;
+	def newFunc() {
+		last_num = 0;
+	}
+}
+
 // Abstract interface for recording and patching addresses in assembled code.
 class X86_64AddrPatcher(absMarker: int, relMarker: int) {
 	def recordAbs32(pos: int, addr: X86_64Addr) {
@@ -256,10 +280,245 @@ class X86_64AddrPatcher(absMarker: int, relMarker: int) {
 	def recordRel32(pos: int, delta: int, addr: X86_64Addr) {
 	}
 }
+
+// An AsmTraceBuilder is a {StringBuilder} which can also dump itself to a
+// NativeFileStream and has custom methods for writing instruction fields, etc.
+class AsmTraceBuilder extends StringBuilder {
+
+	var fs: FileStream;	// receives trace output
+	var w: DataWriter;		// reference to see code bytes
+	def var last_pos: int;		// last known position in w
+	def var marker: int;		// a marker in w, e.g., where the current functio started
+	def var queued = "";		// queued output (textual prefix)
+
+	new(fs, w) super() { }
+
+	// Sets the marker (and last_pos)
+	def set_marker(i: int) -> this {
+		marker = last_pos = i;
+	}
+
+	def puts0(s: string) -> this {
+		puts(queued).puts(s);
+		queued = "";
+	}
+
+	// Appends a newline and flushes to standard out, leaving this builder empty.
+	def outln() -> this {
+		ln();
+		flush();
+	}
+	// Flushes any accumulated characters to standard out and resets.
+	def flush() -> this {
+		out(fs.outK);
+		reset();
+	}
+	// Puts a string {str} into the trace, followed by a newline, and then flushes.
+	def putsln(str: string) -> this {
+		puts0(str).outln();
+	}
+
+	// outputs each byte as two hex digits, preceded by a space
+	def hex_bytes(r: Range<byte>) -> this {
+		for (b in r) putc(' ').putx_8(b);
+	}
+
+	// outputs bytes since last pos, using hex_bytes
+	def bytes() -> this {
+		hex_bytes(w.data[last_pos ... w.pos]).ln();
+		last_pos = w.pos;
+	}
+
+	// show any skipped bytes
+	def show_skipped() -> this {
+		if (w.pos > last_pos) puts("  ...").bytes();
+	}
+
+	// like show_pos, without the formatting
+	def pos() -> this {
+		putd(w.pos - marker);
+	}
+
+	// outputs a byte number index since the marker
+	def show_pos() -> this {
+		show_skipped();
+		puts("  ");
+		var before = length;
+		pos().rjustify(' ', length - before, 5).puts(": ");
+	}
+
+	// functions to output pieces of instructions
+
+	def greg(r: X86_64Gpr, rex: byte) -> this {
+		puts(if((rex & REX_W) == 0, r.name32, r.name64));
+	}
+	def xreg(r: X86_64Xmmr) -> this {
+		puts(r.name);
+	}
+	def reg(r: X86_64Reg, rex: byte) -> this {
+		if (X86_64Gpr.?(r))
+			greg(X86_64Gpr.!(r), rex);
+		else if (X86_64Xmmr.?(r))
+			xreg(X86_64Xmmr.!(r));
+		else putc('?').putd(r.regnum);
+	}
+	def hexdigit(x: byte) -> this {
+		putc(if(x < 10, '0' + x, byte.!('A' + x - 10)));
+	}
+	def hex<T>(n: T) -> this {
+		puts("0x").putx(n);
+	}
+	def addr(a: X86_64Addr, rex: byte) -> this {
+		putc('[');
+		var has_base = a.base != null;
+		if (has_base) {
+			greg(a.base, rex);
+		}
+		var has_index = a.index != null;
+		if (has_index) {
+			if (has_base) putc('+');
+			greg(a.index, rex);
+			if (a.scale != 1) putc('*').putd(a.scale);
+		}
+		if (has_base || has_index) {
+			if (a.disp < 0) putd(a.disp);
+			if (a.disp > 0) putc('+').putd(a.disp);
+		} else {
+			// absolute address
+			hex(a.disp);
+		}
+		putc(']');
+	}
+	def imm<T>(i: T) -> this {
+		putd(i).putc('{').hex(i).putc('}');
+	}
+	def patched_imm<T>(i: T) -> this {
+		puts("p:").imm(i);
+	}
+	def cond(cond: X86_64Cond) -> this {
+		puts(cond.name);
+	}
+	def label(label: X86_64Label) -> this {
+		putc('L').putd(label.num);
+	}
+	def queue(s: string) -> this {
+		queued = Arrays.concat(queued, s);
+	}
+
+	// whole instructions, by format
+
+	def op(name: string) -> this {
+		show_pos().puts0(name).done();
+	}
+	def r(name: string, a: X86_64Gpr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').greg(a, rex).done();
+	}
+	def m(name: string, a: X86_64Addr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').addr(a, rex).done();
+	}
+	def r_r(name: string, a: X86_64Gpr, b: X86_64Gpr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').greg(a, rex).puts(", ").greg(b, rex).done();
+	}
+	def r_s(name: string, a: X86_64Gpr, b: X86_64Xmmr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').greg(a, rex).puts(", ").xreg(b).done();
+	}
+	def r_m(name: string, a: X86_64Gpr, b: X86_64Addr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').greg(a, rex).puts(", ").addr(b, rex).done();
+	}
+	def m_r(name: string, a: X86_64Addr, b: X86_64Gpr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').addr(a, rex).puts(", ").greg(b, rex).done();
+	}
+	def r_i(name: string, a: X86_64Gpr, i: int, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').greg(a, rex).puts(", ").imm(i).done();
+	}
+	def r_l(name: string, a: X86_64Gpr, l:long, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').greg(a, rex).puts(", ").imm(l).done();
+	}
+	def r_p(name: string, a: X86_64Gpr, l:long, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').greg(a, rex).puts(", ").patched_imm(l).done();
+	}
+	def r_cl(name: string, a: X86_64Gpr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').greg(a, rex).puts(", cl").done();
+	}
+	def m_i(name: string, a: X86_64Addr, i: int, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').addr(a, rex).puts(", ").imm(i).done();
+	}
+	def m_cl(name: string, a: X86_64Addr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').addr(a, rex).puts(", cl").done();
+	}
+	def c_r_r(name: string, cond: X86_64Cond, a: X86_64Gpr, b: X86_64Gpr, rex: byte) -> this {
+		show_pos().puts0(name).cond(cond).putc(' ').greg(a, rex).puts(", ").greg(b, rex).done();
+	}
+	def c_r_m(name: string, cond: X86_64Cond, a: X86_64Gpr, b: X86_64Addr, rex: byte) -> this {
+		show_pos().puts0(name).cond(cond).putc(' ').greg(a, rex).puts(", ").addr(b, rex).done();
+	}
+	def c_i(name: string, cond: X86_64Cond, i: int) -> this {
+		show_pos().puts0(name).cond(cond).putc(' ').imm(i).done();
+	}
+	def c_lab(name: string, cond: X86_64Cond, label: X86_64Label) -> this {
+		show_pos().puts0(name).cond(cond).putc(' ').label(label).done();
+	}
+	def c_r(name: string, cond: X86_64Cond, a: X86_64Gpr, rex: byte) -> this {
+		show_pos().puts0(name).cond(cond).putc(' ').greg(a, rex).done();
+	}
+	def c_m(name: string, cond: X86_64Cond, a: X86_64Addr, rex: byte) -> this {
+		show_pos().puts0(name).cond(cond).putc(' ').addr(a, rex).done();
+	}
+	def c_r_lab(name: string, cond: X86_64Cond, a: X86_64Gpr, label: X86_64Label, rex: byte) -> this {
+		show_pos().puts0(name).cond(cond).putc(' ').greg(a, rex).done();
+	}
+	def i(name: string, i: int) -> this {
+		show_pos().puts0(name).putc(' ').imm(i).done();
+	}
+	def abs(name: string, off: int) -> this {
+		show_pos().puts0(name).puts(" @").hex(w.pos + 5 + off).done();
+	}
+	def lab(name: string, label: X86_64Label) -> this {
+		show_pos().puts0(name).putc(' ').label(label).done();
+	}
+	def s_s(name: string, a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		show_pos().puts0(name).putc(' ').xreg(a).puts(", ").xreg(b).done();
+	}
+	def s_i(name: string, a: X86_64Xmmr, imm: int) -> this {
+		show_pos().puts0(name).putc(' ').xreg(a).puts(", ").imm(imm).done();
+	}
+	def s_s_i(name: string, a: X86_64Xmmr, b: X86_64Xmmr, imm: int) -> this {
+		show_pos().puts0(name).putc(' ').xreg(a).puts(", ").xreg(b).puts(", ").imm(imm).done();
+	}
+	def s_m(name: string, a: X86_64Xmmr, b: X86_64Addr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').xreg(a).puts(", ").addr(b, rex).done();
+	}
+	def m_s(name: string, a: X86_64Addr, b: X86_64Xmmr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').addr(a, rex).puts(", ").xreg(b).done();
+	}
+	def m_s_i(name: string, a: X86_64Addr, b: X86_64Xmmr, imm: int, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').addr(a, rex).puts(", ").xreg(b).puts(", ").imm(imm).done();
+	}
+	def reg_s(name: string, a: X86_64Reg, b: X86_64Xmmr, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').reg(a, rex).puts(", ").xreg(b).done();
+	}
+	def r_s_i(name: string, a: X86_64Reg, b: X86_64Xmmr, imm: int, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').reg(a, rex).puts(", ").xreg(b).puts(", ").imm(imm).done();
+	}
+	def s_reg(name: string, a: X86_64Xmmr, b: X86_64Reg, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').xreg(a).puts(", ").reg(b, rex).done();
+	}
+	def s_r_i(name: string, a: X86_64Xmmr, b: X86_64Reg, imm: int, rex: byte) -> this {
+		show_pos().puts0(name).putc(' ').xreg(a).puts(", ").reg(b, rex).puts(", ").imm(imm).done();
+	}
+
+	def done() -> this {
+		puts("        ").bytes().flush();
+	}
+
+}
+
 // Utilities to create an assembler.
 component X86_64Assemblers {
 	def REX_W: byte		= 0b00001000;
 	def NO_REX: byte	= 0b00000000;
+
+	def tracingEnabled	= false;
 
 	def create32(w: DataWriter) -> X86_64Assembler {
 		var d = X86_64Assembler.new(w, NO_REX);
@@ -276,6 +535,7 @@ component X86_64Assemblers {
 		return q;
 	}
 }
+
 // Assembles x86 instructions into the provided buffer. Use X86_64Assemblers.create{32/64} to
 // create an assembler that has its {d} and {q} fields set appropriately, rather than calling
 // the constructor directly.
@@ -284,6 +544,26 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 	def var q: X86_64Assembler;
 	var shorten = true;
 	var patcher: X86_64AddrPatcher;
+	def tracingEnabled = X86_64Assemblers.tracingEnabled;	// shorthand
+	def var tracing: bool;
+	def var tb: AsmTraceBuilder;
+
+	def setTracing(out: FileStream) {
+		if (out != null) {
+			d.tb = q.tb = AsmTraceBuilder.new(out, w);
+		}
+		d.tracing = q.tracing = (out != null);
+	}
+	def comment(s: string) -> this {
+		if (tracingEnabled && tracing) tb.puts(s).flush();
+	}
+	def newFunc() -> this {
+		if (tracingEnabled && tracing) tb.set_marker(w.pos);	// ignore any intervening bytes
+		X86_64Labels.newFunc();
+	}
+	def done() {
+		if (tracing) tb.done();
+	}
 
 	def pos() -> int { return w.pos; }
 
@@ -293,6 +573,8 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 	def bind(label: X86_64Label) {
 		if (label.pos >= 0) System.error(ERROR, "label already bound");
 		label.pos = w.pos;
+		if (tracingEnabled && tracing)
+			tb.show_skipped().puts("<L").putd(label.num).puts(">(").pos().putc(')').done();
 		for (l = label.near_uses; l != null; l = l.tail) {
 			var offset = label.pos - l.head;
 			if (offset != i8.view(offset)) System.error(ERROR, "label too far for near jump");
@@ -323,15 +605,19 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 
 	def btr_r_i(a: X86_64Gpr, imm: u6) -> this {
 		var rex = OP_REX | rex_r(a, REX_B);
+		if (tracingEnabled && tracing) tb.r_i("btr", a, imm, rex);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		emitbb_r(0x0F, 0xBA, a, 6);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def btr_m_i(a: X86_64Addr, imm: u6) -> this {
 		var rex = OP_REX | rex_m(a, REX_B);
+		if (tracingEnabled && tracing) tb.m_i("btr", a, imm, rex);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		emitbb_m(0x0F, 0xBA, a, 6);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 
 	def or_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this  { emitop2_r_r(a, b, OP_REX, 1); }
@@ -417,17 +703,24 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 
 	def cmpb_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this  {  // XXX: factor out common routine
 		var rex = if(a.regnum > 3 || b.regnum > 3, REX_BYTE, NO_REX);
+		if (tracingEnabled && tracing) tb.r_r("cmpb", a, b, rex);
 		emit_rex_b_r_r(a, b, rex, 0x38);
+		if (tracingEnabled) done();
 	}
 	def cmpb_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {  // XXX: factor out common routine
 		var rex = if(a.regnum > 3, REX_BYTE, NO_REX);
+		if (tracingEnabled && tracing) tb.r_m("cmpb", a, b, rex);
 		emit_rex_b_r_m(a, b, rex, 0x3A);
+		if (tracingEnabled) done();
 	}
 	def cmpb_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {  // XXX: factor out common routine
 		var rex = if(b.regnum > 3, REX_BYTE, NO_REX);
+		if (tracingEnabled && tracing) tb.m_r("cmpb", a, b, rex);
 		emit_rex_b_m_r(a, b, rex, 0x38);
+		if (tracingEnabled) done();
 	}
 	def cmpb_r_i(a: X86_64Gpr, i: int/*XXX:byte*/) -> this { // XXX: factor out common routine
+		if (tracingEnabled && tracing) tb.r_i("cmpb", a, i, 0);
 		if (a == X86_64Regs.RAX) {
 			emitbb(0x3C, i);
 		} else {
@@ -435,10 +728,13 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 			emit_rex_b_r_x(a, rex, 0x80, 7);
 			emitb(i);
 		}
+		if (tracingEnabled) done();
 	}
 	def cmpb_m_i(a: X86_64Addr, i: int/*XXX:byte*/) -> this { // XXX: factor out common routine
+		if (tracingEnabled && tracing) tb.m_i("cmpb", a, i, 0);
 		emit_rex_b_m_x(a, NO_REX, 0x80, 7);
 		emitb(i);
+		if (tracingEnabled) done();
 	}
 
 	def cmp_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this  { emitop2_r_r(a, b, OP_REX, 7); }
@@ -449,50 +745,88 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 
 	def cmpxchgb_r_r(b: X86_64Gpr, a: X86_64Gpr) -> this {
 		var rex = if(a.regnum > 3 || b.regnum > 3, REX_BYTE);
+		if (tracingEnabled && tracing) tb.r_r("cmpxchgb", a, b, rex);
 		emit_rex_bb_r_r(a, b, rex, 0x0F, 0xB0);
+		if (tracingEnabled) done();
 	}
 	def cmpxchgb_m_r(b: X86_64Addr, a: X86_64Gpr) -> this {
 		var rex = if(a.regnum > 3, REX_BYTE);
+		if (tracingEnabled && tracing) tb.r_m("cmpxchgb", a, b, rex);
 		emit_rex_bb_r_m(a, b, rex, 0x0F, 0xB0);
+		if (tracingEnabled) done();
 	}
 	def cmpxchgw_r_r(b: X86_64Gpr, a: X86_64Gpr) -> this {
 		emitb(PREFIX_W);
+		if (tracingEnabled && tracing) tb.r_r("cmpxchgw", a, b, 0);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xB1);
+		if (tracingEnabled) done();
 	}
 	def cmpxchgw_m_r(b: X86_64Addr, a: X86_64Gpr) -> this {
 		emitb(PREFIX_W);
+		if (tracingEnabled && tracing) tb.r_m("cmpxchgw", a, b, 0);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xB1);
+		if (tracingEnabled) done();
 	}
 	def cmpxchg_r_r(b: X86_64Gpr, a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("cmpxchg", a, b, OP_REX);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0xB1);
+		if (tracingEnabled) done();
 	}
 	def cmpxchg_m_r(b: X86_64Addr, a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("cmpxchg", a, b, OP_REX);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0xB1);
+		if (tracingEnabled) done();
 	}
 
 	def bsf_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("bsf", a, b, OP_REX);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0xBC);
+		if (tracingEnabled) done();
 	}
 	def bsf_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("bsf", a, b, OP_REX);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0xBC);
+		if (tracingEnabled) done();
 	}
 	def bsr_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("bsr", a, b, OP_REX);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0xBD);
+		if (tracingEnabled) done();
 	}
 	def bsr_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("bsf", a, b, OP_REX);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0xBD);
+		if (tracingEnabled) done();
 	}
-	def callr(off: int) -> this { emitbd(0xE8, off); } // relative call
-	def calld(off: int) -> this { emitbd(0x9A, off); } // direct call
+	def callr(off: int) -> this {
+		if (tracingEnabled && tracing) tb.abs("call", off);
+		emitbd(0xE8, off); // relative call
+		if (tracingEnabled) done();
+	}
+	def callr_abs(off: int, abs: int) {
+		if (tracingEnabled && tracing) tb.abs("call", abs);
+		emitbd(0xE8, off);
+		if (tracingEnabled) done();
+	}
+	def calld(off: int) -> this {
+		if (tracingEnabled && tracing) tb.i("call", off);
+		emitbd(0x9A, off); // direct call
+		if (tracingEnabled) done();
+	}
 	def callr_addr(m: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("call", m, 0);
 		emitbd(0xE8, checkAbs(m));
 		recordRel32(w.pos - 4, 4, m);
+		if (tracingEnabled) done();
 	}
 	def calld_addr(m: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("call", m, 0);
 		emitbd(0x9A, checkAbs(m));
 		recordAbs32(w.pos - 4, m);
+		if (tracingEnabled) done();
 	}
 	def call_rel_far(label: X86_64Label) -> this {
+		if (tracingEnabled && tracing) tb.lab("call", label);
 		if (label.pos >= 0) {
 			var offset = (label.pos - w.pos);
 			emitbd(0xE8, offset - 5);
@@ -500,76 +834,128 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 			emitbd(0xE8, -5);
 			label.far_uses = List.new(w.pos, label.far_uses);
 		}
+		if (tracingEnabled) done();
 	}
-	def cdq() -> this { emitb(0x99); }
-	def cqo() -> this { emitbb(REX_BYTE | REX_W, 0x99); }
-	def lock() -> this { emitb(0xF0); }
-	def mfence() -> this { emitbbb(0x0F, 0xAE, 0xF0);}
-
+	def cdq() -> this {
+		if (tracingEnabled && tracing) tb.op("cdq");
+		emitb(0x99);
+		if (tracingEnabled) done();
+	}
+	def cqo() -> this {
+		if (tracingEnabled && tracing) tb.op("cqo");
+		emitbb(REX_BYTE | REX_W, 0x99);
+		if (tracingEnabled) done();
+	}
+	def lock() -> this {
+		if (tracingEnabled && tracing) tb.op("lock");
+		emitb(0xF0);
+		if (tracingEnabled) done();
+	}
+	def mfence() -> this {
+		if (tracingEnabled && tracing) tb.op("mfence");
+		emitbbb(0x0F, 0xAE, 0xF0);
+		if (tracingEnabled) done();
+	}
 	private def checkAbs(m: X86_64Addr) -> int {
 		if (m.base != null || m.index != null) System.error(ERROR, "expected absolute address");
 		return m.disp;
 	}
-
 	def cmov_r(cond: X86_64Cond, a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.c_r_r("cmov", cond, a, b, REX_W);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, byte.view(0x40 + cond.index));
+		if (tracingEnabled) done();
 	}
 	def cmov_m(cond: X86_64Cond, a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.c_r_m("cmov", cond, a, b, REX_W);
 		emit_rex_bb_r_m(a, b, REX_W, 0x0F, byte.view(0x40 + cond.index));
+		if (tracingEnabled) done();
 	}
 	def dec_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("dec", a, OP_REX);
 		emit_rex_b_r_x(a, OP_REX, 0xFF, 1);
+		if (tracingEnabled) done();
 	}
 	def dec_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("dec", a, OP_REX);
 		emit_rex_b_m_x(a, OP_REX, 0xFF, 1);
+		if (tracingEnabled) done();
 	}
 	def div_r(b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("div", b, OP_REX);
 		emit_rex_b_r_x(b, OP_REX, 0xF7, 6);
+		if (tracingEnabled) done();
 	}
 	def div_m(b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("div", b, OP_REX);
 		emit_rex_b_m_x(b, OP_REX, 0xF7, 6);
+		if (tracingEnabled) done();
 	}
 
 	def icall_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("call", a, NO_REX);
 		emit_rex_b_r_x(a, NO_REX, 0xFF, 2);
+		if (tracingEnabled) done();
 	}
 	def icall_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("call", a, NO_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xFF, 2);
+		if (tracingEnabled) done();
 	}
 	def idiv_r(b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("idiv", b, OP_REX);
 		emit_rex_b_r_x(b, OP_REX, 0xF7, 7);
+		if (tracingEnabled) done();
 	}
 	def idiv_m(b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("idiv", b, OP_REX);
 		emit_rex_b_m_x(b, OP_REX, 0xF7, 7);
+		if (tracingEnabled) done();
 	}
 	def ijmp_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("jmp", a, 0);
 		emit_rex_b_m_x(a, NO_REX, 0xFF, 4);
+		if (tracingEnabled) done();
 	}
 	def inc_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("inc", a, OP_REX);
 		emit_rex_b_r_x(a, OP_REX, 0xFF, 0);
+		if (tracingEnabled) done();
 	}
 	def inc_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("inc", a, OP_REX);
 		emit_rex_b_m_x(a, OP_REX, 0xFF, 0);
+		if (tracingEnabled) done();
 	}
 	def ijmp_r(a: X86_64Gpr) -> this {
 		var rex = rex_r(a, REX_B);
+		if (tracingEnabled && tracing) tb.r("jmp", a, rex);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		emitb_r(0xFF, a, 4);
+		if (tracingEnabled) done();
 	}
 	def imul_r(b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("imul", b, OP_REX);
 		emit_rex_b_r_x(b, OP_REX, 0xF7, 5);
+		if (tracingEnabled) done();
 	}
 	def imul_m(b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("imul", b, OP_REX);
 		emit_rex_b_m_x(b, OP_REX, 0xF7, 5);
+		if (tracingEnabled) done();
 	}
 	def imul_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("imul", a, b, OP_REX);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0xAF);
+		if (tracingEnabled) done();
 	}
 	def imul_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("imul", a, b, OP_REX);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0xAF);
+		if (tracingEnabled) done();
 	}
 	def imul_r_i(a: X86_64Gpr, i: int) -> this {
 		var rex = OP_REX | rex_r(a, REX_B | REX_R);
+		if (tracingEnabled && tracing) tb.r_i("imul", a, i, OP_REX);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		if (i < -128 || i > 127) {
 			emitb_r(0x69, a, a.low3);
@@ -578,15 +964,25 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 			emitb_r(0x6B, a, a.low3);
 			emitb(i);
 		}
+		if (tracingEnabled) done();
 	}
 	def intK(i: int) -> this {
 		if (shorten && i == 3) emitb(0xCC);
 		else emitbb(0xCD, i);
 	}
-	def iret() -> this { emitb(0xCF); }
-	def invalid() -> this { emitbb(0x0F, 0x0B); }
+	def iret() -> this {
+		if (tracingEnabled && tracing) tb.op("iret");
+		emitb(0xCF);
+		if (tracingEnabled) done();
+	}
+	def invalid() -> this {
+		if (tracingEnabled && tracing) tb.op("invalid");
+		emitbb(0x0F, 0x0B);
+		if (tracingEnabled) done();
+	}
 	def jc_rel(cond: X86_64Cond, offset: int) -> this {
 		// input is relative to start of instruction, but encoded as relative to end
+		// Tracing is done in the caller, to pick up labels
 		if (offset <= 129 && offset >= -126) {
 			emitbb(0x70 + cond.index, offset - 2);
 		} else {
@@ -594,181 +990,281 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 		}
 	}
 	def jc_rel_addr(cond: X86_64Cond, m: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.c_m("j", cond, m, 0);
 		emitbbd(0x0F, 0x80 + cond.index, checkAbs(m));
 		recordRel32(w.pos - 4, 4, m);
+		if (tracingEnabled) done();
 	}
 	def jc_rel_near(cond: X86_64Cond, label: X86_64Label) -> this {
+		if (tracingEnabled && tracing) tb.c_lab("j", cond, label);
 		if (label.pos >= 0) {
 			jc_rel(cond, label.pos - w.pos);
 		} else {
 			emitbb(0x70 + cond.index, -2);
 			label.near_uses = List.new(w.pos, label.near_uses);
 		}
+		if (tracingEnabled) done();
 	}
 	def jc_rel_far(cond: X86_64Cond, label: X86_64Label) -> this {
+		if (tracingEnabled && tracing) tb.c_lab("j", cond, label);
 		if (label.pos >= 0) {
 			jc_rel(cond, label.pos - w.pos);
 		} else {
 			emitbbd(0x0F, 0x80 + cond.index, -5);
 			label.far_uses = List.new(w.pos, label.far_uses);
 		}
+		if (tracingEnabled) done();
 	}
-	def jmp_rel(offset: int) -> this {
+	def jc_c0_rel_near(label: X86_64Label) -> this {
+		if (tracingEnabled && tracing) tb.c_r_lab("jcx", X86_64Conds.Z, X86_64Regs.RCX, label, OP_REX);
+		if (label.pos >= 0) {
+			emitbb(0xE3, label.pos - w.pos);
+		} else {
+			emitbb(0xE3, -2);
+			label.near_uses = List.new(w.pos, label.near_uses);
+		}
+		if (tracingEnabled) done();
+	}
+	def jmp_rel_raw(offset: int) -> this {
+		// trace in caller
 		if (offset <= 129 && offset >= -126) emitbb(0xEB, offset - 2);
 		else emitbd(0xE9, offset - 5);
 	}
+	def jmp_rel(offset: int) -> this {
+		if (tracingEnabled && tracing) tb.i("jmp", offset - w.pos);
+		jmp_rel_raw(offset);
+		if (tracingEnabled) done();
+	}
 	def jmp_rel_addr(m: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("jmp", m, OP_REX);
 		emitbd(0xE9, checkAbs(m));
 		recordRel32(w.pos - 4, 4, m);
+		if (tracingEnabled) done();
 	}
 	def jmp_rel_near(label: X86_64Label) -> this {
+		if (tracingEnabled && tracing) tb.lab("jmp", label);
 		if (label.pos >= 0) {
-			jmp_rel(label.pos - w.pos);
+			jmp_rel_raw(label.pos - w.pos);
 		} else {
 			emitbb(0xEB, -2);
 			label.near_uses = List.new(w.pos, label.near_uses);
 		}
+		if (tracingEnabled) done();
 	}
 	def jmp_rel_far(label: X86_64Label) -> this {
+		if (tracingEnabled && tracing) tb.lab("jmp", label);
 		if (label.pos >= 0) {
-			jmp_rel(label.pos - w.pos);
+			jmp_rel_raw(label.pos - w.pos);
 		} else {
 			emitbd(0xE9, -5);
 			label.far_uses = List.new(w.pos, label.far_uses);
 		}
+		if (tracingEnabled) done();
 	}
-	def jmp_abs(abs: int) -> this { emitbd(0xEA, abs); } // jump absolute
+	def jmp_abs(abs: int) -> this {
+		if (tracingEnabled && tracing) tb.abs("jmp", abs);
+		emitbd(0xEA, abs); // jump absolute
+		if (tracingEnabled) done();
+	}
 	def jmp_abs_addr(m: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("jmp", m, OP_REX);
 		emitbd(0xEA, checkAbs(m));
 		recordAbs32(w.pos - 4, m);
+		if (tracingEnabled) done();
 	}
 	def lea(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("lea", a, b, OP_REX);
 		emit_rex_b_r_m(a, b, OP_REX, 0x8D);
+		if (tracingEnabled) done();
 	}
 	def ldmxcsr_m(a: X86_64Addr) -> this {
 		var rex = rex_m(a, REX_B);
+		if (tracingEnabled && tracing) tb.m("ldmxcsr", a, rex);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		emitbb_m(0x0f, 0xAE, a, 2);
+		if (tracingEnabled) done();
 	}
 	def stmxcsr_m(a: X86_64Addr) -> this {
 		var rex = rex_m(a, REX_B);
+		if (tracingEnabled && tracing) tb.m("stmxcsr", a, rex);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		emitbb_m(0x0f, 0xAE, a, 3);
+		if (tracingEnabled) done();
 	}
 	def popcnt_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("popcnt", a, b, OP_REX);
 		emitb(0xf3);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0xB8);
+		if (tracingEnabled) done();
 	}
 	def popcnt_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("popcnt", a, b, OP_REX);
 		emitb(0xf3);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0xB8);
+		if (tracingEnabled) done();
 	}
-	def pushfq() -> this { emitb(0x9C); }
+	def pushfq() -> this {
+		if (tracingEnabled && tracing) tb.op("pushfq");
+		emitb(0x9C);
+		if (tracingEnabled) done();
+	}
 	def pushq_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("push", a, REX_W);
 		emit_rex_b_r(a, NO_REX, 0x50);
+		if (tracingEnabled) done();
 	}
 	// 16-byte moves
 	def movdqu_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("movdqu", a, b, REX_W);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x6F);
+		if (tracingEnabled) done();
 	}
 	def movdqu_m_s(a: X86_64Addr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.m_s("movdqu", a, b, 0);
 		emitb(0xF3);
 		emit_rex_bb_r_m(b, a, NO_REX, 0x0F, 0x7F);
+		if (tracingEnabled) done();
 	}
 	def movddup_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("movddup", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x12);
+		if (tracingEnabled) done();
 	}
 	def movshdup_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("movshdup", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x16);
+		if (tracingEnabled) done();
 	}
 	def movshdup_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("movshdup", a, b, REX_W);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x16);
+		if (tracingEnabled) done();
 	}
 	def movaps_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("movaps", a, b, REX_W);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x28);
+		if (tracingEnabled) done();
 	}
 	def movaps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("movaps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x28);
+		if (tracingEnabled) done();
 	}
 	def pmovsxbw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmovsxbw", a, b, REX_W);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x20);
+		if (tracingEnabled) done();
 	}
 	def pmovsxbw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmovsxbw", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x20);
+		if (tracingEnabled) done();
 	}
 	def pmovzxbw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmovzxbw", a, b, REX_W);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x30);
+		if (tracingEnabled) done();
 	}
 	def pmovzxbw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmovzxbw", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x30);
+		if (tracingEnabled) done();
 	}
 	def pmovsxwd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmovsxwd", a, b, REX_W);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x23);
+		if (tracingEnabled) done();
 	}
 	def pmovsxwd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmovsxwd", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x23);
+		if (tracingEnabled) done();
 	}
 	def pmovzxwd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmovzxwd", a, b, REX_W);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x33);
+		if (tracingEnabled) done();
 	}
 	def pmovzxwd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmovzxwd", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x33);
+		if (tracingEnabled) done();
 	}
 	def pmovsxdq_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmovsxdq", a, b, REX_W);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x25);
+		if (tracingEnabled) done();
 	}
 	def pmovsxdq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmovsxdq", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x25);
+		if (tracingEnabled) done();
 	}
 	def pmovzxdq_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmovzxdq", a, b, REX_W);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x35);
+		if (tracingEnabled) done();
 	}
 	def pmovzxdq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmovzxdq", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x35);
+		if (tracingEnabled) done();
 	}
 	def movmskps_r_s(a: X86_64Gpr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.r_s("movmskps", a, b, 0);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x50);
+		if (tracingEnabled) done();
 	}
 	def movmskpd_r_s(a: X86_64Gpr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.r_s("movmskpd", a, b, 0);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x50);
+		if (tracingEnabled) done();
 	}
 
 	// 8-byte moves
 	def movq_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("mov", a, b, REX_W);
 		emit_rex_b_r_r(a, b, REX_W, 0x89);
+		if (tracingEnabled) done();
 	}
 	def movq_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("mov", a, b, REX_W);
 		if (/*TODO*/false && b == X86_64Regs.RAX && a.absolute()) {
 			emitbbd(REX_BYTE | REX_W, 0xA3, a.disp);
 			recordAbs32(w.pos - 4, a);
+			if (tracingEnabled) done();
 			return;
 		}
 		emit_rex_b_m_r(a, b, REX_W, 0x89);
+		if (tracingEnabled) done();
 	}
 	def movq_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("mov", a, b, REX_W);
 		if (/*TODO*/false && a == X86_64Regs.RAX && b.absolute()) {
 			emitbbd(REX_BYTE | REX_W, 0xA1, b.disp);
 			recordAbs32(w.pos - 4, b);
+			if (tracingEnabled) done();
 			return;
 		}
 		emit_rex_b_r_m(a, b, REX_W, 0x8B);
+		if (tracingEnabled) done();
 	}
 	def movq_r_i(a: X86_64Gpr, i: int) -> this {
 		if (i >= 0) {
@@ -776,12 +1272,15 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 				d.xor_r_r(a, a);
 				return;
 			}
+			if (tracingEnabled && tracing) tb.r_i("mov", a, i, REX_W);
 			emit_rex_b_r(a, NO_REX, 0xB8);
 			emitd(i);
 		} else {
+			if (tracingEnabled && tracing) tb.r_i("mov", a, i, REX_W);
 			emit_rex_b_r_x(a, REX_W, 0xC7, 0);
 			emitd(i);
 		}
+		if (tracingEnabled) done();
 	}
 	def movq_r_l(a: X86_64Gpr, l: long) -> this {
 		var i = int.view(l);
@@ -793,326 +1292,591 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 			movd_r_i(a, i);
 			return;
 		}
+		if (tracingEnabled && tracing) tb.r_l("mov", a, l, REX_W);
 		emit_rex_b_r(a, REX_BYTE | REX_W, 0xB8);
 		emitq(l);
+		if (tracingEnabled) done();
 	}
 	// Move a (patchable) 64-bit constant into a GPR and return the position where to patch.
 	def movq_r_p(a: X86_64Gpr, l: long) -> int {
+		if (tracingEnabled && tracing) tb.r_p("mov", a, l, REX_W);
 		emit_rex_b_r(a, REX_BYTE | REX_W, 0xB8);
 		emitq(l);
+		if (tracingEnabled) done();
 		return w.pos - 8;
 	}
 	def movq_m_i(a: X86_64Addr, i: int) -> this {
+		if (tracingEnabled && tracing) tb.m_i("mov", a, i, REX_W);
 		emit_rex_b_m_x(a, REX_W, 0xC7, 0);
 		emitd(i);
+		if (tracingEnabled) done();
 	}
 
 	// 4-byte moves
 	def movd_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("mov", a, b, 0);
 		emit_rex_b_r_r(a, b, NO_REX, 0x89);
+		if (tracingEnabled) done();
 	}
 	def movd_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("mov", a, b, 0);
 		if (/*TODO*/false && b == X86_64Regs.RAX && a.absolute()) {
 			emitbd(0xA3, a.disp);
 			recordAbs32(w.pos - 4, a);
+			if (tracingEnabled) done();
 			return;
 		}
 		emit_rex_b_m_r(a, b, NO_REX, 0x89);
+		if (tracingEnabled) done();
 	}
 	def movd_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("mov", a, b, 0);
 		if (/*TODO*/false && a == X86_64Regs.RAX && b.absolute()) {
 			emitbd(0xA1, b.disp);
 			recordAbs32(w.pos - 4, b);
+			if (tracingEnabled) done();
 			return;
 		}
 		emit_rex_b_r_m(a, b, NO_REX, 0x8B);
+		if (tracingEnabled) done();
 	}
 	def movd_r_i(a: X86_64Gpr, i: int) -> this {
 		if (shorten && i == 0) {
 			d.xor_r_r(a, a);
 			return;
 		}
+		if (tracingEnabled && tracing) tb.r_i("mov", a, i, 0);
 		emit_rex_b_r(a, NO_REX, 0xB8);
 		emitd(i);
+		if (tracingEnabled) done();
 	}
 	def movd_m_i(a: X86_64Addr, i: int) -> this {
+		if (tracingEnabled && tracing) tb.m_i("mov", a, i, 0);
 		emit_rex_b_m_x(a, NO_REX, 0xC7, 0);
 		emitd(i);
+		if (tracingEnabled) done();
 	}
 
 	// 2-byte moves
 	def movw_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("movw", a, b, 0);
 		emitb(PREFIX_W);
 		emit_rex_b_r_r(a, b, NO_REX, 0x89);
+		if (tracingEnabled) done();
 	}
 	def movw_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("movw", a, b, 0);
 		emitb(PREFIX_W);
 		emit_rex_b_r_m(a, b, NO_REX, 0x8B);
+		if (tracingEnabled) done();
 	}
 	def movw_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("movw", a, b, 0);
 		emitb(PREFIX_W);
 		emit_rex_b_m_r(a, b, NO_REX, 0x89);
+		if (tracingEnabled) done();
 	}
 	def movw_r_i(a: X86_64Gpr, imm: int) -> this {
+		if (tracingEnabled && tracing) tb.r_i("movw", a, imm, 0);
 		emitb(PREFIX_W);
 		emit_rex_b_r(a, NO_REX, 0xB8);
 		emitw(imm);
+		if (tracingEnabled) done();
 	}
 	def movw_m_i(a: X86_64Addr, imm: int) -> this {
+		if (tracingEnabled && tracing) tb.m_i("movw", a, imm, 0);
 		emitb(PREFIX_W);
 		emit_rex_b_m_x(a, NO_REX, 0xC7, 0);
 		emitw(imm);
+		if (tracingEnabled) done();
 	}
 	def movwsx_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("movwsx", a, b, 0);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, 0xBF);
+		if (tracingEnabled) done();
 	}
 	def movwsx_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("movwsx", a, b, 0);
 		emit_rex_bb_r_m(a, b, REX_W, 0x0F, 0xBF);
+		if (tracingEnabled) done();
 	}
 	def movwzx_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("movwzx", a, b, 0);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, 0xB7);
+		if (tracingEnabled) done();
 	}
 	def movwzx_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("movwzx", a, b, 0);
 		emit_rex_bb_r_m(a, b, REX_W, 0x0F, 0xB7);
+		if (tracingEnabled) done();
 	}
 	def pmovmskb_r_s(a: X86_64Gpr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.r_s("pmovmskb", a, b, 0);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xD7);
+		if (tracingEnabled) done();
 	}
 
 	// 1-byte moves
 	def movb_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("movb", a, b, 0);
 		var rex = if(a.regnum > 3 || b.regnum > 3, REX_BYTE);
 		emit_rex_b_r_r(a, b, rex, 0x88);
+		if (tracingEnabled) done();
 	}
 	def movb_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("movb", a, b, 0);
 		var rex = if(b.regnum > 3, REX_BYTE);
 		emit_rex_b_m_r(a, b, rex, 0x88);
+		if (tracingEnabled) done();
 	}
 	def movb_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("movb", a, b, 0);
 		var rex = if(a.regnum > 3, REX_BYTE);
 		emit_rex_b_r_m(a, b, rex, 0x8A);
+		if (tracingEnabled) done();
 	}
 	def movb_r_i(a: X86_64Gpr, i: int) -> this {
+		if (tracingEnabled && tracing) tb.r_i("movb", a, i, 0);
 		var rex = if(a.regnum > 3, REX_BYTE);
 		emit_rex_b_r(a, rex, 0xB0);
 		emitb(i);
+		if (tracingEnabled) done();
 	}
 	def movb_m_i(a: X86_64Addr, i: int) -> this {
+		if (tracingEnabled && tracing) tb.m_i("movb", a, i, 0);
 		emit_rex_b_m_x(a, NO_REX, 0xC6, 0);
 		emitb(i);
+		if (tracingEnabled) done();
 	}
 	def movbsx_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("movbsx", a, b, 0);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, 0xBE);
+		if (tracingEnabled) done();
 	}
 	def movbsx_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("movbsx", a, b, 0);
 		emit_rex_bb_r_m(a, b, REX_W, 0x0F, 0xBE);
+		if (tracingEnabled) done();
 	}
 	def movbzx_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("movbzx", a, b, 0);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, 0xB6);
+		if (tracingEnabled) done();
 	}
 	def movbzx_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("movbzx", a, b, 0);
 		emit_rex_bb_r_m(a, b, REX_W, 0x0F, 0xB6);
+		if (tracingEnabled) done();
 	}
-	def movsb() -> this { emitb(0xA4); }
+	def movsb() -> this {
+		if (tracingEnabled && tracing) tb.op("movsb");
+		emitb(0xA4);
+		if (tracingEnabled) done();
+	}
 
 	// SSE moves
 	def movss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("movss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x10);
+		if (tracingEnabled) done();
 	}
 	def movss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("movss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x10);
+		if (tracingEnabled) done();
 	}
 	def movss_m_s(a: X86_64Addr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.m_s("movss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(b, a, NO_REX, 0x0F, 0x11);
+		if (tracingEnabled) done();
 	}
 	def movsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("movsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x10);
+		if (tracingEnabled) done();
 	}
 	def movsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("movsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x10);
+		if (tracingEnabled) done();
 	}
 	def movsd_m_s(a: X86_64Addr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.m_s("movsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(b, a, NO_REX, 0x0F, 0x11);
+		if (tracingEnabled) done();
 	}
 	def movhlps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("movhlps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x12);
+		if (tracingEnabled) done();
 	}
 	def movlhps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("movlhps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x16);
+		if (tracingEnabled) done();
 	}
 	def movd_s_r(a: X86_64Xmmr, b: X86_64Reg) -> this {
+		if (tracingEnabled && tracing) tb.s_reg("movd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x6E);
+		if (tracingEnabled) done();
 	}
 	def movd_r_s(b: X86_64Reg, a: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.reg_s("movd", b, a, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x7E);
+		if (tracingEnabled) done();
 	}
 	def movq_s_r(a: X86_64Xmmr, b: X86_64Reg) -> this {
+		if (tracingEnabled && tracing) tb.s_reg("movq", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, 0x6E);
+		if (tracingEnabled) done();
 	}
 	def movq_r_s(b: X86_64Reg, a: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.reg_s("movq", b, a, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, 0x7E);
+		if (tracingEnabled) done();
 	}
 
+	// Arithmetic ops, etc.
+
 	def mul_r(b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("mul", b, OP_REX);
 		emit_rex_b_r_x(b, OP_REX, 0xF7, 4);
+		if (tracingEnabled) done();
 	}
 	def mul_m(b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("mul", b, OP_REX);
 		emit_rex_b_m_x(b, OP_REX, 0xF7, 4);
+		if (tracingEnabled) done();
 	}
 	def nop1() -> this {
+		if (tracingEnabled && tracing) tb.op("nop1");
 		emitb(0x90);
+		if (tracingEnabled) done();
 	}
 	def nop2() -> this {
+		if (tracingEnabled && tracing) tb.op("nop2");
 		emitbb(0x66, 0x90);
+		if (tracingEnabled) done();
 	}
 	def nop3() -> this {
+		if (tracingEnabled && tracing) tb.op("nop3");
 		emitbbb(0x0F, 0x1F, 0x00);
+		if (tracingEnabled) done();
 	}
 	def nop4() -> this {
+		if (tracingEnabled && tracing) tb.op("nop4");
 		emitd(0x00401F0F);
+		if (tracingEnabled) done();
 	}
 	def not_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("not", a, OP_REX);
 		emit_rex_b_r_x(a, OP_REX, 0xF7, 2);
+		if (tracingEnabled) done();
 	}
 	def not_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("not", a, OP_REX);
 		emit_rex_b_m_x(a, OP_REX, 0xF7, 2);
+		if (tracingEnabled) done();
 	}
 	def neg_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("neg", a, OP_REX);
 		emit_rex_b_r_x(a, OP_REX, 0xF7, 3);
+		if (tracingEnabled) done();
 	}
 	def neg_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("neg", a, OP_REX);
 		emit_rex_b_m_x(a, OP_REX, 0xF7, 3);
+		if (tracingEnabled) done();
 	}
 	def negb_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("negb", a, NO_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xF6, 3);
+		if (tracingEnabled) done();
 	}
 	def negw_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("negw", a, NO_REX);
 		emitb(PREFIX_W);
 		emit_rex_b_m_x(a, NO_REX, 0xF7, 3);
+		if (tracingEnabled) done();
 	}
 	def negd_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("neg", a, NO_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xF7, 3);
+		if (tracingEnabled) done();
 	}
 	def negq_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("negb", a, OP_REX);
 		emit_rex_b_m_x(a, REX_W, 0xF7, 3);
+		if (tracingEnabled) done();
 	}
         def negb_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("negb", a, NO_REX);
 		var rex = NO_REX;
 		if (a == X86_64Regs.RSP || a == X86_64Regs.RBP || a == X86_64Regs.RSI || a == X86_64Regs.RDI) rex = REX_BYTE;
                 emit_rex_b_r_x(a, rex, 0xF6, 3);
+		if (tracingEnabled) done();
         }
         def negw_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("negw", a, NO_REX);
                 emitb(PREFIX_W);
                 emit_rex_b_r_x(a, NO_REX, 0xF7, 3);
+		if (tracingEnabled) done();
         }
         def negd_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("neg", a, NO_REX);
                 emit_rex_b_r_x(a, NO_REX, 0xF7, 3);
+		if (tracingEnabled) done();
         }
         def negq_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("neg", a, OP_REX);
                 emit_rex_b_r_x(a, REX_W, 0xF7, 3);
+		if (tracingEnabled) done();
         }
 
 	def pushq_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("pushq", a, REX_W);
 		emit_rex_b_m_x(a, NO_REX, 0xFF, 6);
+		if (tracingEnabled) done();
 	}
 	def pushq_i(imm: int) -> this {
+		if (tracingEnabled && tracing) tb.i("pushq", imm);
 		if (imm < -128 || imm > 127) emitbd(0x68, imm);
 		else emitbb(0x6A, imm);
+		if (tracingEnabled) done();
 	}
 	def popq_r(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("popq", a, REX_W);
 		emit_rex_b_r(a, NO_REX, 0x58);
+		if (tracingEnabled) done();
 	}
 	def popq_m(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("popq", a, REX_W);
 		var rex = rex_m(a, REX_B);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		emitb_m(0x8F, a, 0);
+		if (tracingEnabled) done();
 	}
 
-	def rdtsc() -> this { emitbb(0x0F, 0x31); }
-	def rdfsbase(a: X86_64Gpr) -> this { emitb(0xF3); emit_rex_bb_r(a, OP_REX, 0x0F, 0xAE, 0x0); }
-	def rdgsbase(a: X86_64Gpr) -> this { emitb(0xF3); emit_rex_bb_r(a, OP_REX, 0x0F, 0xAE, 0x1); }
-	def repz() -> this { emitb(0xF3); } // prefix
-	def repne() -> this { emitb(0xF2); } // prefix
-	def ret() -> this { emitb(0xC3); }
+	def rdtsc() -> this {
+		if (tracingEnabled && tracing) tb.op("rdtsc");
+		emitbb(0x0F, 0x31);
+		if (tracingEnabled) done();
+	}
+	def rdfsbase(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.op("rdfsbase");
+		emitb(0xF3); emit_rex_bb_r(a, OP_REX, 0x0F, 0xAE, 0x0);
+		if (tracingEnabled) done();
+	}
+	def rdgsbase(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.op("rdgsbase");
+		emitb(0xF3); emit_rex_bb_r(a, OP_REX, 0x0F, 0xAE, 0x1);
+		if (tracingEnabled) done();
+	}
+	def repz() -> this { // prefix
+		if (tracingEnabled && tracing) tb.queue("repz ");
+		emitb(0xF3);
+	}
+	def repne() -> this { // prefix
+		if (tracingEnabled && tracing) tb.queue("repne ");
+		emitb(0xF2);
+	}
+	def ret() -> this {
+		if (tracingEnabled && tracing) tb.op("ret");
+		emitb(0xC3);
+		if (tracingEnabled) done();
+	}
 
-	def rol_r_i(a: X86_64Gpr, imm: u6) -> this { shx_r_i(a, OP_REX, imm, 8); }
-	def rol_r_cl(a: X86_64Gpr) -> this { shx_r_cl(a, OP_REX, 8); }
-	def rol_m_cl(a: X86_64Addr) -> this { shx_m_cl(a, OP_REX, 8); }
+	def rol_r_i(a: X86_64Gpr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.r_i("rol", a, imm, OP_REX);
+		shx_r_i(a, OP_REX, imm, 8);
+		if (tracingEnabled) done();
+	}
+	def rol_r_cl(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_cl("rol", a, OP_REX);
+		shx_r_cl(a, OP_REX, 8);
+		if (tracingEnabled) done();
+	}
+	def rol_m_cl(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m_cl("rol", a, OP_REX);
+		shx_m_cl(a, OP_REX, 8);
+		if (tracingEnabled) done();
+	}
 
-	def ror_r_i(a: X86_64Gpr, imm: u6) -> this { shx_r_i(a, OP_REX, imm, 9); }
-	def ror_m_cl(a: X86_64Addr) -> this { shx_m_cl(a, OP_REX, 9); }
-	def ror_r_cl(a: X86_64Gpr) -> this { shx_r_cl(a, OP_REX, 9); }
+	def ror_r_i(a: X86_64Gpr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.r_i("ror", a, imm, OP_REX);
+		shx_r_i(a, OP_REX, imm, 9);
+		if (tracingEnabled) done();
+	}
+	def ror_m_cl(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m_cl("ror", a, OP_REX);
+		shx_m_cl(a, OP_REX, 9);
+		if (tracingEnabled) done();
+	}
+	def ror_r_cl(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_cl("ror", a, OP_REX);
+		shx_r_cl(a, OP_REX, 9);
+		if (tracingEnabled) done();
+	}
 
-	def sar_r_i(a: X86_64Gpr, imm: u6) -> this { shx_r_i(a, OP_REX, imm, 7); }
-	def sar_m_i(a: X86_64Addr, imm: u6) -> this { shx_m_i(a, OP_REX, imm, 7); }
-	def sar_r_cl(a: X86_64Gpr) -> this { shx_r_cl(a, OP_REX, 7); }
-	def sar_m_cl(a: X86_64Addr) -> this { shx_m_cl(a, OP_REX, 7); }
+	def sar_r_i(a: X86_64Gpr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.r_i("sar", a, imm, OP_REX);
+		shx_r_i(a, OP_REX, imm, 7);
+		if (tracingEnabled) done();
+	}
+	def sar_m_i(a: X86_64Addr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.m_i("sar", a, imm, OP_REX);
+		shx_m_i(a, OP_REX, imm, 7);
+		if (tracingEnabled) done();
+	}
+	def sar_r_cl(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_cl("sar", a, OP_REX);
+		shx_r_cl(a, OP_REX, 7);
+		if (tracingEnabled) done();
+	}
+	def sar_m_cl(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m_cl("sar", a, OP_REX);
+		shx_m_cl(a, OP_REX, 7);
+		if (tracingEnabled) done();
+	}
 
-	def shl_r_i(a: X86_64Gpr, imm: u6) -> this { shx_r_i(a, OP_REX, imm, 4); }
-	def shl_m_i(a: X86_64Addr, imm: u6) -> this { shx_m_i(a, OP_REX, imm, 4); }
-	def shl_r_cl(a: X86_64Gpr) -> this { shx_r_cl(a, OP_REX, 4); }
-	def shl_m_cl(a: X86_64Addr) -> this { shx_m_cl(a, OP_REX, 4); }
+	def shl_r_i(a: X86_64Gpr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.r_i("shl", a, imm, OP_REX);
+		shx_r_i(a, OP_REX, imm, 4);
+		if (tracingEnabled) done();
+	}
+	def shl_m_i(a: X86_64Addr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.m_i("shl", a, imm, OP_REX);
+		shx_m_i(a, OP_REX, imm, 4);
+		if (tracingEnabled) done();
+	}
+	def shl_r_cl(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_cl("shl", a, OP_REX);
+		shx_r_cl(a, OP_REX, 4);
+		if (tracingEnabled) done();
+	}
+	def shl_m_cl(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m_cl("shl", a, OP_REX);
+		shx_m_cl(a, OP_REX, 4);
+		if (tracingEnabled) done();
+	}
 
-	def shr_r_i(a: X86_64Gpr, imm: u6) -> this { shx_r_i(a, OP_REX, imm, 5); }
-	def shr_m_i(a: X86_64Addr, imm: u6) -> this { shx_m_i(a, OP_REX, imm, 5); }
-	def shr_r_cl(a: X86_64Gpr) -> this { shx_r_cl(a, OP_REX, 5); }
-	def shr_m_cl(a: X86_64Addr) -> this { shx_m_cl(a, OP_REX, 5); }
+	def shr_r_i(a: X86_64Gpr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.r_i("shr", a, imm, OP_REX);
+		shx_r_i(a, OP_REX, imm, 5);
+		if (tracingEnabled) done();
+	}
+	def shr_m_i(a: X86_64Addr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.m_i("shr", a, imm, OP_REX);
+		shx_m_i(a, OP_REX, imm, 5);
+		if (tracingEnabled) done();
+	}
+	def shr_r_cl(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_cl("shr", a, OP_REX);
+		shx_r_cl(a, OP_REX, 5);
+		if (tracingEnabled) done();
+	}
+	def shr_m_cl(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m_cl("shr", a, OP_REX);
+		shx_m_cl(a, OP_REX, 5);
+		if (tracingEnabled) done();
+	}
 
-	def scasb() -> this { emitb(0xAE); }
+	def scasb() -> this {
+		if (tracingEnabled && tracing) tb.op("scasb");
+		emitb(0xAE);
+		if (tracingEnabled) done();
+	}
 
 	def set_r(cond: X86_64Cond, a: X86_64Gpr) -> this {
 		var sop = 0x90 + cond.index;
 		var rex = rex_r(a, REX_B);
 		if (a.regnum >= 4) rex |= REX_BYTE;
+		if (tracingEnabled && tracing) tb.c_r("set", cond, a, rex);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		emitbb_r(0x0f, sop, a, 0);
+		if (tracingEnabled) done();
 	}
 	def set_m(cond: X86_64Cond, a: X86_64Addr) -> this {
 		var sop = 0x90 + cond.index;
 		var rex = rex_m(a, REX_B);
+		if (tracingEnabled && tracing) tb.c_m("set", cond, a, rex);
 		if (rex != 0) emitb(REX_BYTE | rex);
 		emitbb_m(0x0f, sop, a, 0);
+		if (tracingEnabled) done();
 	}
 
-	def syscall() -> this { emitbb(0x0f, 0x05); }
-	def sysenter() -> this { emitbb(0x0f, 0x34); }
-	def sysexit() -> this { emitbb(0x0f, 0x35); }
+	def syscall() -> this {
+		if (tracingEnabled && tracing) tb.op("syscall");
+		emitbb(0x0f, 0x05);
+		if (tracingEnabled) done();
+	}
+	def sysenter() -> this {
+		if (tracingEnabled && tracing) tb.op("sysenter");
+		emitbb(0x0f, 0x34);
+		if (tracingEnabled) done();
+	}
+	def sysexit() -> this {
+		if (tracingEnabled && tracing) tb.op("sysexit");
+		emitbb(0x0f, 0x35);
+		if (tracingEnabled) done();
+	}
 
 	def test_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("test", a, b, OP_REX);
 		emit_rex_b_r_r(a, b, OP_REX, 0x85);
+		if (tracingEnabled) done();
 	}
 	def test_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("test", a, b, OP_REX);
 		emit_rex_b_r_m(a, b, OP_REX, 0x85);
+		if (tracingEnabled) done();
 	}
 	def test_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("test", a, b, OP_REX);
 		emit_rex_b_m_r(a, b, OP_REX, 0x85);
+		if (tracingEnabled) done();
 	}
 	def test_r_i(a: X86_64Gpr, i: int) -> this {
+		if (tracingEnabled && tracing) tb.r_i("test", a, i, OP_REX);
 		if (a == X86_64Regs.RAX) {
 			if (OP_REX != 0) emitb(REX_BYTE | OP_REX);
-			return emitbd(0xA9, i);
+			emitbd(0xA9, i);
+			if (tracingEnabled) done();
+			return;
 		}
 		emit_rex_b_r_x(a, OP_REX, 0xF7, 0);
 		emitd(i);
+		if (tracingEnabled) done();
 	}
 	def test_m_i(a: X86_64Addr, i: int) -> this {
+		if (tracingEnabled && tracing) tb.m_i("test", a, i, OP_REX);
 		emit_rex_b_m_x(a, OP_REX, 0xF7, 0);
 		emitd(i);
+		if (tracingEnabled) done();
 	}
-	def wrfsbase(a: X86_64Gpr) -> this { emitb(0xF3); emit_rex_bb_r(a, OP_REX, 0x0F, 0xAE, 0b010); }
-	def wrgsbase(a: X86_64Gpr) -> this { emitb(0xF3); emit_rex_bb_r(a, OP_REX, 0x0F, 0xAE, 0b011); }
+	def wrfsbase(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("wrfsbase", a, OP_REX);
+		emitb(0xF3); emit_rex_bb_r(a, OP_REX, 0x0F, 0xAE, 0b010);
+		if (tracingEnabled) done();
+	}
+	def wrgsbase(a: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r("wrgsbase", a, OP_REX);
+		emitb(0xF3); emit_rex_bb_r(a, OP_REX, 0x0F, 0xAE, 0b011);
+		if (tracingEnabled) done();
+	}
 	def xchg_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("xchg", a, b, OP_REX);
 		if (a == X86_64Regs.RAX) {
 			if (b == X86_64Regs.RAX && OP_REX == 0) {
 				// XXX: working around nasm weirdness.
@@ -1120,481 +1884,721 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 			}
 			var rex = OP_REX | rex_r(b, REX_B);
 			if (rex != 0) emitb(REX_BYTE | rex);
-			return emitb(0x90 + b.low3);
+			emitb(0x90 + b.low3);
+			if (tracingEnabled) done();
+			return;
 		}
 		if (b == X86_64Regs.RAX) {
 			var rex = OP_REX | rex_r(a, REX_B);
 			if (rex != 0) emitb(REX_BYTE | rex);
-			return emitb(0x90 + a.low3);
+			emitb(0x90 + a.low3);
+			if (tracingEnabled) done();
+			return;
 		}
 		emit_rex_b_r_r(b, a, OP_REX, 0x87);
+		if (tracingEnabled) done();
 	}
 
 	def xchgb_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("xchgb", a, b, OP_REX);
 		var rex = if(b.regnum > 3, REX_BYTE);
 		emit_rex_b_m_r(a, b, rex, 0x86);
+		if (tracingEnabled) done();
 	}
 	def xchgw_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("xchgw", a, b, OP_REX);
 		emitb(PREFIX_W);
 		emit_rex_b_m_r(a, b, NO_REX, 0x87);
+		if (tracingEnabled) done();
 	}
 	def xchgq_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("xchgq", a, b, OP_REX);
 		emit_rex_b_m_r(a, b, REX_W, 0x87);
+		if (tracingEnabled) done();
 	}
 	def xchgd_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("xchgd", a, b, OP_REX);
 		emit_rex_b_m_r(a, b, NO_REX, 0x87);
+		if (tracingEnabled) done();
 	}
 	def xchg_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("xchg", a, b, OP_REX);
 		emit_rex_b_m_r(a, b, OP_REX, 0x87);
+		if (tracingEnabled) done();
 	}	
-	
 	def xaddb_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("xaddb", a, b, OP_REX);
 		var rex = if(b.regnum > 3, REX_BYTE);
 		emit_rex_bb_r_m(b, a, rex, 0x0F, 0xC0);
+		if (tracingEnabled) done();
 	}
 	def xaddw_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("xaddw", a, b, OP_REX);
 		emitb(PREFIX_W);
 		emit_rex_bb_r_m(b, a, NO_REX, 0x0F, 0xC1);
+		if (tracingEnabled) done();
 	}
 	def xadd_r_r(a: X86_64Gpr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.r_r("xadd", a, b, OP_REX);
 		emit_rex_bb_r_r(b, a, OP_REX, 0x0F, 0xC1);
+		if (tracingEnabled) done();
 	}
 	def xadd_m_r(a: X86_64Addr, b: X86_64Gpr) -> this {
+		if (tracingEnabled && tracing) tb.m_r("xadd", a, b, OP_REX);
 		emit_rex_bb_r_m(b, a, OP_REX, 0x0F, 0xC1);
+		if (tracingEnabled) done();
 	}
 
 	// SSE arithmetic
 	// XXX: factor SSE arithmetic further
 	def paddq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("paddq", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xD4);
+		if (tracingEnabled) done();
 	}
 	def paddd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("paddd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xFE);
+		if (tracingEnabled) done();
 	}
 	def paddw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("paddw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xFD);
+		if (tracingEnabled) done();
 	}
 	def paddb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("paddb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xFC);
+		if (tracingEnabled) done();
 	}
 	def paddsb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("paddsb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xEC);
+		if (tracingEnabled) done();
 	}
 	def paddusb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("paddusb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xDC);
+		if (tracingEnabled) done();
 	}
 	def paddsw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("paddsw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xED);
+		if (tracingEnabled) done();
 	}
 	def paddusw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("paddusw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xDD);
+		if (tracingEnabled) done();
 	}
 	def pmaddubsw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmaddubsw", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x04);
+		if (tracingEnabled) done();
 	}
 	def pmaddwd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmaddwd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xF5);
+		if (tracingEnabled) done();
 	}
 	def sqrtps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("sqrtps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x51);
+		if (tracingEnabled) done();
 	}
 	def sqrtpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("sqrtpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x51);
+		if (tracingEnabled) done();
 	}
 
 	def addss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("addss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x58);
+		if (tracingEnabled) done();
 	}
 	def addss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("addss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x58);
+		if (tracingEnabled) done();
 	}
 	def addsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("addsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x58);
+		if (tracingEnabled) done();
 	}
 	def addsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("addsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x58);
+		if (tracingEnabled) done();
 	}
 	def addps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("addps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x58);
+		if (tracingEnabled) done();
 	}
 	def addpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("addpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x58);
+		if (tracingEnabled) done();
 	}
 
 	def subss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("subss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5C);
+		if (tracingEnabled) done();
 	}
 	def subss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("subss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5C);
+		if (tracingEnabled) done();
 	}
 	def subsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("subsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5C);
+		if (tracingEnabled) done();
 	}
 	def subsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("subsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5C);
+		if (tracingEnabled) done();
 	}
 	def psubb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psubb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xF8);
+		if (tracingEnabled) done();
 	}
 	def psubw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psubw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xF9);
+		if (tracingEnabled) done();
 	}
 	def psubd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psubd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xFA);
+		if (tracingEnabled) done();
 	}
 	def psubq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psubq", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xFB);
+		if (tracingEnabled) done();
 	}
 	def psubsb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psubsb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE8);
+		if (tracingEnabled) done();
 	}
 	def psubusb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psubusb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xD8);
+		if (tracingEnabled) done();
 	}
 	def psubsw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psubsw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE9);
+		if (tracingEnabled) done();
 	}
 	def psubusw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psubusw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xD9);
+		if (tracingEnabled) done();
 	}
 	def subps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("subps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5C);
+		if (tracingEnabled) done();
 	}
 	def subpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("subpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5C);
+		if (tracingEnabled) done();
 	}
 
 	def mulss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("mulss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x59);
+		if (tracingEnabled) done();
 	}
 	def mulss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("mulss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x59);
+		if (tracingEnabled) done();
 	}
 	def mulsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("mulsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x59);
+		if (tracingEnabled) done();
 	}
 	def mulsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("mulsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x59);
+		if (tracingEnabled) done();
 	}
 
 	def pmuldq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmuldq", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x28);
+		if (tracingEnabled) done();
 	}
 	def pmuludq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmuludq", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xF4);
+		if (tracingEnabled) done();
 	}
 	def pmulld_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmulld", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x40);
+		if (tracingEnabled) done();
 	}
 	def pmullw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmullw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xD5);
+		if (tracingEnabled) done();
 	}
 	def pmulhw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmulhw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE5);
+		if (tracingEnabled) done();
 	}
 	def pmulhuw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmulhuw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE4);
+		if (tracingEnabled) done();
 	}
 	def pmulhrsw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmulhrsw", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x0B);
+		if (tracingEnabled) done();
 	}
 
 	def mulps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("mulps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x59);
+		if (tracingEnabled) done();
 	}
 	def mulpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("mulpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x59);
+		if (tracingEnabled) done();
 	}
 	def pclmulqdq_s_s_imm(a: X86_64Xmmr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_s_i("pclmulqdq", a, b, imm);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x0B);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 
 	def divss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("divss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5E);
+		if (tracingEnabled) done();
 	}
 	def divss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("divss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5E);
+		if (tracingEnabled) done();
 	}
 	def divsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("divsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5E);
+		if (tracingEnabled) done();
 	}
 	def divsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("divsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5E);
+		if (tracingEnabled) done();
 	}
 	def divps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("divps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5E);
+		if (tracingEnabled) done();
 	}
 	def divpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("divpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5E);
+		if (tracingEnabled) done();
 	}
 	def sqrtss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("sqrtss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x51);
+		if (tracingEnabled) done();
 	}
 	def sqrtss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("sqrtss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x51);
+		if (tracingEnabled) done();
 	}
 	def sqrtsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("sqrtsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x51);
+		if (tracingEnabled) done();
 	}
 	def sqrtsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("sqrtsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x51);
+		if (tracingEnabled) done();
 	}
 	def maxss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("maxss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5F);
+		if (tracingEnabled) done();
 	}
 	def maxss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("maxss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5F);
+		if (tracingEnabled) done();
 	}
 	def maxsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("maxsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5F);
+		if (tracingEnabled) done();
 	}
 	def maxsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("maxsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5F);
+		if (tracingEnabled) done();
 	}
 	def maxps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("maxps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5F);
+		if (tracingEnabled) done();
 	}
 	def maxpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("maxpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5F);
+		if (tracingEnabled) done();
 	}
 	def minss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("minss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5D);
+		if (tracingEnabled) done();
 	}
 	def minss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("minss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5D);
+		if (tracingEnabled) done();
 	}
 	def minsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("minsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5D);
+		if (tracingEnabled) done();
 	}
 	def minsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("minsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5D);
+		if (tracingEnabled) done();
 	}
 	def minps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("minps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5D);
+		if (tracingEnabled) done();
 	}
 	def minpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("minpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5D);
+		if (tracingEnabled) done();
 	}
 	def pminsb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pminsb", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x38);
+		if (tracingEnabled) done();
 	}
 	def pminsb_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pminsb", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x38);
+		if (tracingEnabled) done();
 	}
 	def pminub_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pminub", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xDA);
+		if (tracingEnabled) done();
 	}
 	def pminub_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pminub", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xDA);
+		if (tracingEnabled) done();
 	}
 	def pminsw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pminsw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xEA);
+		if (tracingEnabled) done();
 	}
 	def pminsw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pminsw", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xEA);
+		if (tracingEnabled) done();
 	}
 	def pminuw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pminuw", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x3A);
+		if (tracingEnabled) done();
 	}
 	def pminuw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pminuw", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x3A);
+		if (tracingEnabled) done();
 	}
 	def pminsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pminsd", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x39);
+		if (tracingEnabled) done();
 	}
 	def pminsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pminsd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x39);
+		if (tracingEnabled) done();
 	}
 	def pminud_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pminud", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x3B);
+		if (tracingEnabled) done();
 	}
 	def pminud_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pminud", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x3B);
+		if (tracingEnabled) done();
 	}
 	def pmaxsb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmaxsb", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x3C);
+		if (tracingEnabled) done();
 	}
 	def pmaxsb_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmaxsb", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x3C);
+		if (tracingEnabled) done();
 	}
 	def pmaxsw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmaxsw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xEE);
+		if (tracingEnabled) done();
 	}
 	def pmaxsw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmaxsw", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xEE);
+		if (tracingEnabled) done();
 	}
 	def pmaxsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmaxsd", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x3D);
+		if (tracingEnabled) done();
 	}
 	def pmaxsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmaxsd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x3D);
+		if (tracingEnabled) done();
 	}
 	def pmaxub_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmaxub", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xDE);
+		if (tracingEnabled) done();
 	}
 	def pmaxub_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmaxub", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xDE);
+		if (tracingEnabled) done();
 	}
 	def pmaxuw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmaxuw", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x3E);
+		if (tracingEnabled) done();
 	}
 	def pmaxuw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmaxuw", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x3E);
+		if (tracingEnabled) done();
 	}
 	def pmaxud_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pmaxud", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x3F);
+		if (tracingEnabled) done();
 	}
 	def pmaxud_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pmaxud", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x3F);
+		if (tracingEnabled) done();
 	}
 	def pavgb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pavgb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE0);
+		if (tracingEnabled) done();
 	}
 	def pavgb_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pavgb", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xE0);
+		if (tracingEnabled) done();
 	}
 	def pavgw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pavgw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE3);
+		if (tracingEnabled) done();
 	}
 	def pavgw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pavgw", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xE3);
+		if (tracingEnabled) done();
 	}
 	def pabsb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pabsb", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x1C);
+		if (tracingEnabled) done();
 	}
 	def pabsb_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pabsb", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x1C);
+		if (tracingEnabled) done();
 	}
 	def pabsw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pabsw", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x1D);
+		if (tracingEnabled) done();
 	}
 	def pabsw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pabsw", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x1D);
+		if (tracingEnabled) done();
 	}
 	def pabsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pabsd", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x1E);
+		if (tracingEnabled) done();
 	}
 	def pabsd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pabsd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x1E);
+		if (tracingEnabled) done();
 	}
 
 	// x87 FPU instructions
 	def faddd(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("faddd", a, OP_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xD8, 0);
+		if (tracingEnabled) done();
 	}
 	def fldd(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("fldd", a, OP_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xD9, 0);
+		if (tracingEnabled) done();
 	}
 	def fldq(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("fldq", a, OP_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xDD, 0);
+		if (tracingEnabled) done();
 	}
 	def fildq(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("fildq", a, OP_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xDF, 5);
+		if (tracingEnabled) done();
 	}
 	def fstpd(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("fstpd", a, OP_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xD9, 3);
+		if (tracingEnabled) done();
 	}
 	def fstpq(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("fstpq", a, OP_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xDD, 3);
+		if (tracingEnabled) done();
 	}
 	def fisttpq(a: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.m("fisttpq", a, OP_REX);
 		emit_rex_b_m_x(a, NO_REX, 0xDD, 1);
+		if (tracingEnabled) done();
 	}
 	def fs_prefix() -> this {
 		emitb(0x64);
@@ -1604,297 +2608,447 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 	}
 
 	def ucomisd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("ucomisd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x2E);
+		if (tracingEnabled) done();
 	}
 	def ucomisd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("ucomisd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x2E);
+		if (tracingEnabled) done();
 	}
 	def ucomiss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("ucomiss", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x2E);
+		if (tracingEnabled) done();
 	}
 	def ucomiss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("ucomiss", a, b, OP_REX);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x2E);
+		if (tracingEnabled) done();
 	}
 
 	def roundsd_s_s(a: X86_64Xmmr, b: X86_64Xmmr, c: X86_64Rounding) -> this {
+		if (tracingEnabled && tracing) tb.s_s("roundsd", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x3A, 0x0B);
 		emitb(c.value);
+		if (tracingEnabled) done();
 	}
 	def roundsd_s_m(a: X86_64Xmmr, b: X86_64Addr, c: X86_64Rounding) -> this {
+		if (tracingEnabled && tracing) tb.s_m("roundsd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x3A, 0x0B);
 		emitb(c.value);
+		if (tracingEnabled) done();
 	}
 	def roundss_s_s(a: X86_64Xmmr, b: X86_64Xmmr, c: X86_64Rounding) -> this {
+		if (tracingEnabled && tracing) tb.s_s("roundss", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x3A, 0x0A);
 		emitb(c.value);
+		if (tracingEnabled) done();
 	}
 	def roundss_s_m(a: X86_64Xmmr, b: X86_64Addr, c: X86_64Rounding) -> this {
+		if (tracingEnabled && tracing) tb.s_m("roundss", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x3A, 0x0A);
 		emitb(c.value);
+		if (tracingEnabled) done();
 	}
 	def roundps_s_s(a: X86_64Xmmr, b: X86_64Xmmr, c: X86_64Rounding) -> this {
+		if (tracingEnabled && tracing) tb.s_s("roundps", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x3A, 0x08);
 		emitb(c.value);
+		if (tracingEnabled) done();
 	}
 	def roundps_s_m(a: X86_64Xmmr, b: X86_64Addr, c: X86_64Rounding) -> this {
+		if (tracingEnabled && tracing) tb.s_m("roundps", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x3A, 0x08);
 		emitb(c.value);
+		if (tracingEnabled) done();
 	}
 	def roundpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr, c: X86_64Rounding) -> this {
+		if (tracingEnabled && tracing) tb.s_s("roundpd", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x3A, 0x09);
 		emitb(c.value);
+		if (tracingEnabled) done();
 	}
 	def roundpd_s_m(a: X86_64Xmmr, b: X86_64Addr, c: X86_64Rounding) -> this {
+		if (tracingEnabled && tracing) tb.s_m("roundpd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x3A, 0x09);
 		emitb(c.value);
+		if (tracingEnabled) done();
 	}
 
 	def andps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("andps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x54);
+		if (tracingEnabled) done();
 	}
 	def andps_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("andps", a, b, OP_REX);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x54);
+		if (tracingEnabled) done();
 	}
 	def andpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("andpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x54);
+		if (tracingEnabled) done();
 	}
 	def andpd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("andpd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x54);
+		if (tracingEnabled) done();
 	}
 	def andnps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("andnps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x55);
+		if (tracingEnabled) done();
 	}
 	def andnpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("andnpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x55);
+		if (tracingEnabled) done();
 	}
 	def pand_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pand", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xDB);
+		if (tracingEnabled) done();
 	}
 	def orps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("orps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x56);
+		if (tracingEnabled) done();
 	}
 	def orpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("orpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x56);
+		if (tracingEnabled) done();
 	}
 	def xorps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("xorps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x57);
+		if (tracingEnabled) done();
 	}
 	def xorps_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("xorps", a, b, OP_REX);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x57);
+		if (tracingEnabled) done();
 	}
 	def xorpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("xorpd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x57);
+		if (tracingEnabled) done();
 	}
 	def xorpd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("xorpd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x57);
+		if (tracingEnabled) done();
 	}
 	def pxor_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pxor", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xEF);
+		if (tracingEnabled) done();
 	}
 
 	def pcmpeqb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pcmpeqb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x74);
+		if (tracingEnabled) done();
 	}
 	def pcmpeqb_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pcmpeqb", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x74);
+		if (tracingEnabled) done();
 	}
 	def pcmpeqw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pcmpeqw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x75);
+		if (tracingEnabled) done();
 	}
 	def pcmpeqw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pcmpeqw", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x75);
+		if (tracingEnabled) done();
 	}
 	def pcmpeqd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pcmpeqd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x76);
+		if (tracingEnabled) done();
 	}
 	def pcmpeqd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pcmpeqd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x76);
+		if (tracingEnabled) done();
 	}
 	def pcmpeqq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pcmpeqq", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x29);
+		if (tracingEnabled) done();
 	}
 	def pcmpeqq_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pcmpeqq", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x29);
+		if (tracingEnabled) done();
 	}
 	def pcmpgtb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pcmpgtb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x64);
+		if (tracingEnabled) done();
 	}
 	def pcmpgtb_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pcmpgtb", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x64);
+		if (tracingEnabled) done();
 	}
 	def pcmpgtw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pcmpgtw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x65);
+		if (tracingEnabled) done();
 	}
 	def pcmpgtw_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pcmpgtw", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x65);
+		if (tracingEnabled) done();
 	}
 	def pcmpgtd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pcmpgtd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x66);
+		if (tracingEnabled) done();
 	}
 	def pcmpgtd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pcmpgtd", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x66);
+		if (tracingEnabled) done();
 	}
 	def pcmpgtq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pcmpgtq", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x37);
+		if (tracingEnabled) done();
 	}
 	def pcmpgtq_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("pcmpgtq", a, b, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_m(a, b, NO_REX, 0x0F, 0x38, 0x37);
+		if (tracingEnabled) done();
 	}
 
 	def cmpss_s_s(cmp: SSECmp, a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpss", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xC2);
 		emitb(cmp.index);
+		if (tracingEnabled) done();
 	}
 	def cmpss_s_m(cmp: SSECmp, a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("cmpss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xC2);
 		emitb(cmp.index);
+		if (tracingEnabled) done();
 	}
 	def cmpsd_s_s(cmp: SSECmp, a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpsd", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xC2);
 		emitb(cmp.index);
+		if (tracingEnabled) done();
 	}
 	def cmpsd_s_m(cmp: SSECmp, a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("cmpsd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0xC2);
 		emitb(cmp.index);
+		if (tracingEnabled) done();
 	}
 	def cmpps_s_s(cmp: SSECmp, a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xC2);
 		emitb(cmp.index);
+		if (tracingEnabled) done();
 	}
 	def cmppd_s_s(cmp: SSECmp, a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmppd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xC2);
 		emitb(cmp.index);
+		if (tracingEnabled) done();
 	}
 	def cmpunordps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpunordps", a, b);
 		cmpps_s_s(SSECmps.UNORD, a, b);
+		if (tracingEnabled) done();
 	}
 	def cmpunordpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpunordpd", a, b);
 		cmppd_s_s(SSECmps.UNORD, a, b);
+		if (tracingEnabled) done();
 	}	
 	def cmpeqps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpeqps", a, b);
 		cmpps_s_s(SSECmps.EQ, a, b);
+		if (tracingEnabled) done();
 	}
 	def cmpeqpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpeqpd", a, b);
 		cmppd_s_s(SSECmps.EQ, a, b);
+		if (tracingEnabled) done();
 	}
 	def cmpneqps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpneqps", a, b);
 		cmpps_s_s(SSECmps.NEQ, a, b);
+		if (tracingEnabled) done();
 	}
 	def cmpneqpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpneqpd", a, b);
 		cmppd_s_s(SSECmps.NEQ, a, b);
+		if (tracingEnabled) done();
 	}
 	def cmpltps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpltps", a, b);
 		cmpps_s_s(SSECmps.LT, a, b);
+		if (tracingEnabled) done();
 	}
 	def cmpltpd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpltpd", a, b);
 		cmppd_s_s(SSECmps.LT, a, b);
+		if (tracingEnabled) done();
 	}
 	def cmpleps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmpleps", a, b);
 		cmpps_s_s(SSECmps.LE, a, b);
+		if (tracingEnabled) done();
 	}
 	def cmplepd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cmplepd", a, b);
 		cmppd_s_s(SSECmps.LE, a, b);
+		if (tracingEnabled) done();
 	}
 
 	def ptest_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("ptest", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x17);
+		if (tracingEnabled) done();
 	}
 
 	def psllw_i(a: X86_64Xmmr, imm: u5) -> this {
+		if (tracingEnabled && tracing) tb.s_i("psllw", a, imm);
 		psl_i(a, imm, 0x71, 6);
+		if (tracingEnabled) done();
 	}
 	def psrld_i(a: X86_64Xmmr, imm: u5) -> this {
+		if (tracingEnabled && tracing) tb.s_i("psrld", a, imm);
 		psl_i(a, imm, 0x72, 2);
+		if (tracingEnabled) done();
 	}
 	def psrlq_i(a: X86_64Xmmr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.s_i("psrlq", a, imm);
 		psl_i(a, imm, 0x73, 2);
+		if (tracingEnabled) done();
 	}
 	def pslld_i(a: X86_64Xmmr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.s_i("pslld", a, imm);
 		psl_i(a, imm, 0x72, 6);
+		if (tracingEnabled) done();
 	}
 	def psllq_i(a: X86_64Xmmr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.s_i("psllq", a, imm);
 		psl_i(a, imm, 0x73, 6);
+		if (tracingEnabled) done();
 	}
 	def psllw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psllw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xF1);
+		if (tracingEnabled) done();
 	}
 	def pslld_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pslld", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xF2);
+		if (tracingEnabled) done();
 	}
 	def psllq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psllq", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xF3);
+		if (tracingEnabled) done();
 	}
 	def psrad_i(a: X86_64Xmmr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.s_i("psrad", a, imm);
 		psl_i(a, imm, 0x72, 4);
+		if (tracingEnabled) done();
 	}
 	def psraw_i(a: X86_64Xmmr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.s_i("psraw", a, imm);
 		psl_i(a, imm, 0x71, 4);
+		if (tracingEnabled) done();
 	}
 	def psraw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psraw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE1);
+		if (tracingEnabled) done();
 	}
 	def psrad_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psrad", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE2);
+		if (tracingEnabled) done();
 	}
 	def psrlw_i(a: X86_64Xmmr, imm: u6) -> this {
+		if (tracingEnabled && tracing) tb.s_i("psrlw", a, imm);
 		psl_i(a, imm, 0x71, 2);
+		if (tracingEnabled) done();
 	}
 	def psrlw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psrlw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xD1);
+		if (tracingEnabled) done();
 	}
 	def psrld_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psrld", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xD2);
+		if (tracingEnabled) done();
 	}
 	def psrlq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("psrlq", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xD3);
+		if (tracingEnabled) done();
 	}
 
 
@@ -1907,213 +3061,311 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 	}
 
 	def cvtsd2si_r_s(a: X86_64Gpr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.r_s("cvtsd2si", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0x2D);
+		if (tracingEnabled) done();
 	}
 	def cvtsd2si_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("cvtsd2si", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0x2D);
+		if (tracingEnabled) done();
 	}
 
 	def cvtss2si_r_s(a: X86_64Gpr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.r_s("cvtss2si", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0x2D);
+		if (tracingEnabled) done();
 	}
 	def cvtss2si_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("cvtss2si", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0x2D);
+		if (tracingEnabled) done();
 	}
 
 	def cvtsi2sd_s_r(a: X86_64Xmmr, b: X86_64Reg) -> this {
+		if (tracingEnabled && tracing) tb.s_reg("cvtsi2sd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0x2A);
+		if (tracingEnabled) done();
 	}
 	def cvtsi2sd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("cvtsi2sd", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0x2A);
+		if (tracingEnabled) done();
 	}
 
 	def cvtsi2ss_s_r(a: X86_64Xmmr, b: X86_64Reg) -> this {
+		if (tracingEnabled && tracing) tb.s_reg("cvtsi2ss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, OP_REX, 0x0F, 0x2A);
+		if (tracingEnabled) done();
 	}
 	def cvtsi2ss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("cvtsi2ss", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, OP_REX, 0x0F, 0x2A);
+		if (tracingEnabled) done();
 	}
 
 	def cvtss2sd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cvtss2sd", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5A);
+		if (tracingEnabled) done();
 	}
 	def cvtss2sd_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("cvtss2sd", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5A);
+		if (tracingEnabled) done();
 	}
 	def cvtsd2ss_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cvtsd2ss", a, b);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5A);
+		if (tracingEnabled) done();
 	}
 	def cvtsd2ss_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("cvtsd2ss", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5A);
+		if (tracingEnabled) done();
 	}
 	def cvttss2si_r_s(a: X86_64Gpr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.r_s("cvttss2si", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, 0x2C);
+		if (tracingEnabled) done();
 	}
 	def cvttss2si_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("cvttss2si", a, b, OP_REX);
 		emitb(0xF3);
 		emit_rex_bb_r_m(a, b, REX_W, 0x0F, 0x2C);
+		if (tracingEnabled) done();
 	}
 	def cvttsd2si_r_s(a: X86_64Gpr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.r_s("cvttsd2si", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, REX_W, 0x0F, 0x2C);
+		if (tracingEnabled) done();
 	}
 	def cvttsd2si_r_m(a: X86_64Gpr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.r_m("cvttsd2si", a, b, OP_REX);
 		emitb(0xF2);
 		emit_rex_bb_r_m(a, b, REX_W, 0x0F, 0x2C);
+		if (tracingEnabled) done();
 	}
 	def cvtdq2ps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cvtdq2ps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5B);
+		if (tracingEnabled) done();
 	}
 	def cvtdq2ps_s_m(a: X86_64Xmmr, b: X86_64Addr) -> this {
+		if (tracingEnabled && tracing) tb.s_m("cvtdq2ps", a, b, OP_REX);
 		emit_rex_bb_r_m(a, b, NO_REX, 0x0F, 0x5B);
+		if (tracingEnabled) done();
 	}
 	def cvtdq2pd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cvtdq2pd", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE6);
+		if (tracingEnabled) done();
 	}
 	def cvtps2pd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cvtps2pd", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5A);
+		if (tracingEnabled) done();
 	}
 	def cvtpd2ps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cvtpd2ps", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5A);
+		if (tracingEnabled) done();
 	}
 	def cvttps2dq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cvttps2dq", a, b);
 		emitb(0xF3);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x5B);
+		if (tracingEnabled) done();
 	}
 	def cvttpd2dq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("cvttpd2dq", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xE6);
+		if (tracingEnabled) done();
 	}
 	def unpcklps_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("unpcklps", a, b);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x14);
+		if (tracingEnabled) done();
 	}
 	def punpckhwd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("punpckhwd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x69);
+		if (tracingEnabled) done();
 	}
 	def punpcklwd_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("punpcklwd", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x61);
+		if (tracingEnabled) done();
 	}
 	def punpckhbw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("punpckhbw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x68);
+		if (tracingEnabled) done();
 	}
 	def punpckhdq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("punpckhdq", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x6A);
+		if (tracingEnabled) done();
 	}
 	def punpcklbw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("punpcklbw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x60);
+		if (tracingEnabled) done();
 	}
 	def punpcklqdq_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("punpcklqdq", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x6C);
+		if (tracingEnabled) done();
 	}
 	def shufps_s_s_i(a: X86_64Xmmr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_s_i("shufps", a, b, imm);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xC6);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pshufd_s_s_i(a: X86_64Xmmr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_s_i("pshufd", a, b, imm);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x70);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pshufb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("pshufb", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x00);
+		if (tracingEnabled) done();
 	}
 	def pshuflw_s_s_i(a: X86_64Xmmr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_s_i("pshuflw", a, b, imm);
 		emitb(0xF2);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x70);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def packuswb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("packuswb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x67);
+		if (tracingEnabled) done();
 	}
 	def packsswb_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("packsswb", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x63);
+		if (tracingEnabled) done();
 	}
 	def packssdw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("packssdw", a, b);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0x6B);
+		if (tracingEnabled) done();
 	}
 	def packusdw_s_s(a: X86_64Xmmr, b: X86_64Xmmr) -> this {
+		if (tracingEnabled && tracing) tb.s_s("packusdw", a, b);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x38, 0x2B);
+		if (tracingEnabled) done();
 	}
 	def pblendw_s_s_i(a: X86_64Xmmr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_s_i("pblendw", a, b, imm);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x3A, 0x0E);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pinsrb_s_r_i(a: X86_64Xmmr, b: X86_64Gpr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_r_i("pinsrb", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x3A, 0x20);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pinsrw_s_r_i(a: X86_64Xmmr, b: X86_64Gpr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_r_i("pinsrw", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xC4);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pinsrd_s_r_i(a: X86_64Xmmr, b: X86_64Gpr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_r_i("pinsrd", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x3A, 0x22);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pinsrq_s_r_i(a: X86_64Xmmr, b: X86_64Gpr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_r_i("pinsrq", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, REX_W, 0x0F, 0x3A, 0x22);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def insertps_s_s_i(a: X86_64Xmmr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.s_s_i("insertps", a, b, imm);
 		emitb(0x66);
 		emit_rex_bbb_r_r(a, b, NO_REX, 0x0F, 0x3A, 0x21);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pextrb_r_s_i(a: X86_64Gpr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.r_s_i("pextrb", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_r2(a, b, NO_REX, 0x0F, 0x3A, 0x14);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pextrw_r_s_i(a: X86_64Gpr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.r_s_i("pextrw", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bb_r_r(a, b, NO_REX, 0x0F, 0xC5);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pextrd_r_s_i(a: X86_64Gpr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.r_s_i("pextrd", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_r2(a, b, NO_REX, 0x0F, 0x3A, 0x16);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pextrq_r_s_i(a: X86_64Gpr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.r_s_i("pextrq", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_r_r2(a, b, REX_W, 0x0F, 0x3A, 0x16);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 	def pextrq_m_s_i(a: X86_64Addr, b: X86_64Xmmr, imm: u8) -> this {
+		if (tracingEnabled && tracing) tb.m_s_i("pextrq", a, b, imm, OP_REX);
 		emitb(0x66);
 		emit_rex_bbb_m_r(a, b, REX_W, 0x0F, 0x3A, 0x16);
 		emitb(imm);
+		if (tracingEnabled) done();
 	}
 
 	//---- Utilities
@@ -2131,16 +3383,23 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 		return rex_r(a.index, REX_X) | rex_r(a.base, b);
 	}
 
-	private def emitop2_r_r(a: X86_64Reg, b: X86_64Reg, rex: byte, op2code: byte) {
+	private def emitop2_r_r(a: X86_64Gpr, b: X86_64Gpr, rex: byte, op2code: byte) {
+		if (tracingEnabled && tracing) tb.r_r(X86_64OP_name(op2code), a, b, rex);
 		emit_rex_b_r_r(a, b, rex, X86_64OP_rm_r[op2code]);
+		if (tracingEnabled) done();
 	}
 	private def emitop2_r_m(a: X86_64Gpr, b: X86_64Addr, rex: byte, op2code: byte) {
+		if (tracingEnabled && tracing) tb.r_m(X86_64OP_name(op2code), a, b, rex);
 		emit_rex_b_r_m(a, b, rex, X86_64OP_r_rm[op2code]);
+		if (tracingEnabled) done();
 	}
 	private def emitop2_m_r(a: X86_64Addr, b: X86_64Gpr, rex: byte, op2code: byte) {
+		if (tracingEnabled && tracing) tb.m_r(X86_64OP_name(op2code), a, b, rex);
 		emit_rex_b_m_r(a, b, rex, X86_64OP_rm_r[op2code]);
+		if (tracingEnabled) done();
 	}
 	private def emitop2_r_i(a: X86_64Gpr, i: int, rex: byte, op2code: byte) {
+		if (tracingEnabled && tracing) tb.r_i(X86_64OP_name(op2code), a, i, rex);
 		if (i < -128 || i > 127) {
 			if (a == X86_64Regs.RAX) {
 				if (rex != 0) emitb(REX_BYTE | rex);
@@ -2153,8 +3412,10 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 			emit_rex_b_r_x(a, rex, 0x83, op2code);
 			emitb(i);
 		}
+		if (tracingEnabled) done();
 	}
 	private def emitop2_m_i(a: X86_64Addr, i: int, rex: byte, op2code: byte) {
+		if (tracingEnabled && tracing) tb.m_i(X86_64OP_name(op2code), a, i, rex);
 		if (i < -128 || i > 127) {
 			emit_rex_b_m_x(a, rex, 0x81, op2code);
 			emitd(i);
@@ -2162,6 +3423,7 @@ class X86_64Assembler(w: DataWriter, OP_REX: byte) {
 			emit_rex_b_m_x(a, rex, 0x83, op2code);
 			emitb(i);
 		}
+		if (tracingEnabled) done();
 	}
 
 	private def shx_r_i(a: X86_64Gpr, rex: byte, imm: u6, op: byte) -> this {
