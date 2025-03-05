@@ -1,12 +1,13 @@
 #!/bin/bash
-. $(command dirname ${BASH_SOURCE[0]})/funcs.bash
-BS=$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)
+HERE=$(command dirname ${BASH_SOURCE[0]})
+. $HERE/funcs.bash
+BS=$(cd $HERE && pwd)
 VIRGIL=$(cd $BS/../../ && pwd)
 
 TMP=$1
 BSTMP=$1/bootstrap
 
-if [ -d "$TMP" ]; then
+if [ -d $TMP ]; then
 	mkdir -p $BSTMP
 else
 	echo "Usage: bootstrap <TMP>"
@@ -17,4 +18,4 @@ cp $VIRGIL/rt/jvm/bin/* $BSTMP
 cat $VIRGIL/aeneas/src/*/*.v3 > $BSTMP/Aeneas.v3
 
 echo "-target=jar -output=$BSTMP -jvm.rt-path=$BSTMP $BSTMP/Aeneas.v3" > $BS/args-large
-echo "$BSTMP/Aeneas.v3"
+echo $BSTMP/Aeneas.v3

@@ -1,12 +1,9 @@
 #!/bin/bash
-. $(command dirname ${BASH_SOURCE[0]})/funcs.bash
-SOURCE="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
-done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+SOURCE=${BASH_SOURCE[0]}
+HERE=$(command dirname $SOURCE)
+. $HERE/funcs.bash
+# set DIR to true directory containing this file
+follow_links $SOURCE
 
 if [ "$#" -gt 0 ]; then
     # first argument is (single) test target
