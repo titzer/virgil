@@ -1,5 +1,5 @@
 (defvar virgil-decls
-  '("class" "component" "def" "enum" "extends" "export" "fun" "in" "import" "layout" "new" "packing" "private" "struct" "super" "type" "var" )
+  '("class" "component" "def" "enum" "extends" "export" "fun" "in" "import" "layout" "new" "packing" "private" "struct" "super" "thread" "type" "var" )
   "Virgil declaration keywords.")
 
 (defvar virgil-stmts
@@ -7,7 +7,7 @@
   "Virgil statement keywords.")
 
 (defvar virgil-builtins
-  '("void" "int" "byte" "bool" "short" "long" "Array" "Ref" "ref" "Range" "true" "false" "this" "null" "string" "float" "double")
+  '("void" "int" "byte" "bool" "short" "long" "Array" "array" "Ref" "ref" "Range" "range" "true" "false" "this" "null" "string" "float" "double")
   "Virgil builtin types and values.")
 
 (defvar virgil-decls-regexp (regexp-opt virgil-decls 'words))

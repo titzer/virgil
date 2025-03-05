@@ -24,6 +24,7 @@ GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
 V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
+TEST_GC_WASM=${TEST_GC_WASM:=1}
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
 # it to character (c) mode
@@ -377,12 +378,9 @@ function execute_target_tests() {
 function execute_tests() {
     for target in $TEST_TARGETS; do
 	if [ "$target" = "v3i" ]; then
-            (execute_v3i_tests "v3i" "-ssa-int=false") || exit $?
-            (execute_v3i_tests "v3i-ra" "-ssa-int=false -ra -ma=false") || exit $?
-            (execute_v3i_tests "v3i-ra-ma" "-ssa-int=false -ra -ma=true") || exit $?
-            (execute_v3i_tests "v3i" "-ssa-int=true") || exit $?
-            (execute_v3i_tests "v3i-ra" "-ssa-int=true -ra -ma=false") || exit $?
-            (execute_v3i_tests "v3i-ra-ma" "-ssa-int=true -ra -ma=true") || exit $?
+            (execute_v3i_tests "v3i" "") || exit $?
+            (execute_v3i_tests "v3i-ra" "-ra -ma=false") || exit $?
+            (execute_v3i_tests "v3i-ra-ma" "-ra -ma=true") || exit $?
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             (compile_target_tests jvm -jvm.script=false) || exit $?
             (execute_target_tests jvm) || exit $?
@@ -446,8 +444,12 @@ function is_gc_target() {
 	return 0
     elif [ "$target" = "x86-64-linux" ]; then
 	return 0
-#TODO    elif [ "$target" = "wasm" ]; then
-#	return 0
+    elif [[ "$target" = "wasm" && "$TEST_GC_WASM" != 0 ]]; then
+        return 0
     fi
     return 1
+}
+
+function do_nothing() {
+    return 0;
 }

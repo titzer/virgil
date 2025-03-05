@@ -40,7 +40,7 @@ def defaultGetBitWidth(compiler: Compiler, prog: Program, t: Type) -> byte {
 }
 
 // Normalizes a program based on the results of reachability analysis.
-def TRANSFERRABLE_FACTS = (Fact.M_ABSTRACT | Fact.M_INLINE | Fact.M_OPERATOR | Fact.M_NEW | Fact.M_EMPTY | Fact.M_EQUALS);
+def TRANSFERRABLE_FACTS = (Fact.M_ABSTRACT | Fact.M_INLINE | Fact.M_ENUM_INIT | Fact.M_NEW | Fact.M_EMPTY | Fact.M_EQUALS);
 class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer) {
 	def liveClasses = Vector<RaClass>.new();
 	def context = SsaContext.new(ra.compiler, ra.prog);
@@ -120,7 +120,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			rc.oldType.render(buf);
 			var oldToken = V3.classDecl(rc.oldType).token;
 			var token = Token.new(oldToken.fileName, buf.toString(), oldToken.beginLine, oldToken.beginColumn);
-			var decl = VstComponent.new(false, null, token, null);
+			var decl = VstComponent.new(false, false, null, token, null);
 			rc.newIrType = V3Component_TypeCon.new(decl, ra.prog.typeCache).create(rc.oldType.nested);
 		}
 		for (ml in rc.methods) {
@@ -177,7 +177,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	}
 
 	def norm(t: Type) -> TypeNorm {
-		if (t.open()) return V3.fail1("is open %q", t.render);
+		if (t.open()) {
+			context.fail1("is open %q", t.render);
+			return null;
+		}
 		var tn = typeMap[t];
 		if (tn != null) return tn;
 		// not in the hashmap, build appropriately
@@ -225,17 +228,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			}
 			TUPLE => {
 				// flatten tuples
-				var vecT = Vector<Type>.new();
-				var vecO = Vector<int>.new();
-				var vecN = Vector<TypeNorm>.new();
-				for (p = t.nested; p != null; p = p.tail) {
-					var n = norm(p.head);
-					vecO.put(vecT.length);
-					vecN.put(n);
-					n.addTo(vecT);
-				}
-				var ta = vecT.extract();
-				tn = TupleNorm.new(t, Tuple.newType(Lists.fromArray(ta)), ta, vecN.extract(), vecO.extract());
+				var seq = NormFlattener.new(context, norm);
+				for (p = t.nested; p != null; p = p.tail) seq.addClosedType(p.head);
+				var ta = seq.result.extract();
+				tn = TupleNorm.new(t, Tuple.newType(Lists.fromArray(ta)), ta, seq.norms.extract(), seq.starts.extract());
 			}
 			VARIANT => {
 				// try flattening variants and data types
@@ -314,20 +310,23 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			if (rf == null) continue;
 			if (rc.inheritedField(rf)) continue;
 			if (rf.isConst()) continue;
-			if (rf.typeNorm == null && rf.fieldType != null) rf.typeNorm = norm(rf.fieldType);
+			var tn = rf.typeNorm;
+			if (tn == null && rf.fieldType != null) rf.typeNorm = tn = norm(rf.fieldType);
 			if (!rf.raFacts.RF_READ) continue;
 			if (receiver_array == null) receiver_array = [rc.oldType];
 			// add normalized field(s)
-			var startIndex = fields.length;
+			var startIndex = fields.length, facts = Facts.NONE;
+
+			if (tn != null && tn.size > 1) facts |= Fact.F_NORM;
+			if (rf.orig.facts.F_POINTED_AT) facts |= Fact.F_POINTED_AT;
+			else if (!rf.raFacts.RF_WRITTEN) facts |= (Fact.F_VALUE | Fact.O_FOLDABLE);
+
 			if (rf.fieldType == null) {
 				// add single monomorphic field to the vector
+				rf.orig.setFact(facts);
 				fields.put(IrSpec.new(rc.oldType, receiver_array, rf.orig));
 			} else {
 				// add normalized field(s) to the vector
-				var tn = rf.typeNorm;
-				var facts = if(tn.size > 1, Fact.F_NORM, Facts.NONE);
-				if (rf.orig.facts.F_POINTED_AT) facts |= Fact.F_POINTED_AT;
-				else if (!rf.raFacts.RF_WRITTEN) facts |= (Fact.F_VALUE | Fact.O_FOLDABLE);
 				for (i < tn.size) {
 					var ft = if(tn.sub == null, tn.newType, tn.sub[i]);
 					var nf = IrField.new(rc.oldType, ft);
@@ -340,12 +339,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		rc.liveFields = fields.extract();
 	}
-	private def normRecordAsArray(rc: RaClass, oldRecord: Record, array: Array<Val>) {
-	}
-	private def getClassAllocIr(vn: VariantNorm) -> IrMethod {
+	private def getClassAllocIr(rc: RaClass, vn: VariantNorm) -> IrMethod {
 		if (constructors[vn.oldType] != null) return constructors[vn.oldType];
 		var context = SsaContext.new(ra.compiler, ra.prog);
-		var meth = IrMethod.new(vn.oldType, null, Function.siga(vn.vecO, vn.newType));
+		var meth = IrMethod.new(vn.oldType, null, Function.siga(rc.origFieldTypes, vn.newType));
 
 		var params = Array<SsaParam>.new(meth.sig.paramTypes.length + 1);
 		var inputs = Array<SsaInstr>.new(meth.sig.paramTypes.length);
@@ -398,7 +395,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 
 			// Unboxed variants might require some type conversions; generate and run the constructor to do so.
 			// XXX: Cache constructor; we can't put the constructor in the first slot of rc.orig.methods, since multiple RaClasses could map to the same IrClass
-			var constructor = getClassAllocIr(vn);
+			var constructor = getClassAllocIr(rc, vn);
 			var r = variantInterp.invoke(Closure.new(Values.BOTTOM, IrSpec.new(vn.oldType, TypeUtil.NO_TYPES, constructor)), inputs.extract());
 			match (r) {
 				x: BoxVal => for (i < x.values.length) result[i] = x.values[i];
@@ -641,7 +638,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		if (ovfAlloc == null) {
 			var prog = context.prog;
 			var name = Arrays.concat(prog.name(), "$ovf");
-			var decl = VstComponent.new(false, null, Token.new("<generated>", name, 0, 0), null);
+			var decl = VstComponent.new(false, true, null, Token.new("<generated>", name, 0, 0), null);
 			var typeCon = V3Component_TypeCon.new(decl, prog.typeCache);
 			decl.memberMap = Strings.newMap();
 			var receiver = typeCon.create0();
@@ -699,3 +696,48 @@ def NO_VALUES = Array<Val>.new(0);
 def NO_RANGES = Array<(int, int)>.new(0);
 def ON_STACK = -1;
 def NO_FIELDS = Array<IrField>.new(0);
+
+// A helper class for flattening a sequence of types as they are normalized
+// and tracking where they start within the final normalized sequence,
+// e.g. for a tuple normalization or the fields of an ADT.
+class NormFlattener(context: SsaContext, norm: Type -> TypeNorm) {
+	def norms = Vector<TypeNorm>.new();	// the type norms in order
+	def starts = Vector<int>.new();		// the offset within {result} where each original index starts
+	def result = Vector<Type>.new();	// the result of flattening and appending all normalizations
+
+	// Adds a closed, i.e. monomorphic, type.
+	def addClosedType(t: Type) -> (int, int) {
+		if (t.open()) context.fail1("expected type %q to be closed", t.render);
+		return addTypeNorm(norm(t));
+	}
+	// Adds a potentially open, i.e. polymorphic, type, that must be monomorphized first.
+	def addOpenType(context: Type, t: Type) -> (int, int) {
+		if (t.open()) t = t.substitute(V3.getTypeArgs(context));
+		return addTypeNorm(norm(t));
+	}
+	// Adds a type normalization that has already been computed.
+	def addTypeNorm(tn: TypeNorm) -> (int, int) {
+		norms.put(tn);
+		var start = result.length;
+		starts.put(start);
+		tn.addTo(result);
+		return (start, result.length);
+	}
+	// Adds an {RaField} without updating its internal indices.
+	def addField(rc: RaClass, index: int) -> (int, int) {
+		var rf = rc.fields[index];
+		if (rf != null) {
+			// Use the {RaField}'s information.
+			if (rf.typeNorm != null) return addTypeNorm(rf.typeNorm);
+			if (rf.fieldType != null) return addTypeNorm(rf.typeNorm = norm(rf.fieldType));
+			return addOpenType(rc.oldType, rf.orig.fieldType);
+		}
+		var f = rc.orig.fields[index];
+		// Use the original {IrField}'s information.
+		return addOpenType(rc.oldType, f.fieldType);
+	}
+	// Packages the result into a {SeqNorm} instance.
+	def finish() -> FlatNorm {
+		return FlatNorm.new(norms.extract(), starts.extract(), result.extract());
+	}
+}
