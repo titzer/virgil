@@ -1,14 +1,16 @@
 #!/bin/bash
-. $(command dirname ${BASH_SOURCE[0]})/funcs.bash
-SOURCE="${BASH_SOURCE[0]}"
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+SOURCE=${BASH_SOURCE[0]}
+HERE=$(command dirname $SOURCE)
+. $HERE/funcs.bash
+# set DIR to true location of this file
+follow_links $SOURCE
 
-VIRGIL_LOC="${DIR}/../.."
-TEST_DIR="${VIRGIL_LOC}/test"
+VIRGIL_LOC=$DIR/../..
+TEST_DIR=$VIRGIL_LOC/test
 
 echo "Install nasm"
 sudo apt -y install nasm
 
-"${TEST_DIR}"/configure
+$TEST_DIR/configure
 
-V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="v3i x86-64-linux" "${TEST_DIR}"/all.bash
+V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="v3i x86-64-linux" "$TEST_DIR"/all.bash
