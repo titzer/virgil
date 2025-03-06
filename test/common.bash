@@ -1,12 +1,9 @@
 #!/bin/bash
-
-SOURCE="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
-done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+SOURCE=${BASH_SOURCE[0]}
+HERE=$(command dirname $SOURCE)
+. $HERE/funcs.bash
+# set DIR to true directory containing this file
+follow_links $SOURCE
 CONFIG=$DIR/config
 
 CYAN='[0;36m'
@@ -21,7 +18,7 @@ export VIRGIL_TEST_OUT=/tmp/$USER/virgil-test
 OUT=$VIRGIL_TEST_OUT/$SUITE
 mkdir -p $OUT
 
-VIRGIL_LOC=${VIRGIL_LOC:=$(cd $(dirname ${BASH_SOURCE[0]}) && cd .. && pwd)}
+VIRGIL_LOC=${VIRGIL_LOC:=$(cd $DIR/.. && pwd)}
 RT_LOC=$VIRGIL_LOC/rt
 GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
