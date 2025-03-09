@@ -5,7 +5,7 @@
 if [ $# -gt 0 ]; then
   TESTS="$*"
 else
-  TESTS=$(cat core.gc cast.gc variants.gc large.gc)
+  TESTS=$(cat *.gc)
 fi
 
 function set_rt_files() {
@@ -28,7 +28,7 @@ function set_rt_files() {
 
 
 function compile_gc_tests() {
-    local SHARDING=100
+    local SHARDING=80
     local target=$1
     shift
 
