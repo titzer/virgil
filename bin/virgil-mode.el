@@ -57,9 +57,11 @@
 
 (define-key virgil-mode-map (kbd "TAB") 'self-insert-command)
 
-(add-to-list 'compilation-error-regexp-alist-alist '(virgil
+(defvar compilation-error-regexp-alist-alist nil "List compilation error parsing regexps")
+(setq compilation-error-regexp-alist-alist (cons
+  '(virgil
 "^\\[\\(.+;.+?m\\)?\\(?1:.*\\.v3\\)\\(.+;.+?m\\)? @ \\(.+;.+?m\\)?\\(?2:[0-9]+\\):\\(?3:[0-9]+\\)\\(.+;.+?m\\)?\\]"
-1 2 3))
+   1 2 3) compilation-error-regexp-alist-alist))
 ;; Pattern is (without the extra blackslashes, etc.: ^[_color__filename__color_ @ _color__line_:_col__color_]
 ;; where _color_ is an optional ANSI escape code sequence for color (ESC [ digits ; digits m), _filename_ is
 ;; a file name ending in .v3, and _line_ and _col_ are decimal numbers.  The color is optional mostly to be
