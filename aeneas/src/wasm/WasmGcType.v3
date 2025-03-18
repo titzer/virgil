@@ -35,7 +35,7 @@ class WasmGcTypeInfo(wtype: WasmHeapType) {
 }
 
 // Canonicalizes and encodes Virgil types and signatures into WASM GC types and function sigs
-class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
+class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen) {
 	// Signatures are treated differently.  Because they don't arrive as Virgil types,
 	// already canonicalized, their Wasm form needs its own canonicalization.  Also,
 	// they are not of themselves recursive.
@@ -46,21 +46,14 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 	// Map indicating which Wasm type is used to represent each (canonicalized) Virgil
 	// heap type, except for class types
 	def heapTypeMap = TypeUtil.newTypeMap<WasmHeapType>();
+	def heapTypes = Vector<WasmHeapType>.new();	// in the order added to heapTypeMap
 
 	// Map indicating the Wasm type for each IrClass; these do not appear in heapTypeMap
 	def classMap = HashMap<IrClass, WasmStructType>.new(IrItem.uid, IrClass.==);
 
-	// These hold the various WasmHeapTypes and associated data so we can go through them later
-	def structTypes   = Vector<(WasmStructType, IrClass  )>.new();
-	def arrayTypes    = Vector<(WasmArrayType , Type     )>.new();
-	def functionTypes = Vector<(WasmFuncType  , Signature)>.new();
-
-	def eltTypeMap = HashMap<WasmStorageType, WasmArrayType>.new(
-		WasmStorageType.hash, WasmStorageType.equals
-		);	// WASM array element type -> WasmArrayType
-
 	// The (recursion) groups of types for eventual output in the type section of a Wasm module
 	def var typeGroups: Vector<Vector<WasmGcTypeInfo>>;
+	def var canonicalGroups = Vector<Vector<WasmGcTypeInfo>>.new();
 
 	// Note: since index 0 means "unassigned", the actual Wasm type index
 	// for a type is one smaller than the WasmType index field.  Thus
@@ -95,19 +88,29 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 	def addHeapType(typ: Type) -> WasmHeapType {
 		var wht = heapTypeMap[typ];
 		if (wht == null) {
+			// filter out these with constructor CLASS but are not really heap types
+			match (typ) {
+				x: AnyRefType => return null;
+				x: NullType => return null;
+				_ => ;
+			}
 			match (typ.typeCon.kind) {
 				ARRAY => wht = addArrayType(typ);
 				FUNCREF, CLOSURE => wht = addSignature(FuncType.!(typ).sig());
-				// CLASS, VARIANT => ...  shouldn't happen
+				CLASS, VARIANT => {
+					errgen.addError(null, null, "WasmGcTypeTable.addHeapType",
+							StringBuilder.new().put1("expected map entry for %q", typ.render).extract());
+					return null;
+				}
 				_ => return null;
 			}
 			heapTypeMap[typ] = wht;
+			heapTypes.put(wht);
 		}
 		return wht;
 	}
 
-	// adds an IrClass to classMap, its class type to heapTypemap,
-	// and its struct type to structTypes
+	// adds an IrClass to classMap and its class type to heapTypemap
 	def addClass(cls: IrClass) -> WasmHeapType {
 		// ignore if already present
 		var wht = classMap[cls];
@@ -115,6 +118,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 			var st = WasmStructType.new().initTypeInfo();
 			classMap[cls] = st;
 			heapTypeMap[cls.ctype] = wht = st;
+			heapTypes.put(wht);
 		}
 		return wht;
 	}
@@ -145,6 +149,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 				var results = Array<WasmValueType>.new(rtypes.length);
 				wft = WasmFuncType.new(params, results).initTypeInfo();
 				heapTypeMap[ft] = wft;
+				heapTypes.put(wft);
 				for (i < params.length) {
 					var wvtype = params[i] = getValueTypeFor(ptypes[i]);
 					wft.addEdgeTo(wvtype.heapType());
@@ -165,6 +170,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 	def addArrayType(atype: Type) -> WasmArrayType {
 		var wat = WasmArrayType.new().initTypeInfo();
 		heapTypeMap[atype] = wat;
+		heapTypes.put(wat);
 		var etype = V3Array.elementType(atype);
 		var estype = wat.elem = getStorageTypeFor(etype, true);
 		wat.addEdgeTo(estype.heapType());
@@ -183,7 +189,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 	}
 
 	// Helper for first depth-first search of the type graph
-	private def dfs0(stack: ListStack<WasmGcTypeInfo>, t: Type, wt: WasmHeapType) {
+	private def dfs0(stack: ListStack<WasmGcTypeInfo>, wt: WasmHeapType) {
 		// Note: we don't use getTypeInfo here so that we catch any
 		// case where the info is absent
 		dfs0_visit(stack, wt.typeInfo);
@@ -212,7 +218,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 		// Step 1: Do a depth-first search and push nodes on a stack
 		// in the order in which we *finish* with them.
 		var stack = ListStack<WasmGcTypeInfo>.new();
-		heapTypeMap.apply(dfs0(stack, _, _));
+		heapTypes.apply(dfs0(stack, _));
 		// reset visited for second DFS
 		for (node = stack.top; node != null; node = node.tail) {
 			node.head.visited = false;
@@ -245,46 +251,51 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 		typeGroups = components.reverse();
 	}
 
-	// This fills in fields (etc.) of types entered so far, then finds the
-	// recursion groups of types and assign type indices.  Any types
-	// encountered later may refer to these types, but may not be recursive.
-	// Such types should be added using insureTypeAdded.
+	// This finds the recursion groups of types and assign type indices.
+	// It can also (a) minimize individual recursion groups using what is
+	// essentially DFA minimization, and (b) canonicalize recursion groups
+	// using what is essentially DFA equivalence.  Singleton types are
+	// canonicalized since they also are groups (of one).
+
 	def assignTypeIndices() {
 		findTypeGroups();
 		var idx: i32 = 0;
 		for (i < typeGroups.length) {
 			var group = typeGroups[i];
+			if (WasmHeapTypes.minimizeRecursionGroups)
+				minimizeGroup(group);
+			if (WasmHeapTypes.canonicalizeRecursionGroups &&
+			    !isCanonicalGroup(group))
+				continue;
+			// Have a new canonical group;
+			// number it and add it to the canonical groups
 			for (j < group.length) {
 				group[j].wtype.index = ++maxIndex;
 			}
+			canonicalGroups.put(group);
 		}
 	}
 
-	// This returns Wasm value types, not heap types
-	// Non-recursive ("top-level") function
-	def addValueType(t: Type) -> WasmValueType {
-		match (t) {
-			null => return WasmValueType.Void;
-			x: IntType => return if(x.width > 32, WasmValueType.I64, WasmValueType.I32);
-			x: FloatType => return if(x.is64, WasmValueType.F64, WasmValueType.F32);
-			x: AnyRefType => return WasmValueType.AnyRef;
-			x: NullType => return WasmValueType.NoneRef;
-			_ => match (t.typeCon.kind) {
-				ENUM => return wasmType(V3.getVariantTagType(t));
-				ENUM_SET => return wasmType(V3.getEnumSetType(t));
-				ARRAY, CLASS, VARIANT, FUNCREF =>
-			 	      return addWasmRefType(t); // TODO
-				_ => return WasmValueType.Void;
-			}
-		}
+	// Applies DFA minimization to the group, updating the vector's contents
+	def minimizeGroup(group: Vector<WasmGcTypeInfo>) {
+		// TODO
+	}
+
+	// Searches for an equivalent group already in canonicalGroups.  If it
+	// finds one, it assigns the corresponding type indices to this group
+	// and returns false, otherwise returns true (indicating that this is
+	// a new canonical group)
+	def isCanonicalGroup(group: Vector<WasmGcTypeInfo>) -> bool {
+		// TODO
+		return true;
 	}
 
 	// Wraps a heap type with a layer of Wasm ref
 	private def addWasmRefType(t: Type) -> WasmValueType {
 		var wht = addHeapType(t);
 		if (wht == null) {
-			// System.err.puts(t.render(StringBuilder.new()).put1("addWasmRefType got null for %q\n", t.render).extract());
-			var i = 1/0;
+			errgen.addError(null, null, "WasmGcTypeTable.addWasmRefType",
+					StringBuilder.new().put1("got null for %q\n", t.render).extract());
 		}
 		return WasmValueType.RefNull(wht);
 	}
@@ -294,6 +305,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 	def getValueTypeFor(t: Type) -> WasmValueType {
 		match (t) {
 			null => return WasmValueType.Void;
+			x: BoolType => return WasmValueType.I32;
 			x: IntType => return if(x.width > 32, WasmValueType.I64, WasmValueType.I32);
 			x: FloatType => return if(x.is64, WasmValueType.F64, WasmValueType.F32);
 			x: AnyRefType => return WasmValueType.AnyRef;
@@ -301,8 +313,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 			_ => match (t.typeCon.kind) {
 				ENUM => return wasmType(V3.getVariantTagType(t));
 				ENUM_SET => return wasmType(V3.getEnumSetType(t));
-				ARRAY, CLASS, VARIANT, FUNCREF =>
-			 	      return addWasmRefType(t);
+				ARRAY, CLASS, VARIANT, FUNCREF => return addWasmRefType(t);
 				_ => return WasmValueType.Void;
 			}
 		}
@@ -312,6 +323,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 	}
 	def packingForType(t: Type) -> WasmPacking {
 		match (t) {
+			x: BoolType => return WasmPacking.PACKED_8;
 			x: IntType => {
 				if (x.width <= 8) return WasmPacking.PACKED_8;
 				else if (x.width <= 16) return WasmPacking.PACKED_16;
@@ -321,67 +333,10 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 		}
 	}
 
-	// This is used after the initial building of the types table from
-	// IrModule information, to insure that types encountered in code
-	// (etc.?) are added to the type table.  They should form (at most) an
-	// acyclic graph of new nodes untilmately referring only to scalar
-	// type or types previously entered.
-	def insureTypeAdded(typ: Type) {
-		if (heapTypeMap[typ] != null) {
-			// EBM maybe check that the WasmHeapType is complete
-			return;
-		}
-		match (typ.typeCon.kind) {
-			ARRAY => {
-				// make sure the element type is recorded first (if a heap type)
-				var etype = V3Array.elementType(typ);
-				insureTypeAdded(etype);
-				// make sure the array type is constructed and recorded
-				var wat = addArrayType(typ);
-				// assign type index if necessary
-				if (wat.index == 0) {
-					typeGroups.put(Vectors.of1<WasmGcTypeInfo>(wat.getTypeInfo()));
-					wat.index = ++maxIndex;
-					wat.complete = true;
-				}
-				return;
-			}
-			CLASS, VARIANT => return;	// should not happen
-			FUNCREF, CLOSURE => {
-				if (FuncType.?(typ)) {
-					var sig = FuncType.!(typ).sig();
-					// check if already canonicalized
-					if (signatureMap[sig] != null) return;
-					addSignature(sig);
-					var wht = signatureMap[sig];
-					// assign type index if necessary
-					if (wht.index == 0) {
-						var wft = WasmFuncType.!(wht);
-						// make sure that all mentioned types are recorded first
-						for (i < sig.paramTypes.length) {
-							var t = sig.paramTypes[i];
-							insureTypeAdded(t);
-							wft.params[i] = getValueTypeFor(t);
-						}
-						for (i < sig.returnTypes.length) {
-							var t = sig.returnTypes[i];
-							insureTypeAdded(t);
-							wft.results[i] = getValueTypeFor(t);
-						}
-						// add the WsmFuncType to the type groups
-						typeGroups.put(Vectors.of1<WasmGcTypeInfo>(wft.getTypeInfo()));
-						wft.index = ++maxIndex;
-						wft.complete = true;
-					}
-				}
-				return;
-			}
-			_ => return;	// ignore if not actually a heap type
-		}
-	}
-
 	def emit(out: DataWriter) {
-		// System.err.puts("outputting ").puti(typeGroups.length).puts(" typegroups\n");
+		if (WasmHeapTypes.traceTypeSection)
+			errgen.addError(null, null, "WasmGcTypeTable.emit",
+					StringBuilder.new().put1("outputting %d type groups", typeGroups.length).extract());
 		var cnt = 0;
 		for (i < typeGroups.length) {
 			var group = typeGroups[i];
@@ -389,39 +344,45 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 				out.putb(WasmDefTypeCode.REC.code);
 				out.put_uleb32(u32.!(group.length));
 			}
+			var line: StringBuilder = if(WasmHeapTypes.traceTypeSection, StringBuilder.new(), null);
 			for (j < group.length) {
-				// System.err.puts("type ").puti(cnt++).puts(" [#").puti(cnt).puts("] (").puti(i).puts("): ");
+				if (WasmHeapTypes.traceTypeSection) line.put3("type %d [#%d] (%d): ", cnt++, cnt, i);
 				match (group[j].wtype) {
 					ft: WasmFuncType => {
-						// System.err.puts("function(");
+						if (WasmHeapTypes.traceTypeSection) line.puts("function(");
 						out.putb(WasmDefTypeCode.Function.code);
 						if (ft.params.length == 1 && WasmValueType.Void.?(ft.params[0])) {
-							// System.err.puts("<empty>");
+							if (WasmHeapTypes.traceTypeSection) line.puts("<empty>");
 							out.put_uleb32(0);
 						} else {
 							out.put_uleb32(u32.!(ft.params.length));
 							for (k < ft.params.length) {
-								// System.err.puts(if(k > 0, ", ", "")).puts(StringBuilder.new().put1("%q", ft.params[k].render).extract());
+								if (WasmHeapTypes.traceTypeSection)
+									line.put2("%s%q", if(k > 0, ", ", ""), ft.params[k].render);
 								ft.params[k].put(out);
 							}
 						}
 						if (ft.results.length == 1 && WasmValueType.Void.?(ft.results[0])) {
-							// System.err.puts(")").ln();
+							if (WasmHeapTypes.traceTypeSection) line.puts(")");
 							out.put_uleb32(0);
 						} else {
-							// System.err.puts(")").puts(if(ft.results.length > 0, " -> ", "")).puts(if(ft.results.length > 1, "(", ""));
+							if (WasmHeapTypes.traceTypeSection)
+								line.put2(")%s%s", if(ft.results.length > 0, " -> ", ""),
+										   if(ft.results.length > 1, "(", ""));
 							out.put_uleb32(u32.!(ft.results.length));
 							for (k < ft.results.length) {
-								// System.err.puts(if(k > 0, ", ", "")).puts(StringBuilder.new().put1("%q", ft.results[k].render).extract());
+								if (WasmHeapTypes.traceTypeSection)
+									line.put2("%s%q", if(k > 0, ", ", ""), ft.results[k].render);
 								ft.results[k].put(out);
 							}
-							// System.err.puts(if(ft.results.length > 1, ")", "")).ln();
+							if (WasmHeapTypes.traceTypeSection) line.puts(if(ft.results.length > 1, ")", ""));
 						}
 					}
 					st: WasmStructType => {
-						// System.err.puts("struct(");
+						if (WasmHeapTypes.traceTypeSection) line.puts("struct(");
 						if (st.parent != null) {
-							// System.err.puts("super=").puti(st.parent.index).puts(if(st.fields.length > 0, ", ", ""));
+							if (WasmHeapTypes.traceTypeSection)
+								line.put2("super=%d%s", st.parent.index, if(st.fields.length > 0, ", ", ""));
 							out.putb(WasmDefTypeCode.SUB.code);
 							out.put_uleb32(1);
 							out.put_uleb32(st.parent.index);
@@ -429,18 +390,20 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType) {
 						out.putb(WasmDefTypeCode.Struct.code);
 						out.put_uleb32(u32.!(st.fields.length));
 						for (k < st.fields.length) {
-							// System.err.puts(StringBuilder.new().put1("%q", st.fields[k].render).extract()).puts(if(k + 1 < st.fields.length, ", ", ""));
+							if (WasmHeapTypes.traceTypeSection)
+								line.put2("%q%s", st.fields[k].render, if(k + 1 < st.fields.length, ", ", ""));
 							st.fields[k].put(out);
 						}
-						// System.err.puts(")\n");
+						if (WasmHeapTypes.traceTypeSection) line.puts(")");
 					}
 					at: WasmArrayType => {
 						out.putb(WasmDefTypeCode.Array.code);
-						// System.err.puts(StringBuilder.new().put1("(array %q)\n", at.elem.render).extract());
+						if (WasmHeapTypes.traceTypeSection) line.put1("(array %q)", at.elem.render);
 						at.elem.put(out);
 					}
 					_ => { /* error */ }
 				}
+				errgen.addError(null, null, "WasmGcTypeTable.emit", line.extract());
 			}
 		}
 	}
