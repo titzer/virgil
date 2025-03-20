@@ -1,0 +1,414 @@
+// Copyright 2022-2025 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// This file adds functionality needed by the WasmGc back end but not by the
+// Wasm back end.
+
+enum WasmDefTypeCode(code: byte, val: i7) {
+	Function	(0x60, -32),
+	Struct		(0x5F, -33),
+	Array		(0x5E, -34),
+	Continuation	(0x5D, -35),
+	SUB		(0x50, -48),
+	SUB_FINAL	(0x4F, -49),
+	REC		(0x4E, -50),
+}
+
+// Information for graph algorithm that discovers recursion groups, etc.
+class WasmGcTypeInfo(wtype: WasmHeapType) {
+	def var predecessors: List<WasmGcTypeInfo>;
+	def var successors: List<WasmGcTypeInfo>;
+	var visited: bool;
+	def addEdgeTo(target: WasmGcTypeInfo) {
+		if (target == null) return;
+		successors = List.new(target, successors);
+		target.predecessors = List.new(this, target.predecessors);
+	}
+	def addEdgeToHeapType(target: WasmHeapType) {
+		if (target == null) return;
+		addEdgeTo(target.getTypeInfo());
+	}
+	def addEdgeToType(target: Type, table: WasmGcTypeTable) {
+		var wht = table.heapTypeMap[target];
+		addEdgeToHeapType(wht);
+	}
+}
+
+// Canonicalizes and encodes Virgil types and signatures into WASM GC types and function sigs
+class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen) {
+	// Signatures are treated differently.  Because they don't arrive as Virgil types,
+	// already canonicalized, their Wasm form needs its own canonicalization.  Also,
+	// they are not of themselves recursive.
+
+	// Map for canonicalizing and mapping Signatures
+	def signatureMap = HashMap<Signature, WasmFuncType>.new(Signature.hash, Signature.equals);
+
+	// Map indicating which Wasm type is used to represent each (canonicalized) Virgil
+	// heap type, except for class types
+	def heapTypeMap = TypeUtil.newTypeMap<WasmHeapType>();
+	def heapTypes = Vector<WasmHeapType>.new();	// in the order added to heapTypeMap
+
+	// Map indicating the Wasm type for each IrClass; these do not appear in heapTypeMap
+	def classMap = HashMap<IrClass, WasmStructType>.new(IrItem.uid, IrClass.==);
+
+	// The (recursion) groups of types for eventual output in the type section of a Wasm module
+	def var typeGroups: Vector<Vector<WasmGcTypeInfo>>;
+	def var canonicalGroups = Vector<Vector<WasmGcTypeInfo>>.new();
+
+	// Note: since index 0 means "unassigned", the actual Wasm type index
+	// for a type is one smaller than the WasmType index field.  Thus
+	// maxIndex is also the number of type indices assigned so far.
+	def var maxIndex: u32 = 0;
+
+	// EBM --- plan for processing types
+	// 1) Walk over the IR finding Virgil Types
+	//   a) Add each heap Type to a hash table (heapTypeMap)
+	//   b) If a Type is new, create a WasmHeapType for it, leaving its outgoing references "blank"
+	// 2) Go through the heapTypeMap and create WasmGcTypeInfo edges between the types
+	// 3) Walk the resulting graph using findTypeGroups to discover recursive groups, etc.
+	// 4) Apply finite state machine style minimization to each recursive group
+	// 5) Assign Wasm type numbers to groups in order, checking for Wasm type equivalence,
+	//    using a finite state machine equivalence algorithm.  This canonicalizes the
+	//    Wasm heap types so that equivalent type get the same number (the WasmHeapType
+	//    objects may still be distinct).  This builts a "compacted" list of WasmHeapTypes
+	//    that can be used for the (initial part of the) Wasm module's type table
+	//    This step also fills in the "blank" parts of the WasmHeapTypes since any target
+	//    heap types now have final type numbers.
+	//
+	// It is possible that code generation will find more types later, though they must
+	// not be recursive.  These should be processed in similar stages to the above:
+	// a) Add to heapTypeMap if necessary, creating a new WasmHeapType
+	// b) Search the WasmHeapType canonicalization table to determine and existing type
+	//    number, or assign a new one.
+	// c) Fill in the "blank" parts of the WasmHeapType (if it was new).
+
+
+	// Adds a heap Type to heapTypeMap, if not already present.  Returns the WasmHeapType,
+	// giving null if the type is for a scalar.
+	def addHeapType(typ: Type) -> WasmHeapType {
+		var wht = heapTypeMap[typ];
+		if (wht == null) {
+			// filter out these with constructor CLASS but are not really heap types
+			match (typ) {
+				x: AnyRefType => return null;
+				x: NullType => return null;
+				_ => ;
+			}
+			match (typ.typeCon.kind) {
+				ARRAY => wht = addArrayType(typ);
+				FUNCREF, CLOSURE => wht = addSignature(FuncType.!(typ).sig());
+				CLASS, VARIANT => {
+					errgen.addError(null, null, "WasmGcTypeTable.addHeapType",
+							StringBuilder.new().put1("expected map entry for %q", typ.render).extract());
+					return null;
+				}
+				_ => return null;
+			}
+			heapTypeMap[typ] = wht;
+			heapTypes.put(wht);
+		}
+		return wht;
+	}
+
+	// adds an IrClass to classMap and its class type to heapTypemap
+	def addClass(cls: IrClass) -> WasmHeapType {
+		// ignore if already present
+		var wht = classMap[cls];
+		if (wht == null) {
+			var st = WasmStructType.new().initTypeInfo();
+			classMap[cls] = st;
+			heapTypeMap[cls.ctype] = wht = st;
+			heapTypes.put(wht);
+		}
+		return wht;
+	}
+	def processClass(cls: IrClass, tagType: Type) {
+		var st = classMap[cls];
+		if (cls.parent != null) {
+			st.addEdgeTo(st.parent = WasmStructType.!(addHeapType(cls.parent.ctype)));
+		}
+		var flds = cls.fields;
+		var needsTag = !V3.isComponent(cls.ctype);
+		var wflds = st.fields = Array<WasmStorageType>.new(flds.length + if(needsTag, 1, 0));
+		var j = 0;
+		if (needsTag) wflds[j++] = getStorageTypeFor(tagType, false);
+		for (i < flds.length) {
+			// tag is immutable, rest are mutable
+			var wstype = wflds[j++] = getStorageTypeFor(flds[i].fieldType, true);
+			st.addEdgeTo(wstype.heapType());
+		}
+	}
+
+	// add a Signature to signatureMap and its function type to heapTypeMap
+	def addSignature(sig: Signature) -> WasmFuncType {
+		var wft = signatureMap[sig];
+		if (wft == null) {
+			var ft = sig.funcType();
+			var entry = heapTypeMap[ft];
+			if (entry == null) {
+				var ptypes = sig.paramTypes;
+				var rtypes = sig.returnTypes;
+				var params = Array<WasmValueType>.new(ptypes.length);
+				var results = Array<WasmValueType>.new(rtypes.length);
+				wft = WasmFuncType.new(params, results).initTypeInfo();
+				heapTypeMap[ft] = wft;
+				heapTypes.put(wft);
+				for (i < params.length) {
+					var wvtype = params[i] = getValueTypeFor(ptypes[i]);
+					wft.addEdgeTo(wvtype.heapType());
+				}
+				for (i < results.length) {
+					var wvtype = results[i] = getValueTypeFor(rtypes[i]);
+					wft.addEdgeTo(wvtype.heapType());
+				}
+			} else {
+				wft = WasmFuncType.!(entry);
+			}
+			signatureMap[sig] = wft;
+		}
+		return wft;
+	}
+
+	// Add an array type given its element type
+	def addArrayType(atype: Type) -> WasmArrayType {
+		var wat = WasmArrayType.new().initTypeInfo();
+		heapTypeMap[atype] = wat;
+		heapTypes.put(wat);
+		var etype = V3Array.elementType(atype);
+		var estype = wat.elem = getStorageTypeFor(etype, true);
+		wat.addEdgeTo(estype.heapType());
+		return wat;
+	}
+
+	// Support for dfs0 helper
+
+	private def dfs0_visit(stack: ListStack<WasmGcTypeInfo>, node: WasmGcTypeInfo) {
+		if (node.visited) return;
+		node.visited = true;
+		for (e = node.successors; e != null; e = e.tail) {
+			dfs0_visit(stack, e.head);
+		}
+		stack.push(node);
+	}
+
+	// Helper for first depth-first search of the type graph
+	private def dfs0(stack: ListStack<WasmGcTypeInfo>, wt: WasmHeapType) {
+		// Note: we don't use getTypeInfo here so that we catch any
+		// case where the info is absent
+		dfs0_visit(stack, wt.typeInfo);
+	}
+
+	// Builds a single strongly connected component by doing a DFS from a
+	// given node over predecessors
+	private def dfs1(comp: Vector<WasmGcTypeInfo>, node: WasmGcTypeInfo) {
+		if (node.visited) return;
+		node.visited = true;
+		comp.put(node);
+		for (e = node.predecessors; e != null; e = e.tail) {
+			dfs1(comp, e.head);
+		}
+	}
+
+	// After a pass over the classes (etc.), we should have enough types
+	// entered, with their WasmType's, to form recursion groups and assign
+	// type indices.  We do this by running a strongly connected
+	// components (SCC) algorithm over the graph of types.  Once we have
+	// the SCCs, we order them by repeatedly finding SCCs all of whose
+	// predecessors have already been found.
+	private def findTypeGroups() {
+		// This is an implementation of the Kosaraju-Sharir algorithm.
+
+		// Step 1: Do a depth-first search and push nodes on a stack
+		// in the order in which we *finish* with them.
+		var stack = ListStack<WasmGcTypeInfo>.new();
+		heapTypes.apply(dfs0(stack, _));
+		// reset visited for second DFS
+		for (node = stack.top; node != null; node = node.tail) {
+			node.head.visited = false;
+		}
+
+		// Step 2: Do a depth-first search *over successors* to find
+		// components.  Importantly, this proceeds in reverse of the
+		// order in which Step 1 pushed nodes.
+		var components = Vector<Vector<WasmGcTypeInfo>>.new();
+		while (!stack.empty()) {
+			var node = stack.pop();
+			if (node.visited) continue;
+			var comp = Vector<WasmGcTypeInfo>.new();
+			dfs1(comp, node);
+			components.put(comp);
+		}
+
+		// At this point the components vector has the type groups in
+		// forward order.  This is because, in stack, if there is a
+		// forward path from node u to node v, then either they are in
+		// the same component (in which case the order of u and v is
+		// arbitrary) or u was pushed to the stack *after* v.  This
+		// means that if u and v lie in different components and there
+		// is a path from u to v, u's component will occur earlier in
+		// components than v's will.  Each component is a recursion
+		// group for Wasm type purposes, though singletons will not be
+		// output as recursion groups.
+
+		// We reverse the lsit so that we get leaves first.
+		typeGroups = components.reverse();
+	}
+
+	// This finds the recursion groups of types and assign type indices.
+	// It can also (a) minimize individual recursion groups using what is
+	// essentially DFA minimization, and (b) canonicalize recursion groups
+	// using what is essentially DFA equivalence.  Singleton types are
+	// canonicalized since they also are groups (of one).
+
+	def assignTypeIndices() {
+		findTypeGroups();
+		var idx: i32 = 0;
+		for (i < typeGroups.length) {
+			var group = typeGroups[i];
+			if (WasmHeapTypes.minimizeRecursionGroups)
+				minimizeGroup(group);
+			if (WasmHeapTypes.canonicalizeRecursionGroups &&
+			    !isCanonicalGroup(group))
+				continue;
+			// Have a new canonical group;
+			// number it and add it to the canonical groups
+			for (j < group.length) {
+				group[j].wtype.index = ++maxIndex;
+			}
+			canonicalGroups.put(group);
+		}
+	}
+
+	// Applies DFA minimization to the group, updating the vector's contents
+	def minimizeGroup(group: Vector<WasmGcTypeInfo>) {
+		// TODO
+	}
+
+	// Searches for an equivalent group already in canonicalGroups.  If it
+	// finds one, it assigns the corresponding type indices to this group
+	// and returns false, otherwise returns true (indicating that this is
+	// a new canonical group)
+	def isCanonicalGroup(group: Vector<WasmGcTypeInfo>) -> bool {
+		// TODO
+		return true;
+	}
+
+	// Wraps a heap type with a layer of Wasm ref
+	private def addWasmRefType(t: Type) -> WasmValueType {
+		var wht = addHeapType(t);
+		if (wht == null) {
+			errgen.addError(null, null, "WasmGcTypeTable.addWasmRefType",
+					StringBuilder.new().put1("got null for %q\n", t.render).extract());
+		}
+		return WasmValueType.RefNull(wht);
+	}
+
+	// This returns Wasm value types, not heap types
+	// Non-recursive ("top-level") function
+	def getValueTypeFor(t: Type) -> WasmValueType {
+		match (t) {
+			null => return WasmValueType.Void;
+			x: BoolType => return WasmValueType.I32;
+			x: IntType => return if(x.width > 32, WasmValueType.I64, WasmValueType.I32);
+			x: FloatType => return if(x.is64, WasmValueType.F64, WasmValueType.F32);
+			x: AnyRefType => return WasmValueType.AnyRef;
+			x: NullType => return WasmValueType.NoneRef;
+			_ => match (t.typeCon.kind) {
+				ENUM => return wasmType(V3.getVariantTagType(t));
+				ENUM_SET => return wasmType(V3.getEnumSetType(t));
+				ARRAY, CLASS, VARIANT, FUNCREF => return addWasmRefType(t);
+				_ => return WasmValueType.Void;
+			}
+		}
+	}
+	def getStorageTypeFor(t: Type, mutable: bool) -> WasmStorageType {
+		return WasmStorageType(packingForType(t), getValueTypeFor(t), mutable);
+	}
+	def packingForType(t: Type) -> WasmPacking {
+		match (t) {
+			x: BoolType => return WasmPacking.PACKED_8;
+			x: IntType => {
+				if (x.width <= 8) return WasmPacking.PACKED_8;
+				else if (x.width <= 16) return WasmPacking.PACKED_16;
+				else return WasmPacking.NONE;
+			}
+			_ => return WasmPacking.NONE;
+		}
+	}
+
+	def emit(out: DataWriter) {
+		if (WasmHeapTypes.traceTypeSection)
+			errgen.addError(null, null, "WasmGcTypeTable.emit",
+					StringBuilder.new().put1("outputting %d type groups", typeGroups.length).extract());
+		var cnt = 0;
+		for (i < typeGroups.length) {
+			var group = typeGroups[i];
+			if (group.length > 1) {
+				out.putb(WasmDefTypeCode.REC.code);
+				out.put_uleb32(u32.!(group.length));
+			}
+			var line: StringBuilder = if(WasmHeapTypes.traceTypeSection, StringBuilder.new(), null);
+			for (j < group.length) {
+				if (WasmHeapTypes.traceTypeSection) line.put3("type %d [index=#%d, group=%d]: ", cnt++, cnt, i);
+				match (group[j].wtype) {
+					ft: WasmFuncType => {
+						if (WasmHeapTypes.traceTypeSection) line.puts("function(");
+						out.putb(WasmDefTypeCode.Function.code);
+						if (ft.params.length == 1 && WasmValueType.Void.?(ft.params[0])) {
+							if (WasmHeapTypes.traceTypeSection) line.puts("<empty>");
+							out.put_uleb32(0);
+						} else {
+							out.put_uleb32(u32.!(ft.params.length));
+							for (k < ft.params.length) {
+								if (WasmHeapTypes.traceTypeSection)
+									line.put2("%s%q", if(k > 0, ", ", ""), ft.params[k].render);
+								ft.params[k].put(out);
+							}
+						}
+						if (ft.results.length == 1 && WasmValueType.Void.?(ft.results[0])) {
+							if (WasmHeapTypes.traceTypeSection) line.puts(")");
+							out.put_uleb32(0);
+						} else {
+							if (WasmHeapTypes.traceTypeSection)
+								line.put2(")%s%s", if(ft.results.length > 0, " -> ", ""),
+										   if(ft.results.length > 1, "(", ""));
+							out.put_uleb32(u32.!(ft.results.length));
+							for (k < ft.results.length) {
+								if (WasmHeapTypes.traceTypeSection)
+									line.put2("%s%q", if(k > 0, ", ", ""), ft.results[k].render);
+								ft.results[k].put(out);
+							}
+							if (WasmHeapTypes.traceTypeSection) line.puts(if(ft.results.length > 1, ")", ""));
+						}
+					}
+					st: WasmStructType => {
+						if (WasmHeapTypes.traceTypeSection) line.puts("struct");
+						if (st.parent != null) {
+							if (WasmHeapTypes.traceTypeSection)
+								line.put1("[super=#%d]", st.parent.index);
+							out.putb(WasmDefTypeCode.SUB.code);
+							out.put_uleb32(1);
+							out.put_uleb32(st.parent.index);
+						}
+						if (WasmHeapTypes.traceTypeSection) line.putc('(');
+						out.putb(WasmDefTypeCode.Struct.code);
+						out.put_uleb32(u32.!(st.fields.length));
+						for (k < st.fields.length) {
+							if (WasmHeapTypes.traceTypeSection)
+								line.put2("%q%s", st.fields[k].render, if(k + 1 < st.fields.length, ", ", ""));
+							st.fields[k].put(out);
+						}
+						if (WasmHeapTypes.traceTypeSection) line.puts(")");
+					}
+					at: WasmArrayType => {
+						out.putb(WasmDefTypeCode.Array.code);
+						if (WasmHeapTypes.traceTypeSection) line.put1("(array %q)", at.elem.render);
+						at.elem.put(out);
+					}
+					_ => { /* error */ }
+				}
+				errgen.addError(null, null, "WasmGcTypeTable.emit", line.extract());
+			}
+		}
+	}
+}
