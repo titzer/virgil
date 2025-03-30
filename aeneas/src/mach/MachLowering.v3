@@ -40,6 +40,7 @@ class MachLoweringConfig {
 	var IntConvertFNegSaturates = true; // proper negative saturation
 	var FloatPromoteU64 = true;
 	var IntCastFTraps = false;	// IntCastF machine instruction traps
+	var ObjectLowerFactory = LowerObjects.new;	// factory to make lowerer for object ops
 	var ObjectSystem = false;	// target platform has an object system
 	var NativeCmpSwp = true;	// target platform supports native compare+swap
 
@@ -270,10 +271,447 @@ class SsaGraphNormalizer(context: SsaContext) {
 	def genValIntoArray(v: Val, tn: TypeNorm, dest: Array<Val>, index: int);
 }
 
+// packages up the calls for lowering things related to objects, which some systems
+// handle dramatically differently from other systems
+class LowerObjects(lower: MachLowering, mach: MachProgram, compiler: Compiler, config: MachLoweringConfig) {
+
+	// capture non-varying things from sorrounding context
+	def addIfNull		= lower.addIfNull;
+	def apply		= lower.apply;
+//	def call		= lower.call;
+	def componentFieldPtr	= lower.componentFieldPtr;
+	def context		= lower.context;
+	def genAlloc		= lower.genAlloc;
+	def genArrayElemOffset	= lower.genArrayElemOffset;
+	def genBoundsCheck	= lower.genBoundsCheck;
+	def genIfNull		= lower.genIfNull;
+	def genMtableLookup	= lower.genMtableLookup;
+	def genNormTypedLoads	= lower.genNormTypedLoads;
+	def genNormTypedStores	= lower.genNormTypedStores;
+	def genNullCheck	= lower.genNullCheck;
+	def genNullCheck0	= lower.genNullCheck0;
+	def getAccessViewOp	= lower.getAccessViewOp;
+	def map1		= lower.map1;
+	def mapMultiReturn	= lower.mapMultiReturn;
+	def mapN		= lower.mapN;
+	def normIntType		= lower.normIntType;
+	def normRef1		= lower.normRef1;
+	def normRefN		= lower.normRefN;
+	def normRefs		= lower.normRefs;
+	def normType		= lower.normType;
+	def ptrAdd		= lower.ptrAdd;
+	def ptrLoad		= lower.ptrLoad;
+	def ptrStore		= lower.ptrStore;
+	def refLoad		= lower.refLoad;
+	def storeObjectTag	= lower.storeObjectTag;
+	def wideInputs		= lower.wideInputs;
+	def wideOutputs		= lower.wideOutputs;
+
+	def lowerArrayAlloc(i_old: SsaApplyOp) -> SsaInstr {
+		var olen = i_old.inputs[0], arrayType = i_old.op.typeArgs[0];
+		var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
+		if (SsaConst.?(olen.dest)) {
+			// length is known statically
+			var len = olen.dest.unbox<int>();
+			if (len < 0) return lower.addThrow(i_old.source, V3Exception.LengthCheck);
+			return lowerArrayAllocWithSize(i_old.source, arrayType, hsize, len, scale);
+		}
+		var nlen = normRef1(olen);
+		var curBlock = lower.curBlock;
+		if (!i_old.facts.O_NO_NEGATIVE_CHECK && !context.compiler.DisableLengthChecks) {
+			// add a check (length < 0)
+			var check = curBlock.opIntLt(nlen, context.graph.zeroConst());
+			apply(i_old.source, V3Op.newConditionalThrow(V3Exception.LengthCheck), [check]);
+		}
+		var size: SsaInstr = context.graph.intConst(hsize);
+		if (scale > 0) {
+			// scale the length by the element scale
+			var elemsize = nlen;
+			if (scale > 1) elemsize = curBlock.opIntMul(nlen, context.graph.intConst(scale));
+			if (scale != mach.data.addrAlign.alignUp(scale)) {
+				// alignment is necessary
+				size = curBlock.opIntAdd(elemsize, context.graph.intConst(hsize + mach.data.addrAlign.add));
+				size = curBlock.opIntAnd(size, context.graph.intConst(mach.data.addrAlign.mask));
+			} else {
+				size = curBlock.opIntAdd(elemsize, size);
+			}
+		}
+		// allocate the array, store tag, and store length
+		mach.allocates = true;
+		var narr = genAlloc(i_old.source, mach.machType(arrayType), size);
+		storeObjectTag(narr, arrayType);
+		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), nlen);
+		return narr;
+	}
+	def lowerArrayAllocWithSize(source: Source, arrayType: Type, hsize: int, len: int, scale: int) -> SsaInstr {
+		var totalSize = mach.data.addrAlign.alignUp(hsize + len * scale);
+		// allocate the array with the known size
+		mach.allocates = true;
+		var narr = genAlloc(source, mach.machType(arrayType), context.graph.intConst(totalSize));
+		storeObjectTag(narr, arrayType); // store tag
+		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), context.graph.intConst(len)); // store length
+		return narr;
+	}
+	def lowerArrayInit(i_old: SsaApplyOp) -> SsaInstr {
+		var arrayType = i_old.op.typeArgs[0];
+		var offset = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
+		var narr = lowerArrayAllocWithSize(i_old.source, arrayType, offset, i_old.inputs.length, scale);
+		var machType = mach.machType(V3Array.elementType(arrayType));
+		var tn = normIntType(machType), stride = if(tn == null, 1, tn.size);
+		var inputs = normRefs(i_old.inputs);
+		for (i = 0; i < inputs.length; (i = i + stride, offset = offset + scale)) {
+			// generate unchecked pointer stores to initialize the array
+			// XXX: cache type normalization across calls to this method
+			genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, machType, narr, offset, inputs, i);
+		}
+		return narr;
+	}
+	def lowerArrayTupleInit(i_old: SsaApplyOp, elems: int, length: int) -> SsaInstr {
+		var arrayType = i_old.op.typeArgs[0];
+		var arrayRep = mach.arrayRep(arrayType);
+		var narr = lowerArrayAllocWithSize(i_old.source, arrayType, arrayRep.headerSize, length, arrayRep.elemScale);
+		for (i < length) {
+			for (j < elems) {
+				var val = i_old.inputs[i * elems + j];
+				var inputs = normRefN(val);
+				var offset = arrayRep.headerSize + arrayRep.offsets[j] + i * arrayRep.elemScale;
+				// XXX: cache type normalization across calls to this method
+				genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
+			}
+		}
+		return narr;
+	}
+	def lowerArrayGetElem(i_old: SsaApplyOp, elem: int) {
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0], nindex = inputs[1], arrayType = i_old.op.typeArgs[0];
+		var nullity = context.compiler.nullity(i_old, narr);
+		nullity = genBoundsCheck(i_old, nullity).1;
+		var arrayRep = mach.arrayRep(arrayType);
+		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
+		// XXX: fold null check into pointer access if no bounds check
+		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
+		var loads = genNormTypedLoads(i_old.source, nullity, machType, ptrAdd(narr, offset), 0);
+		mapN(i_old, loads);
+	}
+	def lowerArraySetElem(i_old: SsaApplyOp, elem: int) {
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0], nindex = inputs[1], arrayType = i_old.op.typeArgs[0];
+		var nullity = context.compiler.nullity(i_old, narr);
+		nullity = genBoundsCheck(i_old, nullity).1;
+		var arrayRep = mach.arrayRep(arrayType);
+		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
+		// XXX: fold null check into pointer access if no bounds check
+		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
+		genNormTypedStores(i_old.source, nullity, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
+		i_old.kill();
+		i_old.remove();
+	}
+	def lowerNormRangeGetElem(i_old: SsaApplyOp, elem: int) {
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], rangeType = i_old.op.typeArgs[0];
+		var arrayRep = mach.arrayRep(rangeType);
+		var offset = genArrayElemOffset(if(arrayRep.offsets != null, arrayRep.offsets[elem], 0), arrayRep.elemScale, nindex);
+		var pos = ptrAdd(ptrAdd(narr, rangeStart), offset);
+		var machType = mach.machType(arrayRep.getElemElemType(rangeType, elem));
+		var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, machType, pos, 0);
+		mapN(i_old, loads);
+	}
+	def lowerNormRangeSetElem(i_old: SsaApplyOp, elem: int) {
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], rangeType = i_old.op.typeArgs[0];
+		var arrayRep = mach.arrayRep(rangeType);
+		var offset = genArrayElemOffset(if(arrayRep.offsets != null, arrayRep.offsets[elem], 0), arrayRep.elemScale, nindex);
+		var pos = ptrAdd(ptrAdd(narr, rangeStart), offset);
+		var machType = mach.machType(arrayRep.getElemElemType(rangeType, elem));
+		genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, false, machType, pos, 0, inputs, 3);
+		i_old.kill();
+		i_old.remove();
+	}
+	def lowerByteArrayGetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) {
+		var inputs = normRefs(i_old.inputs);
+		var ni_arr = inputs[0], ni_start = inputs[1];
+		var fieldType = i_old.op.typeArgs[0];
+		var base = ptrAdd(ni_arr, ni_start);
+		var nullity = context.compiler.nullity(i_old, base);
+		if (!nullity.O_NO_NULL_CHECK && !config.ImplicitNullChecks) genNullCheck0(i_old.source, base);
+		if (i_old.op.typeArgs[1] != V3Range.START_TYPE) offset += mach.arrayRep(V3.arrayByteType).getElemElemOffset(0);
+
+		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
+		var t = decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder), tn = t.0, accesses = t.1;
+
+		var ai_results = Array<SsaInstr>.new(accesses.length);
+		for (i < accesses.length) {
+			var a = accesses[i];
+			match (a) {
+				Simple(t, offset) => {
+					var d = ptrLoad(t, base, offset);
+					ai_results[i] = d;
+				}
+				Compound(t, wordType, datums) => {
+					var curBlock = lower.curBlock;
+					var d: SsaInstr, or = wordType.opOr(), shl = wordType.opShl();
+					for (datum in datums) {
+						var l = ptrLoad(datum.t, base, datum.offset);
+						if (datum.t != wordType) l = curBlock.pure(V3Op.newIntViewI(datum.t, wordType), [l]);
+						if (datum.shift > 0) l = curBlock.pure(shl, [l, context.graph.intConst(datum.shift)]);
+						if (d != null) d = curBlock.pure(or, [d, l]);
+						else d = l;
+					}
+					var op = getAccessViewOp(t, wordType);
+					if (op != null) d = curBlock.pure(op, [d]);
+					ai_results[i] = d;
+				}
+			}
+		}
+		if (tn != null && tn.newType != fieldType) {
+			var op = getAccessViewOp(fieldType, tn.newType);
+			if (op != null) ai_results = [wideInputs(op, if(tn.size > 1, tn), ai_results, Fact.O_PURE)];
+		}
+		return mapN(i_old, ai_results);
+	}
+	def lowerByteArraySetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) { // TODO: byte order
+		var inputs = normRefs(i_old.inputs);
+		var ni_arr = inputs[0], ni_start = inputs[1], vals = Arrays.range(inputs, 2, inputs.length);
+		var fieldType = i_old.op.typeArgs[0];
+		var base = ptrAdd(ni_arr, ni_start);
+		var nullity = context.compiler.nullity(i_old, base);
+		if (!nullity.O_NO_NULL_CHECK && !config.ImplicitNullChecks) genNullCheck0(i_old.source, base);
+		if (i_old.op.typeArgs[1] != V3Range.START_TYPE) offset += mach.arrayRep(V3.arrayByteType).getElemElemOffset(0);
+
+		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
+		var t = decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder), tn = t.0, accesses = t.1;
+
+		var ai_results = Array<SsaInstr>.new(accesses.length);
+		if (tn != null && tn.newType != fieldType) {
+			var op = getAccessViewOp(tn.oldType, fieldType);
+			var atn = if(tn.size > 1, tn);
+			if (op != null) vals = wideOutputs(op, atn, vals, Fact.O_PURE);
+		}
+		for (i < accesses.length) {
+			var a = accesses[i], i_val = vals[i];
+			match (a) {
+				Simple(t, offset) => {
+					ptrStore(t, base, offset, i_val);
+				}
+				Compound(t, wordType, datums) => {
+					var curBlock = lower.curBlock;
+					var shr = wordType.opShr();
+					if (t != wordType) match (t) {
+						x: FloatType => i_val = curBlock.pure(if(x.is64, V3Op.opIntViewF64, V3Op.opIntViewF32), [i_val]);
+					}
+					for (datum in datums) {
+						var v = if(datum.shift == 0, i_val, curBlock.pure(shr, [i_val, context.graph.intConst(datum.shift)]));
+						ptrStore(datum.t, base, datum.offset, v);
+					}
+				}
+			}
+		}
+		i_old.kill();
+		i_old.remove();
+	}
+	def lowerArrayGetLength(i_old: SsaApplyOp) -> SsaInstr {
+		var oarr = i_old.inputs[0], narr = normRef1(oarr);
+		var nullity = context.compiler.nullity(i_old, null);
+		return refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
+	}
+	def lowerClassAlloc(i_old: SsaApplyOp, method: IrMethod) {
+		var classType = i_old.getType();
+		var size = mach.getObjectSize(classType, null);
+		// allocate the object
+		mach.allocates = true;
+		var nobj = genAlloc(i_old.source, mach.machType(classType), context.graph.intConst(size));
+		storeObjectTag(nobj, classType);
+		if (method != null) {
+			var newRef = V3Op.extractIrSpec(i_old.op, method);
+			var funcRep = mach.funcRep(newRef);
+			// nontrivial constructor
+			var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(newRef));
+			var args = Arrays.prepend(func, Arrays.prepend(nobj, normRefs(i_old.inputs)));
+			lowerCall(i_old, funcRep, args);
+			return;
+		}
+		return map1(i_old, nobj);
+	}
+	def lowerVariantAlloc(i_old: SsaApplyOp) {
+		var classType = i_old.getType();
+		var size = mach.getObjectSize(classType, null);
+		// allocate the object
+		mach.allocates = true;
+		var i_new = genAlloc(i_old.source, mach.machType(classType), context.graph.intConst(size));
+		storeObjectTag(i_new, classType);
+		var ic = context.prog.ir.getIrClass(classType);
+		var ai_inputs = normRefs(i_old.inputs);
+		// Generate explicit field initializations.
+		var start = 0;
+		for (i < ic.fields.length) {
+			var f = ic.fields[i];
+			var machType = mach.machType(f.fieldType);
+			var tn = normIntType(machType);
+			genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, machType, i_new, f.machOffset, ai_inputs, start);
+			start += if(tn != null, tn.size, 1);
+		}
+		return map1(i_old, i_new);
+	}
+	def lowerClassGetField(isVariant: bool, i_old: SsaApplyOp, field: IrField) {
+		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
+		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
+		var machType = mach.machType(fieldRef.getFieldType());
+		var offset = mach.classFieldOffset(fieldRef);
+		var nullity = context.compiler.nullity(i_old, oobj.dest);
+		if (isVariant) {
+			var tblock: SsaBuilder, fblock: SsaBuilder, merge: SsaBuilder;
+			var sub: Array<Type>;
+			if (!nullity.O_NO_NULL_CHECK) {
+				var t = addIfNull(nobj);
+				tblock = t.0;
+				fblock = t.1;
+				merge = t.2;
+				lower.curBlock = fblock;
+				var tn = normIntType(machType);
+				sub = if(tn == null, [machType], tn.sub);
+			}
+			var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, machType, nobj, offset);
+			if (!nullity.O_NO_NULL_CHECK) {
+				fblock.addGoto(merge.block);
+				tblock.addGoto(merge.block);
+				lower.curBlock = merge;
+				// if (nobj == null) emit null values
+				for (i < loads.length) {
+					loads[i] = lower.curBlock.addPhi(sub[i], [loads[i], context.graph.nullConst(sub[i])]);
+				}
+			}
+			mapN(i_old, loads);
+		} else {
+			var loads = genNormTypedLoads(i_old.source, nullity, machType, nobj, offset);
+			mapN(i_old, loads);
+		}
+	}
+	def lowerClassSetField(i_old: SsaApplyOp, field: IrField, init: bool) {
+		var inputs = normRefs(i_old.inputs);
+		var fieldRef = V3Op.extractIrSpec(i_old.op, field), nobj = inputs[0];
+		var offset = mach.classFieldOffset(fieldRef);
+		var machType = mach.machType(fieldRef.getFieldType());
+		var nullity = compiler.nullity(i_old, nobj);
+		genNormTypedStores(i_old.source, nullity, init, machType, nobj, offset, inputs, 1);
+		i_old.kill();
+		i_old.remove();
+	}
+	def lowerClassGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
+		var methodRef = V3Op.extractIrSpec(i_old.op, method);
+		var funcRep = mach.funcRep(methodRef);
+		genNullCheck(i_old);
+		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+	}
+	def lowerClassGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
+		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
+		var funcRep = mach.funcRep(methodRef);
+		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
+		return genMtableLookup(i_old, oobj, nobj, funcRep, methodRef);
+	}
+	def lowerVariantGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
+		var methodRef = V3Op.extractIrSpec(i_old.op, method);
+		var funcRep = mach.funcRep(methodRef);
+		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+	}
+	def lowerVariantGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
+		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
+		var funcRep = mach.funcRep(methodRef);
+		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
+		var defm = mach.getCodeAddress(context.prog.ir.resolveVariantDefaultMethodImpl(methodRef));
+		return genIfNull(i_old, funcRep.machType, nobj, defm, genMtableLookup(i_old, oobj, _, funcRep, methodRef));
+	}
+	def lowerComponentGetField(i_old: SsaApplyOp, field: IrField) {
+		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
+		var fieldType = mach.machType(fieldRef.getFieldType());
+		var ptr = componentFieldPtr(fieldRef);
+		var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, fieldType, ptr, 0);
+		mapN(i_old, loads);
+	}
+	def lowerComponentSetField(i_old: SsaApplyOp, field: IrField) {
+		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
+		var inputs = normRefs(i_old.inputs);
+		var machType = mach.machType(fieldRef.getFieldType());
+		var ptr = componentFieldPtr(fieldRef);
+		// generate remaining stores for normalized fields.
+		genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, false, machType, ptr, 0, inputs, 1);
+		i_old.kill();
+		i_old.remove();
+	}
+	def lowerBoundsCheck0(i_old: SsaApplyOp, nullity: Fact.set, narr: SsaInstr) -> (SsaInstr, Fact.set) {
+		var oarr = i_old.inputs[0];
+		// load length
+		// XXX: CSE the array length if possible
+		var len = refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
+		var index = normRef1(i_old.inputs[1]);
+		var throwOp = V3Op.newConditionalThrow(V3Exception.BoundsCheck);
+		// throw BoundsCheckException if ugteq(index, length)
+		var op = Int.getType(false, 32).opLtEq();
+		apply(i_old.source, throwOp, [apply(i_old.source, op, [len, index])]);
+		return (index, nullity | Fact.O_NO_NULL_CHECK);
+	}
+	def lowerCallMethod(i_old: SsaApplyOp, method: IrMethod) {
+		var methodRef = V3Op.extractIrSpec(i_old.op, method);
+		var funcRep = mach.funcRep(methodRef);
+		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+		var args = Arrays.prepend(func, normRefs(i_old.inputs));
+		lowerCall(i_old, funcRep, args);
+	}
+	def lowerCallClassMethod(i_old: SsaApplyOp, method: IrMethod) {
+		var methodRef = V3Op.extractIrSpec(i_old.op, method);
+		if (!i_old.facts.O_NO_NULL_CHECK) genNullCheck(i_old);
+		var funcRep = mach.funcRep(methodRef);
+		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+		var args = Arrays.prepend(func, normRefs(i_old.inputs));
+		lowerCall(i_old, funcRep, args);
+	}
+	def lowerCallClassSelector(i_old: SsaApplyOp, selector: IrSelector) {
+		var func = lowerClassGetSelector(i_old, selector);
+		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
+		var args = Arrays.prepend(func, normRefs(i_old.inputs));
+		lowerCall(i_old, mach.funcRep(methodRef), args);
+	}
+	def lowerCallVariantSelector(i_old: SsaApplyOp, selector: IrSelector) {
+		var func = lowerVariantGetSelector(i_old, selector);
+		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
+		var args = Arrays.prepend(func, normRefs(i_old.inputs));
+		lowerCall(i_old, mach.funcRep(methodRef), args);
+	}
+	def lowerVariantGetTag(i_old: SsaApplyOp, nobj: SsaInstr) -> SsaInstr {
+		var val = ptrLoad(mach.tagType, nobj, 0);
+		var root = V3.getRootType(i_old.op.typeArgs[0]);
+		var min = mach.classIdRange(root).0;
+		if (min != 0) {
+			val = apply(i_old.source, mach.tagType.opSub(), [val, context.graph.intConst(min)]);
+		}
+		var shift = mach.code.addressSizeLog2;
+		if (shift > 0) {
+			val = apply(i_old.source, mach.tagType.opShr(), [val, context.graph.intConst(shift)]);
+		}
+		var conv = V3Op.newIntViewI(mach.tagType, i_old.op.sig.returnType());
+		return apply(i_old.source, conv, [val]);
+	}
+	def lowerCall(i_old: SsaApplyOp, funcRep: Mach_FuncRep, args: Array<SsaInstr>) {
+		if (lower.curBlock.end) return;
+//		var i_new = apply(i_old.source, if(config.ObjectSystem, i_old.op, V3Op.newCallAddress(funcRep)), args);
+		var i_new = apply(i_old.source, V3Op.newCallAddress(funcRep), args);
+		i_new.facts = i_new.facts | i_old.facts;
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
+	}
+}
+
 // Lowers Virgil code to machine level in-place by replacing object-level operations
 // with loads and stores. Introduces truncations and wrapping for integer operations
 // according to the {config}.
-class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringConfig) extends SsaGraphNormalizer(SsaContext.new(compiler, mach.prog)) {
+class MachLowering extends SsaGraphNormalizer {
+	def mach: MachProgram;
+	def compiler: Compiler;
+	def config: MachLoweringConfig;
+	def var objLower: LowerObjects;
+	new(mach, compiler, config) super(SsaContext.new(compiler, mach.prog)) {
+		// instantiate lowerer of object ops
+		objLower = config.ObjectLowerFactory(this, mach, compiler, config);
+	}
 	var maybeDead: List<SsaInstr>;
 	def doMethod(method: IrMethod) {
 		context.enterMethod(method);
@@ -488,11 +926,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			TypeCast(cast) => 		return genTypeCast(i_old, cast);
 			TypeQuery(query) => 		i_new = genTypeQuery(i_old, query);
 			TypeSubsume => 			return genTypeSubsume(i_old);
-			ArrayAlloc => 			i_new = genArrayAlloc(i_old);
-			ArrayInit => 			i_new = genArrayInit(i_old);
-			ArrayTupleInit(elems, length) => i_new = genArrayTupleInit(i_old, elems, length);
-			ArrayGetElem => 		return genArrayGetElem(i_old, 0);
-			ArraySetElem => 		return genArraySetElem(i_old, 0);
+			ArrayAlloc => 			i_new = objLower.lowerArrayAlloc(i_old);
+			ArrayInit => 			i_new = objLower.lowerArrayInit(i_old);
+			ArrayTupleInit(elems, length) => i_new = objLower.lowerArrayTupleInit(i_old, elems, length);
+			ArrayGetElem => 		return objLower.lowerArrayGetElem(i_old, 0);
+			ArraySetElem => 		return objLower.lowerArraySetElem(i_old, 0);
 			RangeStartPlusIndex => {
 				var arrayType = i_old.op.typeArgs[0];
 				var inputs = normRefs(i_old.inputs);
@@ -501,49 +939,49 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var offset = genArrayElemOffset(0, mach.getArrayElemScale(arrayType), index);
 				i_new = ptrAdd(rangeStart, offset);
 			}
-			NormRangeGetElem =>		return genNormRangeGetElem(i_old, 0);
-			NormRangeGetElemElem(index) =>	return genNormRangeGetElem(i_old, index);
-			NormRangeSetElem =>		return genNormRangeSetElem(i_old, 0);
-			NormRangeSetElemElem(index) =>	return genNormRangeSetElem(i_old, index);
-			ByteArrayGetField(offset, order) => return genByteArrayGetField(i_old, offset, order);
-			ByteArraySetField(offset, order) => return genByteArraySetField(i_old, offset, order);
-			ArrayGetElemElem(index) => 	return genArrayGetElem(i_old, index);
-			ArraySetElemElem(index) => 	return genArraySetElem(i_old, index);
-			ArrayGetLength => 		i_new = genArrayGetLength(i_old);
-			ClassAlloc(method) => 		return genClassAlloc(i_old, method);
-			ClassGetField(field) => 	return genClassGetField(false, i_old, field);
-			ClassInitField(field) =>	return genClassSetField(i_old, field, true);
-			ClassSetField(field) => 	return genClassSetField(i_old, field, false);
-			ClassGetMethod(method) => 	i_new = genClassGetMethod(i_old, method);
-			ClassGetSelector(selector) => 	i_new = genClassGetSelector(i_old, selector);
+			NormRangeGetElem =>		return objLower.lowerNormRangeGetElem(i_old, 0);
+			NormRangeGetElemElem(index) =>	return objLower.lowerNormRangeGetElem(i_old, index);
+			NormRangeSetElem =>		return objLower.lowerNormRangeSetElem(i_old, 0);
+			NormRangeSetElemElem(index) =>	return objLower.lowerNormRangeSetElem(i_old, index);
+			ByteArrayGetField(offset, order) => return objLower.lowerByteArrayGetField(i_old, offset, order);
+			ByteArraySetField(offset, order) => return objLower.lowerByteArraySetField(i_old, offset, order);
+			ArrayGetElemElem(index) => 	return objLower.lowerArrayGetElem(i_old, index);
+			ArraySetElemElem(index) => 	return objLower.lowerArraySetElem(i_old, index);
+			ArrayGetLength => 		i_new = objLower.lowerArrayGetLength(i_old);
+			ClassAlloc(method) => 		return objLower.lowerClassAlloc(i_old, method);
+			ClassGetField(field) => 	return objLower.lowerClassGetField(false, i_old, field);
+			ClassInitField(field) =>	return objLower.lowerClassSetField(i_old, field, true);
+			ClassSetField(field) => 	return objLower.lowerClassSetField(i_old, field, false);
+			ClassGetMethod(method) => 	i_new = objLower.lowerClassGetMethod(i_old, method);
+			ClassGetSelector(selector) => 	i_new = objLower.lowerClassGetSelector(i_old, selector);
 			VariantGetField(field) => {
 				var rcvrType = i_old.input0().getType();
 				var treatAsVariant = (
 					!ClassType.?(rcvrType) ||
 					!ClassType.!(rcvrType).classDecl.isUnboxed()
 					);
-				return genClassGetField(treatAsVariant, i_old, field);
+				return objLower.lowerClassGetField(treatAsVariant, i_old, field);
 			}
-			VariantAlloc =>			return genVariantAlloc(i_old);
-			VariantGetMethod(method) => 	i_new = genVariantGetMethod(i_old, method);
-			VariantGetSelector(selector) => i_new = genVariantGetSelector(i_old, selector);
-			ComponentGetField(field) => 	return genComponentGetField(i_old, field);
-			ComponentSetField(field) => 	return genComponentSetField(i_old, field);
+			VariantAlloc =>			return objLower.lowerVariantAlloc(i_old);
+			VariantGetMethod(method) => 	i_new = objLower.lowerVariantGetMethod(i_old, method);
+			VariantGetSelector(selector) => i_new = objLower.lowerVariantGetSelector(i_old, selector);
+			ComponentGetField(field) => 	return objLower.lowerComponentGetField(i_old, field);
+			ComponentSetField(field) => 	return objLower.lowerComponentSetField(i_old, field);
 			TupleGetElem(index) => 		return genTupleGetElem(i_old, index);
 			NullCheck =>			i_new = genNullCheck(i_old);
 			BoundsCheck => 			i_new = genBoundsCheck(i_old, Facts.NONE).0;
-			CallMethod(method) => 		return genCallMethod(i_old, method);
-			CallClassMethod(selector) => 	return genCallClassMethod(i_old, selector);
-			CallClassSelector(selector) => 	return genCallClassSelector(i_old, selector);
-			CallVariantSelector(selector) => 	return genCallVariantSelector(i_old, selector);
+			CallMethod(method) => 		return objLower.lowerCallMethod(i_old, method);
+			CallClassMethod(selector) => 	return objLower.lowerCallClassMethod(i_old, selector);
+			CallClassSelector(selector) => 	return objLower.lowerCallClassSelector(i_old, selector);
+			CallVariantSelector(selector) => 	return objLower.lowerCallVariantSelector(i_old, selector);
 			CallFunction => {
 				var funcRep = mach.getFuncRep(i_old.op.typeArgs[0]);
-				call(i_old, funcRep, normRefs(i_old.inputs));
+				objLower.lowerCall(i_old, funcRep, normRefs(i_old.inputs));
 				return;
 			}
 			VariantGetTag => {
 				var i_obj = normRef1(i_old.inputs[0]);
-				i_new = genIfNull(i_old, i_old.op.sig.returnType(), i_obj, null, genVariantGetTag(i_old, _));
+				i_new = genIfNull(i_old, i_old.op.sig.returnType(), i_obj, null, objLower.lowerVariantGetTag(i_old, _));
 			}
 			PtrAtLength => {
 				var i_array = normRef1(i_old.inputs[0]);
@@ -1376,42 +1814,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	def genTypeSubsume(i_old: SsaApplyOp) {
 		mapN(i_old, normRefs(i_old.inputs));  // always a no-op at the machine level
 	}
-	def genArrayAlloc(i_old: SsaApplyOp) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var olen = i_old.inputs[0], arrayType = i_old.op.typeArgs[0];
-		var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
-		if (SsaConst.?(olen.dest)) {
-			// length is known statically
-			var len = olen.dest.unbox<int>();
-			if (len < 0) return addThrow(i_old.source, V3Exception.LengthCheck);
-			return genArrayAllocWithSize(i_old.source, arrayType, hsize, len, scale);
-		}
-		var nlen = normRef1(olen);
-		if (!i_old.facts.O_NO_NEGATIVE_CHECK && !context.compiler.DisableLengthChecks) {
-			// add a check (length < 0)
-			var check = curBlock.opIntLt(nlen, context.graph.zeroConst());
-			apply(i_old.source, V3Op.newConditionalThrow(V3Exception.LengthCheck), [check]);
-		}
-		var size: SsaInstr = context.graph.intConst(hsize);
-		if (scale > 0) {
-			// scale the length by the element scale
-			var elemsize = nlen;
-			if (scale > 1) elemsize = curBlock.opIntMul(nlen, context.graph.intConst(scale));
-			if (scale != mach.data.addrAlign.alignUp(scale)) {
-				// alignment is necessary
-				size = curBlock.opIntAdd(elemsize, context.graph.intConst(hsize + mach.data.addrAlign.add));
-				size = curBlock.opIntAnd(size, context.graph.intConst(mach.data.addrAlign.mask));
-			} else {
-				size = curBlock.opIntAdd(elemsize, size);
-			}
-		}
-		// allocate the array, store tag, and store length
-		mach.allocates = true;
-		var narr = genAlloc(i_old.source, mach.machType(arrayType), size);
-		storeObjectTag(narr, arrayType);
-		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), nlen);
-		return narr;
-	}
 	def genArrayAllocWithSize(source: Source, arrayType: Type, hsize: int, len: int, scale: int) -> SsaInstr {
 		var totalSize = mach.data.addrAlign.alignUp(hsize + len * scale);
 		// allocate the array with the known size
@@ -1433,128 +1835,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			return apply(source, V3Op.newAlloc(mtype), [size]);
 		}
 	}
-	def genArrayInit(i_old: SsaApplyOp) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var arrayType = i_old.op.typeArgs[0];
-		var offset = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
-		var narr = genArrayAllocWithSize(i_old.source, arrayType, offset, i_old.inputs.length, scale);
-		var machType = mach.machType(V3Array.elementType(arrayType));
-		var tn = normIntType(machType), stride = if(tn == null, 1, tn.size);
-		var inputs = normRefs(i_old.inputs);
-		for (i = 0; i < inputs.length; (i = i + stride, offset = offset + scale)) {
-			// generate unchecked pointer stores to initialize the array
-			// XXX: cache type normalization across calls to this method
-			genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, machType, narr, offset, inputs, i);
-		}
-		return narr;
-	}
-	def genArrayTupleInit(i_old: SsaApplyOp, elems: int, length: int) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var arrayType = i_old.op.typeArgs[0];
-		var arrayRep = mach.arrayRep(arrayType);
-		var narr = genArrayAllocWithSize(i_old.source, arrayType, arrayRep.headerSize, length, arrayRep.elemScale);
-		for (i < length) {
-			for (j < elems) {
-				var val = i_old.inputs[i * elems + j];
-				var inputs = normRefN(val);
-				var offset = arrayRep.headerSize + arrayRep.offsets[j] + i * arrayRep.elemScale;
-				// XXX: cache type normalization across calls to this method
-				genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
-			}
-		}
-		return narr;
-	}
-	def genArrayGetElem(i_old: SsaApplyOp, elem: int) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var inputs = normRefs(i_old.inputs);
-		var narr = inputs[0], nindex = inputs[1], arrayType = i_old.op.typeArgs[0];
-		var nullity = context.compiler.nullity(i_old, narr);
-		nullity = genBoundsCheck(i_old, nullity).1;
-		var arrayRep = mach.arrayRep(arrayType);
-		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
-		// XXX: fold null check into pointer access if no bounds check
-		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
-		var loads = genNormTypedLoads(i_old.source, nullity, machType, ptrAdd(narr, offset), 0);
-		mapN(i_old, loads);
-	}
-	def genArraySetElem(i_old: SsaApplyOp, elem: int) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var inputs = normRefs(i_old.inputs);
-		var narr = inputs[0], nindex = inputs[1], arrayType = i_old.op.typeArgs[0];
-		var nullity = context.compiler.nullity(i_old, narr);
-		nullity = genBoundsCheck(i_old, nullity).1;
-		var arrayRep = mach.arrayRep(arrayType);
-		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
-		// XXX: fold null check into pointer access if no bounds check
-		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
-		genNormTypedStores(i_old.source, nullity, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
-		i_old.kill();
-		i_old.remove();
-	}
-	def genNormRangeGetElem(i_old: SsaApplyOp, elem: int) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var inputs = normRefs(i_old.inputs);
-		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], rangeType = i_old.op.typeArgs[0];
-		var arrayRep = mach.arrayRep(rangeType);
-		var offset = genArrayElemOffset(if(arrayRep.offsets != null, arrayRep.offsets[elem], 0), arrayRep.elemScale, nindex);
-		var pos = ptrAdd(ptrAdd(narr, rangeStart), offset);
-		var machType = mach.machType(arrayRep.getElemElemType(rangeType, elem));
-		var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, machType, pos, 0);
-		mapN(i_old, loads);
-	}
-	def genNormRangeSetElem(i_old: SsaApplyOp, elem: int) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var inputs = normRefs(i_old.inputs);
-		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], rangeType = i_old.op.typeArgs[0];
-		var arrayRep = mach.arrayRep(rangeType);
-		var offset = genArrayElemOffset(if(arrayRep.offsets != null, arrayRep.offsets[elem], 0), arrayRep.elemScale, nindex);
-		var pos = ptrAdd(ptrAdd(narr, rangeStart), offset);
-		var machType = mach.machType(arrayRep.getElemElemType(rangeType, elem));
-		genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, false, machType, pos, 0, inputs, 3);
-		i_old.kill();
-		i_old.remove();
-	}
-	def genByteArrayGetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) {
-		var inputs = normRefs(i_old.inputs);
-		var ni_arr = inputs[0], ni_start = inputs[1];
-		var fieldType = i_old.op.typeArgs[0];
-		var base = ptrAdd(ni_arr, ni_start);
-		var nullity = context.compiler.nullity(i_old, base);
-		if (!nullity.O_NO_NULL_CHECK && !config.ImplicitNullChecks) genNullCheck0(i_old.source, base);
-		if (i_old.op.typeArgs[1] != V3Range.START_TYPE) offset += mach.arrayRep(V3.arrayByteType).getElemElemOffset(0);
-
-		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
-		var t = decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder), tn = t.0, accesses = t.1;
-
-		var ai_results = Array<SsaInstr>.new(accesses.length);
-		for (i < accesses.length) {
-			var a = accesses[i];
-			match (a) {
-				Simple(t, offset) => {
-					var d = ptrLoad(t, base, offset);
-					ai_results[i] = d;
-				}
-				Compound(t, wordType, datums) => {
-					var d: SsaInstr, or = wordType.opOr(), shl = wordType.opShl();
-					for (datum in datums) {
-						var l = ptrLoad(datum.t, base, datum.offset);
-						if (datum.t != wordType) l = curBlock.pure(V3Op.newIntViewI(datum.t, wordType), [l]);
-						if (datum.shift > 0) l = curBlock.pure(shl, [l, context.graph.intConst(datum.shift)]);
-						if (d != null) d = curBlock.pure(or, [d, l]);
-						else d = l;
-					}
-					var op = getAccessViewOp(t, wordType);
-					if (op != null) d = curBlock.pure(op, [d]);
-					ai_results[i] = d;
-				}
-			}
-		}
-		if (tn != null && tn.newType != fieldType) {
-			var op = getAccessViewOp(fieldType, tn.newType);
-			if (op != null) ai_results = [wideInputs(op, if(tn.size > 1, tn), ai_results, Fact.O_PURE)];
-		}
-		return mapN(i_old, ai_results);
-	}
 	def getAccessViewOp(fieldType: Type, wordType: Type) -> Operator {
 		if (fieldType == wordType) return null;
 		match (fieldType) {
@@ -1567,45 +1847,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			_ => return null; // TODO
 		}
 	}
-	def genByteArraySetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) { // TODO: byte order
-		var inputs = normRefs(i_old.inputs);
-		var ni_arr = inputs[0], ni_start = inputs[1], vals = Arrays.range(inputs, 2, inputs.length);
-		var fieldType = i_old.op.typeArgs[0];
-		var base = ptrAdd(ni_arr, ni_start);
-		var nullity = context.compiler.nullity(i_old, base);
-		if (!nullity.O_NO_NULL_CHECK && !config.ImplicitNullChecks) genNullCheck0(i_old.source, base);
-		if (i_old.op.typeArgs[1] != V3Range.START_TYPE) offset += mach.arrayRep(V3.arrayByteType).getElemElemOffset(0);
-
-		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
-		var t = decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder), tn = t.0, accesses = t.1;
-
-		var ai_results = Array<SsaInstr>.new(accesses.length);
-		if (tn != null && tn.newType != fieldType) {
-			var op = getAccessViewOp(tn.oldType, fieldType);
-			var atn = if(tn.size > 1, tn);
-			if (op != null) vals = wideOutputs(op, atn, vals, Fact.O_PURE);
-		}
-		for (i < accesses.length) {
-			var a = accesses[i], i_val = vals[i];
-			match (a) {
-				Simple(t, offset) => {
-					ptrStore(t, base, offset, i_val);
-				}
-				Compound(t, wordType, datums) => {
-					var shr = wordType.opShr();
-					if (t != wordType) match (t) {
-						x: FloatType => i_val = curBlock.pure(if(x.is64, V3Op.opIntViewF64, V3Op.opIntViewF32), [i_val]);
-					}
-					for (datum in datums) {
-						var v = if(datum.shift == 0, i_val, curBlock.pure(shr, [i_val, context.graph.intConst(datum.shift)]));
-						ptrStore(datum.t, base, datum.offset, v);
-					}
-				}
-			}
-		}
-		i_old.kill();
-		i_old.remove();
-	}
 	def genArrayElemOffset(headerSize: int, scale: int, index: SsaInstr) -> SsaInstr {
 		if (SsaConst.?(index)) {
 			// fold the offset calculation
@@ -1617,151 +1858,12 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			return offset;
 		}
 	}
-	def genArrayGetLength(i_old: SsaApplyOp) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var oarr = i_old.inputs[0], narr = normRef1(oarr);
-		var nullity = context.compiler.nullity(i_old, null);
-		return refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
-	}
-	def genClassAlloc(i_old: SsaApplyOp, method: IrMethod) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var classType = i_old.getType();
-		var size = mach.getObjectSize(classType, null);
-		// allocate the object
-		mach.allocates = true;
-		var nobj = genAlloc(i_old.source, mach.machType(classType), context.graph.intConst(size));
-		storeObjectTag(nobj, classType);
-		if (method != null) {
-			var newRef = V3Op.extractIrSpec(i_old.op, method);
-			var funcRep = mach.funcRep(newRef);
-			// nontrivial constructor
-			var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(newRef));
-			var args = Arrays.prepend(func, Arrays.prepend(nobj, normRefs(i_old.inputs)));
-			call(i_old, funcRep, args);
-			return;
-		}
-		return map1(i_old, nobj);
-	}
-	def genVariantAlloc(i_old: SsaApplyOp) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var classType = i_old.getType();
-		var size = mach.getObjectSize(classType, null);
-		// allocate the object
-		mach.allocates = true;
-		var i_new = genAlloc(i_old.source, mach.machType(classType), context.graph.intConst(size));
-		storeObjectTag(i_new, classType);
-		var ic = context.prog.ir.getIrClass(classType);
-		var ai_inputs = normRefs(i_old.inputs);
-		// Generate explicit field initializations.
-		var start = 0;
-		for (i < ic.fields.length) {
-			var f = ic.fields[i];
-			var machType = mach.machType(f.fieldType);
-			var tn = normIntType(machType);
-			genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, machType, i_new, f.machOffset, ai_inputs, start);
-			start += if(tn != null, tn.size, 1);
-		}
-		return map1(i_old, i_new);
-	}
-	def genClassGetField(isVariant: bool, i_old: SsaApplyOp, field: IrField) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
-		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
-		var machType = mach.machType(fieldRef.getFieldType());
-		var offset = mach.classFieldOffset(fieldRef);
-		var nullity = context.compiler.nullity(i_old, oobj.dest);
-		if (isVariant) {
-			var tblock: SsaBuilder, fblock: SsaBuilder, merge: SsaBuilder;
-			var sub: Array<Type>;
-			if (!nullity.O_NO_NULL_CHECK) {
-				var t = addIfNull(nobj);
-				tblock = t.0;
-				fblock = t.1;
-				merge = t.2;
-				curBlock = fblock;
-				var tn = normIntType(machType);
-				sub = if(tn == null, [machType], tn.sub);
-			}
-			var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, machType, nobj, offset);
-			if (!nullity.O_NO_NULL_CHECK) {
-				fblock.addGoto(merge.block);
-				tblock.addGoto(merge.block);
-				curBlock = merge;
-				// if (nobj == null) emit null values
-				for (i < loads.length) {
-					loads[i] = curBlock.addPhi(sub[i], [loads[i], context.graph.nullConst(sub[i])]);
-				}
-			}
-			mapN(i_old, loads);
-		} else {
-			var loads = genNormTypedLoads(i_old.source, nullity, machType, nobj, offset);
-			mapN(i_old, loads);
-		}
-	}
-	def genClassSetField(i_old: SsaApplyOp, field: IrField, init: bool) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var inputs = normRefs(i_old.inputs);
-		var fieldRef = V3Op.extractIrSpec(i_old.op, field), nobj = inputs[0];
-		var offset = mach.classFieldOffset(fieldRef);
-		var machType = mach.machType(fieldRef.getFieldType());
-		var nullity = compiler.nullity(i_old, nobj);
-		genNormTypedStores(i_old.source, nullity, init, machType, nobj, offset, inputs, 1);
-		i_old.kill();
-		i_old.remove();
-	}
-	def genClassGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var methodRef = V3Op.extractIrSpec(i_old.op, method);
-		var funcRep = mach.funcRep(methodRef);
-		genNullCheck(i_old);
-		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
-	}
-	def genClassGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
-		var funcRep = mach.funcRep(methodRef);
-		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
-		return genMtableLookup(i_old, oobj, nobj, funcRep, methodRef);
-	}
-	def genVariantGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var methodRef = V3Op.extractIrSpec(i_old.op, method);
-		var funcRep = mach.funcRep(methodRef);
-		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
-	}
-	def genVariantGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
-		var funcRep = mach.funcRep(methodRef);
-		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
-		var defm = mach.getCodeAddress(context.prog.ir.resolveVariantDefaultMethodImpl(methodRef));
-		return genIfNull(i_old, funcRep.machType, nobj, defm, genMtableLookup(i_old, oobj, _, funcRep, methodRef));
-	}
 	def genMtableLookup(i_old: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, funcRep: Mach_FuncRep, methodRef: IrSpec) -> SsaInstr {
 		// use method-table based dispatch
 		var nullity = context.compiler.nullity(i_old, oobj.dest);
 		var tid = refLoad(nullity, mach.tagType, i_old, oobj, nobj, 0);
 		var mtbl = context.graph.valConst(mach.data.ptrType, mach.methodTable(methodRef));
 		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
-	}
-	def genComponentGetField(i_old: SsaApplyOp, field: IrField) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
-		var fieldType = mach.machType(fieldRef.getFieldType());
-		var ptr = componentFieldPtr(fieldRef);
-		var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, fieldType, ptr, 0);
-		mapN(i_old, loads);
-	}
-	def genComponentSetField(i_old: SsaApplyOp, field: IrField) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
-		var inputs = normRefs(i_old.inputs);
-		var machType = mach.machType(fieldRef.getFieldType());
-		var ptr = componentFieldPtr(fieldRef);
-		// generate remaining stores for normalized fields.
-		genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, false, machType, ptr, 0, inputs, 1);
-		i_old.kill();
-		i_old.remove();
 	}
 	def genTupleGetElem(i_old: SsaApplyOp, index: int) {
 		var tn = TupleNorm.!(normType(i_old.op.typeArgs[0]));
@@ -1789,64 +1891,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			if (!nullity.O_NO_NULL_CHECK) genNullCheck0(i_old.source, narr);
 			return (context.graph.nullConst(Void.TYPE), nullity | Fact.O_NO_NULL_CHECK);
 		}
-		if (config.ObjectSystem) return (normId(i_old), nullity);
-		// load length
-		// XXX: CSE the array length if possible
-		var len = refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
-		var index = normRef1(i_old.inputs[1]);
-		var throwOp = V3Op.newConditionalThrow(V3Exception.BoundsCheck);
-		// throw BoundsCheckException if ugteq(index, length)
-		var op = Int.getType(false, 32).opLtEq();
-		apply(i_old.source, throwOp, [apply(i_old.source, op, [len, index])]);
-		return (index, nullity | Fact.O_NO_NULL_CHECK);
+		return objLower.lowerBoundsCheck0(i_old, nullity, narr);
 	}
-	def genCallMethod(i_old: SsaApplyOp, method: IrMethod) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var methodRef = V3Op.extractIrSpec(i_old.op, method);
-		var funcRep = mach.funcRep(methodRef);
-		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
-		var args = Arrays.prepend(func, normRefs(i_old.inputs));
-		call(i_old, funcRep, args);
-	}
-	def genCallClassMethod(i_old: SsaApplyOp, method: IrMethod) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var methodRef = V3Op.extractIrSpec(i_old.op, method);
-		if (!i_old.facts.O_NO_NULL_CHECK) genNullCheck(i_old);
-		var funcRep = mach.funcRep(methodRef);
-		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
-		var args = Arrays.prepend(func, normRefs(i_old.inputs));
-		call(i_old, funcRep, args);
-	}
-	def genCallClassSelector(i_old: SsaApplyOp, selector: IrSelector) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var func = genClassGetSelector(i_old, selector);
-		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
-		var args = Arrays.prepend(func, normRefs(i_old.inputs));
-		call(i_old, mach.funcRep(methodRef), args);
-	}
-	def genCallVariantSelector(i_old: SsaApplyOp, selector: IrSelector) {
-		if (config.ObjectSystem) return void(normId(i_old));
-		var func = genVariantGetSelector(i_old, selector);
-		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
-		var args = Arrays.prepend(func, normRefs(i_old.inputs));
-		call(i_old, mach.funcRep(methodRef), args);
-	}
-	def genVariantGetTag(i_old: SsaApplyOp, nobj: SsaInstr) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
-		var val = ptrLoad(mach.tagType, nobj, 0);
-		var root = V3.getRootType(i_old.op.typeArgs[0]);
-		var min = mach.classIdRange(root).0;
-		if (min != 0) {
-			val = apply(i_old.source, mach.tagType.opSub(), [val, context.graph.intConst(min)]);
-		}
-		var shift = mach.code.addressSizeLog2;
-		if (shift > 0) {
-			val = apply(i_old.source, mach.tagType.opShr(), [val, context.graph.intConst(shift)]);
-		}
-		var conv = V3Op.newIntViewI(mach.tagType, i_old.op.sig.returnType());
-		return apply(i_old.source, conv, [val]);
-	}
-
 	def explicitNullCheck(source: Source, t: Type, nobj: SsaInstr) -> SsaInstr {
 		if (context.compiler.DisableNullChecks) return nobj;
 		var check = apply(source, V3Op.newRefEq(t), [nobj, context.graph.nullConst(t)]);
@@ -1876,13 +1922,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 	}
 
-	def call(i_old: SsaApplyOp, funcRep: Mach_FuncRep, args: Array<SsaInstr>) {
-		if (curBlock.end) return;
-		var i_new = apply(i_old.source, if(config.ObjectSystem, i_old.op, V3Op.newCallAddress(funcRep)), args);
-		i_new.facts = i_new.facts | i_old.facts;
-		var tn = normType(i_old.op.sig.returnType());
-		mapMultiReturn(i_old, i_new, tn);
-	}
 	def apply(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
 		return curBlock.addApply(source, op, args);
 	}
