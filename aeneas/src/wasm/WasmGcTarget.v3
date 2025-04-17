@@ -43,7 +43,6 @@ class WasmGcTarget extends Target {
 		compiler.NormConfig.MixedArrays = false;
 		compiler.NormConfig.ArrayLengthType = Int.getType(true, 32);
 		compiler.NormConfig.ArrayIndexType = Int.getType(true, 32);
-		// EBM: could we have ranges within Wasm Array<byte>?
 		compiler.NormConfig.RangeStartType = Int.getType(true, 32);	// 64-bit memories?
 		// compiler.unboxVariantsOpt = false;	// EBM: can't change it here
 		// compiler.DisableBoundsChecks = true;	// leave since there can be residual checks
@@ -68,9 +67,13 @@ class WasmGcTarget extends Target {
 		prog.tprog = mach;
 		MachModule.install(prog, mach);
 		mach.runtime = MachRuntime.new(mach);
-		// EBM: Pointer not supported on WasmGc
-		// var cirt = CiRuntime_TypeCon.new(MachModule.PTR_32.create0(), prog.typeCache);
-		// prog.typeEnv.add(cirt);
+		// EBM: Note that Pointer use is somewhat limited on WasmGc (these restrictions are
+		// not all set up yet)
+		// - atContents and atElement work only on off heap ranges (give bounds trap otherwise)
+		// - atObject is prohibited
+		// - atField works on on off heap Refs
+		var cirt = CiRuntime_TypeCon.new(MachModule.PTR_32.create0(), prog.typeCache);
+		prog.typeEnv.add(cirt);
 	}
 	def emit(compiler: Compiler, prog: Program) {
 		var context = SsaContext.new(compiler, prog);
@@ -326,10 +329,10 @@ class WasmGcTarget extends Target {
 			// Indirect adapters come next
 			for (i < wasm.indirectAdapters.length) {
 				var e = wasm.indirectAdapters[i];
-				out.put_uleb32(e.1);
+				out.put_uleb32(e.1 - 1);
 				if (WasmComponent.printSection.FUNCTION) {
 					var sb = StringBuilder.new().put2("Indirect adapter index %d sig index #%d",
-									  findex++, e.1);
+									  findex++, e.1 - 1);
 					prog.ERROR.addError(null, null, "Function Section", sb.extract());
 				}
 			}
@@ -598,7 +601,7 @@ class WasmGcTarget extends Target {
 
 		// (9) Emit the data section
 		//--------------------------------------------------------------------------------
-		if (WasmComponent.includeSection.DATA) {
+		if (WasmComponent.includeSection.DATA && false) {	// turn off for now
 			out.startSection(WasmSection.DATA.code);
 			out.putb(1); // 1 data entry
 			out.putb(0); // linear memory #0
@@ -885,7 +888,10 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 	}
 
 	def getSig(receiver: Type, sig: Signature) -> Signature {
-		if (receiver != Void.TYPE) sig = Signature.new(null, Arrays.prepend(receiver, sig.paramTypes), sig.returnTypes);
+//		var sb = StringBuilder.new().put2("receiver=%q  sig=%q", receiver.render, sig.funcType().render);
+//		mach.prog.ERROR.addError(null, null, "getSig", sb.extract());
+		if (receiver != Void.TYPE && !V3.isComponent(receiver))
+			sig = Signature.new(null, Arrays.prepend(receiver, sig.paramTypes), sig.returnTypes);
 		return sig;
 	}
 	def addSig(receiver: Type, sig: Signature) -> u32 {
@@ -1145,133 +1151,201 @@ class WasmGcLowering extends MachLowering {
 	def wasm: WasmGcProgram;
 
 	new(wasm, mach: MachProgram, compiler: Compiler, config: MachLoweringConfig)
-		super(mach, compiler, config) {
-			var sb = StringBuilder.new().puts("WasmGcLowering created");
-			mach.prog.ERROR.addError(null, null, "WasmGcLowering", sb.extract());
-		}
+		super(mach, compiler, config) {	}
 
+	def genSimpleVal(val: Val, tn: TypeNorm) -> Val {
+		if (val == null) return null;
+		match (val) {
+			x: ArrayRangeStart => return Int.box(x.start);
+			x: PointerRangeStart => return x.start;
+		}
+		return mach.machVal(val);
+	}
 	def genArrayAlloc(i_old: SsaApplyOp) -> SsaInstr {
-		wasm.gcTypeTable.addArrayType(i_old.op.sig.returnTypes[0]);
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.returnTypes[0]);
 		return normId(i_old);
-/*
-		var olen = i_old.inputs[0], arrayType = i_old.op.typeArgs[0];
-		var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
-		if (SsaConst.?(olen.dest)) {
-			// length is known statically
-			var len = olen.dest.unbox<int>();
-			if (len < 0) return addThrow(i_old.source, V3Exception.LengthCheck);
-			return genArrayAllocWithSize(i_old.source, arrayType, hsize, len, scale);
-		}
-		var nlen = normRef1(olen);
-		if (!i_old.facts.O_NO_NEGATIVE_CHECK && !context.compiler.DisableLengthChecks) {
-			// add a check (length < 0)
-			var check = curBlock.opIntLt(nlen, context.graph.zeroConst());
-			apply(i_old.source, V3Op.newConditionalThrow(V3Exception.LengthCheck), [check]);
-		}
-		var size: SsaInstr = context.graph.intConst(hsize);
-		if (scale > 0) {
-			// scale the length by the element scale
-			var elemsize = nlen;
-			if (scale > 1) elemsize = curBlock.opIntMul(nlen, context.graph.intConst(scale));
-			if (scale != mach.data.addrAlign.alignUp(scale)) {
-				// alignment is necessary
-				size = curBlock.opIntAdd(elemsize, context.graph.intConst(hsize + mach.data.addrAlign.add));
-				size = curBlock.opIntAnd(size, context.graph.intConst(mach.data.addrAlign.mask));
-			} else {
-				size = curBlock.opIntAdd(elemsize, size);
-			}
-		}
-		// allocate the array, store tag, and store length
-		mach.allocates = true;
-		var narr = genAlloc(i_old.source, mach.machType(arrayType), size);
-		storeObjectTag(narr, arrayType);
-		ptrStore(Int.TYPE, narr, mach.getArrayLengthOffset(arrayType), nlen);
-		return narr;
-*/
 	}
 	def genArrayInit(i_old: SsaApplyOp) -> SsaInstr {
-		wasm.gcTypeTable.addArrayType(i_old.op.sig.returnTypes[0]);
-		wasm.gcTypeTable.addArrayType(i_old.op.sig.returnTypes[0]);
-		return normId(i_old);
-/*
 		var arrayType = i_old.op.typeArgs[0];
-		var offset = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
-		var narr = genArrayAllocWithSize(i_old.source, arrayType, offset, i_old.inputs.length, scale);
-		var machType = mach.machType(V3Array.elementType(arrayType));
-		var tn = normIntType(machType), stride = if(tn == null, 1, tn.size);
-		var inputs = normRefs(i_old.inputs);
-		for (i = 0; i < inputs.length; (i = i + stride, offset = offset + scale)) {
-			// generate unchecked pointer stores to initialize the array
-			// XXX: cache type normalization across calls to this method
-			genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, machType, narr, offset, inputs, i);
-		}
-		return narr;
-*/
+		wasm.gcTypeTable.addHeapType(arrayType);
+		return normId(i_old);
 	}
 	def genArrayTupleInit(i_old: SsaApplyOp, elems: int, length: int) -> SsaInstr {
-		wasm.gcTypeTable.addArrayType(i_old.op.sig.returnTypes[0]);
-		return normId(i_old);
-/*
-		var arrayType = i_old.op.typeArgs[0];
-		var arrayRep = mach.arrayRep(arrayType);
-		var narr = genArrayAllocWithSize(i_old.source, arrayType, arrayRep.headerSize, length, arrayRep.elemScale);
-		for (i < length) {
-			for (j < elems) {
-				var val = i_old.inputs[i * elems + j];
-				var inputs = normRefN(val);
-				var offset = arrayRep.headerSize + arrayRep.offsets[j] + i * arrayRep.elemScale;
-				// XXX: cache type normalization across calls to this method
-				genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
-			}
-		}
-		return narr;
-*/
+		// should not happen since MixedArrays is turned off
+		wasm.context.fail("genArrayTupleInit called but MixedArrays is false");
+		return normId(i_old);	// satisfy compiler
 	}
 	def genArrayGetElem(i_old: SsaApplyOp, elem: int) {
-		wasm.gcTypeTable.addArrayType(i_old.op.sig.paramTypes[0]);
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
 		return void(normId(i_old));
-/*
-		var inputs = normRefs(i_old.inputs);
-		var narr = inputs[0], nindex = inputs[1], arrayType = i_old.op.typeArgs[0];
-		var nullity = context.compiler.nullity(i_old, narr);
-		nullity = genBoundsCheck(i_old, nullity).1;
-		var arrayRep = mach.arrayRep(arrayType);
-		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
-		// XXX: fold null check into pointer access if no bounds check
-		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
-		var loads = genNormTypedLoads(i_old.source, nullity, machType, ptrAdd(narr, offset), 0);
-		mapN(i_old, loads);
-*/
 	}
 	def genArraySetElem(i_old: SsaApplyOp, elem: int) {
-		wasm.gcTypeTable.addArrayType(i_old.op.sig.paramTypes[0]);
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
 		return void(normId(i_old));
-/*
+	}
+	def genRangeStartPlusIndex(i_old: SsaApplyOp) -> SsaInstr {
+		var rangeType = i_old.op.typeArgs[0];
+		wasm.gcTypeTable.addHeapType(rangeType);
 		var inputs = normRefs(i_old.inputs);
-		var narr = inputs[0], nindex = inputs[1], arrayType = i_old.op.typeArgs[0];
-		var nullity = context.compiler.nullity(i_old, narr);
-		nullity = genBoundsCheck(i_old, nullity).1;
-		var arrayRep = mach.arrayRep(arrayType);
-		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
-		// XXX: fold null check into pointer access if no bounds check
-		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
-		genNormTypedStores(i_old.source, nullity, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
-		i_old.kill();
-		i_old.remove();
+		var narr = inputs[0];
+		var rangeStart = inputs[1];
+		var nindex = inputs[2]; // XXX: discarding upper words for normalized integers
+		var etype = V3Array.elementType(rangeType);
+		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
+		var itype = IntType.!(i_old.op.typeArgs[1]);
+		var i_new: SsaInstr;
+
+
+		var sum = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+		if (wst.pack == WasmPacking.PACKED_8) {
+			// byte: null ok, no scaling so can add start and index early, then if
+			if (narr.facts.V_ZERO) {
+				i_new = ptrAdd(rangeStart, nindex);
+			} else if (narr.facts.V_NON_ZERO) {
+				i_new = sum;
+			} else {
+				var t = addIfNull(narr);
+				var tblock = t.0, fblock = t.1, merge = t.2;
+				curBlock = fblock;
+				// if (nobj != null) generate the nonnull (array) case
+				var aresult = sum;
+				fblock.addGoto(merge.block);
+
+				// if (nobj == null) generate the null (memory) case
+				curBlock = tblock;
+				var mresult = ptrAdd(rangeStart, nindex);
+				tblock.addGoto(merge.block);
+
+				curBlock = merge;
+				i_new = curBlock.addPhi(etype, [aresult, mresult]);
+			}
+		} else {
+			match (wst.valType) {
+				I32, I64, F32, F64 => {
+					var ptype = PrimType.!(etype);
+					var scale = ptype.byteSize;
+					var i_scale = context.graph.intConst(scale);
+					// int/float: null ok, scaling so add start and index*scale later (within if)
+					if (narr.facts.V_ZERO) {
+						var prod = apply(i_old.source, itype.opMul(), [nindex, i_scale]);
+						i_new = ptrAdd(rangeStart, prod);
+					} else if (narr.facts.V_NON_ZERO) {
+						i_new = sum;
+					} else {
+						var t = addIfNull(narr);
+						var tblock = t.0, fblock = t.1, merge = t.2;
+						curBlock = fblock;
+						// if (nobj != null) generate the nonnull (array) case
+						var aresult = sum;
+						fblock.addGoto(merge.block);
+
+						// if (nobj == null) generate the null (memory) case
+						curBlock = tblock;
+						var mprod = apply(i_old.source, itype.opMul(), [nindex, i_scale]);
+						var mresult = ptrAdd(rangeStart, mprod);
+						tblock.addGoto(merge.block);
+
+						curBlock = merge;
+						i_new = curBlock.addPhi(etype, [aresult, mresult]);
+					}
+				}
+				_ => {
+					// no explicit null check needed
+					i_new = sum;
+				}
+			}
+		}
+		map1(i_old, i_new);
+		return i_new;
+/*
+		generate an if-then-else based on off-heap vs on-heap
+
+		var arrayType = i_old.op.typeArgs[0];
+		var inputs = normRefs(i_old.inputs);
+		var rangeStart = inputs[0];
+		var index = inputs[1]; // XXX: discarding upper words for normalized integers
+		var offset = genArrayElemOffset(0, mach.getArrayElemScale(arrayType), index);
+		return ptrAdd(rangeStart, offset);
 */
 	}
 	def genNormRangeGetElem(i_old: SsaApplyOp, elem: int) {
-		return void(normId(i_old));
-/*
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
 		var inputs = normRefs(i_old.inputs);
 		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], rangeType = i_old.op.typeArgs[0];
-		var arrayRep = mach.arrayRep(rangeType);
-		var offset = genArrayElemOffset(if(arrayRep.offsets != null, arrayRep.offsets[elem], 0), arrayRep.elemScale, nindex);
-		var pos = ptrAdd(ptrAdd(narr, rangeStart), offset);
-		var machType = mach.machType(arrayRep.getElemElemType(rangeType, elem));
-		var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, machType, pos, 0);
-		mapN(i_old, loads);
-*/
+		var etype = V3Array.elementType(rangeType);
+		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
+		var itype = IntType.!(i_old.op.typeArgs[1]);
+		// op is usually needed
+		var op = Operator.new(Opcode.ArrayGetElem, i_old.op.typeArgs, Function.siga(i_old.op.typeArgs, etype));
+		if (wst.pack == WasmPacking.PACKED_8) {
+			// byte: null ok, no scaling so can add start and index early, then if
+			var sum = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+			if (narr.facts.V_ZERO) {
+				var result = apply(null, V3Op.newPtrLoad(mach.data.ptrType, etype), [sum]);
+				map1(i_old, result);
+			} else if (narr.facts.V_NON_ZERO) {
+				var result = apply(null, op, [narr, sum]);
+				map1(i_old, result);
+			} else {
+				var t = addIfNull(narr);
+				var tblock = t.0, fblock = t.1, merge = t.2;
+				curBlock = fblock;
+				// if (nobj != null) generate the nonnull (array) case
+				var aresult = apply(null, op, [narr, sum]);
+				fblock.addGoto(merge.block);
+
+				// if (nobj == null) generate the null (memory) case
+				curBlock = tblock;
+				var mresult = apply(null, V3Op.newPtrLoad(mach.data.ptrType, etype), [sum]);
+				tblock.addGoto(merge.block);
+
+				curBlock = merge;
+				map1(i_old, curBlock.addPhi(etype, [aresult, mresult]));
+			}
+		} else {
+			match (wst.valType) {
+				I32, I64, F32, F64 => {
+					var ptype = PrimType.!(etype);
+					var scale = ptype.byteSize;
+					var i_scale = context.graph.intConst(scale);
+					// int/float: null ok, scaling so add start and index*scale later (within if)
+					if (narr.facts.V_ZERO) {
+						var prod = apply(i_old.source, itype.opMul(), [nindex, i_scale]);
+						var sum = apply(i_old.source, itype.opAdd(), [rangeStart, prod]);
+						var result = apply(i_old.source, V3Op.newPtrLoad(mach.data.ptrType, etype), [sum]);
+						map1(i_old, result);
+					} else if (narr.facts.V_NON_ZERO) {
+						var sum = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+						var result = apply(i_old.source, op, [narr, sum]);
+						map1(i_old, result);
+					} else {
+						var t = addIfNull(narr);
+						var tblock = t.0, fblock = t.1, merge = t.2;
+						curBlock = fblock;
+						// if (nobj != null) generate the nonnull (array) case
+						var asum = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+						var aresult = apply(i_old.source, op, [narr, asum]);
+						fblock.addGoto(merge.block);
+
+						// if (nobj == null) generate the null (memory) case
+						curBlock = tblock;
+						var mprod = apply(i_old.source, itype.opMul(), [nindex, i_scale]);
+						var msum = apply(i_old.source, itype.opAdd(), [rangeStart, mprod]);
+						var mresult = apply(i_old.source, V3Op.newPtrLoad(mach.data.ptrType, etype), [msum]);
+						tblock.addGoto(merge.block);
+
+						curBlock = merge;
+						map1(i_old, curBlock.addPhi(etype, [aresult, mresult]));
+					}
+				}
+				_ => {
+					// no explicit null check needed
+					var sum = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+					var result = apply(null, op, [narr, sum]);
+					map1(i_old, result);
+				}
+			}
+		}
 	}
 	def genNormRangeSetElem(i_old: SsaApplyOp, elem: int) {
 		return void(normId(i_old));
@@ -1288,13 +1362,8 @@ class WasmGcLowering extends MachLowering {
 */
 	}
 	def genArrayGetLength(i_old: SsaApplyOp) -> SsaInstr {
-		wasm.gcTypeTable.addArrayType(i_old.op.sig.paramTypes[0]);
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
 		return normId(i_old);
-/*
-		var oarr = i_old.inputs[0], narr = normRef1(oarr);
-		var nullity = context.compiler.nullity(i_old, null);
-		return refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
-*/
 	}
 	def genClassAlloc(i_old: SsaApplyOp, method: IrMethod) {
 		return void(normId(i_old));
@@ -1423,6 +1492,8 @@ class WasmGcLowering extends MachLowering {
 		return normId(i_old);
 	}
 	def genMtableLookup(i_old: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, funcRep: Mach_FuncRep, methodRef: IrSpec) -> SsaInstr {
+		mach.methodTable(methodRef);
+		return normId(i_old);
 /*
 		// use method-table based dispatch
 		var nullity = context.compiler.nullity(i_old, oobj.dest);
@@ -1430,8 +1501,6 @@ class WasmGcLowering extends MachLowering {
 		var mtbl = context.graph.valConst(mach.data.ptrType, mach.methodTable(methodRef));
 		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
 */
-		mach.methodTable(methodRef);
-		return normId(i_old);
 	}
 	def genComponentGetField(i_old: SsaApplyOp, field: IrField) {
 		return void(normId(i_old));
@@ -1472,14 +1541,11 @@ class WasmGcLowering extends MachLowering {
 */
 	}
 	def genCallMethod(i_old: SsaApplyOp, method: IrMethod) {
-		return void(normId(i_old));
-/*
 		var methodRef = V3Op.extractIrSpec(i_old.op, method);
 		var funcRep = mach.funcRep(methodRef);
 		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
 		var args = Arrays.prepend(func, normRefs(i_old.inputs));
 		call(i_old, funcRep, args);
-*/
 	}
 	def genCallClassMethod(i_old: SsaApplyOp, method: IrMethod) {
 		return void(normId(i_old));
@@ -1527,10 +1593,19 @@ class WasmGcLowering extends MachLowering {
 		return apply(i_old.source, conv, [val]);
 */
 	}
+	def genNullCheck0(source: Source, nobj: SsaInstr) {
+		if (SsaConst.?(nobj)) {
+			var oval = SsaConst.!(nobj).val;
+			if (oval == null) addThrow(source, V3Exception.NullCheck);
+			return; // constant is non-null
+		}
+		
+
+		ptrLoadT(source, Void.TYPE, nobj, 0);
+	}
 	def call(i_old: SsaApplyOp, funcRep: Mach_FuncRep, args: Array<SsaInstr>) {
 		if (curBlock.end) return;
-//		var i_new = apply(i_old.source, V3Op.newCallAddress(funcRep), args);
-		var i_new = apply(i_old.source, i_old.op, args);
+		var i_new = apply(i_old.source, V3Op.newCallAddress(funcRep), args);
 		i_new.facts = i_new.facts | i_old.facts;
 		var tn = normType(i_old.op.sig.returnType());
 		mapMultiReturn(i_old, i_new, tn);
