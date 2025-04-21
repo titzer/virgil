@@ -26,8 +26,7 @@ component Arm64Common {
 // TODO: negative object headers
 class Arm64Backend extends MachBackend {
 	def test: bool;
-	var patcher: Arm64AddrPatcher;
-	var asm: Arm64Assembler;
+	var asm: Arm64MacroAssembler;
 	var codegen: SsaArm64Gen;
 	var allocateRegs: void -> void;
 	var allocateRegsGlobal: void -> void;
@@ -50,28 +49,25 @@ class Arm64Backend extends MachBackend {
 			objReg = Arm64Regs.R0;
 			sizeReg = Arm64Regs.R0;
 		}
-		asm = Arm64Assembler.new(w);
-		patcher = Arm64AddrPatcher.new(w, mach, asm);
+		asm = Arm64MacroAssembler.new(w);
 		codegen = SsaArm64Gen.new(context, mach, asm, w, dwarf);
 
 		if (compiler.useGlobalRegAllocMatcher != VstMatcher.None) allocateRegsGlobal = GlobalRegAlloc.new(MRegs.SET, codegen).allocate;
 		if (compiler.LocalRegAlloc) allocateRegs = LocalRegAlloc.new(MRegs.SET, codegen).allocate;
 		else allocateRegs = SimpleRegAlloc.new(MRegs.SET, codegen).allocate;
 	}
+	
+	// Override MachBackend	
 
-	// Override MachBackend
 	def genEntryStub() {
 		def main = prog.getMain().asMethod();
 		def frame = computeFrameSize(getFrame(main.ssa));
 		genTestInputs(main, frame);
 
 		def mainAddr = mach.addrOfMethod(main);
-		asm.bl_i26(patcher.REL_IMM26_MARKER);
-		patcher.record(mainAddr);
-
+		asm.bl_a(mainAddr);
 		// write return value to stdout if this is a test
 		genTestOutput(main, frame);
-
 		// Exit successfully
 		asm_exit_code(0);
 	}
@@ -99,7 +95,7 @@ class Arm64Backend extends MachBackend {
 				.putx(abs)
 				.outln();
 		}
-		patcher.patch(kind, posAddr, abs);
+		asm.patcher.patch(kind, posAddr, abs);
 	}
 	def genSignalHandlerStub() {
 		unimplemented();
@@ -107,11 +103,19 @@ class Arm64Backend extends MachBackend {
 	def genFatalStub(ex: string, addr: Addr) {
 		unimplemented();
 	}
+
+	// Methods that must be provided by each OS target
+	def genSigHandlerInstall(signo: int, handler: Addr);
+	def asm_exit_r(r: Arm64Gpr);
+	def asm_exit_code(code: int);
+	def genTestOutput(main: IrMethod, frame: MachFrame);
+
+	// Helper functions
+
 	// Returns call frame for an SsaGraph
 	def getFrame(ssa: SsaGraph) -> MachFrame {
 		return MachFrame.new(Arm64VirgilCallConv.getForGraph(mach, ssa), mach.data.addrAlign, mach.refSize);
 	}
-
 	// Adds Arm64 specific frame size to MachFrame
 	def computeFrameSize(frame: MachFrame) -> MachFrame {
 		frame.frameSize = mach.alignTo((frame.slots() + 1) * mach.refSize + mach.code.addressSize, mach.stackAlign);
@@ -129,9 +133,8 @@ class Arm64Backend extends MachBackend {
 		def params = main.ssa.params, conv = frame.conv;
 		if (conv.overflow > 0) {
 			// allocate space for overflow arguments
-			// TODO: will this always fit?
-			def overflowSpace = i12.view(conv.overflow * mach.data.addressSize);
-			asm.subq_r_r_i12_u1(Regs.SP, Regs.SP, overflowSpace, 0);
+			def overflowSpace = conv.overflow * mach.data.addressSize;
+			asm.subd_r_r_i32_u1(Regs.SP, Regs.SP, overflowSpace, 0);
 		}
 
 		def vals = mach.runtime.parseTestInputs(prog, prog.ERROR, params.length - 1);
@@ -145,31 +148,23 @@ class Arm64Backend extends MachBackend {
 			// load the register value from the table to follow
 			def tableLow16 = Addr.new(mach.codeRegion, null, 0);
 			def tableHigh16 = Addr.new(mach.codeRegion, null, 0);
-
-			// Move low 16 bits of table addr
-			asm.movd_r_i16(Regs.R9, patcher.ABS_IMM16_MARKER);
-			patcher.record(tableLow16);
-			// Move high 16 bits of table addr
-			asm.movkd_r_i16_u1(Regs.R9, patcher.ABS_IMM16_MARKER, 1);
-			patcher.record(tableHigh16);
+			asm.movd_r_a_a(Regs.R9, tableLow16, tableHigh16);
 
 			if (dest == null) {
 				// destination is a stack location
-				def scratchReg = MRegs.toGpr(MRegs.SCRATCH_GPR);
-				// TODO: will this always fit?
-				def offset = i9.view(mach.data.addressSize * (loc - frame.conv.regSet.callerStart));
+				def scratchReg = MRegs.toGpr(MRegs.SCRATCH1);
+				def offset = mach.data.addressSize * (loc - frame.conv.regSet.callerStart);
 				// table value is at tableAddr + argc * 4
 				asm.ldrd_r_r_r_ex_u1(scratchReg, Regs.R9, Regs.R8, MemRegExtend.LSL, 1);
 				// Store table value on stack
-				asm.strd_r_r_i9(scratchReg, Regs.SP, offset);
+				asm.strd_r_r_i32(scratchReg, Regs.SP, offset);
 			} else {
 				asm.ldrd_r_r_r_ex_u1(dest, Regs.R9, Regs.R8, MemRegExtend.LSL, 1);
 			}
 
 			// Jump over the table
 			def endAddr = Addr.new(mach.codeRegion, null, 0);
-			asm.b_i26(patcher.REL_IMM26_MARKER);
-			patcher.record(endAddr);
+			asm.b_a(endAddr);
 			// Now we know the start address of the table
 			def tableAddr = w.posAddr() - 4; // argc = 1 adjustment
 			tableLow16.absolute = tableAddr & 0x0000FFFF;
@@ -185,9 +180,4 @@ class Arm64Backend extends MachBackend {
 		if (r == null) return V3.fail(Strings.format1("expected GPR, but got %s", frame.conv.regSet.identify(loc)));
 		return r;
 	}
-	// Methods that must be provided by each OS target
-	def genSigHandlerInstall(signo: int, handler: Addr);
-	def asm_exit_r(r: Arm64Gpr);
-	def asm_exit_code(code: int);
-	def genTestOutput(main: IrMethod, frame: MachFrame);
 }
