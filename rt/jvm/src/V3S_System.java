@@ -146,18 +146,6 @@ public class V3S_System {
 	}
     }
 
-    public static int exec(byte[][] args) throws Exception {
-        String[] a = new String[args.length];
-        for (int i = 0; i < args.length; i++) {
-	    a[i] = new String(args[i]);
-	}
-	//        try {
-	    return Runtime.getRuntime().exec(a).waitFor();
-	    //        } catch (Throwable t) {
-	    //            return -1;
-	    //	}
-    }
-
     private static InputStream getFileInput(int fd) {
 	return (fd < 0 || fd > fileInput.length) ? null : fileInput[fd];
     }
