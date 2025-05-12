@@ -2,7 +2,7 @@ AENEAS_SOURCE=aeneas/src/*/*.v3
 LIB_UTIL=lib/util/*.v3
 LIB_ASM=lib/asm/*/*.v3
 LIB_RT=rt/*/*.v3
-UTILS=bin/utils/vctags bin/utils/progress bin/utils/nu bin/utils/np
+UTILS=bin/utils/vctags bin/utils/progress bin/utils/nu bin/utils/np bin/utils/demangle
 
 all: bootstrap utils TAGS
 
@@ -17,6 +17,9 @@ bin/utils/nu: bootstrap apps/NumUtil/* $(LIB_UTIL)
 
 bin/utils/np: bootstrap apps/NumParse/* $(LIB_UTIL)
 	(cd apps/NumParse && v3c-host -program-name=np -output=../../bin/utils/ *.v3 `cat DEPS`)
+
+bin/utils/demangle: bootstrap apps/Demangle/* $(LIB_UTIL)
+	(cd apps/Demangle && v3c-host -program-name=demangle -output=../../bin/utils/ *.v3 `cat DEPS`)
 
 utils: $(UTILS)
 
