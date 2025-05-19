@@ -22,6 +22,55 @@ def GLOBALS_REGION = Region.new("globals", GLOBALS_SPACE);
 def FUNCTIONS_SPACE = AddressSpace.new("functions", false, 32, 4, Alignment.new(1), Alignment.new(1));
 def FUNCTIONS_REGION = Region.new("functions", FUNCTIONS_SPACE);	// the "main" table
 
+// information about a dispatch table entry
+type DispatchInfo {
+	case Absolute(method: IrMethod, funcIndex: u32) {
+		// a function known in advance
+		def render(buf: StringBuilder) -> StringBuilder {
+			return buf.put2("dispatch function %d method %q", funcIndex, method.render);
+		}
+	}
+	case Relative(method: IrMethod, adapterIndex: u32) {
+		// an adapter, relative to the dispatch adapter base
+		def render(buf: StringBuilder) -> StringBuilder {
+			return buf.put2("dispatch adapter %d method %q", adapterIndex, method.render);
+		}
+	}
+	def render(buf: StringBuilder) -> StringBuilder;
+}
+
+type TableInfo {
+	case Dispatch(tabnum: u32, rootRcvr: Type, rootSig: Signature, sigIndex: int, entries: Vector<DispatchInfo>) {
+		// a table of dispatch adapters for methods (used by CallClassSelector, etc.)
+		def render(buf: StringBuilder) -> StringBuilder {
+			return buf.put3("Dispatch adapter table %d, root type %q, root sig %q,",
+					tabnum, rootRcvr.render, rootSig.funcType().render)
+				  .put2(" sig index %d, # entries %d", sigIndex, entries.length);
+		}
+	}
+	case Indirect(tabnum: u32, rootRcvr: Type, rootSig: Signature, entries: Vector<int>) {
+		// a table of indirect adapters for methods (used by ClassGetSelector, etc.)
+		def render(buf: StringBuilder) -> StringBuilder {
+			return buf.put3("Indirect adapter table %d root type %q root sig %q",
+					tabnum, rootRcvr.render, rootSig.funcType().render)
+				  .put1(" # entries = %d", entries.length);
+		}
+	}
+	case ReserveDispatch(mtable: IrMtable) {
+		// a reservation for a dispatch adapter
+		def render(buf: StringBuilder) -> StringBuilder {
+			return buf.put1("Dispatch adapter table reservation for mtable for %q", mtable.render);
+		}
+	}
+	case ReserveIndirect(mtable: IrMtable) {
+		// a reservation for an indirect adapter
+		def render(buf: StringBuilder) -> StringBuilder {
+			return buf.put1("Indirect adapter table reservation for mtable for %q", mtable.render);
+		}
+	}
+	def render(buf: StringBuilder) -> StringBuilder;
+}
+
 // Started from a copy of class WasmTarget
 class WasmGcTarget extends Target {
 	def test: bool;
@@ -174,7 +223,7 @@ class WasmGcTarget extends Target {
 		m.methodMap.apply(wasm.addIrMethodAddr);
 
 		// Generate WASM code into the code buffer. Generating code populates
-		// the signatures and indirect table, which must happen before they can
+		// the signatures and indirect tables, which must happen before they can
 		// be emitted.
 		def codebuf = MachDataWriter.new(Alignment.new(1), 0, initialSize);
 		if (WasmComponent.includeSection.CODE) {
@@ -207,6 +256,19 @@ class WasmGcTarget extends Target {
 					prog.ERROR.addError(null, null, "Code Section", sb.extract());
 				}
 			}
+
+			// Build method dispatch tables, now that code gen has indicated what's needed
+			if (WasmComponent.printSection.FUNCTION ||
+			    WasmComponent.printSection.TABLE ||
+			    WasmComponent.printSection.CODE)
+				prog.ERROR.addError(null, null, "Function/Table/Code Section", "processing mtables");
+			wasm.processMtables();
+			if (WasmComponent.printSection.FUNCTION ||
+			    WasmComponent.printSection.TABLE ||
+			    WasmComponent.printSection.CODE)
+				prog.ERROR.addError(null, null, "Function/Table/Code Section", "done processing mtables");
+
+			// now we can emit the indirect adapters
 			var base = methods.length;
 			for (i < wasm.indirectAdapters.length) {
 				if (WasmComponent.printSection.CODE) {
@@ -216,17 +278,7 @@ class WasmGcTarget extends Target {
 				codegen.emitIndirectAdapter(wasm.indirectAdapters[i]);
 			}
 			base += wasm.indirectAdapters.length;
-
-			// Build method dispatch tables, now that code gen has indicated what's needed
-			if (WasmComponent.printSection.FUNCTION ||
-			    WasmComponent.printSection.TABLE ||
-			    WasmComponent.printSection.CODE)
-				prog.ERROR.addError(null, null, "Function/Table/Code Section", "processing mtableMap");
-			m.mtableMap.apply(wasm.addMtable);
-			if (WasmComponent.printSection.FUNCTION ||
-			    WasmComponent.printSection.TABLE ||
-			    WasmComponent.printSection.CODE)
-				prog.ERROR.addError(null, null, "Function/Table/Code Section", "done processing mtableMap");
+			wasm.dispatchAdapterBase = u32.!(base);
 
 			for (i < wasm.dispatchAdapters.length) {
 				if (WasmComponent.printSection.CODE) {
@@ -236,6 +288,9 @@ class WasmGcTarget extends Target {
 				var entry = wasm.dispatchAdapters[i];
 				var meth = entry.5;
 				codegen.emitDispatchAdapter(meth);
+				var funcNum = wasm.getNextFuncIndex();
+				wasm.functionTable.put((meth, u32.!(funcNum)));
+				wasm.dispatchAdapterFor[meth] = funcNum;
 			}
 	                rt.recordCodeEnd(codebuf.endAddr());
 			if (WasmComponent.printSection.CODE)
@@ -333,11 +388,12 @@ class WasmGcTarget extends Target {
 			}
 			// Indirect adapters come next
 			for (i < wasm.indirectAdapters.length) {
-				var e = wasm.indirectAdapters[i];
-				out.put_uleb32(e.1 - 1);
+				var m = wasm.indirectAdapters[i];
+				var index = wasm.addSig(AnyRef.TYPE, m.sig);
+				out.put_uleb32(index - 1);
 				if (WasmComponent.printSection.FUNCTION) {
 					var sb = StringBuilder.new().put2("Indirect adapter index %d sig index #%d",
-									  findex++, e.1 - 1);
+									  findex++, index);
 					prog.ERROR.addError(null, null, "Function Section", sb.extract());
 				}
 			}
@@ -357,18 +413,15 @@ class WasmGcTarget extends Target {
 				prog.ERROR.addError(null, null, "Function Section", "========== Done ==========");
 		}
 
-		// (5) Emit indirect function table and method tables
+		// (5) Emit indirect function table and method indirect and dispatch tables
 		//--------------------------------------------------------------------------------
 		var table_length = u32.!(wasm.functionTable.length + 1);
-		var ndispTables = wasm.dispatchTables.length;
-		var dispIndexes: Array<int>;
+		var numOtherTables = wasm.tables.length;
 		if (WasmComponent.includeSection.TABLE) {
-			if ((table_length > 1 || wasm.containsCallIndirect || ndispTables > 0)) {
-				var ntables = ndispTables + 1;
+			if ((table_length > 1 || numOtherTables > 0)) {
+				var ntables = numOtherTables + 1;
 				if (WasmComponent.printSection.TABLE) {
 					var sb = StringBuilder.new().put1("========== Emitting %d tables ==========", ntables);
-					prog.ERROR.addError(null, null, "Table Section", sb.extract());
-					sb.put2("# dispatch tables = %d  # mtables = %d", ndispTables, wasm.mtables.length);
 					prog.ERROR.addError(null, null, "Table Section", sb.extract());
 				}
 				var tabnum = 0;
@@ -383,46 +436,62 @@ class WasmGcTarget extends Target {
 					var sb = StringBuilder.new().put2("Indirect function table (#%d); num entries %d", tabnum++, table_length);
 					prog.ERROR.addError(null, null, "Table Section", sb.extract());
 				}
-				// Dispatch tables
-				// To get these in order, we need an auxiliary table
-				// that maps table number to index in dispatchTables.
-				// Table number 0 is skipped, hence the + 1.
-				dispIndexes = Array<int>.new(wasm.mtables.length + 1);
-				for (i < dispIndexes.length) dispIndexes[i] = -1;
-				for (i < ndispTables) {
-					var dt = wasm.dispatchTables[i];
-					var num = dt.3;
-					dispIndexes[num] = i;
-				}
-				for (i = 1; i < dispIndexes.length; i++) {
-					var index = dispIndexes[i];
-					if (index < 0) {
-						// an empty table??
-						out.putb(WasmTypeConCode.FUNCREF.code);  // type of table
-						out.putb(1);	// flags = contains maximum
-						out.put_uleb32(0);  // initial table length
-						out.put_uleb32(0);  // maximum table length
-						if (WasmComponent.printSection.TABLE) {
-							var sb = StringBuilder.new().put3("Dispatch table %d (table #%d); num entries %d (EMPTY)", i, tabnum++, 0);
-							prog.ERROR.addError(null, null, "Table Section", sb.extract());
+				// Remaining tables, in order
+				// The two kinds are mixed (sigh)
+				for (tabidx < wasm.tables.length) {
+					var wtabnum = tabidx + 1;
+					var tab = wasm.tables[tabidx];
+					match (tab) {
+						Dispatch(tabnum, rootRcvr, rootSig, sigIndex, entries) => {
+							if (WasmComponent.printSection.TABLE) {
+								var sb = StringBuilder.new().put1("%q", tab.render);
+								prog.ERROR.addError(null, null, "Table Section", sb.extract());
+							}
+							var count = entries.length;
+							if (count == 0) {
+								out.putb(WasmTypeConCode.FUNCREF.code);  // type of table
+								out.putb(1);	// flags = contains maximum
+								out.put_uleb32(0);  // initial table length
+								out.put_uleb32(0);  // maximum table length
+								continue;
+							}
+
+							var fsig = wasm.getSig(rootRcvr, rootSig);
+							var wft = wasm.gcTypeTable.addSignature(fsig);
+							var wvt = WasmValueType.RefNull(wft);
+							wvt.put(out);
+							out.putb(1);	// flags = contains maximum
+							out.put_uleb32(u32.!(count));
+							out.put_uleb32(u32.!(count));
 						}
-						continue;
+						Indirect(tabnum, rootRcvr, rootSig, entries) => {
+							if (WasmComponent.printSection.TABLE) {
+								var sb = StringBuilder.new().put1("%q", tab.render);
+								prog.ERROR.addError(null, null, "Table Section", sb.extract());
+							}
+
+							var sigidx = wasm.addSig(AnyRef.TYPE, rootSig);
+							var fsig = wasm.getSig(AnyRef.TYPE, rootSig);
+							var wft = wasm.gcTypeTable.addSignature(fsig);
+							var wvt = WasmValueType.RefNull(wft);
+
+							var count = entries.length;
+							if (count == 0) {
+								// an empty table??
+								out.putb(WasmTypeConCode.FUNCREF.code);  // type of table
+								out.putb(1);	// flags = contains maximum
+								out.put_uleb32(0);  // initial table length
+								out.put_uleb32(0);  // maximum table length
+								continue;
+							}
+							wvt.put(out);
+							out.putb(1);	// flags = contains maximum
+							out.put_uleb32(u32.!(count));
+							out.put_uleb32(u32.!(count));
+						}
+						ReserveDispatch, ReserveIndirect => ; // reservations already dealt with
 					}
-					var dt = wasm.dispatchTables[index];
-					var typ = dt.0; var sig = dt.1; var tab = dt.2; var num = dt.3; var sigidx = dt.4;
-					var fsig = wasm.getSig(typ, sig);
-					var wft = wasm.gcTypeTable.addSignature(fsig);
-					var wvt = WasmValueType.RefNull(wft);
-					wvt.put(out);
-					out.putb(1);	// flags = contains maximum
-					var count = tab.length;
-					out.put_uleb32(u32.!(count));
-					out.put_uleb32(u32.!(count));
-					if (WasmComponent.printSection.TABLE) {
-						var sb = StringBuilder.new().put3("Dispatch table %d (table #%d); num entries %d", i, tabnum++, count)
-									    .put2("; type %q; sig index #%d", typ.render, sigidx);
-						prog.ERROR.addError(null, null, "Table Section", sb.extract());
-					}
+					
 				}
 				out.endSection();
 				if (WasmComponent.printSection.TABLE)
@@ -538,11 +607,11 @@ class WasmGcTarget extends Target {
 				}
 
 		// (8) Emit the function table entries
-		// At present this includes indirect adapters plus the method table for each class
+		// This includes indirect and dispatch adapter tables for each class that needs them
 		//--------------------------------------------------------------------------------
 		if (WasmComponent.includeSection.ELEMENT) {
-			if ((table_length > 1 || wasm.containsCallIndirect || ndispTables > 0)) {
-				var ntables = u32.!(ndispTables + 1);
+			if ((table_length > 1 || numOtherTables > 0)) {
+				var ntables = u32.!(numOtherTables + 1);
 				if (WasmComponent.printSection.ELEMENT) {
 					var sb = StringBuilder.new().put1("========== Emitting %d element groups ==========", ntables);
 					prog.ERROR.addError(null, null, "Element Section", sb.extract());
@@ -570,32 +639,72 @@ class WasmGcTarget extends Target {
 						prog.ERROR.addError(null, null, "Element Section", sb.extract());
 					}
 				}
-				for (i = 1; i < dispIndexes.length; i++) {
-					var index = dispIndexes[i];
-					if (index < 0) continue;
-					var dt = wasm.dispatchTables[index];
-					var typ = dt.0; var sig = dt.1; var tab = dt.2; var num = dt.3; var sigidx = dt.4;
-					var fsig = wasm.getSig(typ, sig);
-					var wft = wasm.gcTypeTable.addSignature(fsig);
-					var wvt = WasmValueType.RefNull(wft);
-					if (WasmComponent.printSection.ELEMENT) {
-						var sb = StringBuilder.new().put3("Dispatch table, table %d; # entries %d; type %q", i, tab.length, wvt.render);
-						prog.ERROR.addError(null, null, "Element Section", sb.extract());
-					}
-					out.putb(2);  // Elements kind is "Active: start offset is an expression, table number is explicit"
-					out.put_uleb32(u32.!(num));  // table number
-					out.putb(WasmOp.I32_CONST.opcode);
-					out.putb(0);  // start at index 0
-					out.putb(WasmOp.END.opcode);
-					out.putb(0); // elem kind
-					out.put_uleb32(u32.!(tab.length));  // number of entries
-					for (j < tab.length) {
-						var dispIdx = tab[j].1;
-						out.put_uleb32(u32.!(dispIdx)); // -1 values should not get here
-						if (WasmComponent.printSection.ELEMENT) {
-							var sb = StringBuilder.new().put3("Dispatch table, table %d; entry %d; function %d", i, j, dispIdx);
-							prog.ERROR.addError(null, null, "Element Section", sb.extract());
+				for (tabidx < wasm.tables.length) {
+					var tab = wasm.tables[tabidx];
+					var wtabnum = tabidx + 1;
+					match (tab) {
+						Dispatch(tabnum, rootRcvr, rootSig, sigIndex, entries) => {
+							var fsig = wasm.getSig(rootRcvr, rootSig);
+							var wft = wasm.gcTypeTable.addSignature(fsig);
+							var wvt = WasmValueType.RefNull(wft);
+							if (WasmComponent.printSection.ELEMENT) {
+								var sb = StringBuilder.new().put2("%q type %q", tab.render, wvt.render);
+								prog.ERROR.addError(null, null, "Element Section", sb.extract());
+							}
+							out.putb(2);  // Elements kind is "Active: start offset is an expression, table number is explicit"
+							out.put_uleb32(tabnum);  // table number
+							out.putb(WasmOp.I32_CONST.opcode);
+							out.putb(0);  // start at index 0
+							out.putb(WasmOp.END.opcode);
+							out.putb(0); // elem kind
+							out.put_uleb32(u32.!(entries.length));  // number of entries
+							for (j < entries.length) {
+								var entry = entries[j];
+								var meth: IrMethod;
+								var adapterFunc: u32;
+								match (entry) {
+									Absolute(m, funcNum) => {
+										meth = m; adapterFunc = funcNum;
+									}
+									Relative(m, adapterIndex) => {
+										meth = m; adapterFunc = wasm.dispatchAdapterBase + adapterIndex;
+									}
+								}
+								out.put_uleb32(adapterFunc);
+								if (WasmComponent.printSection.ELEMENT) {
+									var sb = StringBuilder.new().put3("Table %d entry %d %q", wtabnum, j, entry.render)
+												    .put1(" function %d", adapterFunc);
+									prog.ERROR.addError(null, null, "Element Section", sb.extract());
+								}
+							}
 						}
+						Indirect(tabnum, rootRcvr, rootSig, entries) => {
+							// Indirect function table
+				 			out.putb(2);  // Elements kind is "Active Index: start offset is an expression, table number is explicit"
+							// Table number
+							out.put_uleb32(tabnum);
+							// start init expr for base index of elements
+							out.putb(WasmOp.I32_CONST.opcode);
+							out.putb(0);  // start index of elements: 0
+							out.putb(WasmOp.END.opcode);
+							// end init expr
+							out.putb(0);  // element kind: 0
+							// count of entries, followed by their values (function numbers)
+							if (WasmComponent.printSection.ELEMENT) {
+								var sb = StringBuilder.new().put1("%q", tab.render);
+								prog.ERROR.addError(null, null, "Element Section", sb.extract());
+							}
+							out.put_uleb32(u32.!(entries.length));
+							for (j < entries.length) {
+								out.put_uleb32(u32.!(entries[j]));
+								if (WasmComponent.printSection.ELEMENT) {
+									var sb = StringBuilder.new().put3("Table %d entry %d function %d",
+													  wtabnum, j, entries[j]);
+									prog.ERROR.addError(null, null, "Element Section", sb.extract());
+								}
+							}
+						}
+						ReserveDispatch, ReserveIndirect => ; // reservations already dealt with
 					}
 				}
 				if (WasmComponent.printSection.ELEMENT)
@@ -865,6 +974,7 @@ class WasmGcTarget extends Target {
 		compiler.makeExecutable(fileName);
         }
 }
+
 // class WasmGcProgram(prog: Program, context: SsaContext, test: bool) {
 class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 	var gcTypeTable: WasmGcTypeTable;
@@ -872,18 +982,31 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 	//
 	// EBM: From WasmProgram; revisit
 	//
-// EBM: ok
+	// Maps from a method to its index in the function table
 	def functionTable = Vector<(IrMethod, u32)>.new();
-// EBM: ok
-	def indirectAdapters = Vector<(Signature, u32, IrMethod)>.new();
-// EBM: new: 1st Type, Signature is root class Type, Signature, 2nd is subclass Type, Signature, last three
-// are function number and IrMethod for the subclass method, and signature type index of the root
+
+	// Methods that need indirect adapters
+	def indirectAdapters = Vector<IrMethod>.new();
+	// Indicates the indirect adapter function number for a given method
+	def indirectAdapterFor = HashMap<IrMethod,int>.new(IrMethod.uid, IrMethod.==);
+	// Maps from method tables to corresponding indirection table (Wasm table number)
+	def indirectTableFor = HashMap<IrMtable,u32>.new(IrItem.uid, IrMtable.==);
+
+	// The 1st Type,Signature is root class Type,Signature, 2nd is subclass Type,Signature, last three
+	// are function number and IrMethod for the subclass method, and signature type index of the root;
+	// the dispatch adapter function number is the position in the vector plus a base determined later
 	def dispatchAdapters = Vector<(Type, Signature, Type, Signature, u32, IrMethod, int)>.new();
-// EBM: new: function table for each method table; Type and Signature are those of root method
-//           the last u32 is the table number among the Wasm tables
-	def dispatchTables = Vector<(Type, Signature, Vector<(IrMethod, i32)>, u32, int)>.new();
+	// Indicates the dispatch adapter function number for a given method
+	def dispatchAdapterFor = HashMap<IrMethod,int>.new(IrMethod.uid, IrMethod.==);
+	var dispatchAdapterBase: u32 = 0;  // function index of first dispatch adapter
+	// Maps from method table to corresponding dispatch tables (Wasm table number)
+	def dispatchTableFor = HashMap<IrMtable,u32>.new(IrItem.uid, IrMtable.==);
+
+	// method tables that need to be emitted
 	def mtables = Vector<IrMtable>.new();
 
+	// this accumulates the tables in the order they need to be output
+	def tables = Vector<TableInfo>.new();
 
 	var sigIndex_i_i = -1;
 	var sigIndex_entryStub = -1;
@@ -919,6 +1042,26 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 			mtaddr.setAbsolute(mtables.length);
 		}
 		return mtaddr.absolute;
+	}
+	def getIndirectTableNumber(mtable: IrMtable) -> u32 {
+		getMtableNumber(mtable);  // insure recorded
+		if (!indirectTableFor.has(mtable)) {
+			tables.put(TableInfo.ReserveIndirect(mtable));
+			var num = u32.!(tables.length);
+			indirectTableFor[mtable] = num;
+			return num;
+		}
+		return indirectTableFor[mtable];
+	}
+	def getDispatchTableNumber(mtable: IrMtable) -> u32 {
+		getMtableNumber(mtable);  // insure recorded
+		if (!dispatchTableFor.has(mtable)) {
+			tables.put(TableInfo.ReserveDispatch(mtable));
+			var num = u32.!(tables.length);
+			dispatchTableFor[mtable] = num;
+			return num;
+		}
+		return dispatchTableFor[mtable];
 	}
 	def wasmGcType(t: Type) -> WasmValueType {
 		return gcTypeTable.getValueTypeFor(t);
@@ -962,20 +1105,18 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 		var m = addr.val;
 		var name: string = if(WasmComponent.printSection.FUNCTION || WasmComponent.printSection.ELEMENT,
 				      getMethodName(m), null);
-		// allocate indirect call wrapper for component methods (first param void)
 		if (m.machIndex < 0) context.fail1("method not assigned an index: %q", m.renderLong);
-		var tableEntry = u32.!(m.machIndex);
-		if (V3.isComponent(m.receiver)) {
-			// component method; allocate a signature with the object type prepended
-			var index = addSig(AnyRef.TYPE, m.sig);
-			// queue up information to emit an indirect adapter
-			indirectAdapters.put((m.sig, index, m));
-			// the indirect adapter is its own Wasm function
-			tableEntry = u32.!(getNextFuncIndex());
-			if (WasmComponent.printSection.FUNCTION || WasmComponent.printSection.ELEMENT) {
-				var sb = StringBuilder.new().put3("Adding indirect adapter for %s; sig idx=#%d entry #%d", name, index, tableEntry);
-				mach.prog.ERROR.addError(null, null, "Function/Element Section", sb.extract());
-			}
+//		var tableEntry = u32.!(m.machIndex);
+
+		// allocate indirect call wrapper for method (first param void)
+		var index = addSig(AnyRef.TYPE, m.sig);
+		indirectAdapterFor[m] = functionTable.length + 1; // + 1 to skip null entry at beginning
+		indirectAdapters.put(m);
+		// the indirect adapter is its own Wasm function
+		var tableEntry = u32.!(getNextFuncIndex());
+		if (WasmComponent.printSection.FUNCTION || WasmComponent.printSection.ELEMENT) {
+			var sb = StringBuilder.new().put3("Adding indirect adapter for %s; sig idx=#%d entry #%d", name, index, tableEntry);
+			mach.prog.ERROR.addError(null, null, "Function/Element Section", sb.extract());
 		}
 		// An IrMethod's "address" is its index into the function table
 		addr.absolute = int.!(tableEntry);
@@ -987,41 +1128,42 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 		functionTable.put((m, tableEntry));
 	}
 	def addDispatchedMethodAddr(rootRcvr: Type, rootSig: Signature,
-				    superIdx: i32, superDispatch: i32,
-	                            table: Vector<(IrMethod, i32)>,
-				    addr: Address<IrMethod>) -> i32 {
+				    superInfo: DispatchInfo, superIdx: i32,
+	                            table: Vector<DispatchInfo>,
+				    addr: Address<IrMethod>) -> DispatchInfo {
 		// rootRcvr and rootSig give the root methods class and signature (in case we need
 		// to add a dispatchAdapters entry).
+		// superInfo gives info on the superclass's dispatch method (so it can be re-used
+		// if the subclass version of the method is the same).
 		// superIdx is the index of the superclass's version of the method.  If this method's
 		// index is different, then it needs a new dispatch method.
-		// superDispatch is the index of the superclass's dispath method (so it can be re-used
-		// if the subclass version of the method is the same).
 		// table is the vector of (method,dispatch function index) pairs we are building.
 		// addr is the Address of the IrMethod being added (it carries the method with it).
-		// returns the function index of the dispatch method
+		// A negative return value is the negative of the relative number of a dispatch adapter,
+		// a non-negative return value is the function index of a root method
 		var m = addr.val;
 		var name = if(WasmComponent.printSection.FUNCTION || WasmComponent.printSection.ELEMENT,
 			      getMethodName(m), null);
 		var mFuncIdx = u32.!(m.machIndex);
-		var dispIdx = superIdx;
-		if (mFuncIdx != superIdx) {
+		var dinfo = superInfo;
+		if (superInfo != DispatchInfo.Absolute(m, mFuncIdx)) {
 			// New dispatch adapter needed
 			var sigIdx = addSig(rootRcvr, rootSig);	// make sure signature is present
+			dinfo = DispatchInfo.Relative(m, u32.!(dispatchAdapters.length));
 			dispatchAdapters.put((rootRcvr, rootSig, m.receiver, m.sig, mFuncIdx, m, int.!(sigIdx)));
 			// the dispatch adapter is its own Wasm function
-			dispIdx = getNextFuncIndex();
 			if (WasmComponent.printSection.FUNCTION || WasmComponent.printSection.ELEMENT) {
-				var sb = StringBuilder.new().put3("Adding dispatch adapter for %s; sig idx=#%d entry #%d", name, sigIdx, dispIdx);
+				var sb = StringBuilder.new().put3("Adding dispatch adapter for %s; sig idx=#%d entry %q", name, sigIdx, dinfo.render);
 				mach.prog.ERROR.addError(null, null, "Function/Element Section", sb.extract());
 			}
 		}
 		addr.absolute = int.!(mFuncIdx);
-		table.put((m, dispIdx));
+		table.put(dinfo);
 		if (WasmComponent.printSection.FUNCTION || WasmComponent.printSection.ELEMENT) {
-			var sb = StringBuilder.new().put3("Adding dispatch table entry for %s; func #%d entry #%d", name, mFuncIdx, dispIdx);
+			var sb = StringBuilder.new().put3("Adding dispatch table entry for %s; func #%d entry %q", name, mFuncIdx, dinfo.render);
 			mach.prog.ERROR.addError(null, null, "Function/Element Section", sb.extract());
 		}
-		return dispIdx;
+		return dinfo;
 	}
 	def addIrMethods() -> Vector<IrMethod> {
 		var methods = mach.prog.ir.methods;
@@ -1092,48 +1234,129 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 			mach.prog.ERROR.addError(null, null, "Function/Element Section", sb.extract());
 		}
 	}
-	def addMtable(m: IrItem, addr: Addr) {
-		var mtable = IrMtable.!(m);
-		if (WasmComponent.printSection.FUNCTION || WasmComponent.printSection.TABLE ||
-		    WasmComponent.printSection.ELEMENT) {
-			var sb = StringBuilder.new().put1("Adding method table for %q", mtable.render);
-			mach.prog.ERROR.addError(null, null, "Function/Table/Element Section", sb.extract());
-		}
-		var root: IrMethod = mtable.root;
-		var superIdx = root.machIndex;
-		var superDispatch = superIdx;
-		var table = Vector<(IrMethod, i32)>.new();
-		for (m in mtable.table) {
-			if (m != null) {
-				if (root == null) {
-					root = m;
-					superIdx = root.machIndex;
-					superDispatch = superIdx;	// root never needs dispatch adapter
-				}
-				superDispatch =
-					addDispatchedMethodAddr(root.receiver, root.sig, superIdx, superDispatch,
-								table, mach.addrOfMethod(m));
-				superIdx = m.machIndex;
-			}
-		}
-		if (root != null) {
-			var tableNumber = u32.!(getMtableNumber(mtable));
-			// associate the table number with the mtable
+	def processMtables() {
+		for (mtIndex < mtables.length) {
+			var mtable = mtables[mtIndex];
 			if (WasmComponent.printSection.FUNCTION || WasmComponent.printSection.TABLE ||
 			    WasmComponent.printSection.ELEMENT) {
-				var sb = StringBuilder.new().put2("Assigning table number %d to method table for %q", tableNumber, mtable.render);
+				var sb = StringBuilder.new().put1("Processing method table for %q", mtable.render);
 				mach.prog.ERROR.addError(null, null, "Function/Table/Element Section", sb.extract());
 			}
-			// add a dispatch tables entry
-			var sigIdx = addSig(root.receiver, root.sig);	// make sure signature is present
-			dispatchTables.put((root.receiver, root.sig, table, tableNumber, int.!(sigIdx)));
+			
+			var root: IrMethod = mtable.root;
+			var superIdx = root.machIndex;
+			var superDispatch: DispatchInfo = DispatchInfo.Absolute(mtable.root, u32.!(superIdx));
+			var dispTable = Vector<DispatchInfo>.new();
+			var needIndirectTable = indirectTableFor.has(mtable);
+			if (needIndirectTable && (WasmComponent.printSection.FUNCTION ||
+						  WasmComponent.printSection.TABLE ||
+						  WasmComponent.printSection.CODE)) {
+				var sb = StringBuilder.new().put2("Adding method indirect table %d for method table for %q",
+								  indirectTableFor[mtable], mtable.render);
+				mach.prog.ERROR.addError(null, null, "Function/Table/Code Section", sb.extract());
+			}
+			var indirectTable: Vector<int> = if(needIndirectTable,Vector<int>.new(),null);
+			for (m in mtable.table) {
+				if (m != null) {
+					if (root == null) {
+						root = m;
+						superIdx = root.machIndex;
+						superDispatch = DispatchInfo.Absolute(root, u32.!(superIdx));	// root never needs dispatch adapter
+					}
+					superDispatch =
+						addDispatchedMethodAddr(root.receiver, root.sig, superDispatch,
+									superIdx, dispTable, mach.addrOfMethod(m));
+					superIdx = m.machIndex;
+
+					if (needIndirectTable) {
+						if (!indirectAdapterFor.has(m)) {
+							var index = addSig(AnyRef.TYPE, m.sig);
+							var tableEntry = getNextFuncIndex();
+							indirectAdapterFor[m] = tableEntry;
+							indirectAdapters.put(m);
+							if (WasmComponent.printSection.FUNCTION ||
+							    WasmComponent.printSection.TABLE ||
+							    WasmComponent.printSection.CODE) {
+								var sb = StringBuilder.new().put3("Adding method indirect adapter %d for method %d sig %d",
+												  tableEntry, m.machIndex, index);
+								mach.prog.ERROR.addError(null, null, "Function/Table/Code Section", sb.extract());
+							}
+						}
+						if (WasmComponent.printSection.FUNCTION ||
+						    WasmComponent.printSection.TABLE ||
+						    WasmComponent.printSection.CODE) {
+							var sb = StringBuilder.new().put3("Method indirect table %d entry %d is function %d",
+											  indirectTableFor[mtable], indirectTable.length,
+											  indirectAdapterFor[m]);
+							mach.prog.ERROR.addError(null, null, "Function/Table/Code Section", sb.extract());
+						}
+						indirectTable.put(indirectAdapterFor[m]);
+					}
+				}
+			}
+
+			if (root != null && dispatchTableFor.has(mtable)) {
+				var tableNumber = dispatchTableFor[mtable];
+				// show association of table number with the mtable
+				if (WasmComponent.printSection.FUNCTION || WasmComponent.printSection.TABLE ||
+				    WasmComponent.printSection.ELEMENT) {
+					var sb = StringBuilder.new().put2("Dispatch table number is %d for method table for %q", tableNumber, mtable.render);
+					mach.prog.ERROR.addError(null, null, "Function/Table/Element Section", sb.extract());
+				}
+				// insert a dispatch table
+				var sigIdx = addSig(root.receiver, root.sig);	// make sure signature is present
+				var tinfo = TableInfo.Dispatch(tableNumber, root.receiver, root.sig, int.!(sigIdx), dispTable);
+				var index = int.!(tableNumber - 1);
+				var oldEntry = tables[index];
+				match (oldEntry) {
+					ReserveDispatch(mt) => {
+						if (mt != mtable) {
+							var sb = StringBuilder.new()
+									      .put2("expected mtable for %q but have mtable for %q",
+										    mtable.render, mt.render);
+							context.fail(sb.extract());
+						}
+					}
+					_ => context.fail1("unexpected table info %q", oldEntry.render);
+				}
+				tables[index] = tinfo;
+			}
+			if (needIndirectTable) {
+				var tableNumber = indirectTableFor[mtable];
+				// show association of table number with the mtable
+				if (WasmComponent.printSection.FUNCTION || WasmComponent.printSection.TABLE ||
+				    WasmComponent.printSection.ELEMENT) {
+					var sb = StringBuilder.new().put2("Indirect table number is %d for method table for %q", tableNumber, mtable.render);
+					mach.prog.ERROR.addError(null, null, "Function/Table/Element Section", sb.extract());
+				}
+				// insert an indirect table
+				var tinfo = TableInfo.Indirect(tableNumber, root.receiver, root.sig, indirectTable);
+				var index = int.!(tableNumber - 1);
+				var oldEntry = tables[index];
+				match (oldEntry) {
+					ReserveIndirect(mt) => {
+						if (mt != mtable) {
+							var sb = StringBuilder.new()
+									      .put2("expected mtable for %q but have mtable for %q",
+										    mtable.render, mt.render);
+							context.fail(sb.extract());
+						}
+					}
+					_ => context.fail1("unexpected table info %q", oldEntry.render);
+				}
+				tables[index] = tinfo;
+			}
 		}
 	}
 }
 // adds to the gcTypeTable all non-class heap types
 def addIrTypes<T>(irObject: T, prog: WasmGcProgram) {
+	var errgen = prog.mach.prog.ERROR;
 	match (irObject) {
 		module: IrModule => {
+			if (WasmComponent.printSection.TYPE) {
+				errgen.addError(null, null, "Type Section", "Processing module");
+			}
 			// *Add* all the classes first, so their ctypes are in heapTypeMap, etc
 			for (i < module.classes.length) prog.gcTypeTable.addClass(module.classes[i]);
 			// Now process the classes (etc) more thoroughly
@@ -1144,31 +1367,65 @@ def addIrTypes<T>(irObject: T, prog: WasmGcProgram) {
 		}
 		cls: IrClass => {
 			// finish processing the class - could not process the fields with addClass
+			if (WasmComponent.printSection.TYPE) {
+				var ctype = cls.ctype;
+				var name: string = if(ClassType.?(ctype),ClassType.!(ctype).classDecl.name(),ctype.typeCon.name);
+				var line = StringBuilder.new().put1("Processing IR class: %s", name);
+				errgen.addError(null, null, "Type Section", line.extract());
+			}
 			prog.gcTypeTable.processClass(cls, prog.mach.tagType);
 			// go through the rest
 			for (m in cls.methods) addIrTypes(m, prog);
 			for (f in cls.fields ) addIrTypes(f, prog);
 		}
 		method: IrMethod => {
+			if (WasmComponent.printSection.TYPE) {
+				var line = StringBuilder.new().put2("Processing IR method: %q.%q",
+								    method.receiver.render, method.render);
+				errgen.addError(null, null, "Type Section", line.extract());
+			}
 			prog.gcTypeTable.addSignature(prog.getSig(method.receiver, method.sig));
 		}
 		field: IrField => {
+			if (WasmComponent.printSection.TYPE) {
+				var line = StringBuilder.new().put3("Processing IR field: %q.%q: %q",
+								    field.receiver.render, field.render, field.fieldType.render);
+				errgen.addError(null, null, "Type Section", line.extract());
+			}
 			prog.gcTypeTable.addHeapType(field.fieldType);
 		}
 		selector: IrSelector => {
+			if (WasmComponent.printSection.TYPE) {
+				var line = StringBuilder.new().put2("Processing IR selector: %q.%q",
+								    selector.receiver.render, selector.render);
+				errgen.addError(null, null, "Type Section", line.extract());
+			}
 			addIrTypes(selector.method, prog);
 			addIrTypes(selector.mtable, prog);
 		}
 		mtable: IrMtable => {
+			if (WasmComponent.printSection.TYPE) {
+				var line = StringBuilder.new().put1("Processing IR mtable: %q", mtable.render);
+				errgen.addError(null, null, "Type Section", line.extract());
+			}
 			addIrTypes(mtable.root, prog);
 			for (meth in mtable.table) addIrTypes(meth, prog);
 			prog.gcTypeTable.addHeapType(mtable.record.rtype);
 		}
 		spec: IrSpec => {
+			if (WasmComponent.printSection.TYPE) {
+				var line = StringBuilder.new().put1("Processing IR spec: %q", spec.render);
+				errgen.addError(null, null, "Type Section", line.extract());
+			}
 			addIrTypes(spec.member, prog);
 			for (typ in spec.typeArgs) prog.gcTypeTable.addHeapType(typ);
 		}
 		root: IrRoot => {
+			if (WasmComponent.printSection.TYPE) {
+				var name = if(root.name == null,"??",root.name);
+				var line = StringBuilder.new().put1("Processing IR root: %s", name);
+				errgen.addError(null, null, "Type Section", line.extract());
+			}
 			addIrTypes(root.spec, prog);
 		}
 	}
@@ -1528,6 +1785,7 @@ class WasmGcLowering extends MachLowering {
 		normId(i_old);
 	}
 	def genClassGetField(isVariant: bool, i_old: SsaApplyOp, field: IrField) {
+		// Leave the ClassGetField for code gen
 		var classType = i_old.op.sig.paramTypes[0];
 		var irClass = wasm.mach.prog.ir.getIrClass(classType);
 		wasm.gcTypeTable.addClass(irClass);
@@ -1536,51 +1794,51 @@ class WasmGcLowering extends MachLowering {
 		// it is for handing 64-bit numbers on 32-bit platforms.
 	}
 	def genClassSetField(i_old: SsaApplyOp, field: IrField, init: bool) {
+		// Leave the ClassGetField for code gen
 		var classType = i_old.op.sig.paramTypes[0];
 		var irClass = wasm.mach.prog.ir.getIrClass(classType);
 		wasm.gcTypeTable.addClass(irClass);
 		return void(normId(i_old));
 	}
 	def genClassGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
-		return normId(i_old);
-/*
 		var methodRef = V3Op.extractIrSpec(i_old.op, method);
 		var funcRep = mach.funcRep(methodRef);
 		genNullCheck(i_old);
 		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
-*/
 	}
 	def genClassGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
-		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
-		var funcRep = mach.funcRep(methodRef);
-		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
-		return genMtableLookup(i_old, oobj, nobj, funcRep, methodRef);
+		// insure class is recorded
+		var classType = selector.receiver;
+		var irClass = wasm.mach.prog.ir.getIrClass(classType);
+		wasm.gcTypeTable.addClass(irClass);
+
+		// insure mtable is recorded and indirect adapters requested
+		wasm.getIndirectTableNumber(selector.mtable);
+
+		// pass through to code gen
+		return normId(i_old);
 	}
 	def genVariantGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
-		return normId(i_old);
-/*
 		var methodRef = V3Op.extractIrSpec(i_old.op, method);
 		var funcRep = mach.funcRep(methodRef);
 		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
-*/
 	}
 	def genVariantGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
-		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
-		var funcRep = mach.funcRep(methodRef);
-		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
-		var defIrSpec = context.prog.ir.resolveVariantDefaultMethodImpl(methodRef);
-		var defMethod = IrMethod.!(defIrSpec.member);
-		var defVal = Int.box(defMethod.machIndex);
-// Ben indicates that the null case should not happen
-		return genMtableLookup(i_old, oobj, nobj, funcRep, methodRef);
-//		return genIfNull(i_old, mach.tagType, nobj, defVal, genMtableLookup(i_old, oobj, _, funcRep, methodRef));
-// EBM: TODO - check this
-//		mach.getCodeAddress(context.prog.ir.resolveVariantDefaultMethodImpl(methodRef));
-//		wasm.getMtableNumber(selector.mtable);
-//		return normId(i_old);
+		// insure class is recorded
+		var classType = selector.receiver;
+		var irClass = wasm.mach.prog.ir.getIrClass(classType);
+		wasm.gcTypeTable.addClass(irClass);
+
+		// insure mtable is recorded and indirect adapters requested
+		wasm.getIndirectTableNumber(selector.mtable);
+
+		// pass through to code gen
+		return normId(i_old);
 	}
+/*
 	def genMtableLookup(i_old: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, funcRep: Mach_FuncRep, methodRef: IrSpec) -> SsaInstr {
 		// for WasmGc creates code to compute the dispatch offset into the method table
+		// and obtain the function reference
 
 		normId(i_old);
 
@@ -1608,7 +1866,9 @@ class WasmGcLowering extends MachLowering {
 
 		return i_offset;
 	}
+*/
 	def genComponentGetField(i_old: SsaApplyOp, field: IrField) {
+		// Leave the ComponentGetField for code gen
 		return void(normId(i_old));
 /*
 		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
@@ -1619,6 +1879,7 @@ class WasmGcLowering extends MachLowering {
 */
 	}
 	def genComponentSetField(i_old: SsaApplyOp, field: IrField) {
+		// Leave the ComponentSetField for code gen
 		return void(normId(i_old));
 /*
 		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
@@ -1671,40 +1932,45 @@ class WasmGcLowering extends MachLowering {
 		call(i_old, funcRep, args);
 	}
 	def genCallClassSelector(i_old: SsaApplyOp, selector: IrSelector) {
-		// add code to get the tag and subtract the root id
-		
 		var classType = selector.receiver;
 		var irClass = wasm.mach.prog.ir.getIrClass(classType);
 		// insure class type is entered
 		wasm.gcTypeTable.addClass(irClass);
 
-		var i_offset = genClassGetSelector(i_old, selector);
-		var args = Arrays.prepend(i_offset, normRefs(i_old.inputs));
+		// insure mtable is recorded and dispatch adapters requested
+		wasm.getDispatchTableNumber(selector.mtable);
 
-		var tabnum = wasm.getMtableNumber(selector.mtable);
-		var tbl = context.graph.valConst(Int.getType(false, 31), Int.box(tabnum));
-		args = Arrays.prepend(tbl, args);
+		var args = normRefs(i_old.inputs);
+		var i_new = apply(i_old.source, i_old.op, args);
 
-		var methodRef = V3Op.extractIrSpec(i_old.op, selector.method);
-		call(i_old, mach.funcRep(methodRef), args);
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
 	}
 	def genCallVariantSelector(i_old: SsaApplyOp, selector: IrSelector) {
-		// add code to get the tag and subtract the root id
-		
 		var classType = selector.receiver;
 		var irClass = wasm.mach.prog.ir.getIrClass(classType);
 		// insure class type is entered
 		wasm.gcTypeTable.addClass(irClass);
 
-		var i_offset = genVariantGetSelector(i_old, selector);
-		var args = Arrays.prepend(i_offset, normRefs(i_old.inputs));
+		// insure mtable is recorded and dispatch adapters requested
+		wasm.getDispatchTableNumber(selector.mtable);
 
-		var tabnum = wasm.getMtableNumber(selector.mtable);
-		var tbl = context.graph.valConst(Int.getType(false, 31), Int.box(tabnum));
-		args = Arrays.prepend(tbl, args);
+		var args = normRefs(i_old.inputs);
+		var i_new = apply(i_old.source, i_old.op, args);
 
-		var methodRef = V3Op.extractIrSpec(i_old.op, selector.method);
-		call(i_old, mach.funcRep(methodRef), args);
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
+	}
+	def genCallFunction(i_old: SsaApplyOp) {
+//		wasm.context.fail("genCallFunction called");
+		var funcRep = mach.getFuncRep(i_old.op.typeArgs[0]);
+		var ptype = funcRep.machType;
+		var args = normRefs(i_old.inputs);
+		// essentially the same instruction; helps code below work
+		var i_new = apply(i_old.source, i_old.op, args);
+		i_new.facts = i_new.facts | i_old.facts;
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
 	}
 	def genVariantGetTag(i_old: SsaApplyOp, nobj: SsaInstr) -> SsaInstr {
 		return normId(i_old);
