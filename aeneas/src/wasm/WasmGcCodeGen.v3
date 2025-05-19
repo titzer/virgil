@@ -1,0 +1,1504 @@
+// Copyright 2017-2025 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def XXX: Terminal;
+def REGS = MachRegSet.new(1, [[1]], ["tos"], [1], [1], 1000, 2000);
+class WasmGcCodeGen extends SsaMachGen {
+	def wasm: WasmGcProgram;
+	def rt: MachRuntime;
+	def stackgen = WasmGcStackInstrGen.new(wasm);
+	var stackifier: MachStackifier;
+	def matcher = SsaInstrMatcher.new();
+	def spiller = ShadowStackSpiller.new();
+	def cfgr = CfgRestructurer.new();
+	def stackBlocks = Vector<(int, ArchInstr, ArchInstr)>.new();
+	def useShadowStack = rt.shadowStackSize > 0;
+
+	new(context: SsaContext, wasm: WasmGcProgram, rt, w: MachDataWriter) super(context, wasm.mach, REGS, w) {
+		stackgen.context = context;
+		stackifier = MachStackifier.new(this);
+	}
+	def emitWasm(m: IrMethod, funcNum: int) {
+		context.enterMethod(m);
+		stackBlocks.length = 0;
+		if (useShadowStack) Ssa.splitCriticalEdges(m.ssa);
+		var order = SsaBlockOrder.new(m.ssa);
+		reset(m.ssa, order, null);
+		cfgr.context = context;
+		var code = cfgr.gen(order);
+
+		var out = if(context.shouldPrintMach(), this.getOutput());
+		stackifier.out = if(CLOptions.PRINT_STACKIFY.get(), out);
+		if (out != null) cfgr.print(out, context, regSet, code);
+		if (Debug.PARANOID) cfgr.verify();
+
+		// Reset locals and assign parameter spill slots.
+		stackgen.reset(m, m.ssa.params, getVReg);
+		// Select instructions for CFG code.
+		blockEnd = cursor = ArchInstr.new(ArchInstrs.ARCH_END, []);
+		for (i = code.length - 1; i >= 0; i--) {
+			selectInstructionsForCfgInstr(code[i]);
+			advanceCursor();
+		}
+		// Finished generating code.
+		first = cursor;
+		cursor = null;
+		spiller.reset(this, order);
+		if (out != null) {
+			out.put1("wasm func #%d:", funcNum);
+			out.outln();
+//			print();
+			spiller.print();
+		}
+		// Spill livepoints to shadow stack
+		if (useShadowStack) {
+			spiller.run();
+			// Stackify the code after spills are inserted
+			for (i < stackBlocks.length) {
+				var t = stackBlocks[i];
+				stackifier.stackify(t.0, t.1, t.2);
+			}
+		}
+		// Assemble WASM bytecode into the buffer.
+		var sizepos = w.skip_leb32();
+		var start = w.pos;
+		stackgen.emitVarDecls(w);
+		assembleInstrs();
+		var bodysize = w.pos - start;
+		w.at(sizepos).overwrite_uleb32(bodysize).atEnd();
+		first = cursor = null;
+	}
+	def selectInstructionsForCfgInstr(c: CfgInstr) {
+		match (c) {
+			Unreachable => {
+				emit0(WasmOp.UNREACHABLE.opcode);
+			}
+			Fallthrough(bi, vals) => {
+				context.block = bi.block;
+				for (v in vals) use(v);
+				emitN(ArchInstrs.ARCH_NOP);
+			}
+			Ret(r) => {
+				context.block = r.block();
+				for (e in r.inputs) use(e.dest);
+				emitN(ArchInstrs.ARCH_RET);
+			}
+			Block(t, bi) => {
+				blockEnd = cursor;
+				emit1(WasmOp.BLOCK.opcode, useInt(wasm.wasmGcType(t).toInt()));
+			}
+			Loop(bi) => {
+				emit1(WasmOp.LOOP.opcode, useInt(WasmValueType.Void.toInt()));
+				blockEnd = cursor;
+			}
+			Body(bi) => {
+				var block = bi.block, prevEnd = blockEnd;
+				context.block = block;
+				gatherLivenessForBlock(block);
+				selectInstructionsForBlock(block);
+				if (useShadowStack) {
+					stackBlocks.put((block.uid, cursor, prevEnd));
+				} else {
+					stackifier.stackify(block.uid, cursor, prevEnd);
+				}
+				blockEnd = cursor;
+			}
+			If(split, val, t, join) => {
+				context.block = split;
+				blockEnd = cursor;
+				emit2(WasmOp.IF.opcode, useInt(wasm.wasmGcType(t).toInt()), use(val));
+			}
+			Else => {
+				emit0(WasmOp.ELSE.opcode);
+				blockEnd = cursor;
+			}
+			End => {
+				blockEnd = cursor;
+				emit0(WasmOp.END.opcode);
+			}
+			Br(bi, reldepth) => {
+				blockEnd = cursor;
+				emit1(WasmOp.BR.opcode, useInt(reldepth));
+			}
+			BrIf(split, val, bi, reldepth) => {
+				context.block = split;
+				blockEnd = cursor;
+				emit2(WasmOp.BR_IF.opcode, use(val), useInt(reldepth));
+			}
+			BrTable(split, val, reldepths) => {
+				context.block = split;
+				blockEnd = cursor;
+				use(val);
+				for (i < reldepths.length) useImm(Int.box(reldepths[i]));
+				emitN(WasmOp.BR_TABLE.opcode);
+			}
+		}
+	}
+	def visitApply(block: SsaBlock, i: SsaApplyOp) {
+		match (i.op.opcode) {
+			IntAdd => emitIntBinop(i, WasmOp.I32_ADD, WasmOp.I64_ADD);
+			IntSub => emitIntBinop(i, WasmOp.I32_SUB, WasmOp.I64_SUB);
+			IntMul => emitIntBinop(i, WasmOp.I32_MUL, WasmOp.I64_MUL);
+			IntDiv => emitIntBinopSU(i, WasmOp.I32_DIV_S, WasmOp.I32_DIV_U, WasmOp.I64_DIV_S, WasmOp.I64_DIV_U);
+			IntMod => emitIntBinopSU(i, WasmOp.I32_REM_S, WasmOp.I32_REM_U, WasmOp.I64_REM_S, WasmOp.I64_REM_U);
+			IntAnd => emitIntBinop(i, WasmOp.I32_AND, WasmOp.I64_AND);
+			IntOr  => emitIntBinop(i, WasmOp.I32_OR, WasmOp.I64_OR);
+			IntXor => emitIntBinop(i, WasmOp.I32_XOR, WasmOp.I64_XOR);
+			IntShl => emitShift(i, WasmOp.I32_SHL, WasmOp.I64_SHL);
+			IntSar => emitShift(i, WasmOp.I32_SHR_S, WasmOp.I64_SHR_S);
+			IntShr => emitShift(i, WasmOp.I32_SHR_U, WasmOp.I64_SHR_U);
+			IntViewI => emitIntViewI(i);
+			IntCastF(isDouble) => emitIntCastF(i, isDouble);
+			IntViewF(isDouble) => emitFloatUnop(i, isDouble, WasmOp.I32_REINTERPRET_F32, WasmOp.I64_REINTERPRET_F64);
+			BoolAnd => emit3(WasmOp.I32_AND.opcode, dfn(i), use(i.input0()), use(i.input1()));
+			BoolOr => emit3(WasmOp.I32_OR.opcode, dfn(i), use(i.input0()), use(i.input1()));
+			BoolNot => {
+				// XXX: match and invert comparisons
+				emit2(WasmOp.I32_EQZ.opcode, dfn(i), use(i.input0()));
+			}
+			IntTruncF(isDouble) =>          emitIntTruncF(i, isDouble);
+			FloatPromoteI(isDouble) =>	emitFloatPromoteI(i, isDouble);
+			FloatPromoteF => {
+				emit2(WasmOp.F64_PROMOTE_F32.opcode, dfn(i), use(i.input0()));
+			}
+			FloatViewI(isDouble) => emitFloatUnop(i, isDouble, WasmOp.F32_REINTERPRET_I32, WasmOp.F64_REINTERPRET_I64);
+			FloatRoundI(isDouble) => emitFloatRoundI(i, isDouble);
+			FloatRound(isDouble) => emitFloatUnop(i, isDouble, WasmOp.F32_NEAREST, WasmOp.F64_NEAREST);
+			FloatRoundD => {
+				emit2(WasmOp.F32_DEMOTE_F64.opcode, dfn(i), use(i.input0()));
+			}
+			FloatAdd(isDouble) => emitFloatBinop(i, isDouble, WasmOp.F32_ADD, WasmOp.F64_ADD);
+			FloatSub(isDouble) => emitFloatBinop(i, isDouble, WasmOp.F32_SUB, WasmOp.F64_SUB);
+			FloatMul(isDouble) => emitFloatBinop(i, isDouble, WasmOp.F32_MUL, WasmOp.F64_MUL);
+			FloatDiv(isDouble) => emitFloatBinop(i, isDouble, WasmOp.F32_DIV, WasmOp.F64_DIV);
+			FloatBitEq(isDouble) => emitFloatBitEq(i, isDouble);
+			FloatEq(isDouble) => emitFloatBinop(i, isDouble, WasmOp.F32_EQ, WasmOp.F64_EQ);
+			FloatNe(isDouble) => emitFloatBinop(i, isDouble, WasmOp.F32_NE, WasmOp.F64_NE);
+			FloatLt(isDouble) => emitFloatBinop(i, isDouble, WasmOp.F32_LT, WasmOp.F64_LT);
+			FloatLteq(isDouble) => emitFloatBinop(i, isDouble, WasmOp.F32_LE, WasmOp.F64_LE);
+			FloatAbs(isDouble) => emitFloatUnop(i, isDouble, WasmOp.F32_ABS, WasmOp.F64_ABS);
+			FloatCeil(isDouble) => emitFloatUnop(i, isDouble, WasmOp.F32_CEIL, WasmOp.F64_CEIL);
+			FloatFloor(isDouble) => emitFloatUnop(i, isDouble, WasmOp.F32_FLOOR, WasmOp.F64_FLOOR);
+			FloatSqrt(isDouble) => emitFloatUnop(i, isDouble, WasmOp.F32_SQRT, WasmOp.F64_SQRT);
+			BoolEq,
+			IntEq	=> emitEq(i);
+			IntLt	=> emitIntBinopSU(i, WasmOp.I32_LT_S, WasmOp.I32_LT_U, WasmOp.I64_LT_S, WasmOp.I64_LT_U);
+			IntLteq => emitIntBinopSU(i, WasmOp.I32_LE_S, WasmOp.I32_LE_U, WasmOp.I64_LE_S, WasmOp.I64_LE_U);
+			RefEq => emitRefEq(i);
+			PtrLoad => {
+				var ty = i.op.typeArgs[1];
+				var wop: WasmOp, size = mach.sizeOf(ty);
+				if (FloatType.?(ty)) {
+					wop = if(FloatType.!(ty).is64, WasmOp.F64_LOAD, WasmOp.F32_LOAD);
+				} else {
+					match (size) {
+						1 => wop = if(V3.isSigned(ty), WasmOp.I32_LOAD8_S, WasmOp.I32_LOAD8_U);
+						2 => wop = if(V3.isSigned(ty), WasmOp.I32_LOAD16_S, WasmOp.I32_LOAD16_U);
+						4 => wop = WasmOp.I32_LOAD;
+						8 => wop = WasmOp.I64_LOAD;
+						_ => context.fail("invalid load size");
+					}
+				}
+				var t = matchAddress(i.input0()), opcode = wop.opcode | ArchInstrs.FLAG_LOAD;
+				if (t.1 == null) {
+					emit3(opcode, dfn(i), useImm(t.0), use(context.graph.zeroConst()));
+				} else {
+					emit3(opcode, dfn(i), useImm(t.0), use(t.1));
+				}
+			}
+			PtrStore => {
+				var ty = i.op.typeArgs[1];
+				var wop: WasmOp, size = mach.sizeOf(ty);
+//				var sb = StringBuilder.new().put1("size = %d", size);
+//				context.prog.ERROR.addError(null, null, "PtrStore", sb.extract());
+				if (FloatType.?(ty)) {
+					wop = if(FloatType.!(ty).is64, WasmOp.F64_STORE, WasmOp.F32_STORE);
+				} else {
+					var l = isLong(i.input1().getType());  // handle store narrowing
+					match (size) {
+						1 => wop = if(l, WasmOp.I64_STORE8, WasmOp.I32_STORE8);
+						2 => wop = if(l, WasmOp.I64_STORE16, WasmOp.I32_STORE16);
+						4 => wop = if(l, WasmOp.I64_STORE32, WasmOp.I32_STORE);
+						8 => wop = WasmOp.I64_STORE;
+						_ => context.fail("invalid store size");
+					}
+				}
+				var t = matchAddress(i.input0()), opcode = wop.opcode | ArchInstrs.FLAG_STORE;
+				if (t.1 == null) {
+					emit3(opcode, useImm(t.0), use(context.graph.zeroConst()), use(i.input1()));
+				} else {
+					emit3(opcode, useImm(t.0), use(t.1), use(i.input1()));
+				}
+			}
+			PtrAdd => emitBinop(i, WasmOp.I32_ADD);
+			PtrSub => emitBinop(i, WasmOp.I32_SUB);
+			PtrLt => emitBinop(i, WasmOp.I32_LT_U);
+			PtrLteq => emitBinop(i, WasmOp.I32_LE_U);
+			ConditionalThrow => {
+				emit2(WasmOp.IF.opcode, useInt(WasmValueType.Void.toInt()), use(i.inputs[0].dest));
+				emitN(WasmOp.UNREACHABLE.opcode);
+				emitN(WasmOp.END.opcode);
+			}
+			CallAddress => {
+				// first arg is table number
+				// second arg is offset - may be constant or computed
+
+				dfnAll(i);
+				if (useShadowStack) refmap(null);
+				var table = i.inputs[0].dest;
+				var tblval = SsaConst.!(table).val;
+				var tblnum = Int.unbox(tblval);
+				var target = i.inputs[1].dest;
+				if (SsaConst.?(target) && tblnum == 0) {
+//				if (SsaConst.?(target)) {
+					// how is null represented??
+					var val = SsaConst.!(target).val, m: IrMethod;
+					if (val == null) {  // call of a null address => always throws
+						emitN(WasmOp.UNREACHABLE.opcode);
+						return;
+					}
+					if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+					else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+					else context.fail("constant target is not an address or function value");
+					var start = if(V3.isComponent(m.receiver), 3, 2);
+					useAll(i.inputs, start); // skip table number, target, and maybe receiver
+					useInt(m.machIndex);
+					emitN(WasmOp.CALL.opcode);
+//					var sb = StringBuilder.new().put2("Emitting call of function %d  tblnum %d", m.machIndex, tblnum);
+//					context.prog.ERROR.addError(null, null, "CallAddress", sb.extract());
+				} else {
+					var sig = FuncType.!(i.op.typeArgs[0].nested.head).sig();
+					var sigIndex = wasm.addSig(Void.TYPE, sig);
+//					var sb = StringBuilder.new().put2("sigindex = %d  tblnum = %d", sigIndex, tblnum);
+//					context.prog.ERROR.addError(null, null, "CallAddress", sb.extract());
+					useAll(i.inputs, 2);   // use arguments, except table number and target
+					use(i.inputs[1].dest); // target of the call comes last
+					useInt(int.view(sigIndex - 1));
+					useInt(tblnum);
+					emitN(WasmOp.CALL_INDIRECT.opcode);
+					wasm.containsCallIndirect = true;
+				}
+				// XXX: match Call(PtrLoad(PtrAdd(#meta, x))
+			}
+			CallFunction => {
+				// first arg is ref to function
+{
+//				var sb = StringBuilder.new().put1("ftype is %q", i.op.typeArgs[0].render);
+//				context.prog.ERROR.addError(null, null, "CallFunction", sb.extract());
+//				sb.put1("sig type is %q", i.op.sig.funcType().render);
+//				context.prog.ERROR.addError(null, null, "CallFunction", sb.extract());
+}
+//				if (true) return;
+				var sig = FuncType.!(i.op.typeArgs[0]).sig();
+				var sigIndex = wasm.addSig(Void.TYPE, sig);
+				dfnAll(i);
+				useAll(i.inputs, 1);
+				use(i.inputs[0].dest);  // function is pushed last
+				useInt(int.!(sigIndex - 1));
+				emitN(WasmOp.CALL_REF.opcode);
+//				var sb = StringBuilder.new().put1("Emitting call_ref of sigindex %d", sigIndex - 1);
+//				context.prog.ERROR.addError(null, null, "CallFunction", sb.extract());
+			}
+			TypeCast(cast) => {
+				// only the CLASS and VARIANT cases get here
+				var toType = i.op.typeArgs[1];
+				var wht = wasm.gcTypeTable.addHeapType(toType);
+				emit3(WasmExtOp.REF_CAST_NULL.extopcode, dfn(i), use(i.input0()), useInt(int.!(wht.index - 1)));
+			}
+			// REF_TEST does not do *Virgil* subclass checking, only Wasm *structural* type comparison;
+			// so this is handled in WasmGcTarget
+// EBM uncomment TypeQuery (along with a line in WasmGcTarget) to demo why REF_TEST does not work
+//			TypeQuery => {
+//				var toType = i.op.typeArgs[1];
+//				var wht = wasm.gcTypeTable.addHeapType(toType);
+//				emit3(WasmExtOp.REF_TEST.extopcode, dfn(i), use(i.input0()), useInt(int.!(wht.index - 1)));
+//			}
+			TypeSubsume => {
+				// An explicit cast is required to get the type right for subsequent uses
+				var toType = i.op.typeArgs[1];
+				var wht = wasm.gcTypeTable.addHeapType(toType);
+				emit3(WasmExtOp.REF_CAST_NULL.extopcode, dfn(i), use(i.input0()), useInt(int.!(wht.index - 1)));
+			}
+// EBM TODO
+			Alloc => {
+				dfn(i);
+				if (useShadowStack) refmap(null);
+				use(i.inputs[0].dest);
+				useInt(wasm.allocateStubFuncIndex);
+				emitN(WasmOp.CALL.opcode);
+			}
+			// Not in Wasm Gc:
+			// CallerSp => { }
+			// Not in Wasm Gc:
+			// CallerIp => { }
+			CallVariantSelector(selector) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+
+				var tagTmp = newTmpVReg(WasmValueType.I32);
+				// fetch tag (field 0)
+				dfnv0(tagTmp);
+				use(i.inputs[0].dest);
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+				// subtract minClassId to get offset
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				var minClassId = irClass.minClassId;
+				var offsetTmp: VReg;
+				if (minClassId == 0) {
+					offsetTmp = tagTmp;
+				} else {
+					offsetTmp = newTmpVReg(WasmValueType.I32);
+					var tagType = mach.tagType;
+					var minIdVal = context.graph.valConst(tagType, Int.box(irClass.minClassId));
+					emit3(WasmOp.I32_SUB.opcode, dfnv0(offsetTmp), usev0(tagTmp), use(minIdVal));
+				}
+
+				// obtain type index
+				var mtable = selector.mtable;
+				var root = mtable.root;
+				var sigIdx = wasm.addSig(root.receiver, root.sig);	// make sure signature is present
+
+				// obtain table number
+				if (!wasm.dispatchTableFor.has(mtable))
+					context.fail1("no dispatch table for mtable %q", mtable.render);
+				var tabnum = int.!(wasm.dispatchTableFor[mtable]);
+
+				// do the call
+				dfnAll(i);
+				if (useShadowStack) refmap(null);
+				useAll(i.inputs, 0);   // use arguments, including receiver
+				usev0(offsetTmp);
+				useInt(int.!(sigIdx - 1));  // type index
+				useInt(tabnum);  // table number
+				emitN(WasmOp.CALL_INDIRECT.opcode);
+			}
+//			VariantGetTag => {
+//				// TODO
+//			}
+			ClassGetField(field) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+				dfn(i);
+				use(i.input0());
+				useInt(int.!(wht.index - 1));
+				useInt(field.machOffset);
+				var wst = WasmStructType.!(wht).fields[field.machOffset];
+				var wop = WasmExtOp.STRUCT_GET;
+				if (wst.pack != WasmPacking.NONE) {
+					match (op.sig.returnTypes[0]) {
+						x: BoolType => { wop = WasmExtOp.STRUCT_GET_U; }
+						x: IntType => {
+							wop = if(x.signed, WasmExtOp.STRUCT_GET_S, WasmExtOp.STRUCT_GET_U);
+						}
+					}
+				}
+				emitN(wop.extopcode);
+			}
+			ClassInitField(field) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+				use(i.input0());
+				use(i.input1());
+				useInt(int.!(wht.index - 1));
+				useInt(field.machOffset);
+				emitN(WasmExtOp.STRUCT_SET.extopcode);
+			}
+			ClassSetField(field) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+				use(i.input0());
+				use(i.input1());
+				useInt(int.!(wht.index - 1));
+				useInt(field.machOffset);
+				emitN(WasmExtOp.STRUCT_SET.extopcode);
+			}
+			// Handled in WasmGcTarget:
+			// ClassGetMethod(method) => { }
+			ClassGetSelector(selector) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+
+				var tagTmp = newTmpVReg(WasmValueType.I32);
+				// fetch tag (field 0)
+				dfnv0(tagTmp);
+				use(i.inputs[0].dest);
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+				// subtract minClassId to get offset
+				var offsetTmp: VReg;
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				var minClassId = irClass.minClassId;
+				if (minClassId == 0) {
+					offsetTmp = tagTmp;
+				} else {
+					offsetTmp = newTmpVReg(WasmValueType.I32);
+					var tagType = mach.tagType;
+					var minIdVal = context.graph.valConst(tagType, Int.box(irClass.minClassId));
+					emit3(WasmOp.I32_SUB.opcode, dfnv0(offsetTmp), usev0(tagTmp), use(minIdVal));
+				}
+
+				// load function reference from table
+				if (!wasm.indirectTableFor.has(selector.mtable))
+					context.fail1("no indirect table for mtable %q", selector.mtable.render);
+				var tabnum = int.!(wasm.indirectTableFor[selector.mtable]);
+				emit3(WasmOp.TABLE_GET.opcode, dfn(i), usev0(offsetTmp), useInt(tabnum));
+			}
+			VariantGetField(field) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+				dfn(i);
+				use(i.input0());
+				useInt(int.!(wht.index - 1));
+				useInt(field.machOffset);
+				var wst = WasmStructType.!(wht).fields[field.machOffset];
+				var wop = WasmExtOp.STRUCT_GET;
+				if (wst.pack != WasmPacking.NONE) {
+					match (op.sig.returnTypes[0]) {
+						x: BoolType => { wop = WasmExtOp.STRUCT_GET_U; }
+						x: IntType => {
+							wop = if(x.signed, WasmExtOp.STRUCT_GET_S, WasmExtOp.STRUCT_GET_U);
+						}
+					}
+				}
+				emitN(wop.extopcode);
+			}
+			// Handled in WasmGcTarget:
+			// VariantGetMethod(method) => { }
+			VariantGetSelector(selector) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+
+				var tagTmp = newTmpVReg(WasmValueType.I32);
+				// fetch tag (field 0)
+				dfnv0(tagTmp);
+				use(i.inputs[0].dest);
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+				// subtract minClassId to get offset
+				var offsetTmp: VReg;
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				var minClassId = irClass.minClassId;
+				if (minClassId == 0) {
+					offsetTmp = tagTmp;
+				} else {
+					offsetTmp = newTmpVReg(WasmValueType.I32);
+					var tagType = mach.tagType;
+					var minIdVal = context.graph.valConst(tagType, Int.box(irClass.minClassId));
+					emit3(WasmOp.I32_SUB.opcode, dfnv0(offsetTmp), usev0(tagTmp), use(minIdVal));
+				}
+
+				// load function reference from table
+				if (!wasm.indirectTableFor.has(selector.mtable))
+					context.fail1("no indirect table for mtable %q", selector.mtable.render);
+				var tabnum = int.!(wasm.indirectTableFor[selector.mtable]);
+				emit3(WasmOp.TABLE_GET.opcode, dfn(i), usev0(offsetTmp), useInt(tabnum));
+			}
+//			ComponentGetField(field) => {
+/*
+				var fieldRef = V3Op.extractIrSpec(i_old.op, field);
+				var fieldType = mach.machType(fieldRef.getFieldType());
+				var ptr = componentFieldPtr(fieldRef);
+				var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, fieldType, ptr, 0);
+				mapN(i_old, loads);
+*/
+//			}
+//			ComponentSetField(field) => {
+//				// TODO
+//			}
+			// Handled in WasmGcTarget:
+			// CallClassMethod(selector) => { }
+			// Handled in WasmGcTarget:
+			CallClassSelector(selector) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+
+				var tagTmp = newTmpVReg(WasmValueType.I32);
+				// fetch tag (field 0)
+				dfnv0(tagTmp);
+				use(i.inputs[0].dest);
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+				// subtract minClassId to get offset
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				var minClassId = irClass.minClassId;
+				var offsetTmp: VReg;
+				if (minClassId == 0) {
+					offsetTmp = tagTmp;
+				} else {
+					offsetTmp = newTmpVReg(WasmValueType.I32);
+					var tagType = mach.tagType;
+					var minIdVal = context.graph.valConst(tagType, Int.box(irClass.minClassId));
+					emit3(WasmOp.I32_SUB.opcode, dfnv0(offsetTmp), usev0(tagTmp), use(minIdVal));
+				}
+
+				// obtain type index
+				var mtable = selector.mtable;
+				var root = mtable.root;
+				var sigIdx = wasm.addSig(root.receiver, root.sig);	// make sure signature is present
+
+				// obtain table number
+				if (!wasm.dispatchTableFor.has(mtable))
+					context.fail1("no dispatch table for mtable %q", mtable.render);
+				var tabnum = int.!(wasm.dispatchTableFor[mtable]);
+
+				// do the call
+				dfnAll(i);
+				if (useShadowStack) refmap(null);
+				useAll(i.inputs, 0);   // use arguments, including receiver
+				usev0(offsetTmp);
+				useInt(int.!(sigIdx - 1));  // type index
+				useInt(tabnum);  // table number
+				emitN(WasmOp.CALL_INDIRECT.opcode);
+			}
+			ArrayAlloc => {
+				var arrType = i.op.sig.returnTypes[0];
+				var wat = wasm.gcTypeTable.addHeapType(arrType);
+				emit3(WasmExtOp.ARRAY_NEW_DEFAULT.extopcode, dfn(i), use(i.input0()), useInt(i32.!(wat.index - 1)));
+			}
+			ArrayInit => {
+				var arrType = i.op.sig.returnTypes[0];
+				var wat = wasm.gcTypeTable.addHeapType(arrType);
+				dfn(i);
+				useAll(i.inputs, 0);
+				useInt(i32.!(wat.index - 1));
+				useInt(i32.!(i.inputs.length));
+				emitN(WasmExtOp.ARRAY_NEW_FIXED.extopcode);
+			}
+			// Not in Wasm Gc:
+			// ArrayTupleInit(elems, length) => { }
+			ArrayGetElem => {
+				var op = i.op;
+				var arrType = op.sig.paramTypes[0];
+				var wat = wasm.gcTypeTable.addHeapType(arrType);
+				var wst = WasmArrayType.!(wat).elem;
+				var wop = WasmExtOp.ARRAY_GET;
+				if (wst.pack != WasmPacking.NONE) {
+					match (op.sig.returnTypes[0]) {
+						x: BoolType => { wop = WasmExtOp.ARRAY_GET_U; }
+						x: IntType => {
+							wop = if(x.signed, WasmExtOp.ARRAY_GET_S, WasmExtOp.ARRAY_GET_U);
+						}
+					}
+				}
+				dfn(i);
+				use(i.input0());
+				use(i.input1());
+				useInt(i32.!(wat.index - 1));
+				emitN(wop.extopcode);
+			}
+			ArraySetElem => {
+				var op = i.op;
+				var arrType = op.sig.paramTypes[0];
+				var wat = wasm.gcTypeTable.addHeapType(arrType);
+				use(i.input0());
+				use(i.input1());
+				use(i.inputs[2].dest);
+				useInt(i32.!(wat.index - 1));
+				emitN(WasmExtOp.ARRAY_SET.extopcode);
+			}
+			// Handled in WasmGcTarget:
+			// NormRangeGetElem => { }
+			// Not in Wasm Gc:
+			// NormRangeGetElemElem(index) => { }
+			// Handled in WasmGcTarget:
+			// NormRangeSetElem => { }
+			// Not in Wasm Gc:
+			// NormRangeSetElemElem(index) => { }
+			ArrayGetLength => {
+				emit2(WasmExtOp.ARRAY_LEN.extopcode, dfn(i), use(i.input0()));
+			}
+			ClassAlloc => {
+				var op = i.op;
+				var clsType = op.sig.returnTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+				emit2(WasmExtOp.STRUCT_NEW_DEFAULT.extopcode, dfn(i), useInt(i32.!(wht.index - 1)));
+				// set tag
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				use(i);
+				useIntConst(irClass.minClassId);
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_SET.extopcode);
+			}
+			VariantAlloc => {
+				var op = i.op;
+				var clsType = op.sig.returnTypes[0];
+				var wht = wasm.gcTypeTable.addHeapType(clsType);
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				dfn(i);
+				useIntConst(irClass.minClassId);  // include tag
+				useAll(i.inputs, 0);
+				useInt(i32.!(wht.index - 1));
+				emitN(WasmExtOp.STRUCT_NEW.extopcode);
+			}
+			_ => return context.fail1("unexpected opcode %s in WASM GC codegen", i.op.opcode.name);
+		}
+	}
+	def emitFloatUnop(i: SsaApplyOp, isDouble: bool, op32: WasmOp, op64: WasmOp) {
+		var op = if(isDouble, op64, op32);
+		emit2(op.opcode, dfn(i), use(i.input0()));
+	}
+	def emitFloatBinop(i: SsaApplyOp, isDouble: bool, op32: WasmOp, op64: WasmOp) {
+		var op = if(isDouble, op64, op32);
+		emit3(op.opcode, dfn(i), use(i.input0()), use(i.input1()));
+	}
+	def emitFloatBitEq(i: SsaApplyOp, isDouble: bool) {
+		if (isDouble) {
+			var ia = newTmpVReg(WasmValueType.I64);
+			emit2(WasmOp.I64_REINTERPRET_F64.opcode, dfnv0(ia), use(i.input0()));
+			var ib = newTmpVReg(WasmValueType.I64);
+			emit2(WasmOp.I64_REINTERPRET_F64.opcode, dfnv0(ib), use(i.input1()));
+			emit3(WasmOp.I64_EQ.opcode, dfn(i), usev0(ia), usev0(ib));
+		} else {
+			var ia = newTmpVReg(WasmValueType.I32);
+			emit2(WasmOp.I32_REINTERPRET_F32.opcode, dfnv0(ia), use(i.input0()));
+			var ib = newTmpVReg(WasmValueType.I32);
+			emit2(WasmOp.I32_REINTERPRET_F32.opcode, dfnv0(ib), use(i.input1()));
+			emit3(WasmOp.I32_EQ.opcode, dfn(i), usev0(ia), usev0(ib));
+		}
+	}
+	def emitIntTruncF(i: SsaApplyOp, isDouble: bool) {
+		var itt = IntType.!(i.op.typeArgs[1]);
+		var op: WasmExtOp;
+		match (itt.rank) {
+			SUBI32, I32 => op = if(isDouble, WasmExtOp.I32_TRUNC_SAT_F64_S, WasmExtOp.I32_TRUNC_SAT_F32_S);
+			SUBU32, U32 => op = if(isDouble, WasmExtOp.I32_TRUNC_SAT_F64_U, WasmExtOp.I32_TRUNC_SAT_F32_U);
+			SUBI64, I64 => op = if(isDouble, WasmExtOp.I64_TRUNC_SAT_F64_S, WasmExtOp.I64_TRUNC_SAT_F32_S);
+			SUBU64, U64 => op = if(isDouble, WasmExtOp.I64_TRUNC_SAT_F64_U, WasmExtOp.I64_TRUNC_SAT_F32_U);
+		}
+		emit2(op.extopcode, dfn(i), use(i.input0()));
+	}
+	def emitFloatPromoteI(i: SsaApplyOp, isDouble: bool) {
+		emitFloatRoundI(i, isDouble);
+	}
+	def emitFloatRoundI(i: SsaApplyOp, isDouble: bool) {
+		var ift = IntType.!(i.op.typeArgs[0]);
+		match (ift.rank) {
+			SUBI32, I32 => {
+				var op = if(isDouble, WasmOp.F64_CONVERT_S_I32, WasmOp.F32_CONVERT_S_I32);
+				emit2(op.opcode, dfn(i), use(i.input0()));
+			}
+			SUBU32, U32 => {
+				var op = if(isDouble, WasmOp.F64_CONVERT_U_I32, WasmOp.F32_CONVERT_U_I32);
+				emit2(op.opcode, dfn(i), use(i.input0()));
+			}
+			SUBI64, I64 => {
+				var op = if(isDouble, WasmOp.F64_CONVERT_S_I64, WasmOp.F32_CONVERT_S_I64);
+				emit2(op.opcode, dfn(i), use(i.input0()));
+			}
+			SUBU64, U64 => {
+				var op = if(isDouble, WasmOp.F64_CONVERT_U_I64, WasmOp.F32_CONVERT_U_I64);
+				emit2(op.opcode, dfn(i), use(i.input0()));
+			}
+		}
+	}
+	def emitEq(i: SsaApplyOp) {
+		var l = i.op.typeArgs.length > 0 && isLong(i.op.typeArgs[0]);
+		matcher.binop(i);
+		if (matcher.yzero) {
+			var op = if (l, WasmOp.I64_EQZ, WasmOp.I32_EQZ);
+			emit2(op.opcode, dfn(i), use(matcher.x));
+		} else {
+			var op = if(l, WasmOp.I64_EQ, WasmOp.I32_EQ);
+			emit3(op.opcode, dfn(i), use(matcher.x), use(matcher.y));
+		}
+	}
+	def emitRefEq(i: SsaApplyOp) {
+		matcher.binop(i);
+		if (matcher.yzero) {
+			emit2(WasmOp.REF_IS_NULL.opcode, dfn(i), use(matcher.x));
+		} else {
+			emit3(WasmOp.REF_EQ.opcode, dfn(i), use(matcher.x), use(matcher.y));
+		}
+	}
+	def visitThrow(block: SsaBlock, i: SsaThrow) {
+		emitN(WasmOp.UNREACHABLE.opcode); // TODO: record exception location
+	}
+	def visitIf(block: SsaBlock, i: SsaIf) {
+		// do nothing; handled by CfgRestructurer
+	}
+	def visitSwitch(block: SsaBlock, i: SsaSwitch) {
+		// do nothing; handled by CfgRestructurer
+	}
+	def visitGoto(block: SsaBlock, target: SsaGoto) {
+		// do nothing; handled by CfgRestructurer
+	}
+	def visitReturn(block: SsaBlock, i: SsaReturn) {
+		// do nothing; handled by CfgRestructurer
+	}
+	def emitShiftShiftL(i: SsaApplyOp, op1: WasmOp, op2: WasmOp, width: int) {
+		var t = newTmpVReg(WasmValueType.I64);
+		emit3(op1.opcode, dfnv0(t), use(i.input0()), useLongConst(width));
+		emit3(op2.opcode, dfn(i), usev0(t), useLongConst(width));
+	}
+	def emitShiftShiftI(i: SsaApplyOp, op1: WasmOp, op2: WasmOp, width: int) {
+		var t = newTmpVReg(WasmValueType.I64);
+		emit3(op1.opcode, dfnv0(t), use(i.input0()), useIntConst(width));
+		emit3(op2.opcode, dfn(i), usev0(t), useIntConst(width));
+	}
+	def emitIntViewI(i: SsaApplyOp) {
+		var ft = IntType.!(i.op.sig.paramTypes[0]), tt = IntType.!(i.op.sig.returnType());
+		if (ft.width > 32) {
+			// Converting from 64-bit
+			match (tt.rank) {
+				SUBI64, I64 => {
+					emitShiftShiftL(i, WasmOp.I64_SHL, WasmOp.I64_SHR_S, tt.lshift);
+				}
+				SUBU64, U64 => {
+					emit3(WasmOp.I64_AND.opcode, dfn(i), use(i.input0()), use(context.graph.valConst(Long.TYPE, tt.max)));
+				}
+				I32, U32 => {
+					emit2(WasmOp.I32_WRAP_I64.opcode, dfn(i), use(i.input0()));
+				}
+				SUBI32 => {
+					var t1 = newTmpVReg(WasmValueType.I32);
+					emit2(WasmOp.I32_WRAP_I64.opcode, dfnv0(t1), use(i.input0()));
+					var t2 = newTmpVReg(WasmValueType.I32);
+					emit3(WasmOp.I32_SHL.opcode, dfnv0(t2), usev0(t1), useIntConst(tt.ishift));
+					emit3(WasmOp.I32_SHR_S.opcode, dfn(i), usev0(t2), useIntConst(tt.ishift));
+				}
+				SUBU32 => {
+					var t1 = newTmpVReg(WasmValueType.I32);
+					emit2(WasmOp.I32_WRAP_I64.opcode, dfnv0(t1), use(i.input0()));
+					emit3(WasmOp.I32_AND.opcode, dfn(i), usev0(t1), use(context.graph.valConst(Int.TYPE, tt.max)));
+				}
+			}
+		} else {
+			match (tt.rank) {
+				SUBI32, I32 => {
+					emitShiftShiftI(i, WasmOp.I32_SHL, WasmOp.I32_SHR_S, tt.ishift);
+				}
+				SUBU32, U32 => {
+					emit3(WasmOp.I32_AND.opcode, dfn(i), use(i.input0()), use(context.graph.valConst(Int.TYPE, tt.max)));
+				}
+				_ => {
+					// int-long conversion.
+					var op = if(ft.signed, WasmOp.I64_EXTEND_S_I32, WasmOp.I64_EXTEND_U_I32);
+					if (!tt.signed && ft.signed && tt.width < 64) {
+						var t1 = newTmpVReg(WasmValueType.I64), t2 = newTmpVReg(WasmValueType.I64);
+						emit2(op.opcode, dfnv0(t1), use(i.input0()));
+						emit3(WasmOp.I64_SHL.opcode, dfnv0(t2), usev0(t1), useLongConst(tt.lshift));
+						emit3(WasmOp.I64_SHR_U.opcode, dfn(i), usev0(t2), useLongConst(tt.lshift));
+					} else {
+						emit2(op.opcode, dfn(i), use(i.input0()));
+					}
+				}
+			}
+		}
+	}
+	def emitIntCastF(i: SsaApplyOp, isDouble: bool) {
+		var itt = IntType.!(i.op.typeArgs[1]);
+		var op: WasmOp;
+		match (itt.rank) {
+			SUBI32, I32 => op = if(isDouble, WasmOp.I32_TRUNC_S_F64, WasmOp.I32_TRUNC_S_F32);
+			SUBU32, U32 => op = if(isDouble, WasmOp.I32_TRUNC_U_F64, WasmOp.I32_TRUNC_U_F32);
+			SUBI64, I64 => op = if(isDouble, WasmOp.I64_TRUNC_S_F64, WasmOp.I64_TRUNC_S_F32);
+			SUBU64, U64 => op = if(isDouble, WasmOp.I64_TRUNC_U_F64, WasmOp.I64_TRUNC_U_F32);
+		}
+		emit2(op.opcode, dfn(i), use(i.input0()));
+	}
+	def matchAddress(a: SsaInstr) -> (Val, SsaInstr) {
+		if (SsaConst.?(a)) return (SsaConst.!(a).val, null);
+		var add = cover(Opcode.PtrAdd.tag, a);
+		if (add != null) {
+			var r = add.input1();
+			if (SsaConst.?(r)) return (SsaConst.!(r).val, add.input0());
+		}
+		return (null, a);
+	}
+	def emitShift(i: SsaApplyOp, op32: WasmOp, op64: WasmOp) {
+		if (IntType.!(i.op.typeArgs[0]).width <= 32) {
+			emit3(op32.opcode, dfn(i), use(i.input0()), use(i.input1()));
+		} else {
+			// wasm requires a 64-bit shiftend
+			var t = newTmpVReg(WasmValueType.I64);
+			emit2(WasmOp.I64_EXTEND_U_I32.opcode, dfnv0(t), use(i.input1()));
+			emit3(op64.opcode, dfn(i), use(i.input0()), usev0(t));
+		}
+	}
+	def emitIntBinop(i: SsaApplyOp, op32: WasmOp, op64: WasmOp) {
+		var op = if(isLong(i.op.typeArgs[0]), op64, op32);
+		emit3(op.opcode, dfn(i), use(i.input0()), use(i.input1()));
+	}
+	def emitIntBinopSU(i: SsaApplyOp, op32s: WasmOp, op32u: WasmOp, op64s: WasmOp, op64u: WasmOp) {
+		if (isSigned(i.op)) emitIntBinop(i, op32s, op64s);
+		else emitIntBinop(i, op32u, op64u);
+	}
+	def emitBinop(i: SsaApplyOp, op: WasmOp) {
+		emit3(op.opcode, dfn(i), use(i.input0()), use(i.input1()));
+	}
+	def newTmpVReg(wasmGcType: WasmValueType) -> VReg {
+		return stackgen.allocSlot(newVReg(null), wasmGcType);
+	}
+	// Assembling support
+	def assemble(opcode: int, a: Array<Operand>) {
+		match (opcode) {
+			ArchInstrs.ARCH_NOP => return;
+			ArchInstrs.ARCH_RET => {
+				w.putb(WasmOp.RETURN.opcode);
+				return;
+			}
+			ArchInstrs.ARCH_BLOCK => {
+				context.block = toBlock(a[0]);
+				return;
+			}
+			ArchInstrs.ARCH_END => {
+				w.putb(WasmOp.END.opcode);
+				return;
+			}
+			ArchInstrs.ARCH_BLOCK_END => {
+				return; // do nothing.
+			}
+			ArchInstrs.ARCH_GETSHADOWSTACKPTR => {
+				emitRefLoad(0);
+				return;
+			}
+			ArchInstrs.ARCH_ALLOCSHADOWSTACK => {
+				w.putb(WasmOp.I32_ADD.opcode);
+				emitRefStore(0);
+				return;
+			}
+			ArchInstrs.ARCH_SETSHADOWSTACKPTR => {
+				emitRefStore(0);
+				return;
+			}
+			ArchInstrs.ARCH_SAVE => {
+				emitRefStore(toInt(a[0]) * mach.data.addressSize);
+				return;
+			}
+			ArchInstrs.ARCH_RESTORE => {
+				emitRefLoad(toInt(a[1]) * mach.data.addressSize);
+				return;
+			}
+			ArchInstrs.ARCH_PARMOVE => return context.fail("parallel move instructions should be removed by stackifier");
+		}
+		if (opcode > 255) w.put_b16be(opcode);
+		else w.putb(opcode);
+		// emit immediates for specific opcodes
+		match (opcode) {
+			WasmOp.GET_LOCAL.opcode,
+			WasmOp.SET_LOCAL.opcode,
+			WasmOp.TEE_LOCAL.opcode => {
+				var v = toVar(a[0]), slot = stackgen.slotOf(v);
+				if (slot < 0) context.fail1("variable @%d not allocated a spill slot", v.ssa.uid);
+				w.put_sleb32(slot);
+			}
+
+			WasmOp.LOOP.opcode,
+			WasmOp.BLOCK.opcode,
+			WasmOp.IF.opcode => {
+				var val = toInt(a[0]); // XXX: introduce a toBlockType() helper?
+				if (val < 0) w.put_sleb32(val);
+				else w.putb(WasmTypeConCode.REF_NULL.code).put_uleb32(u32.view(val));
+			}
+
+			WasmOp.BR.opcode => w.put_uleb32(u32.!(toInt(a[0])));
+			WasmOp.BR_IF.opcode => w.put_uleb32(u32.!(toInt(a[1])));
+			WasmOp.BR_TABLE.opcode => {
+				var count = a.length - 2;
+				w.put_uleb32(u32.!(count));
+				for (i = 1; i < a.length; i++) {
+					w.put_uleb32(u32.!(toInt(a[i])));
+				}
+			}
+
+			WasmOp.I32_LOAD8_S.opcode,
+			WasmOp.I32_LOAD8_U.opcode,
+			WasmOp.I64_LOAD8_S.opcode,
+			WasmOp.I64_LOAD8_U.opcode => asmls(0, a, 1);
+
+			WasmOp.I32_STORE8.opcode,
+			WasmOp.I64_STORE8.opcode => asmls(0, a, 0);
+
+			WasmOp.I32_LOAD16_S.opcode,
+			WasmOp.I32_LOAD16_U.opcode,
+			WasmOp.I64_LOAD16_S.opcode,
+			WasmOp.I64_LOAD16_U.opcode => asmls(1, a, 1);
+
+			WasmOp.I32_STORE16.opcode,
+			WasmOp.I64_STORE16.opcode => asmls(1, a, 0);
+
+			WasmOp.I32_LOAD.opcode,
+			WasmOp.F32_LOAD.opcode => asmls(2, a, 1);
+
+			WasmOp.I64_LOAD32_S.opcode,
+			WasmOp.I64_LOAD32_U.opcode => asmls(3, a, 1);
+
+			WasmOp.I32_STORE.opcode,
+			WasmOp.F32_STORE.opcode => asmls(2, a, 0);
+
+			WasmOp.I64_STORE32.opcode => asmls(2, a, 0);
+
+			WasmOp.I64_LOAD.opcode,
+			WasmOp.F64_LOAD.opcode => asmls(3, a, 1);
+
+			WasmOp.I64_STORE.opcode,
+			WasmOp.F64_STORE.opcode => asmls(3, a, 0);
+
+			WasmOp.I64_CONST.opcode,
+			WasmOp.I32_CONST.opcode => emitInt(a[a.length - 1]);
+			WasmOp.F32_CONST.opcode => {
+				var val = Operand.Immediate.!(a[0]).val;
+				if (val == null) w.put_b32(0);
+				else w.put_b32(i32.view(Float32Val.!(val).bits));
+			}
+			WasmOp.F64_CONST.opcode => {
+				var val = Operand.Immediate.!(a[0]).val;
+				if (val == null) w.put_b64(0);
+				else w.put_b64(i64.view(Float64Val.!(val).bits));
+			}
+			WasmOp.CALL.opcode => {
+				emitUint(a[a.length - 1]); // function_index
+			}
+			WasmOp.CALL_REF.opcode => {
+				emitUint(a[a.length - 1]); // sig index
+			}
+			WasmOp.CALL_INDIRECT.opcode => {
+				emitUint(a[a.length - 2]); // type_index
+				emitUint(a[a.length - 1]); // table number
+			}
+			WasmOp.TABLE_GET.opcode => {
+				emitUint(a[a.length - 1]); // table number
+			}
+			WasmOp.REF_NULL.opcode,
+			WasmExtOp.REF_TEST.extopcode,
+			WasmExtOp.REF_TEST_NULL.extopcode,
+			WasmExtOp.REF_CAST_NULL.extopcode,
+			WasmExtOp.REF_CAST.extopcode,
+			WasmExtOp.STRUCT_NEW.extopcode,
+			WasmExtOp.STRUCT_NEW_DEFAULT.extopcode,
+			WasmExtOp.ARRAY_NEW_DEFAULT.extopcode,
+			WasmExtOp.ARRAY_GET.extopcode,
+			WasmExtOp.ARRAY_GET_S.extopcode,
+			WasmExtOp.ARRAY_GET_U.extopcode,
+			WasmExtOp.ARRAY_SET.extopcode => {
+				emitUint(a[a.length - 1]); // type index
+			}
+			WasmExtOp.ARRAY_NEW_FIXED.extopcode => {
+				emitUint(a[a.length - 2]); // type index
+				emitUint(a[a.length - 1]); // size
+			}
+			WasmExtOp.STRUCT_GET.extopcode,
+			WasmExtOp.STRUCT_GET_S.extopcode,
+			WasmExtOp.STRUCT_GET_U.extopcode,
+			WasmExtOp.STRUCT_SET.extopcode => {
+				emitUint(a[a.length - 2]); // type index
+				emitUint(a[a.length - 1]); // field index
+			}
+		}
+	}
+	def emitRefStore(offset: int) {
+		w.putb(WasmOp.I32_STORE.opcode);
+		w.putb(2);	// flags = alignment
+		w.put_sleb32(offset);
+	}
+	def emitRefLoad(offset: int) {
+		w.putb(WasmOp.I32_LOAD.opcode);
+		w.putb(2);	// flags = alignment
+		w.put_sleb32(offset);
+	}
+	def emitAddr(addr: Addr) {
+		w.recordPatch(addr, w.pos);
+		w.skipN(5);
+	}
+	def emitInt(o: Operand) {
+		var val = Operand.Immediate.!(o).val;
+		match (val) {
+			null => w.putb(0);
+			x: Addr => emitAddr(x);
+			x: Record => emitAddr(mach.addrOfRecord(x));
+			x: Box<int> => w.put_sleb32(x.val);
+			x: Box<long> => w.put_sleb64(x.val);
+			_ => context.fail1("cannot convert immediate to int: %s", V3.renderVal(val));
+		}
+	}
+	def emitUint(o: Operand) {
+		var val = Operand.Immediate.!(o).val;
+		match (val) {
+			null => w.putb(0);
+			x: Box<int> => w.put_uleb32(u32.view(x.val));
+			_ => context.fail1("cannot convert immediate to unsigned int: %s", V3.renderVal(val));
+		}
+	}
+	def asmls(logAlign: int, a: Array<Operand>, offsetOperand: int) {
+		w.putb(logAlign);	// flags = alignment
+		emitInt(a[offsetOperand]);  // offset
+	}
+	def emitEntryStub(test: bool) {
+		def b = w.putb;
+		var sizepos = w.pos;
+
+		b(/*body_size=*/0);
+		var start = w.pos;
+		b(/*locals_count=*/0);
+
+		// ============ entrypoint stub code =========================
+		var ri_init = rt.getRiInit();
+		var main = mach.prog.getMain();
+		var mainMeth = if(main != null, main.asMethod());
+		var mainSig = if(mainMeth != null, mainMeth.sig);
+
+		if (test) {
+			if (ri_init != null) {
+				// Call ri_init with default values
+				for (t in ri_init.sig.paramTypes) emitDefaultConst(w, t);
+				b(WasmOp.CALL.opcode); w.put_sleb32(ri_init.machIndex);
+				for (i < ri_init.sig.returnTypes.length) b(WasmOp.DROP.opcode);
+			}
+			// Forward arguments to main
+			for (i < mainSig.paramTypes.length) {
+				b(WasmOp.GET_LOCAL.opcode); b(i);
+			}
+			b(WasmOp.CALL.opcode); w.put_uleb32(u32.!(mainMeth.machIndex));
+			b(WasmOp.END.opcode); // Leave main's results on the stack and fall-through return
+
+			var bodysize = w.pos - start;
+			w.at(sizepos).putb(bodysize);
+			w.atEnd();
+			return;
+		}
+
+
+		if (ri_init != null) {
+			// call main(RiRuntime.init())
+			for (i < ri_init.sig.paramTypes.length) {
+				b(WasmOp.GET_LOCAL.opcode); b(i);
+			}
+			b(WasmOp.CALL.opcode); w.put_sleb32(ri_init.machIndex);
+			if (mainSig == null || mainSig.paramTypes.length == 0) {
+				// main with no parameters => drop args
+				b(WasmOp.DROP.opcode);
+			}
+		} else if (mainSig != null) {
+			// no ri_init, call main(0...)
+			for (t in mainSig.paramTypes) emitDefaultConst(w, t);
+		}
+		if (mainMeth != null) {
+			b(WasmOp.CALL.opcode); w.put_uleb32(u32.!(mainMeth.machIndex));
+		}
+		if (mainSig == null || mainSig.returnTypes.length == 0) {
+			// main with no return => emit i32.const #0
+			b(WasmOp.I32_CONST.opcode);
+			b(0);
+		}
+		var ri_exit = rt.getRiExit();
+		if (ri_exit != null) {
+			b(WasmOp.CALL.opcode); w.put_uleb32(u32.!(ri_exit.machIndex));
+		}
+		b(WasmOp.END.opcode);
+		// ============================================================
+		var bodysize = w.pos - start;
+		w.at(sizepos).putb(bodysize);
+		w.atEnd();
+	}
+	def emitDefaultConst(w: DataWriter, t: Type) {
+		def b = w.putb;
+		match (t) {
+			x: IntType => {
+				if (x.width > 32) { b(WasmOp.I64_CONST.opcode); b(0); }
+				else { b(WasmOp.I32_CONST.opcode); b(0); }
+			}
+			x: FloatType => {
+				if (x.is64) { b(WasmOp.F64_CONST.opcode); w.put_b64(0); }
+				else { b(WasmOp.F32_CONST.opcode); w.put_b32(0); }
+			}
+			_ => context.fail1("unimplemented main parameter type %q", t.render);
+		}
+	}
+	def emitAllocationStub() {
+		var gcmeth = rt.getRiGc();
+		def b = w.putb;
+
+		var sizepos = w.pos;
+		b(/*body_size=*/0);
+		var start = w.pos;
+
+		def tSize = 0;
+		def tNewHeapCur = 1;
+		// A temporary local is needed to use the new heap cur twice
+		b(/*locals_count=*/1);
+		w.put_sleb32(1); w.putb(WasmTypeConCode.I32.code);
+
+		// ============ allocation stub code =========================
+		genLoadRtAddr_i32(CiRuntimeModule.HEAP_CUR_LOC);
+		b(WasmOp.I32_CONST.opcode); emitAddr(CiRuntimeModule.HEAP_CUR_LOC);
+		genLoadRtAddr_i32(CiRuntimeModule.HEAP_CUR_LOC);
+		b(WasmOp.GET_LOCAL.opcode); b(0);
+		b(WasmOp.I32_ADD.opcode);
+		b(WasmOp.TEE_LOCAL.opcode); b(tNewHeapCur);
+		// if (newHeapCur > heapEnd)
+		genLoadRtAddr_i32(CiRuntimeModule.HEAP_END_LOC);
+		b(WasmOp.I32_GT_S.opcode);
+		b(WasmOp.IF.opcode); b(WasmTypeConCode.EmptyBlock.code);
+		if (gcmeth != null) {
+			// return gcmeth(size);
+			b(WasmOp.GET_LOCAL.opcode); b(tSize);
+			b(WasmOp.I32_CONST.opcode); b(0); // ip
+			b(WasmOp.I32_CONST.opcode); b(0); // sp
+			b(WasmOp.CALL.opcode); w.put_sleb32(gcmeth.machIndex);
+			b(WasmOp.RETURN.opcode);
+		} else {
+			// if no RiRuntime.gc() method, just crash.
+			b(WasmOp.UNREACHABLE.opcode);
+		}
+		// end if
+		b(WasmOp.END.opcode);
+                b(WasmOp.GET_LOCAL.opcode); b(tNewHeapCur);
+		b(WasmOp.I32_STORE.opcode); b(/*align=*/2); b(/*offset=*/0);
+		b(WasmOp.END.opcode);
+		// ============================================================
+		var bodysize = w.pos - start;
+		w.at(sizepos).putb(bodysize);
+		w.atEnd();
+	}
+	def emitIndirectAdapter(m: IrMethod) {
+		def b = w.putb;
+
+		var sizepos = w.skip_leb32(); /*body_size*/
+		var start = w.pos;
+		b(/*locals_count=*/0);
+
+		// indirect adapters can be for component methods, which drop
+		// the first parameters, and for methods with receivers, which
+		// load and cast the first parameter (as do dispatch adapters)
+		// ============ indirect adapter code ========================
+		var rcvr = m.receiver;
+		if (rcvr != Void.TYPE && !V3.isComponent(rcvr)) {
+			// get the receiver and cast it
+			b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(0);
+			w.put_b16be(WasmExtOp.REF_CAST_NULL.extopcode);
+			var wht = wasm.gcTypeTable.addHeapType(rcvr);
+			w.put_sleb32(int.!(wht.index - 1));
+		}
+		for (i = 1; i < m.ssa.params.length; i++) {
+			b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(i);
+		}
+		b(WasmOp.CALL.opcode);
+		w.put_sleb32(m.machIndex);
+		b(WasmOp.END.opcode);
+		// ===========================================================
+		var bodysize = w.pos - start;
+		w.at(sizepos).overwrite_uleb32(bodysize).atEnd();
+	}
+	def emitDispatchAdapter(m: IrMethod) {
+		def b = w.putb;
+
+		var sizepos = w.skip_leb32(); /*body_size*/
+		var start = w.pos;
+		b(/*locals_count=*/0);
+
+		// dispatch adapters down-cast their first arguments and pass all
+		// arguments to the target function
+		// ============ dispatch adapter code ========================
+		b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(0);
+		w.put_b16be(WasmExtOp.REF_CAST_NULL.extopcode);
+		var wht = wasm.gcTypeTable.addHeapType(m.receiver);
+		w.put_sleb32(int.!(wht.index - 1));
+		for (i = 1; i < m.ssa.params.length; i++) {
+			b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(i);
+		}
+		b(WasmOp.CALL.opcode);
+		w.put_sleb32(m.machIndex);
+		b(WasmOp.END.opcode);
+		// ===========================================================
+		var bodysize = w.pos - start;
+		w.at(sizepos).overwrite_uleb32(bodysize).atEnd();
+	}
+	def genLoadRtAddr_i32(addr: CiRuntime_Address) {
+		def b = w.putb;
+		b(WasmOp.I32_CONST.opcode); emitAddr(addr);
+		b(WasmOp.I32_LOAD.opcode); b(/*align=*/2); b(/*offset=*/0);
+	}
+	// Used by MachStackifier
+	def genLoadLocal(v: VReg) {
+		emit1(WasmOp.GET_LOCAL.opcode, usev0(stackgen.mapVar(v)));
+	}
+	def genStoreLocal(v: VReg, pop: bool) {
+		var opcode = if(pop, WasmOp.SET_LOCAL.opcode, WasmOp.TEE_LOCAL.opcode);
+		emit1(opcode, dfnv0(stackgen.mapVar(v)));
+	}
+	def genPop(v: VReg) {
+		emit0(WasmOp.DROP.opcode);
+	}
+	def genLoadConst(t: Type, val: Val) {
+		match (t.typeCon.kind) {
+			ENUM,
+			ENUM_SET,
+			INT,
+			RANGE_START => {
+				if (isLong(t)) {
+					var signed = IntType.?(t) && IntType.!(t).signed;
+					val = Long.box(Long.unboxSU(val, signed));
+					emit1(WasmOp.I64_CONST.opcode, useImm(val));
+				} else {
+					emit1(WasmOp.I32_CONST.opcode, useImm(val));
+				}
+			}
+			BOOL => {
+				var truth = if(Values.equal(Bool.TRUE, val), Int.ONE);
+				emit1(WasmOp.I32_CONST.opcode, useImm(truth));
+			}
+			FLOAT => {
+				var opcode = if(V3.isDouble(t), WasmOp.F64_CONST.opcode, WasmOp.F32_CONST.opcode);
+				emit1(opcode, useImm(val));
+			}
+			POINTER => {
+				if (t.nested == null || t.nested.head == null) {
+					emit1(WasmOp.I32_CONST.opcode, useImm(val));
+				} else {
+					var targetType = t.nested.head;
+					match(targetType.typeCon.kind) {
+						FUNCREF => {
+							var m: IrMethod;
+							if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+							else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+							else context.fail("constant function is not an address or function value");
+							var entryNum = wasm.indirectAdapterFor[m];
+							if (entryNum == 0) {
+								entryNum = mach.addrOfMethod(m).absolute;
+							}
+							// context.fail1("constant function %d has no indirect adapter", m.machIndex);
+							var entryTmp = newTmpVReg(WasmValueType.I32);
+							emit2(WasmOp.I32_CONST.opcode, dfnv0(entryTmp), useInt(entryNum));
+							var refTmp = newTmpVReg(WasmValueType.FuncRef);
+							emit3(WasmOp.TABLE_GET.opcode, dfnv0(refTmp), usev0(entryTmp), useInt(0));
+							// cast to the specific function type
+							var ftype = Function.prependParamType(AnyRef.TYPE, targetType);
+							var wht = wasm.gcTypeTable.addHeapType(ftype);
+							emit2(WasmExtOp.REF_CAST_NULL.extopcode, usev0(refTmp), useInt(int.!(wht.index - 1)));
+						}
+						_ => emit1(WasmOp.I32_CONST.opcode, useImm(val));
+					}
+				}
+			}
+			FUNCREF,
+			ANYFUNC,
+			CLASS,
+			ARRAY,
+			VARIANT => {
+				if (val == null) {
+					var wht = wasm.gcTypeTable.addHeapType(t);
+					if (wht == null) {
+						useInt(WasmTypeConCode.ANYREF.code);
+					} else {
+						useInt(i32.!(wht.index - 1));
+					}
+					emitN(WasmOp.REF_NULL.opcode);
+				} else {
+					context.fail1("genLoadConst() not null for type %q", t.render);
+				}
+			}
+			_ => context.fail1("unimplemented genLoadConst() of type %q", t.render);
+		}
+	}
+	// Used by ShadowStackSpiller
+	def newShadowSpTmp() -> VReg {
+		return newTmpVReg(WasmValueType.I32);
+	}
+	def getOutput() -> ArchInstrBuffer {
+		if (out != null) return out;
+		return out = WasmInstrBuffer.new(this, context.prog, regSet);
+	}
+}
+class WasmInstrBufferXY extends ArchInstrBuffer {
+	new(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) super(codegen, prog, regSet) { }
+	def putArchInstr(indent: int, i: ArchInstr) -> int {
+		var opcode = int.view(i.opcode()), a = i.operands;
+		var name = WasmOpNames.getName(opcode);
+		match (opcode) {
+			WasmOp.IF.opcode,
+			WasmOp.BLOCK.opcode,
+			WasmOp.LOOP.opcode => {
+				putIndent(indent);
+				puts(name);
+				var val = codegen.toInt(a[0]);
+				yellow();
+				match (val) {
+					WasmTypeConCode.EmptyBlock.val => ; // do nothing
+					WasmTypeConCode.I32.val => puts(": i32");
+					WasmTypeConCode.I64.val => puts(": i64");
+					WasmTypeConCode.F32.val => puts(": f32");
+					WasmTypeConCode.F64.val => puts(": f64");
+					WasmTypeConCode.FUNCREF.val => puts(": funcref");
+					_ => put1(": refnull %d", val);
+				}
+				end();
+				if (a.length > 1) sp().putOperand(a[1]);
+				return indent+1;
+			}
+			WasmOp.BR.opcode => {
+				putIndent(indent);
+				puts(name);
+				puts(" depth=");
+				green().putd(codegen.toInt(a[0])).end();
+				return indent;
+			}
+			WasmOp.BR_IF.opcode => {
+				putIndent(indent);
+				puts(name);
+				sp();
+				putOperand(a[0]);
+				puts(" depth=");
+				green().putd(codegen.toInt(a[1])).end();
+				return indent;
+			}
+			WasmOp.I32_LOAD.opcode,
+			WasmOp.I64_LOAD.opcode,
+			WasmOp.F32_LOAD.opcode,
+			WasmOp.F64_LOAD.opcode,
+			WasmOp.I32_LOAD8_S.opcode,
+			WasmOp.I32_LOAD8_U.opcode,
+			WasmOp.I32_LOAD16_S.opcode,
+			WasmOp.I32_LOAD16_U.opcode,
+			WasmOp.I64_LOAD8_S.opcode,
+			WasmOp.I64_LOAD8_U.opcode,
+			WasmOp.I64_LOAD16_S.opcode,
+			WasmOp.I64_LOAD16_U.opcode,
+			WasmOp.I64_LOAD32_S.opcode,
+			WasmOp.I64_LOAD32_U.opcode => {
+				putIndent(indent);
+				puts(name);
+				puts(" offset=").green();
+				putcv(codegen.toImm(a[1]), Int.TYPE);
+				end().sp();
+				if (Operand.Def.?(a[0])) putOperand(a[0]).sp();
+				if (a.length > 2) putOperand(a[2]);
+				return indent;
+			}
+			WasmOp.I32_STORE.opcode,
+			WasmOp.I64_STORE.opcode,
+			WasmOp.F32_STORE.opcode,
+			WasmOp.F64_STORE.opcode,
+			WasmOp.I32_STORE8.opcode,
+			WasmOp.I32_STORE16.opcode,
+			WasmOp.I64_STORE8.opcode,
+			WasmOp.I64_STORE16.opcode,
+			WasmOp.I64_STORE32.opcode => {
+				putIndent(indent);
+				puts(name);
+				puts(" offset=").green();
+				putcv(codegen.toImm(a[0]), Int.TYPE);
+				end().sp();
+				for (j = 1; j < a.length; j++) {
+					if (j > 1) csp();
+					putOperand(a[j]);
+				}
+				return indent;
+			}
+			WasmOp.ELSE.opcode => {
+				var i = if(indent == 1, 1, indent - 1);
+				putIndent(i);
+				puts(name);
+				return indent;
+			}
+			WasmOp.END.opcode => {
+				var i = if(indent == 1, 1, indent - 1);
+				putIndent(i);
+				puts(name);
+				return i;
+			}
+			_ => {
+				if (name == null) return putSimpleInstr(indent, i);
+				return putNamedInstr(indent, name, a);
+			}
+		}
+	}
+}
+def isLong(t: Type) -> bool {
+	if (IntType.?(t)) return IntType.!(t).width > 32;
+	if (EnumSetType.?(t)) return EnumSetType.!(t).repType.width > 32;
+	return false;
+}
+
+def VRegHash(v: VReg) -> int {
+	return v.varNum;
+}
+def VRegEquals(v1: VReg, v2: VReg) -> bool {
+	return v1.varNum == v2.varNum;
+}
+
+// A stack instruction generator specifically for WASM.
+// Since it may dynamically assign locals for machine variables, it manages this mapping
+// as well.
+class WasmGcStackInstrGen(wasm: WasmGcProgram) {
+	var context: SsaContext;
+	var params = 0;  // last param slot (may be -1)
+	var counts: HashMap<WasmValueType, (int, int)>;  // (base, count)
+	var types: HashMap<VReg, WasmValueType>;
+
+	def reset(m: IrMethod, params: Array<SsaParam>, getVReg: SsaInstr -> VReg) {
+		counts = HashMap<WasmValueType, (int, int)>.new(WasmValueType.hash, WasmValueType.equals2);  // easiest way ...
+		types = HashMap<VReg, WasmValueType>.new(VRegHash, VRegEquals);
+
+// EBM
+		var curr = if(V3.isComponent(m.receiver), 1, 0);
+		var slot = 0;
+		while (curr < params.length) {
+			var p = params[curr++];
+			var v = getVReg(p);
+			v.spill = slot++;
+			v.hint = wasm.wasmGcType(p.vtype).tag;
+		}
+		this.params = slot;
+	}
+	def mapVar(v: VReg) -> VReg {
+		if (v.hint != 0) return v;
+		return allocSlot(v, wasm.wasmGcType(v.ssa.getType()));
+	}
+	def allocSlot(v: VReg, wasmType: WasmValueType) -> VReg {
+		v.hint = wasmType.tag;
+		var entry = counts[wasmType];
+		var index = entry.1;
+		counts[wasmType] = (-1, index + 1);
+		types[v] = wasmType;
+		v.spill = params + index;
+		// spill - params == index within same-type locals
+		return v;
+	}
+	def slotOf(v: VReg) -> int {
+		var slot = v.spill;
+		if (v.spill < 0) return -1;
+		if (slot < params) return slot;
+		var wvt = types[v];
+		var entry = counts[wvt];
+		return int.!(entry.0) + (slot - params);
+	}
+	private var total: int;
+	private var ntypes: int;
+	private var decls: Vector<(WasmValueType, int, int)>;
+	private def addToTotal(key: WasmValueType, val: (int, int)) {
+		decls.put((key, total, val.1));
+		total += val.1;
+		ntypes += 1;
+	}
+	def emitVarDecls(w: MachDataWriter) {
+		total = params;
+		ntypes = 0;
+		decls = Vector<(WasmValueType, int, int)>.new();
+		counts.apply(addToTotal);
+		w.putb(ntypes);
+		for (i < decls.length) {
+			var decl = decls[i];
+			w.put_sleb32(decl.2);
+			decl.0.put(w);
+			counts[decl.0] = (decl.1, decl.2);
+		}
+	}
+}
