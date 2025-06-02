@@ -20,7 +20,6 @@ In `lib/util` we can find:
 * [Vectors](../../lib/util/Vector.v3) - growable, indexable, appendable arrays with efficient storage
 * [String utilities](../../lib/util/Strings.v3) - comparison, matching of strings
 * [String formatting](../../lib/util/StringBuilder.v3) - print out data and strings in textual format
-* [IO](../../lib/util/IO.v3) - Read and write from files using in-memory buffers
 * [Decoding](../../lib/util/DataReader.v3) / [Encoding](../../lib/util/DataWriter.v3) - utilities for reading and writing binary data
 * [HashMap](../../lib/util/Map.v3) - efficient general mapping of key type to value type
 * [Lists](../../lib/util/List.v3) - linked lists and associated utilities like `map`, `fold`, etc
