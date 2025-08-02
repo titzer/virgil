@@ -899,6 +899,14 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					return graph.valConst(ftype, if(record != null, record.values[field.index]));
 				}
 				if (!i.facts.F_POINTED_AT) i.facts |= Fact.F_VALUE;
+				if (receiver.optag() == Opcode.VariantAlloc.tag) {
+					// VariantGetField[n](x:VariantAlloc(...)) => x[n]
+					var r = SsaApplyOp.!(receiver);
+					var variantType = i.op.typeArgs[0];
+					var ic = context.prog.ir.getIrClass(variantType);
+					// Ugly: avoid arity mismatch problems for tuple/void fields
+					if (r.inputs.length == ic.fields.length) return r.inputs[field.index].dest;
+				}
 				if (optimize_loads) return state.load(receiver, field, i);
 			}
 			VariantGetMethod(method) => {
@@ -912,7 +920,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					return graph.valConst(meth.getBoundType(), Closure.new(obj, meth));
 				}
 			}
-			VariantGetVirtual(method) => {
+			VariantGetVirtual(method) => { // XXX: also optimize VariantGetSelector
 				var meth = V3Op.extractIrSpec(i.op, method);
 				var receiver = i.input0();
 				var dv = devirtualize(meth, receiver);
@@ -925,7 +933,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					return replaceOp(i, V3Op.newCreateClosure(dv, i.op.typeArgs[0]));  // VariantGetVirtual[m](K) => CreateClosure[m](K)
 				}
 			}
-			ClassGetSelector(method) => {
+			ClassGetSelector(method) => { // XXX: combine with ClassGetVirtual
 				var meth = V3Op.extractIrSpec(i.op, method);
 				var receiver = nullcheck(i);
 				if (state.end) return receiver;
@@ -1343,18 +1351,32 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return receiver;
 	}
 	def devirtualize(m: IrSpec, x: SsaInstr) -> IrSpec {
-		if (!m.member.facts.M_OVERRIDDEN) {
-			return m; // CHA devirtualization
-		} else if (SsaConst.?(x) && asRecord(x) != null) {
-			return context.prog.ir.resolveMethodImpl(asRecord(x).rtype, m); // devirtualize K
-		} else if (x.optag() == Opcode.ClassAlloc.tag) {
-			return context.prog.ir.resolveMethodImpl(SsaApplyOp.!(x).op.typeArgs[0], m); // devirtualize ClassAlloc
+		// Try to devirtualize based on the class hierachy first.
+		if (!m.member.facts.M_OVERRIDDEN) return m;
+		var optag = x.optag();
+		// Look through TypeSubsumes at a potentially more precise receiver.
+		while (optag == Opcode.TypeSubsume.tag) {
+			x = SsaApplyOp.!(x).inputs[0].dest;
+			optag = x.optag();
+		}
+		// Try to constant-fold.
+		var r = asRecord(x);
+		if (r != null) 	return context.prog.ir.resolveMethodImpl(r.rtype, m); // devirtualize K
+		// Pattern-match allocations.
+		if (optag == Opcode.ClassAlloc.tag || optag == Opcode.VariantAlloc.tag) {
+			return context.prog.ir.resolveMethodImpl(SsaApplyOp.!(x).op.typeArgs[0], m); // devirtualize {Class,Variant}Alloc
+		}
+		// Try resolving on the (potentially more precise) static type of the receiver.
+		var xt = x.getType();
+		if (TypeSystem.isSubtype(xt, m.receiver)) {
+			var xm = context.prog.ir.resolveMethodImpl(xt, m);
+			if (!xm.member.facts.M_OVERRIDDEN) return xm;
 		}
 		return null;
 	}
 
 	def asRecord(i: SsaInstr) -> Record {
-		return Record.!(SsaConst.!(i).val);
+		return if(SsaConst.?(i), Record.!(SsaConst.!(i).val));
 	}
 	def getFieldType(op: Operator, field: IrField) -> Type {
 		return if(op.isPolymorphic(), V3Op.extractIrSpec(op, field).getFieldType(), field.fieldType);
