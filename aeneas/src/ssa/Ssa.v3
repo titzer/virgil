@@ -120,6 +120,19 @@ class SsaCfEdge {
 		desti = odesti;
 		dest.preds[desti] = this;
 	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.puts("#");
+		if (src == null) {
+			buf.puts("null.end=@null");
+		} else {
+			var b = src.block();
+			if (b != null) buf.putd(b.uid);
+			else buf.puts("null");
+			buf.put1(".end=@%d", src.uid);
+		}
+		buf.put2(" -> #%d[%d]", dest.uid, desti);
+		return buf;
+	}
 }
 // A parameter to this function
 class SsaParam(index: int, vtype: Type) extends SsaInstr(null) {
@@ -179,6 +192,7 @@ class SsaPhi extends SsaInstr {
 }
 // A basic block
 class SsaBlock extends SsaLink {
+	var info: SsaBlockInfo;
 	var preds: Array<SsaCfEdge> = Ssa.NO_CF_EDGES;
 	new() {
 		next = this;
@@ -289,6 +303,39 @@ class SsaGoto extends SsaEnd {
 	new(target: SsaBlock) super(Ssa.NO_INSTRS, [target]) { }
 	def target() -> SsaBlock { return block().succ(0).dest; }
 }
+// Information about a basic block, including the containing loop,
+// the code range, and its dominator information.
+class SsaBlockInfo(block: SsaBlock, srpo_num: int) {
+	def label = Label.new();
+	var loop: SsaLoopInfo;  	// loop information, if this block is a loop header
+	var start: int = -1;    	// start position of code belonging to this block
+	var end: int = -1;      	// end position of code belonging to this block
+
+	// Dominator tree fields
+	var dom_depth: int;		// depth in dominator tree
+	var dom_parent: SsaBlockInfo;	// immediate dominator (parent in dom tree)
+	var dom_child: SsaBlockInfo;	// first child in dominator tree
+	var dom_sibling: SsaBlockInfo;	// next sibling in dominator tree
+	var dom_max: int;		// dominator interval end in sRPO
+	// CFG restructurer fields
+	var loop_remainder: bool;
+
+	def clearMark() { block.mark = -1; }
+}
+// Information about a loop
+class SsaLoopInfo(index: int) {
+	var start: int;  // start of block interval containing loop blocks
+	var end: int;    // end of block interval containing loop blocks
+	var depth: int;  // loop depth
+	var exits: List<SsaCfEdge>; // edges leaving loop
+	def contains(b: SsaBlock) -> bool {
+		return containsInfo(b.info);
+	}
+	def containsInfo(info: SsaBlockInfo) -> bool {
+		var order = info.srpo_num;
+		return order >= start && order < end;
+	}
+}
 // Utility methods for dealing with the SSA representation
 component Ssa {
 	def NO_INSTRS: Array<SsaInstr> = [];
@@ -344,5 +391,85 @@ component Ssa {
 			edge.dest = temp;
 			edge.desti = temp.addPred(edge);
 		}
+	}
+	def computeBlockOrder(graph: SsaGraph, splitCriticalEdges: bool, pruneUnreachable: bool) -> SsaBlockOrder {
+		if (splitCriticalEdges) graph = this.splitCriticalEdges(graph); // XXX: combine with the below graph traversal
+		return SsaBlockOrder.new(graph, pruneUnreachable);
+	}
+	def removeUnreachableBlocks(graph: SsaGraph) -> SsaGraph {
+		var marker = SsaInternalMarker.new().reset(graph);
+		var queue = Vector<SsaBlock>.new().grow(10); // TUNABLE: queue size
+		queue.put(graph.startBlock);
+		// do breadth-first walk over all reachable blocks
+		marker.setMark(graph.startBlock, 0);
+		for (i < queue.length) {
+			var block = queue[i];
+			for (e in block.succs()) {
+				var b = e.dest;
+				if (marker.getMark(b) < 0) {
+					marker.setMark(b, 0);
+					queue.put(b);
+				}
+			}
+		}
+		for (i < queue.length) {
+			var b = queue[i], j = 0;;
+			while (j < b.preds.length) {
+				var e = b.preds[j], p = e.src.block();
+				if (p.mark < marker.base) removeEdge(e, false);
+				else j++;
+			}
+		}
+		for (i < queue.length) {
+			var b = queue[i];
+			b.mark = -1;
+		}
+		return graph;
+	}
+	def removeUnmarkedPreds(block: SsaBlock, simplify: bool, maxMark: int) {
+		var i = 0;
+		while (i < block.preds.length) {
+//			Terminal.put3("#%d.mark = %d ? %d\n", block.uid, block.mark, maxMark);
+			var e = block.preds[i], p = e.src.block();
+			if (p.mark < maxMark) removeEdge(e, simplify);
+			else i++;
+		}
+	}
+	def removeEdge(edge: SsaCfEdge, simplify: bool) {
+//		Terminal.put1("Ssa.removeEdge %q\n", edge.render);
+		var dest = edge.dest;
+		if (dest == null) return;
+		var next = dest.next, index = edge.desti, preds = dest.preds;
+		for (i = index + 1; i < preds.length; i++) {
+			var p = preds[i];
+			preds[i - 1] = p;
+			p.desti = i - 1;
+		}
+		dest.preds = Arrays.range(dest.preds, 0, dest.preds.length - 1);
+		while (true) {
+			if (!SsaPhi.?(next)) break;
+			var phi = SsaPhi.!(next), inputs = phi.inputs;
+			// for each phi, remove the corresponding input
+			inputs[index].update(null); // kill the DF edge
+			phi.inputs = Arrays.deleteAt(phi.inputs, index);
+			next = phi.next;
+		}
+		if (simplify && dest.preds.length == 1) simplifyPhis(dest);
+	}
+	def simplifyPhis(block: SsaBlock) {
+		var next = block.next;
+		while (true) {
+			if (!SsaPhi.?(next)) break;
+			var phi = SsaPhi.!(next), nn = phi.next;
+			phi.replace(phi.input0());
+			killInstr(phi);
+			next = nn;
+		}
+	}
+	def killInstr(i: SsaInstr) -> SsaInstr {
+		i.remove();
+		i.kill();
+		i.facts |= Fact.O_KILLED;
+		return i;
 	}
 }
