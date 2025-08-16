@@ -3,6 +3,11 @@
 
 def XXX: Terminal;
 def REGS = MachRegSet.new(1, [[1]], ["tos"], [1], [1], 1000, 2000);
+
+// some helper types for heap init code generation
+class HeapInitLocalInfo(wvt: WasmValueType, var base: int, var count: int) {}
+class HeapInitRecordInfo(rec: Record, wvt: WasmValueType, localOffset: int) {}
+
 class WasmGcCodeGen extends SsaMachGen {
 	def wasm: WasmGcProgram;
 	def rt: MachRuntime;
@@ -19,13 +24,17 @@ class WasmGcCodeGen extends SsaMachGen {
 		stackifier = MachStackifier.new(this);
 	}
 	def emitWasm(m: IrMethod, funcNum: int) {
+		Terminal.buf.put3("emitWasm for %q{%d/%d}", m.render, m.index, m.uid)
+			.put1(" wasm func %d", funcNum).outln();
 		context.enterMethod(m);
 		stackBlocks.length = 0;
 		if (useShadowStack) Ssa.splitCriticalEdges(m.ssa);
 		var order = SsaBlockOrder.new(m.ssa, true);
 		reset(m.ssa, order, null);
 		cfgr.context = context;
+Terminal.buf.puts("emitWasm 1.5").outln();
 		var code = cfgr.gen(order);
+Terminal.buf.puts("emitWasm 2").outln();
 
 		var out = if(context.shouldPrintMach(), this.getOutput());
 		stackifier.out = if(CLOptions.PRINT_STACKIFY.get(), out);
@@ -235,7 +244,7 @@ class WasmGcCodeGen extends SsaMachGen {
 			PtrLt => emitBinop(i, WasmOp.I32_LT_U);
 			PtrLteq => emitBinop(i, WasmOp.I32_LE_U);
 			ConditionalThrow => {
-				emit2(WasmOp.IF.opcode, useInt(WasmValueType.Void.toInt()), use(i.inputs[0].dest));
+				emit2(WasmOp.IF.opcode, useInt(WasmValueType.Void.toInt()), use(i.input0()));
 				emitN(WasmOp.UNREACHABLE.opcode);
 				emitN(WasmOp.END.opcode);
 			}
@@ -244,7 +253,7 @@ class WasmGcCodeGen extends SsaMachGen {
 
 				dfnAll(i);
 				if (useShadowStack) refmap(null);
-				var target = SsaConst.!(i.inputs[0].dest);
+				var target = SsaConst.!(i.input0());
 				var val = target.val, m: IrMethod;
 				if (val == null) {  // call of a null address => always throws
 					emitN(WasmOp.UNREACHABLE.opcode);
@@ -263,31 +272,53 @@ class WasmGcCodeGen extends SsaMachGen {
 			CallClassMethod => {
 				// first arg is function
 
-				dfnAll(i);
 				if (useShadowStack) refmap(null);
-				var target = SsaConst.!(i.inputs[0].dest);
+				var target = SsaConst.!(i.input0());
 				var val = target.val, m: IrMethod;
 				if (val == null) {  // call of a null address => always throws
+					dfnAll(i);
 					emitN(WasmOp.UNREACHABLE.opcode);
 					return;
 				}
 				if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
 				else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
 				else context.fail("constant target is not an address or function value");
-				var start = if(V3.isComponent(m.receiver), 2, 1);
+				var start: int;  // defines how many args to skip (always target, sometimes rcvr)
+				if (V3.isComponent(m.receiver)) {
+					start = 2;
+					dfnAll(i);
+				} else {
+					var rt = i.input1().getType();
+					if (rt == m.receiver) {
+						start = 1;  // just push the receiver as is
+						dfnAll(i);
+					} else {
+						// it can happen that its *static* type is a supertype of m's, but reachability
+						// knows it will always be a subtype (hence m.receiver); for Wasm, we cast
+						// receiver's type.  (We *could* call a dispatch adapter, but that adds a call.)
+						var mwht = wasm.gcTypeTable.addHeapType(m.receiver);
+						var rcvrTmp = newTmpVReg(WasmValueType.RefNull(mwht));
+						emit3(WasmExtOp.REF_CAST_NULL.extopcode, dfnv0(rcvrTmp), use(i.input1()), useInt(int.!(mwht.index - 1)));
+						start = 2;
+						dfnAll(i);
+						usev0(rcvrTmp);
+					}
+				}
 				useAll(i.inputs, start); // skip target, and maybe receiver
 				useInt(m.machIndex);
 				emitN(WasmOp.CALL.opcode);
 //				var sb = StringBuilder.new().put2("Emitting call of function %d (%s)", m.machIndex, wasm.getMethodName(m));
 //				context.prog.ERROR.addError(null, null, "CallClassMethod", sb.extract());
 			}
+// EBM FUNC: believe this should no longer occur
+/*
 			CallAddress => {
 				// first arg is table number
 				// second arg is offset - may be constant or computed
 
 				dfnAll(i);
 				if (useShadowStack) refmap(null);
-				var target = i.inputs[0].dest;
+				var target = i.input0();
 				if (SsaConst.?(target)) {
 					// how is null represented??
 					var val = SsaConst.!(target).val, m: IrMethod;
@@ -310,29 +341,35 @@ class WasmGcCodeGen extends SsaMachGen {
 //					var sb = StringBuilder.new().put2("sigindex = %d  tblnum = %d", sigIndex, tblnum);
 //					context.prog.ERROR.addError(null, null, "CallAddress", sb.extract());
 					useAll(i.inputs, 1);   // use arguments, except target
-					use(i.inputs[0].dest); // target of the call comes last
+					use(i.input0()); // target of the call comes last
 					useInt(int.view(sigIndex - 1));
 					useInt(0);
 					emitN(WasmOp.CALL_INDIRECT.opcode);
 				}
 				// XXX: match Call(PtrLoad(PtrAdd(#meta, x))
 			}
+*/
 			CallFunction => {
 				// first arg is ref to function
-{
+// {
 //				var sb = StringBuilder.new().put1("ftype is %q", i.op.typeArgs[0].render);
 //				context.prog.ERROR.addError(null, null, "CallFunction", sb.extract());
 //				sb.put1("sig type is %q", i.op.sig.funcType().render);
 //				context.prog.ERROR.addError(null, null, "CallFunction", sb.extract());
-}
-//				if (true) return;
-				var sig = FuncType.!(i.op.typeArgs[0]).sig();
+// }
+
+				var funcType = FuncType.!(i.op.typeArgs[0]);
+				var sig = funcType.sig();
 				var sigIndex = wasm.addSig(Void.TYPE, sig);
+
 				dfnAll(i);
-				useAll(i.inputs, 1);
-				use(i.inputs[0].dest);  // function is pushed last
-				useInt(int.!(sigIndex - 1));
-				emitN(WasmOp.CALL_REF.opcode);
+				if (useShadowStack) refmap(null);
+				useAll(i.inputs, 1);   // use arguments, except target
+				use(i.input0());  // target: index into indirect table
+				useInt(int.!(sigIndex - 1));  // type index
+				useInt(0);  // table number
+				emitN(WasmOp.CALL_INDIRECT.opcode);
+
 //				var sb = StringBuilder.new().put1("Emitting call_ref of sigindex %d", sigIndex - 1);
 //				context.prog.ERROR.addError(null, null, "CallFunction", sb.extract());
 			}
@@ -360,7 +397,7 @@ class WasmGcCodeGen extends SsaMachGen {
 			Alloc => {
 				dfn(i);
 				if (useShadowStack) refmap(null);
-				use(i.inputs[0].dest);
+				use(i.input0());
 				useInt(wasm.allocateStubFuncIndex);
 				emitN(WasmOp.CALL.opcode);
 			}
@@ -376,7 +413,7 @@ class WasmGcCodeGen extends SsaMachGen {
 				var tagTmp = newTmpVReg(WasmValueType.I32);
 				// fetch tag (field 0)
 				dfnv0(tagTmp);
-				use(i.inputs[0].dest);
+				use(i.input0());
 				useInt(int.!(wht.index - 1));
 				useInt(0);
 				emitN(WasmExtOp.STRUCT_GET.extopcode);
@@ -458,37 +495,58 @@ class WasmGcCodeGen extends SsaMachGen {
 			}
 			// Handled in WasmGcTarget:
 			// ClassGetMethod(method) => { }
+
+/*
+	// EBM: indirect dispatch is like the Wasm (not Gc) mtable lookup to get the function number
+	def genMtableLookup(i_old: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, funcRep: Mach_FuncRep, methodRef: IrSpec) -> SsaInstr {
+		// use method-table based dispatch
+		var nullity = context.compiler.nullity(i_old, oobj.dest);
+		var tid = refLoad(nullity, mach.tagType, i_old, oobj, nobj, 0);
+		var mtbl = context.graph.valConst(mach.data.ptrType, mach.methodTable(methodRef));
+// EBM: NOTE!  tid must be multiplied times address size, since we store tags without that multiplication;
+// This makes dynamic dispatch faster, but indirect dispatch a little slower
+		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
+	}
+
+
+				var t = matchAddress(i.input0()), opcode = wop.opcode | ArchInstrs.FLAG_LOAD;
+				if (t.1 == null) {
+					emit3(opcode, dfn(i), useImm(t.0), use(context.graph.zeroConst()));
+				} else {
+					emit3(opcode, dfn(i), useImm(t.0), use(t.1));
+				}
+
+
+
+*/
 			ClassGetSelector(selector) => {
 				var op = i.op;
 				var clsType = op.sig.paramTypes[0];
 				var wht = wasm.gcTypeTable.addHeapType(clsType);
 
-				var tagTmp = newTmpVReg(WasmValueType.I32);
 				// fetch tag (field 0)
+				var tagTmp = newTmpVReg(WasmValueType.I32);
 				dfnv0(tagTmp);
-				use(i.inputs[0].dest);
+				use(i.input0());
 				useInt(int.!(wht.index - 1));
 				useInt(0);
 				emitN(WasmExtOp.STRUCT_GET.extopcode);
 
-				// subtract minClassId to get offset
-				var offsetTmp: VReg;
-				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
-				var minClassId = irClass.minClassId;
-				if (minClassId == 0) {
-					offsetTmp = tagTmp;
-				} else {
-					offsetTmp = newTmpVReg(WasmValueType.I32);
-					var tagType = mach.tagType;
-					var minIdVal = context.graph.valConst(tagType, Int.box(irClass.minClassId));
-					emit3(WasmOp.I32_SUB.opcode, dfnv0(offsetTmp), usev0(tagTmp), use(minIdVal));
-				}
+				// multiply tag by 4 to get offset into table stored in memory
+				var offsetTmp = newTmpVReg(WasmValueType.I32);
+				var tagType = mach.tagType;
+				emit3(WasmOp.I32_SHL.opcode, dfnv0(offsetTmp), usev0(tagTmp), use(context.graph.intConst(2)));
 
-				// load function reference from table
-				if (!wasm.indirectTableFor.has(selector.mtable))
-					context.fail1("no indirect table for mtable %q", selector.mtable.render);
-				var tabnum = int.!(wasm.indirectTableFor[selector.mtable]);
-				emit3(WasmOp.TABLE_GET.opcode, dfn(i), usev0(offsetTmp), useInt(tabnum));
+				// load function reference from table in memory
+				var mtable = selector.mtable;
+				if (!wasm.indirectTableAddrFor.has(mtable))
+					context.fail1("no indirect table for mtable %q", mtable.render);
+				var addr = wasm.indirectTableAddrFor[mtable];
+				dfn(i);
+				useImm(addr);
+				usev0(offsetTmp);
+
+				emitN(WasmOp.I32_LOAD.opcode);
 			}
 			VariantGetField(field) => {
 				var op = i.op;
@@ -520,7 +578,7 @@ class WasmGcCodeGen extends SsaMachGen {
 				var tagTmp = newTmpVReg(WasmValueType.I32);
 				// fetch tag (field 0)
 				dfnv0(tagTmp);
-				use(i.inputs[0].dest);
+				use(i.input0());
 				useInt(int.!(wht.index - 1));
 				useInt(0);
 				emitN(WasmExtOp.STRUCT_GET.extopcode);
@@ -544,18 +602,16 @@ class WasmGcCodeGen extends SsaMachGen {
 				var tabnum = int.!(wasm.indirectTableFor[selector.mtable]);
 				emit3(WasmOp.TABLE_GET.opcode, dfn(i), usev0(offsetTmp), useInt(tabnum));
 			}
-//			ComponentGetField(field) => {
-/*
-				var fieldRef = V3Op.extractIrSpec(i_old.op, field);
-				var fieldType = mach.machType(fieldRef.getFieldType());
-				var ptr = componentFieldPtr(fieldRef);
-				var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, fieldType, ptr, 0);
-				mapN(i_old, loads);
-*/
-//			}
-//			ComponentSetField(field) => {
-//				// TODO
-//			}
+			ComponentGetField(field) => {
+				if (!wasm.globalVarForField.has(field))
+					context.fail1("no global var for field %q", field.render);
+				emit2(WasmOp.GET_GLOBAL.opcode, dfn(i), useInt(wasm.globalVarForField[field]));
+			}
+			ComponentSetField(field) => {
+				if (!wasm.globalVarForField.has(field))
+					context.fail1("no global var for field %q", field.render);
+				emit2(WasmOp.SET_GLOBAL.opcode, use(i.input1()), useInt(wasm.globalVarForField[field]));
+			}
 			// Handled in WasmGcTarget:
 			// CallClassMethod(selector) => { }
 			// Handled in WasmGcTarget:
@@ -567,7 +623,7 @@ class WasmGcCodeGen extends SsaMachGen {
 				var tagTmp = newTmpVReg(WasmValueType.I32);
 				// fetch tag (field 0)
 				dfnv0(tagTmp);
-				use(i.inputs[0].dest);
+				use(i.input0());
 				useInt(int.!(wht.index - 1));
 				useInt(0);
 				emitN(WasmExtOp.STRUCT_GET.extopcode);
@@ -660,6 +716,17 @@ class WasmGcCodeGen extends SsaMachGen {
 			// NormRangeSetElemElem(index) => { }
 			ArrayGetLength => {
 				emit2(WasmExtOp.ARRAY_LEN.extopcode, dfn(i), use(i.input0()));
+			}
+			BoundsCheck => {
+				var lenTmp = newTmpVReg(WasmValueType.I32);
+				emit2(WasmExtOp.ARRAY_LEN.extopcode, dfnv0(lenTmp), use(i.input0()));
+
+				var badTmp = newTmpVReg(WasmValueType.I32);
+				emit3(WasmOp.I32_GE_U.opcode, dfnv0(badTmp), use(i.input1()), usev0(lenTmp));
+
+				emit2(WasmOp.IF.opcode, useInt(WasmValueType.Void.toInt()), usev0(badTmp));
+				emitN(WasmOp.UNREACHABLE.opcode);
+				emitN(WasmOp.END.opcode);
 			}
 			ClassAlloc => {
 				var op = i.op;
@@ -759,10 +826,21 @@ class WasmGcCodeGen extends SsaMachGen {
 	}
 	def emitRefEq(i: SsaApplyOp) {
 		matcher.binop(i);
-		if (matcher.yzero) {
-			emit2(WasmOp.REF_IS_NULL.opcode, dfn(i), use(matcher.x));
-		} else {
-			emit3(WasmOp.REF_EQ.opcode, dfn(i), use(matcher.x), use(matcher.y));
+		match (i.op.typeArgs[0]) {
+			x: FuncType => {
+				if (matcher.yzero) {
+					emit2(WasmOp.I32_EQZ.opcode, dfn(i), use(matcher.x));
+				} else {
+					emit3(WasmOp.I32_EQ.opcode, dfn(i), use(matcher.x), use(matcher.y));
+				}
+			}
+			_ => {
+				if (matcher.yzero) {
+					emit2(WasmOp.REF_IS_NULL.opcode, dfn(i), use(matcher.x));
+				} else {
+					emit3(WasmOp.REF_EQ.opcode, dfn(i), use(matcher.x), use(matcher.y));
+				}
+			}
 		}
 	}
 	def visitThrow(block: SsaBlock, i: SsaThrow) {
@@ -937,13 +1015,17 @@ class WasmGcCodeGen extends SsaMachGen {
 				if (slot < 0) context.fail1("variable @%d not allocated a spill slot", v.ssa.uid);
 				w.put_sleb32(slot);
 			}
+			WasmOp.GET_GLOBAL.opcode,
+			WasmOp.SET_GLOBAL.opcode => {
+				emitUint(a[a.length - 1]); // global index
+			}
 
 			WasmOp.LOOP.opcode,
 			WasmOp.BLOCK.opcode,
 			WasmOp.IF.opcode => {
 				var val = toInt(a[0]); // XXX: introduce a toBlockType() helper?
 				if (val < 0) w.put_sleb32(val);
-				else w.putb(WasmTypeConCode.REF_NULL.code).put_uleb32(u32.view(val));
+				else w.putb(WasmTypeConCode.REF_NULL.code).put_sleb32(val - 1);
 			}
 
 			WasmOp.BR.opcode => w.put_uleb32(u32.!(toInt(a[0])));
@@ -1014,7 +1096,9 @@ class WasmGcCodeGen extends SsaMachGen {
 			WasmOp.TABLE_GET.opcode => {
 				emitUint(a[a.length - 1]); // table number
 			}
-			WasmOp.REF_NULL.opcode,
+			WasmOp.REF_NULL.opcode => {
+				emitInt(a[a.length - 1]); // type code
+			}
 			WasmExtOp.REF_TEST.extopcode,
 			WasmExtOp.REF_TEST_NULL.extopcode,
 			WasmExtOp.REF_CAST_NULL.extopcode,
@@ -1145,6 +1229,258 @@ class WasmGcCodeGen extends SsaMachGen {
 		w.at(sizepos).putb(bodysize);
 		w.atEnd();
 	}
+	def pushDefaultValue(wvt: WasmValueType) {
+		def b = w.putb;
+		match (wvt) {
+			Void,
+			I32 => { b(WasmOp.I32_CONST.opcode).put_sleb32(0); } 
+			I64 => { b(WasmOp.I64_CONST.opcode).put_sleb32(0); } 
+			F32 => { b(WasmOp.F32_CONST.opcode).put_sleb32(0); } 
+			F64 => { b(WasmOp.F64_CONST.opcode).put_sleb32(0); } 
+			FuncRef => { b(WasmOp.I32_CONST.opcode).put_sleb32(0); }
+			AnyRef => { b(WasmOp.REF_NULL.opcode).putb(WasmTypeConCode.ANYREF.code); }
+			EqRef => { b(WasmOp.REF_NULL.opcode).put_sleb32(int.!(WasmTypeConCode.EQREF.val)); }
+			RefNull(ht) => { b(WasmOp.REF_NULL.opcode).put_sleb32(int.!(ht.index - 1)); }
+			_ => {}
+		}
+	}
+	def pushValue(val: Val, wvt: WasmValueType) {
+		if (val == null) return pushDefaultValue(wvt);
+		def b = w.putb;
+		match (val) {
+			x: Float32Val => { b(WasmOp.F32_CONST.opcode).put_uleb32(x.bits); }
+			x: Float64Val => { b(WasmOp.F64_CONST.opcode).put_sleb64(long.view(x.bits)); }
+			x: Box<int>   => { b(WasmOp.I32_CONST.opcode).put_sleb32(x.val); }
+			x: Box<long>  => { b(WasmOp.I64_CONST.opcode).put_sleb64(x.val); }
+			x: Box<bool>  => { b(WasmOp.I32_CONST.opcode).putb(if(x.val, 1, 0)); }
+			x: Box<byte>  => { b(WasmOp.I32_CONST.opcode).putb(x.val); }
+			x: FuncVal => {
+				// a function in a component
+				var spec = x.memberRef;
+				var member = spec.member;
+				var method = IrMethod.!(member);
+				var findex = wasm.indirectAdapterIndexFor[method];
+				b(WasmOp.I32_CONST.opcode).put_sleb32(findex);
+			}
+			x: Record => {
+				context.fail1("pushValue Record Val type is %q", x.rtype.render);
+				context.fail1("pushValue got Record Val, wvt is %q", wvt.render);
+			}
+			x: Closure => {
+				context.fail1("pushValue got Closure Val, wvt is %q", wvt.render);
+			}
+			_ => { context.fail1("pushValue got unknown Val type, wvt is %q", wvt.render); }  // figure out other cases later :-)
+		}
+	}
+	// push a value, which may be a reference to an already allocated Record;
+	// return true if done, false if the field needs to be filled in later
+	def pushMaybeAllocated(wasm: WasmGcProgram, val: Val, wvt: WasmValueType, allocated: PartialMap<Record,u32>) -> bool {
+		if (val == null) {
+			pushDefaultValue(wvt);
+			return true;
+		}
+		def b = w.putb;
+		if (Record.?(val)) {
+			var r = Record.!(val);
+			if (allocated.has(r)) {
+				b(WasmOp.GET_LOCAL.opcode).put_uleb32(allocated[r]);
+				return true;
+			} else {
+				var rt = r.rtype;
+				var wht = wasm.gcTypeTable.addHeapType(rt);
+				b(WasmOp.REF_NULL.opcode).put_sleb32(int.!(wht.index - 1));
+				return false;
+			}
+		}
+		pushValue(val, wvt);
+		return true;
+	}
+	def emitHeapInit(prog: WasmGcProgram, compRecords: Vector<Record>,
+			 recordInfo: HashMap<int,IrClass>, otherRecords: Vector<Record>) {
+		// otherRecords are ones that need to be heap allocated
+		// We allocate them, in an order we determine, using STRUCT_NEW / ARRAY_NEW_FIXED,
+		// giving on the stack all the fields we can, and deferring references to records
+		// not yet allocated.  We then go back and fill in the deferred entries.
+
+		// After processing all of this, we do assignments to fields of compRecords
+		// that do not have the default value of their type.  These may include references
+		// to the otherRecord objects allocated.
+
+
+		def localsInfoMap = HashMap<WasmValueType, HeapInitLocalInfo>.new(WasmValueType.hash, WasmValueType.equals);
+		def localInfos = Vector<HeapInitLocalInfo>.new();
+		def othersInfoMap = HashMap<Record, HeapInitRecordInfo>.new(Record.id, Record.==);
+		def localVarMap = HashMap<Record, u32>.new(Record.id, Record.==);
+
+		var allocRecords = Vector<Record>.new();  // in allocation order
+		// for now, just copy from otherRecords
+		for (i < otherRecords.length) allocRecords.put(otherRecords[i]);
+
+		// figure out all types for locals and use a hash map to count how many of each
+		for (i < allocRecords.length) {
+			var r = allocRecords[i];
+			var rt = r.rtype;
+			var wht = wasm.gcTypeTable.addHeapType(rt);
+			if (wht == null) {
+				context.fail1("rtype is %q (not a heap type)", rt.render);
+			}
+// EBM maybe use getValueTypeFor
+			var wvt = WasmValueType.RefNull(wht);
+			var linfo = localsInfoMap[wvt];
+			if (linfo == null) {
+				localsInfoMap[wvt] = linfo = HeapInitLocalInfo.new(wvt, -1, 0);
+				localInfos.put(linfo);
+			}
+			othersInfoMap[r] = HeapInitRecordInfo.new(r, wvt, linfo.count++);
+		}
+		// assign base local # to each group of locals
+		var localsCount = 0;
+		for (i < localInfos.length) {
+			var li = localInfos[i];
+			li.base = localsCount;
+			localsCount += li.count;
+		}
+		// assign local # to each record
+		for (i < allocRecords.length) {
+			var r = allocRecords[i];
+			var recInfo = othersInfoMap[r];
+			var li = localsInfoMap[recInfo.wvt];
+			var localNum = li.base + recInfo.localOffset;
+			localVarMap[r] = u32.!(localNum);
+		}
+
+		def b = w.putb;
+		var sizepos = w.skip_leb32(); /*body_size*/
+		var start = w.pos;
+
+		// output local var decls
+		w.put_uleb32(u32.!(localInfos.length));
+		for (i < localInfos.length) {
+			var li = localInfos[i];
+			w.put_uleb32(u32.!(li.count));
+			li.wvt.put(w);
+		}
+
+		// emit code to build non-component objects
+		var allocated = HashMap<Record,u32>.new(Record.id, Record.==);
+		// tuple is (which local, heap type, which field, which Val)
+		var deferredStructFields = Vector<(u32,WasmStructType,u32,Val)>.new();
+		var deferredArrayFields = Vector<(u32,WasmArrayType,u32,Val)>.new();
+		for (i < allocRecords.length) {
+			var r = allocRecords[i];
+			var wht = wasm.gcTypeTable.addHeapType(r.rtype);
+//			context.fail1("emitHeapInit Record type is %q", r.rtype.render);
+//			context.fail1("emitHeapInit Wasm heap type is %q", wht.render);
+			match (wht) {
+				x: WasmStructType => {
+					// push class tag
+					var rt = r.rtype;
+					var irClass = prog.mach.prog.ir.getIrClass(rt);
+					b(WasmOp.I32_CONST.opcode).put_sleb32(irClass.minClassId);
+					// push remaining values
+					// note: Record does not have class tag, but x.fields takes it into account
+					for (j < r.values.length) {
+						if (!pushMaybeAllocated(wasm, r.values[j], x.fields[j+1].valType, allocated)) {
+							deferredStructFields.put(localVarMap[r], x, u32.!(j+1), r.values[j]);
+						}
+					}
+					w.put_b16be(WasmExtOp.STRUCT_NEW.extopcode).put_sleb32(int.!(wht.index - 1));
+				}
+				x: WasmArrayType => {
+					for (j < r.values.length) {
+						if (!pushMaybeAllocated(wasm, r.values[j], x.elem.valType, allocated)) {
+							deferredArrayFields.put(localVarMap[r], x, u32.!(j), r.values[j]);
+						}
+					}
+					w.put_b16be(WasmExtOp.ARRAY_NEW_FIXED.extopcode)
+					 .put_sleb32(int.!(wht.index - 1))
+					 .put_uleb32(u32.!(r.values.length));
+				}
+				_ => {
+					context.fail1("emitHeapInit Record has unexpected Wasm type %q", wht.render);
+				}
+			}
+			if (wasm.globalVarForRecord.has(r)) {
+				// save to local and global
+				b(WasmOp.TEE_LOCAL.opcode).put_uleb32(localVarMap[r]);
+				b(WasmOp.SET_GLOBAL.opcode).put_uleb32(u32.!(wasm.globalVarForRecord[r]));
+			} else {
+				b(WasmOp.SET_LOCAL.opcode).put_uleb32(localVarMap[r]);
+			}
+			allocated[r] = localVarMap[r];
+		}
+		// fill deferred fields
+		for (i < deferredStructFields.length) {
+			var dsf = deferredStructFields[i];
+			var lv = dsf.0, st = dsf.1, findex = dsf.2, val = dsf.3;
+			b(WasmOp.GET_LOCAL.opcode).put_uleb32(lv);
+			if (!pushMaybeAllocated(wasm, val, st.fields[findex].valType, allocated))
+				context.fail("emitHeapInit: Record (struct field) should have been allocated");
+			w.put_b16be(WasmExtOp.STRUCT_SET.extopcode).put_sleb32(int.!(st.index - 1)).put_uleb32(findex);
+		}
+		for (i < deferredArrayFields.length) {
+			var daf = deferredArrayFields[i];
+			var lv = daf.0, at = daf.1, index = daf.2, val = daf.3;
+			b(WasmOp.GET_LOCAL.opcode).put_uleb32(lv);
+			b(WasmOp.I32_CONST.opcode).put_sleb32(int.!(index));
+			if (!pushMaybeAllocated(wasm, val, at.elem.valType, allocated))
+				context.fail("emitHeapInit: Record (array element) should have been allocated");
+			w.put_b16be(WasmExtOp.ARRAY_SET.extopcode).put_sleb32(int.!(at.index - 1));
+		}
+
+		// emit code to set globals with non-default values
+//		context.fail1("emitHeapInit: # compRecords: %d", compRecords.length);
+		for (i < compRecords.length) {
+			var cr = compRecords[i];
+//			context.fail1("processing compRecord %d", i);
+//			context.fail1("number of fields %d", cr.values.length);
+//			context.fail1("Record type %q", compRecords[i].rtype.render);
+			if (cr.values == null) continue;  // shouldn't happen, but be safe
+			var rt = cr.rtype;
+//			context.fail1("Record type is %q", rt.render);
+			var wst = WasmStructType.!(wasm.gcTypeTable.addHeapType(rt));
+//			context.fail1("wasm struct type is %q", wst.render);
+//			var ct = ComponentType.!(rt);
+//			var decl = ct.componentDecl;
+//			context.fail1("record index %d", decl.recordIndex);
+			var irClass = recordInfo[cr.id];
+//			if (irClass == null) {
+//				context.fail1("irClass is null for %q", rt.render);
+//				continue;
+//			}
+			var flds = irClass.fields;
+//			if (flds == null) {
+//				context.fail("irClass.fields is null");
+//				continue;
+//			}
+			var vals = cr.values;
+			for (j < flds.length) {
+				var fld = flds[j];
+				var val = vals[fld.index];
+//				context.fail1("considering field %d", j);
+//				context.fail1("its index is %d", fld.index);
+				
+				if (WasmGcComponent.isDefaultValue(val)) continue;
+//				context.fail("emitting init of value");
+
+				// emit code to push the constant
+				if (!pushMaybeAllocated(wasm, val, wst.fields[j].valType, allocated)) {
+					context.fail1("Record not allocated for field %q", fld.render);
+				}
+
+				// emit code to set global
+				if (!wasm.globalVarForField.has(fld))
+					context.fail1("no global var for field %q", fld.render);
+				b(WasmOp.SET_GLOBAL.opcode); w.put_uleb32(u32.!(wasm.globalVarForField[fld]));
+			}
+		}
+//		context.fail1("===> Number of other Records: %d", otherRecords.length);
+
+		b(WasmOp.END.opcode); // Leave main's results on the stack and fall-through return
+
+		var bodysize = w.pos - start;
+		w.at(sizepos).overwrite_uleb32(bodysize).atEnd();
+	}
 	def emitDefaultConst(w: DataWriter, t: Type) {
 		def b = w.putb;
 		match (t) {
@@ -1206,6 +1542,9 @@ class WasmGcCodeGen extends SsaMachGen {
 		w.atEnd();
 	}
 	def emitIndirectAdapter(m: IrMethod) {
+		if (m.machIndex < 0)
+			Terminal.buf.yellow().puts("emitIndirectAdapter:").end()
+				.put2(" machIndex not set for %q.%q", m.receiver.render, m.render).ln();
 		def b = w.putb;
 
 		var sizepos = w.skip_leb32(); /*body_size*/
@@ -1222,6 +1561,10 @@ class WasmGcCodeGen extends SsaMachGen {
 			b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(0);
 			w.put_b16be(WasmExtOp.REF_CAST_NULL.extopcode);
 			var wht = wasm.gcTypeTable.addHeapType(rcvr);
+			if (wht.index == 0) {
+				Terminal.buf.yellow().puts("emitIndirectAdapter:").end()
+					.put1(" heap type index 0 for %q", wht.render).outln();
+			}
 			w.put_sleb32(int.!(wht.index - 1));
 		}
 		for (i = 1; i < m.ssa.params.length; i++) {
@@ -1303,42 +1646,66 @@ class WasmGcCodeGen extends SsaMachGen {
 					var targetType = t.nested.head;
 					match(targetType.typeCon.kind) {
 						FUNCREF => {
+							if (val == null) {
+								emit1(WasmOp.I32_CONST.opcode, useInt(0));
+								return;
+							} 
 							var m: IrMethod;
 							if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
 							else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
-							else context.fail("constant function is not an address or function value");
+							else context.fail("constant function is not null or an address or function value");
 							if (!wasm.indirectAdapterIndexFor.has(m))
-								context.fail1("constant function %d has no indirect adapter",
-									      m.machIndex);
-							var entryNum = wasm.indirectAdapterIndexFor[m];
-							var entryTmp = newTmpVReg(WasmValueType.I32);
-							emit2(WasmOp.I32_CONST.opcode, dfnv0(entryTmp), useInt(entryNum));
-							var refTmp = newTmpVReg(WasmValueType.FuncRef);
-							emit3(WasmOp.TABLE_GET.opcode, dfnv0(refTmp), usev0(entryTmp), useInt(0));
-							// cast to the specific function type
-							var ftype = Function.prependParamType(AnyRef.TYPE, targetType);
-							var wht = wasm.gcTypeTable.addHeapType(ftype);
-							emit2(WasmExtOp.REF_CAST_NULL.extopcode, usev0(refTmp), useInt(int.!(wht.index - 1)));
+								context.fail1("constant function %d has no indirect adapter index", m.machIndex);
+							emit1(WasmOp.I32_CONST.opcode, useImm(Int.box(wasm.indirectAdapterIndexFor[m])));
 						}
 						_ => emit1(WasmOp.I32_CONST.opcode, useImm(val));
 					}
 				}
 			}
-			FUNCREF,
+			FUNCREF => {
+				if (val == null) {
+					emit1(WasmOp.I32_CONST.opcode, useInt(0));
+					return;
+				} 
+				var m: IrMethod;
+				if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+				else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+				else context.fail("constant function is not null or an address or function value");
+				if (!wasm.indirectAdapterIndexFor.has(m))
+					context.fail1("constant function %d has no indirect adapter index", m.machIndex);
+				emit1(WasmOp.I32_CONST.opcode, useImm(Int.box(wasm.indirectAdapterIndexFor[m])));
+			}
 			ANYFUNC,
 			CLASS,
 			ARRAY,
 			VARIANT => {
 				if (val == null) {
 					var wht = wasm.gcTypeTable.addHeapType(t);
-					if (wht == null) {
-						useInt(WasmTypeConCode.ANYREF.code);
-					} else {
+					if (wht != null) {
 						useInt(i32.!(wht.index - 1));
+					} else {
+						useInt(int.!(WasmTypeConCode.EQREF.val));
 					}
 					emitN(WasmOp.REF_NULL.opcode);
 				} else {
-					context.fail1("genLoadConst() not null for type %q", t.render);
+					match (val) {
+						x: Record => {
+							if (!wasm.globalVarForRecord.has(x)) {
+								context.fail1("genLoadConst() no global for Record of type %q", t.render);
+							} else {
+								emit1(WasmOp.GET_GLOBAL.opcode, useInt(wasm.globalVarForRecord[x]));
+							}
+						}
+						x: Addr => {
+							var abs = x.absolute;
+							if (abs < 0) {
+								context.fail1("genLoadConst() no global for Addr of type %q", t.render);
+							} else {
+								emit1(WasmOp.GET_GLOBAL.opcode, useInt(abs));
+							}
+						}
+						_ => context.fail1("genLoadConst() no global for value of type %q", t.render);
+					}
 				}
 			}
 			_ => context.fail1("unimplemented genLoadConst() of type %q", t.render);
@@ -1483,7 +1850,6 @@ class WasmGcStackInstrGen(wasm: WasmGcProgram) {
 		counts = HashMap<WasmValueType, (int, int)>.new(WasmValueType.hash, WasmValueType.equals2);  // easiest way ...
 		types = HashMap<VReg, WasmValueType>.new(VRegHash, VRegEquals);
 
-// EBM
 		var curr = if(V3.isComponent(m.receiver), 1, 0);
 		var slot = 0;
 		while (curr < params.length) {

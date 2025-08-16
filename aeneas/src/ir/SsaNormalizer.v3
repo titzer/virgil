@@ -100,6 +100,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 			var nullConst = newGraph.nullConst(funcType.ovfParamFields[0].receiver);
 			for (i < ovfP) {
 				var load = b.opGetField(funcType.ovfParamFields[i], nullConst);
+				// EBM: TODO: prevent this from happening for fields of function type if
+				// the subsume requires work; for Wasm Gc, setting NormConfig.AnyRefOverflow
+				// to false should do the trick.  (The issue is that functions would be
+				// subsumed inappropriately, just because we wanted to pack them into the
+				// same field.)
 				var cast = b.opTypeSubsume(funcType.ovfParamFields[i].getFieldType(), funcType.ovfParamTypes[i], load);
 				newValues[i + maxP] = cast;
 			}
@@ -142,6 +147,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		if (tn.sub == null) {
 			// simple normalization
 			if (tn.size == 0) map0(i_old); // void
+// EBM: check for function subsumption case here
 			else map1(i_old, val = newGraph.valConst(tn.newType, norm.normSimpleVal(tn, v)));
 		} else {
 			// complex normalization
@@ -154,6 +160,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var nv = Array<Val>.new(tn.size);
 		norm.normValIntoArray(v, tn, nv, 0);
 		var vals = Array<SsaInstr>.new(nv.length);
+// EBM: check for function subsumption case here
 		for (j < vals.length) vals[j] = newGraph.valConst(tn.sub[j], nv[j]);
 		mapNnf(i_old, vals);
 		return vals;
@@ -248,10 +255,24 @@ class SsaRaNormalizer extends SsaRebuilder {
 			BoundsCheck =>		normBoundsCheck(i_old, op);
 			// XXX: use SsaBuilder.opCallXXX() methods
 			CallMethod(method) => {
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put2("SsaNormalizer CallMethod method %q{%d}", method.render, method.index).outln();
+					Terminal.buf.put2("SsaNormalizer CallMethod orig %q{%d}", orig.render, method.index).outln();
+				}
 				var rc = norm.ra.getClass(op.typeArgs[0]);
 				var t = extractMethodRef(orig, method), funcNorm = t.0, m = t.1;
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put3("SsaNormalizer CallMethod funcNorm %q  extracted m %q{%d}", funcNorm.render, m.render, m.asMethod().index).outln();
+				}
 				var newOp = V3Op.newCallMethod(m);
 				var ai_new = normArgs(funcNorm, genRefs(i_old.inputs));
+				if (method.facts.M_NORM && V3.isComponent(method.receiver)) {
+					// add back void for component
+					ai_new = Arrays.prepend(context.graph.nullConst(m.receiver), ai_new);
+				}
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put2("SsaNormalizer i_old.inputs.length %d  ai_new.length %d", i_old.inputs.length, ai_new.length).outln();
+				}
 				if (V3.isVariant(rc.oldType)) {
 					if (rc.isUnboxed()) {
 						// flattened data type becomes component call and needs new receiver
@@ -261,9 +282,20 @@ class SsaRaNormalizer extends SsaRebuilder {
 				normCall(i_old, funcNorm, newOp, ai_new);
 			}
 			CallClassMethod(method) => {
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put2("SsaNormalizer CallClassMethod method %q{%d}", method.render, method.index).outln();
+					Terminal.buf.put2("SsaNormalizer CallClassMethod orig %q{%d}", orig.render, method.index).outln();
+				}
 				var t = extractMethodRef(orig, method), funcNorm = t.0, m = t.1;
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put2("SsaNormalizer CallClassMethod extracted method %q{%d}", m.asMethod().render, m.asMethod().index).outln();
+				}
 				var newOp = V3Op.newCallClassMethod(m);
 				var ai_new = normArgs(funcNorm, genRefs(i_old.inputs));
+				if (method.facts.M_NORM && V3.isComponent(method.receiver)) {
+					// add back void for component
+					ai_new = Arrays.prepend(context.graph.nop(), ai_new);
+				}
 				var i = normCall(i_old, funcNorm, newOp, ai_new);
 				if (ai_new[0].facts.V_NON_ZERO) i.setFact(Fact.O_NO_NULL_CHECK);
 			}
@@ -322,6 +354,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			CreateClosure(method) => {
 				var spec = extractMethodRef(orig, method).1;
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put3("norm CreateClosure: spec %q{%d/%d}", spec.render, spec.asMethod().index, spec.asMethod().uid).outln();
+				}
 				var receiver = if(V3.isComponent(spec.receiver), newGraph.nullReceiver(), genRef1(args[0]));
 				return mapN(i_old, [funcRef(spec), receiver]);
 			}
@@ -607,9 +642,35 @@ class SsaRaNormalizer extends SsaRebuilder {
 		// map a return (may return multiple values)
 		var vals = genRefs(oldRet.inputs), maxR = norm.config.MaxReturnValues;
 		if (vals.length > maxR) {
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf.green().puts("genReturn:").end()
+					.put2(" uid = @%d  vals length = %d", oldRet.uid, vals.length).ln();
+				for (i < vals.length) {
+					var ith = vals[i];
+					Terminal.buf.green().puts("genReturn:").end()
+						.put2(" vals[%d] has type %q", i, ith.getType().render).ln();
+				}
+			}
 			var ovfRets = Arrays.range(vals, maxR, vals.length);
 			vals = Arrays.range(vals, 0, maxR);
 			var funcNorm = normFuncType(context.method.sig.funcType());
+			var ftype = context.method.sig.funcType();
+//			var funcNorm = normFuncType(Function.newType(ftype.paramType(), ftype.returnType()));
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf
+					.green().puts("genReturn:").end()
+					.put1(" old type %q", funcNorm.oldType.render).ln()
+					.green().puts("genReturn:").end()
+					.put1(" normed type %q", funcNorm.newType.render).ln()
+					.green().puts("genReturn:").end()
+					.put1(" method type %q", context.method.sig.funcType().render).ln()
+					.green().puts("genReturn:").end()
+					.put1(" returnType %q", context.method.sig.returnType().render).ln()
+					.green().puts("genReturn:").end()
+					.put1(" ovfReturnFields length = %d", funcNorm.ovfReturnFields.length).ln()
+					.green().puts("genReturn:").end()
+					.put1(" vals length = %d", vals.length).ln();
+			}
 			var nullConst = newGraph.nullConst(funcNorm.ovfReturnFields[0].receiver);
 			for (i < ovfRets.length) {
 				curBlock.opComponentSetField(funcNorm.ovfReturnFields[i], nullConst, ovfRets[i]);
@@ -634,6 +695,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			var nullConst = newGraph.nullConst(funcNorm.ovfReturnFields[0].receiver);
 			for (i < funcNorm.ovfReturnTypes.length) {
 				var load = curBlock.opGetField(funcNorm.ovfReturnFields[i], nullConst);
+				// EBM: see comments on similar code sequence in genGraph
 				var cast = curBlock.opTypeSubsume(funcNorm.ovfReturnFields[i].getFieldType(), funcNorm.ovfReturnTypes[i], load);
 				rvals.put(cast);
 			}
@@ -687,6 +749,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def normEqual1(i_old: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		if (V3.isVariant(t)) return normVariantEqual(i_old, t, x, y);
+		if (t.typeCon.kind == Kind.FUNCREF) return normSimpleEqualOp0(i_old, null, t, x, y);
 		return curBlock.opEqual(t, x, y);
 	}
 	def normEqual(i_old: SsaApplyOp, tn: TypeNorm, refs: Array<SsaInstr>) -> SsaInstr {
@@ -700,10 +763,94 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		return expr;
 	}
+	private def getWrappee(x: SsaInstr, val: Val) -> SsaInstr {
+		if (FuncVal.?(val)) {
+			var spec = FuncVal.!(val).memberRef;
+			if (spec.asMethod().facts.M_WRAPPER) {
+				var wrappee = spec;
+				while (norm.ra.prog.wrappeeForWrapper.has(wrappee))
+					wrappee = norm.ra.prog.wrappeeForWrapper[wrappee];
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put3("substituting wrappee %q{%d/%d}", wrappee.render,
+							  wrappee.asMethod().index, wrappee.asMethod().uid)
+						.put3(" for %q{%d/%d}", spec.render, spec.asMethod().index, spec.asMethod().uid).outln();
+				}
+				return funcRef(wrappee);
+			}
+		}
+		return x;
+	}
+	def normSimpleEqualOp0(i_old: SsaApplyOp, op: Operator, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+		if (norm.config.WrapFuncTypeSubsume &&
+		    t.typeCon.kind == Kind.FUNCREF &&
+		    !norm.context.method.facts.M_MAPPER) {
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf.put1("normalizing func comparison @%d", i_old.uid).outln();
+				SsaPrinter.new().printInstrLn(x).printInstrLn(y).buf.outln();
+			}
+			// unmap any constant arguments
+			var xconst = SsaConst.?(x);
+			var xval = if(xconst, SsaConst.!(x).val, null);
+			var xnull = xconst && xval == null;
+
+			var yconst = SsaConst.?(y);
+			var yval = if(yconst, SsaConst.!(y).val, null);
+			var ynull = yconst && yval == null;
+
+			if (xconst && !xnull) x = getWrappee(x, xval);
+			if (yconst && !ynull) y = getWrappee(y, yval);
+
+			if (CLOptions.PRINT_RA.get()) {
+				if (xconst && !xnull) {
+					var xspec = FuncVal.!(SsaConst.!(x).val).memberRef;
+					Terminal.buf.put1("normalizing func comparison @%d:", i_old.uid)
+						.put3("x is now %q{%d/%d}", xspec.render, xspec.asMethod().index, xspec.asMethod().uid)
+						.outln();
+				}
+				if (yconst && !ynull) {
+					var yspec = FuncVal.!(SsaConst.!(y).val).memberRef;
+					Terminal.buf.put1("normalizing func comparison @%d:", i_old.uid)
+						.put3("y is now %q{%d/%d}", yspec.render, yspec.asMethod().index, yspec.asMethod().uid)
+						.outln();
+				}
+				Terminal.buf.put1("normalizing func comparison @%d continuing", i_old.uid).outln();
+			}
+
+			var unmapper: IrSpec;
+			// Two known functions do not need a run-time unmapper
+			if (xconst && yconst) { }
+			// Comparison with null does not require unmapping
+			else if (xnull || ynull) { }
+			else if ((unmapper = norm.ra.prog.getUnmapper(t)) != null) {
+				// insert unmapping for non-const argument(s)
+				// (if unmapper is null, unmapping is not needed for this type)
+				if (!xconst) {
+					if (CLOptions.PRINT_RA.get()) {
+							Terminal.buf.puts("adding unmap call for x of comparision").outln();
+					}
+					var op = V3Op.newCallMethod(unmapper);
+					var args = [curBlock.graph.nullReceiver(), x];
+					x = curBlock.addApply(null, op, args);
+				}
+				if (!yconst) {
+					if (CLOptions.PRINT_RA.get()) {
+						Terminal.buf.puts("adding unmap call for y of comparision").outln();
+					}
+					var op = V3Op.newCallMethod(unmapper);
+					var args = [curBlock.graph.nullReceiver(), y];
+					y = curBlock.addApply(null, op, args);
+				}
+				return curBlock.opEqualOf(V3Op.newRefEq(AnyFunction.TYPE), x, y);
+			}
+		}
+		if (op == null) op = V3Op.newEqual(t);
+		return curBlock.opEqualOf(op, x, y);
+	}
 	def normSimpleEqualOp(i_old: SsaApplyOp, op: Operator) {
 		var refs = genRefs(i_old.inputs);
-		var tn = normTypeArg(op, 0), size = if(tn == null, 1, tn.size);
-		return map1(i_old, curBlock.opEqualOf(op, refs[0], refs[size]));
+		var tn = normTypeArg(op, 0);
+		var i_new = normSimpleEqualOp0(i_old, op, tn.newType, refs[0], refs[tn.size]);
+		return map1(i_old, i_new);
 	}
 	def normVariantEqual(i_old: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		var rc = norm.ra.getClass(t);
@@ -800,8 +947,16 @@ class SsaRaNormalizer extends SsaRebuilder {
 		curBlock.addThrow(curBlock.source, V3Exception.TypeCheck);
 	}
 	def normTypeCastRec(ai_old: Array<SsaInstr>, offset: int, atn: TypeNorm, rtn: TypeNorm, result: Vector<SsaInstr>) {
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put1("normTypeCastRec: cast is %s", TypeSystem.newTypeCast(atn.oldType, rtn.oldType).name).outln();
+		}
 		match (TypeSystem.newTypeCast(atn.oldType, rtn.oldType)) {
 			TRUE => {
+				if (atn != rtn && FuncType.?(atn.oldType) && context.compiler.NormConfig.WrapFuncTypeSubsume) {
+					if (atn.sub == null) result.put(curBlock.opTypeSubsume(atn.newType, rtn.newType, ai_old[offset]));
+					else for (i < rtn.size) result.put(curBlock.opTypeSubsume(atn.sub[i], rtn.sub[i], ai_old[offset + i]));
+					return;
+				}
 				for (i < rtn.size) result.put(ai_old[offset + i]);
 				return;
 			}
@@ -1533,9 +1688,24 @@ class SsaRaNormalizer extends SsaRebuilder {
 		return norm.norm(t);
 	}
 	private def normFuncType(t: Type) -> FuncNorm {
-		def funcNorm = FuncNorm.!(normType(t));
-		norm.allocOverflowFields(funcNorm);
-		return funcNorm;
+		def normt = normType(t);
+		if (FuncNorm.?(normt)) {
+			def funcNorm = FuncNorm.!(normt);
+			norm.allocOverflowFields(funcNorm);
+			if (CLOptions.PRINT_RA.get()) {
+//				Terminal.color(Terminal.CTRL_BRIGHT_GREEN, "%s: ", "normFuncType");
+//				Terminal.buf.put2(" norming type %q  normed type %q", t.render, normt.render).ln();
+			}
+			return funcNorm;
+		} else {
+			Terminal.color(Terminal.CTRL_BRIGHT_GREEN, "%s: ", "normFuncType");
+			Terminal.buf
+				.put2(" norming type %q  normed type %q", t.render, normt.render)
+				.put3("; is TupleNorm %z  is FuncNorm %z  is TypeNorm %z",
+				      TupleNorm.?(normt), FuncNorm.?(normt), TypeNorm.?(normt)).ln();
+			if (true) { var i = 1/0; }
+			return null;
+		}
 	}
 	private def extractFieldRef(i_old: SsaApplyOp, field: IrField) -> RaField {
 		var spec = if (specSet != null, specSet.first(), context.spec);
@@ -1544,8 +1714,18 @@ class SsaRaNormalizer extends SsaRebuilder {
 	private def extractMethodRef(op: Operator, method: IrMethod) -> (FuncNorm, IrSpec) {
 		if (specSet != null) op = op.subst(specSet.first().instantiateType);
 		else if (context.spec != null) op = op.subst(context.spec.instantiateType);
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put1("extractMethodRef updated op %q;", op.render)
+				.put3(" method %q{%d/%d}", method.render, method.index, method.uid).outln();
+		}
 		var ta = op.typeArgs;
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put1("extractMethodRef ta[0] %q", ta[0].render).outln();
+		}
 		var t = norm.normalizeMethodRef(IrSpec.new(ta[0], ta, method));
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("extractMethodRef normed spec %q{%d/%d}", t.1.render, t.1.asMethod().index, t.1.asMethod().uid).outln();
+		}
 		return (norm.allocOverflowFields(t.0.funcNorm), t.1);
 	}
 	private def extractVirtualRef(op: Operator, method: IrMethod) -> (FuncNorm, IrSpec, bool) {
@@ -1597,6 +1777,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 		return normType(op.sig.returnType());
 	}
 	private def funcRef(m: IrSpec) -> SsaInstr {
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("funcRef: spec %q{%d/%d}", m.render, m.asMethod().index, m.asMethod().uid).outln();
+		}
 		return newGraph.valConst(Function.funcRefType(m.getFuncType()), FuncVal.new(m));
 	}
 	private def nonzero(tn: TypeNorm) -> TypeNorm {

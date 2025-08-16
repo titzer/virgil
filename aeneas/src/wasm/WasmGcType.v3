@@ -35,7 +35,7 @@ class WasmGcTypeInfo(wtype: WasmHeapType) {
 }
 
 // Canonicalizes and encodes Virgil types and signatures into WASM GC types and function sigs
-class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen) {
+class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen, ir: IrModule, prog: WasmGcProgram) {
 	// Signatures are treated differently.  Because they don't arrive as Virgil types,
 	// already canonicalized, their Wasm form needs its own canonicalization.  Also,
 	// they are not of themselves recursive.
@@ -97,14 +97,11 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen) {
 				x: NullType => return null;
 				_ => ;
 			}
+//			AddTypes.addIrTypes(typ, prog);
 			match (typ.typeCon.kind) {
 				ARRAY => wht = addArrayType(typ);
 				FUNCREF, CLOSURE => wht = addSignature(FuncType.!(typ).sig());
-				CLASS, VARIANT => {
-					errgen.addError(null, null, "WasmGcTypeTable.addHeapType",
-							StringBuilder.new().put1("expected map entry for %q", typ.render).extract());
-					return null;
-				}
+				CLASS, VARIANT => wht = addClassType(typ);
 				_ => return null;
 			}
 			if (WasmComponent.printSection.TYPE) {
@@ -117,17 +114,50 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen) {
 		return wht;
 	}
 
+	def addClassType(ctype: Type) -> WasmHeapType {
+		if (!ClassType.?(ctype)) return null;  // happens for Null, AnyRef
+		if (heapTypeMap.has(ctype)) return heapTypeMap[ctype];
+		var cls = ir.getIrClass(ctype);
+		if (cls == null) {
+			// Class is never instantiated, but type appears
+			var stype = ClassType.!(ctype).superType;
+			if (stype == null) {
+				// No superclass - give this class no fields
+				var st = WasmStructType.new().initTypeInfo();
+				st.fields = [];
+				if (WasmComponent.printSection.TYPE) {
+					var line = StringBuilder.new().put2("Adding Virgil class type %q ==> Wasm type %q", ctype.render, st.render);
+					errgen.addError(null, null, "Type Section", line.extract());
+				}
+				heapTypes.put(st);
+				heapTypeMap[ctype] = st;
+				return st;
+			} else {
+				// Structurally, this is the same as the superclass
+				var wht = addClassType(stype);
+				if (WasmComponent.printSection.TYPE) {
+					var line = StringBuilder.new().put3("Adding Virgil class type %q ==> Wasm type %q (same as for super %q)", ctype.render, wht.render, stype.render);
+					errgen.addError(null, null, "Type Section", line.extract());
+				}
+				heapTypeMap[ctype] = wht;
+				return wht;
+			}
+		} else {
+			return addClass(cls);
+		}
+	}
+
 	// adds an IrClass to classMap and its class type to heapTypemap
 	def addClass(cls: IrClass) -> WasmHeapType {
 		// ignore if already present
 		var wht = classMap[cls];
 		if (wht == null) {
 			var st = WasmStructType.new().initTypeInfo();
-			classMap[cls] = st;
 			heapTypeMap[cls.ctype] = wht = st;
 			heapTypes.put(wht);
+			classMap[cls] = wht;
 			if (WasmComponent.printSection.TYPE) {
-				var line = StringBuilder.new().put2("Adding Virgil type %q ==> Wasm type %q", cls.ctype.render, wht.render);
+				var line = StringBuilder.new().put2("Adding Virgil IrClass for %q ==> Wasm type %q", cls.ctype.render, wht.render);
 				errgen.addError(null, null, "Type Section", line.extract());
 			}
 		}
@@ -184,11 +214,17 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen) {
 					errgen.addError(null, null, "Type Section", line.extract());
 				}
 				for (i < params.length) {
-					var wvtype = params[i] = getValueTypeFor(ptypes[i]);
+					var typ = ptypes[i];
+					AddTypes.addIrTypes(typ, prog);
+//					addHeapType(typ);
+					var wvtype = params[i] = getValueTypeFor(typ);
 					wft.addEdgeTo(wvtype.heapType());
 				}
 				for (i < results.length) {
-					var wvtype = results[i] = getValueTypeFor(rtypes[i]);
+					var typ = rtypes[i];
+					AddTypes.addIrTypes(typ, prog);
+//					addHeapType(typ);
+					var wvtype = results[i] = getValueTypeFor(typ);
 					wft.addEdgeTo(wvtype.heapType());
 				}
 				insureTypeProcessed(wft);
@@ -206,6 +242,7 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen) {
 		heapTypeMap[atype] = wat;
 		heapTypes.put(wat);
 		var etype = V3Array.elementType(atype);
+		addHeapType(etype);
 		var estype = wat.elem = getStorageTypeFor(etype, true);
 		wat.addEdgeTo(estype.heapType());
 		insureTypeProcessed(wat);
@@ -382,28 +419,28 @@ class WasmGcTypeTable(wasmType: Type -> WasmValueType, errgen: ErrorGen) {
 			x: BoolType => return WasmValueType.I32;
 			x: IntType => return if(x.width > 32, WasmValueType.I64, WasmValueType.I32);
 			x: FloatType => return if(x.is64, WasmValueType.F64, WasmValueType.F32);
-			x: AnyRefType => return WasmValueType.AnyRef;
+			x: AnyRefType => return WasmValueType.EqRef;
 			x: NullType => return WasmValueType.NoneRef;
 			_ => match (t.typeCon.kind) {
 				ENUM => return wasmType(V3.getVariantTagType(t));
 				ENUM_SET => return wasmType(V3.getEnumSetType(t));
 				ARRAY, CLASS, VARIANT => return addWasmRefType(t);
-				FUNCREF => {
-					var ftype = Function.prependParamType(AnyRef.TYPE, t);
-					return addWasmRefType(ftype);
+				FUNCREF, ANYFUNC => {
+					return WasmValueType.I32;
+//					var ftype = Function.prependParamType(AnyRef.TYPE, t);
+//					return addWasmRefType(ftype);
 				}
-
 				POINTER => {
 					var targetType = t.nested.head;
 					match(targetType.typeCon.kind) {
 						FUNCREF => {
-							var ftype = Function.prependParamType(AnyRef.TYPE, targetType);
-							return addWasmRefType(ftype);
+							return WasmValueType.I32;
+//							var ftype = Function.prependParamType(AnyRef.TYPE, targetType);
+//							return addWasmRefType(ftype);
 						}
 						_ => return WasmValueType.I32;
 					}
 				}
-
 				_ => return WasmValueType.Void;
 			}
 		}

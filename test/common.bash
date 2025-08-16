@@ -384,6 +384,8 @@ function execute_tests() {
             (execute_v3i_tests "v3i" "") || exit $?
             (execute_v3i_tests "v3i-ra" "-ra -ma=false") || exit $?
             (execute_v3i_tests "v3i-ra-ma" "-ra -ma=true") || exit $?
+#            (execute_v3i_tests "v3i-ra-wfts" "-ra -ma=false -wfts=true") || exit $?
+#            (execute_v3i_tests "v3i-ra-ma-wfts" "-ra -ma=true -wfts=true") || exit $?
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             (compile_target_tests jvm -jvm.script=false) || exit $?
             (execute_target_tests jvm) || exit $?
