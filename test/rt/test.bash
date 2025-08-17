@@ -40,12 +40,18 @@ function run_reserved_code_test() {
     $T/reserved_code2
 }
 
+EXPLICIT_TESTS="$@"
+
 for target in $TEST_TARGETS; do
     T=$OUT/$target
     mkdir -p $T
     
     if [ -d $target ]; then
-	TESTS=$(ls *.v3 $target/*.v3)
+	if [ "$EXPLICIT_TESTS" != "" ]; then
+	    TESTS="$EXPLICIT_TESTS"
+	else
+	    TESTS=$(ls *.v3 $target/*.v3)
+	fi
 	print_compiling $target
 	compile_target_tests_with_flags $target $TESTS | $PROGRESS
 	fail_fast
