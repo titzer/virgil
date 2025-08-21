@@ -37,9 +37,6 @@ def RECORD_REGION = Region.new("records", RECORD_SPACE);
 def FUNCTIONS_SPACE = AddressSpace.new("functions", false, 32, 4, Alignment.new(1), Alignment.new(1));
 def FUNCTIONS_REGION = Region.new("functions", FUNCTIONS_SPACE);	// the "main" table
 
-// Indirect tables are placed in the Wasm common memory space (in the Wasm linear memory)
-def IndirectTablesRegion = Region.new("indirects", WasmCommon.SPACE);
-
 // information about a dispatch table entry
 type DispatchInfo {
 	case Abstract(method: IrMethod) {
@@ -132,6 +129,7 @@ class WasmGcTarget extends Target {
 		compiler.NormConfig.RangeStartType = Int.getType(true, 32);	// 64-bit memories?
 		compiler.NormConfig.WrapFuncTypeSubsume = true;
 		compiler.NormConfig.AnyRefOverflow = false;
+		compiler.NormConfig.ExplicitRefTypeCast = true;
 		// compiler.unboxVariantsOpt = false;	// EBM: can't change it here
 		// compiler.DisableBoundsChecks = true;	// leave since there can be residual checks
 		// compiler.DisableNullChecks = true;	// EBM: look into this
@@ -341,11 +339,13 @@ class WasmGcTarget extends Target {
 
 		// Lowering has set up individual indirectly-referenced
 		// functions.  These go into table 0.
-		def numIndividualIndirectAdapters = wasm.indirectAdapterRequests.length;
-		def needTable0 = (numIndividualIndirectAdapters > 0 || wasm.indirectTableRequests.length > 0) || wasm.anyCallFunctions;
+		def needTable0 = (wasm.indirectAdapterRequests.length > 0) ||
+				 (wasm.indirectTableRequests.length > 0) ||
+				 wasm.anyCallFunctions;
 		def table0Infos: Vector<FunctionInfo> = if(needTable0, Vector<FunctionInfo>.new(), null);
 		def tableInfos = Vector<(TableKind, Vector<FunctionInfo>)>.new();
 		if (needTable0) tableInfos.put((TableKind.Indirect0, table0Infos));
+		def numIndividualIndirectAdapters = wasm.indirectAdapterRequests.length;
 		for (i < numIndividualIndirectAdapters) {
 			var meth = wasm.indirectAdapterRequests[i];
 			var findex = functionInfos.length;
@@ -374,7 +374,7 @@ class WasmGcTarget extends Target {
 
 		// Add all the indirect adapter methods from method tables.
 		// This also adds their signatures.
-		def firstIndirectTable = nextTableNum;
+//		def firstIndirectTable = nextTableNum;
 		if (WasmComponent.printSection.FUNCTION ||
 		    WasmComponent.printSection.TABLE ||
 		    WasmComponent.printSection.CODE) {
@@ -389,11 +389,8 @@ class WasmGcTarget extends Target {
 				var sb = StringBuilder.new().put2("Indirect table %d for %q", nextTableNum, mtable.render);
 				prog.ERROR.addError(null, null, "Function/Table/Code Section", sb.extract());
 			}
-			wasm.indirectTableFor[mtable] = nextTableNum++;
-			var finfos = Vector<FunctionInfo>.new();
+			wasm.indirectTableBase[mtable] = table0Infos.length + 1;  // account for null entry
 			var rootSig: Signature = null;
-			var countPos = wasm.tableMemoryInts.length;
-			var tableInts = Vector<int>.new();
 			for (m in mtable.table) {
 				if (m == null) continue;
 				if (rootSig == null) rootSig = m.sig;
@@ -405,11 +402,9 @@ class WasmGcTarget extends Target {
 				wasm.indirectAdapterFor[m] = findex;
 				var sigIdx = wasm.addSig(AnyRef.TYPE, m.sig);
 				var fi = FunctionInfo.new(FunctionInfoKind.Indirect, AnyRef.TYPE, m.sig, sigIdx, m, findex);
-				finfos.put(fi);
 				table0Infos.put(fi);
 				wasm.indirectAdapterIndexFor[m] = table0Infos.length;
 				wasm.indirectAdapterVector.put(m);
-				tableInts.put(table0Infos.length);
 				functionInfos.put(fi);
 				if (WasmComponent.printSection.FUNCTION ||
 				    WasmComponent.printSection.TABLE ||
@@ -418,14 +413,7 @@ class WasmGcTarget extends Target {
 					prog.ERROR.addError(null, null, "Function/Table/Code Section", sb.extract());
 				}
 			}
-			tableInfos.put((TableKind.Indirect(rootSig), finfos));
-
-			// insure table is aligned
-			IndirectTablesRegion.align(4);
-			// allocate space in the table region
-			var mtaddr = IndirectTablesRegion.allocate(tableInts, tableInts.length * 4);
-			// adjust the address so that it automatically subtracts the rootId
-			wasm.indirectTableAddrFor[mtable] = mtaddr.add(0 - mtable.rootId * 4);
+//			tableInfos.put((TableKind.Indirect(rootSig), finfos));
 		}
 
 		// Add all the dispatch adapter methods from method tables.
@@ -458,8 +446,18 @@ class WasmGcTarget extends Target {
 			var dispIdx = superIdx;
 			var entryNum = 0;
 			var tableInfo = Vector<FunctionInfo>.new();
+			// we need a function index to use for nay null entries
+			var recentMethod: IrMethod;
 			for (m in mtable.table) {
 				if (m == null) continue;
+				recentMethod = m;
+				break;
+			}
+			for (m0 in mtable.table) {
+				// m0 == null means there are no instances -
+				// but we still need an entry for proper indexing
+				var m = if(m0 == null, recentMethod, m0);
+				recentMethod = m;
 				var name = if(WasmComponent.printSection.FUNCTION || WasmComponent.printSection.ELEMENT,
 					      wasm.getMethodName(m), null);
 				var mFuncIdx = m.machIndex;
@@ -650,7 +648,6 @@ class WasmGcTarget extends Target {
 						out.put_uleb32(len);  // initial table length
 						out.put_uleb32(len);  // maximum table length
 					}
-// EBM TABLES working to replace Indirect case with a "table" in memory vs a Wasm table
 					Indirect(rSig) => {
 						var rootSig = if(rSig == null, Signature.new(null, [], []), rSig);
 						var sigidx = wasm.addSig(AnyRef.TYPE, rootSig);
@@ -715,11 +712,10 @@ class WasmGcTarget extends Target {
 		//--------------------------------------------------------------------------------
 		var hasMemorySection = false;
 		if (WasmComponent.includeSection.MEMORY) {
-			var minBytes = u32.!(IndirectTablesRegion.mark);
 			if ((m.allocates || wasm.usesMemory) && rt.heapSize == 0) {
 				rt.heapSize = pageSize;  // min of one page to allocate into
 			}
-			var totalSize = minBytes + rt.heapSize + rt.shadowStackSize;
+			var totalSize = rt.heapSize + rt.shadowStackSize;
 			if (totalSize > 0) {
 				hasMemorySection = true;
 				if (WasmComponent.printSection.MEMORY)
@@ -779,10 +775,10 @@ class WasmGcTarget extends Target {
 							out.putb(WasmOp.I64_CONST.opcode).putb(0).putb(WasmOp.END.opcode);
 						}
 						F32 => {
-							out.putb(WasmOp.F32_CONST.opcode).putb(0).putb(WasmOp.END.opcode);
+							out.putb(WasmOp.F32_CONST.opcode).put_b32(0).putb(WasmOp.END.opcode);
 						}
 						F64 => {
-							out.putb(WasmOp.F64_CONST.opcode).putb(0).putb(WasmOp.END.opcode);
+							out.putb(WasmOp.F64_CONST.opcode).put_b64(0).putb(WasmOp.END.opcode);
 						}
 						FuncRef => {
 							out.putb(WasmOp.REF_NULL.opcode).put_sleb32(int.!(WasmTypeConCode.FUNCREF.val)).putb(WasmOp.END.opcode);
@@ -1074,7 +1070,7 @@ class WasmGcTarget extends Target {
 		// (10) Emit the data section
 		//--------------------------------------------------------------------------------
 		if (WasmComponent.includeSection.DATA) {	// turn off for now
-			var totalDataSize = IndirectTablesRegion.mark;
+			var totalDataSize = 0;
 			if (totalDataSize > 0) {
 				if (WasmComponent.printSection.DATA) {
 					var sb = StringBuilder.new().put1("========== Bytes emitted = %d ==========", totalDataSize);
@@ -1088,10 +1084,6 @@ class WasmGcTarget extends Target {
 				var data_sizepos = out.skip_leb32(); // data size
 				var data_start = out.pos;
 				out.startAddr = u64.view(i64.!(dataStartAddr) - i64.!(out.end()));
-
-				IndirectTablesRegion.setStartAddr(out.addr_end());
-				// encode indirect tables into the buffer
-				m.encodeRegion(IndirectTablesRegion, out);
 
 		                rt.recordDataStart(out.addr_end());
 				// not sure what might go in the middle
@@ -1168,7 +1160,7 @@ class WasmGcTarget extends Target {
 		match (val) {
 			// Can these occur?
 //			x: ArrayRangeVal => { addrOfRecord(m, x.array); m.prog.ERROR.addError(null, null, "+++++", "layoutVal saw an ArrayRangeVal"); }
-//			x: ArrayRangeStart => { m.prog.ERROR.addError(null, null, "+++++", "layoutVal saw an ArrayRangeStart"); }
+			x: ArrayRangeStart => {}  // nothing intesting here (just an int)
 //			x: PointerRangeStart => { m.prog.ERROR.addError(null, null, "+++++", "layoutVal saw a PointerRangeStart"); }
 //			x: ByteArrayOffset => { addrOfRecord(m, x.array); m.prog.ERROR.addError(null, null, "+++++", "layoutVal saw a ByteArrayOffset"); }
 
@@ -1433,26 +1425,30 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 	// EBM: From WasmProgram; revisit
 	//
 
+	//
+	// Info for indirect tables
+	//
+
+	var anyCallFunctions = false;  // may have indirect call (of null function) w/o any adapters ...
 	// Indicates the indirect adapter function number for a given method
-	var anyCallFunctions = false;  // may have indirect call (of null function) w/o any adpaters ...
+	// Initially set to -1 and later updated when laid out
 	def indirectAdapterFor = HashMap<IrMethod,int>.new(IrMethod.uid, IrMethod.==);
 	def indirectAdapterRequests = Vector<IrMethod>.new();
+
 	// Index in indirect table 0 of a method whose address is taken
+	// This includes individual methods plus ones needed from mtables
 	def indirectAdapterIndexFor = HashMap<IrMethod,int>.new(IrMethod.uid, IrMethod.==);
-	def indirectAdapterVector = Vector<IrMethod>.new().put(null);
+	// The indirect adapters, in order
+	def indirectAdapterVector = Vector<IrMethod>.new().put(null);  // start with 0 entry
 
-	// Maps from method tables to corresponding indirection table (Wasm table number)
-	def indirectTableFor = HashMap<IrMtable,int>.new(IrItem.uid, IrMtable.==);
+	// Maps from method tables to starting index of entries in table 0
+	// At time of request, the base is set to -1 and later updated when laid out
+	def indirectTableBase = HashMap<IrMtable,int>.new(IrItem.uid, IrMtable.==);
 	def indirectTableRequests = Vector<IrMtable>.new();
-	// The Addr actually holds and Address<Vector<int>>
-	def indirectTableAddrFor = HashMap<IrMtable,Addr>.new(IrMtable.uid, IrMtable.==);
 
-	// Holds indirect table information to go into Wasm memory.  Consists of I32's, like this:
-	// # of tables; # entries table 1; table entries ...; # entries table 2; table entries ...; ...
-	def tableMemoryInts = Vector<int>.new();  // build up the information to go into Wasm memory
-	// Indicates offset in tableMemoryInts (in terms of number of I32s) of first entry of table
-	// for each IrMtable that has an indirect adapter table
-	def tableMemoryBases = HashMap<IrMtable,int>.new(IrMtable.uid,IrMtable.==);
+	//
+	// Info for dispatch tables
+	//
 
 	// Indicates the dispatch adapter function number for a given method
 	def dispatchAdapterFor = HashMap<IrMethod,int>.new(IrMethod.uid, IrMethod.==);
@@ -1462,6 +1458,10 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 	def dispatchTableFor = HashMap<IrMtable,int>.new(IrItem.uid, IrMtable.==);
 	def dispatchTableRequests = Vector<IrMtable>.new();
 
+	//
+	// Info for Wasm globals
+	//
+
 	// Maps from IrField to corresponding global variable (fields of components)
 	def globalVarForField = HashMap<IrField,int>.new(IrItem.uid, IrField.==);
 	def globalVarsForFields = Vector<IrField>.new();
@@ -1469,6 +1469,9 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 	// Maps from Record to corresponding global variable (non-component Records)
 	def globalVarForRecord = HashMap<Record,int>.new(Record.id, Record.==);
 	def globalVarsForRecords = Vector<Record>.new();
+
+	//
+	// Wasm signature and function indexes for entry / alloc / heap init
 
 	var sigIndex_i_i = -1;
 	var sigIndex_entryStub = -1;
@@ -1480,6 +1483,7 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 	var heapInitFuncIndex = -1;
 
 	var numImports = 0;
+
 	//
 	// End from WasmProgram
 	//
@@ -1499,8 +1503,8 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 		}
 	}
 	def requestIndirectTable(m: IrMtable) {
-		if (!indirectTableFor.has(m)) {
-			indirectTableFor[m] = -1;
+		if (!indirectTableBase.has(m)) {
+			indirectTableBase[m] = -1;
 			indirectTableRequests.put(m);
 		}
 	}
@@ -1860,7 +1864,7 @@ class WasmGcLowering extends MachLowering {
 		match (castOp) {
 			TRUE => i_new = normRef1(i_old.inputs[0]);  // XXX: maybe dead?
 			SUBSUME => return void(normId(i_old));  // XXX: maybe dead?
-			CLASS_CAST, VARIANT_CAST => return void(genClassCast(ft, tt, i_old));
+			CLASS_CAST, VARIANT_CAST => i_new = genClassCast(ft, tt, i_old);
 			THROW => i_new = addThrow(i_old.source, V3Exception.TypeCheck);
 			INT_VIEW_I => return genIntViewI(i_old);
 			_ => {
@@ -1876,9 +1880,34 @@ class WasmGcLowering extends MachLowering {
 		wasm.gcTypeTable.addClass(fromIrClass);
 		var toIrClass = mach.prog.ir.makeIrClass(tt);  // sometimes not otherwise present
 		wasm.gcTypeTable.addClass(toIrClass);
-//		var sb = StringBuilder.new().put2("TypeCast (CLASS_CAST) at @%d to type %q", i_old.uid, toIrClass.ctype.render);
-//		context.prog.ERROR.addError(null, null, "WasmGcLowering", sb.extract());
-		return normId(i_old);
+
+		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
+		if (context.compiler.DisableTypeChecks) return nobj;
+		var t = classIdRange(tt), low = t.0, high = t.1;
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("genClassCast: inst @%d  low %d  high %d", i_old.uid, low, high).outln();
+		}
+		if (low == high) {
+			// no live classes can match, only null
+			if (V3Op.needsNullCheck(i_old, oobj.dest)) {
+				var cmp = curBlock.opNotEqual(ft, nobj, context.graph.nullConst(ft));
+				apply(i_old.source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp]);
+				return context.graph.nullConst(tt);
+			}
+			return addThrow(i_old.source, V3Exception.TypeCheck);
+		}
+		return genIfNull(i_old, mach.machType(tt), nobj, null, genClassIdCheckAndCast(i_old, low, high, _));
+	}
+	def genClassIdCheckAndCast(i_old: SsaApplyOp, low: int, high: int, i_new: SsaInstr) -> SsaInstr {
+		var tagType = mach.tagType;
+		var fromType = i_old.op.typeArgs[0];
+		var field = IrField.new(fromType, tagType);
+		field.machOffset = 0;  // flags a tag field
+		var spec = IrSpec.new(fromType, null, field);
+		var i_tid = apply(i_old.source, V3Op.newClassGetField(spec), [i_new]);
+		curBlock.opIntRangeCheck(1, low, high, i_tid);
+		var i_cast = apply(i_old.source, V3Op.newTypeCast(fromType, i_old.op.typeArgs[1]), [i_new]);
+		return i_cast;
 	}
 	def genTypeQuery(i_old: SsaApplyOp, query: TypeQuery) -> SsaInstr {
 		var ft = i_old.op.typeArgs[0], tt = i_old.op.typeArgs[1];
@@ -2248,10 +2277,8 @@ class WasmGcLowering extends MachLowering {
 		wasm.requestIndirectTable(selector.mtable);
 
 		// pass through to code gen, after any required null check
-		if (true) return i_old;
-		var i_new = genNullCheck(i_old);
-		map1(i_old, i_new);
-		return i_new;
+		genNullCheck(i_old);
+		return i_old;
 	}
 	def genVariantGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
 		wasm.requestIndirectAdapter(method);
@@ -2276,42 +2303,13 @@ class WasmGcLowering extends MachLowering {
 	def genComponentGetField(i_old: SsaApplyOp, field: IrField) {
 		// Leave the ComponentGetField for code gen
 		return void(normId(i_old));
-/*
-		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
-		var fieldType = mach.machType(fieldRef.getFieldType());
-		var ptr = componentFieldPtr(fieldRef);
-		var loads = genNormTypedLoads(i_old.source, Fact.O_NO_NULL_CHECK, fieldType, ptr, 0);
-		mapN(i_old, loads);
-*/
 	}
 	def genComponentSetField(i_old: SsaApplyOp, field: IrField) {
 		// Leave the ComponentSetField for code gen
 		return void(normId(i_old));
-/*
-		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
-		var inputs = normRefs(i_old.inputs);
-		var machType = mach.machType(fieldRef.getFieldType());
-		var ptr = componentFieldPtr(fieldRef);
-		// generate remaining stores for normalized fields.
-		genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, false, machType, ptr, 0, inputs, 1);
-		i_old.kill();
-		i_old.remove();
-*/
 	}
 	def genBoundsCheck0(i_old: SsaApplyOp, nullity: Fact.set, narr: SsaInstr) -> (SsaInstr, Fact.set) {
 		return (normId(i_old), nullity);
-/*
-		var oarr = i_old.inputs[0];
-		// load length
-		// XXX: CSE the array length if possible
-		var len = refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
-		var index = normRef1(i_old.inputs[1]);
-		var throwOp = V3Op.newConditionalThrow(V3Exception.BoundsCheck);
-		// throw BoundsCheckException if ugteq(index, length)
-		var op = Int.getType(false, 32).opLtEq();
-		apply(i_old.source, throwOp, [apply(i_old.source, op, [len, index])]);
-		return (index, nullity | Fact.O_NO_NULL_CHECK);
-*/
 	}
 	def genCallMethod(i_old: SsaApplyOp, method: IrMethod) {
 		var methodRef = V3Op.extractIrSpec(i_old.op, method);
@@ -2322,12 +2320,6 @@ class WasmGcLowering extends MachLowering {
 		var i_new = apply(i_old.source, i_old.op, args);
 		var tn = normType(i_old.op.sig.returnType());
 		mapMultiReturn(i_old, i_new, tn);
-
-//		var tblnum = Int.box(0);
-//		var tbl = context.graph.valConst(Int.getType(false, 31), tblnum);
-//		args = Arrays.prepend(tbl, args);
-
-//		call(i_old, funcRep, args);
 	}
 	def genCallClassMethod(i_old: SsaApplyOp, method: IrMethod) {
 		genNullCheck(i_old);
@@ -2339,12 +2331,6 @@ class WasmGcLowering extends MachLowering {
 		var i_new = apply(i_old.source, i_old.op, args);
 		var tn = normType(i_old.op.sig.returnType());
 		mapMultiReturn(i_old, i_new, tn);
-
-//		var tblnum = Int.box(0);
-//		var tbl = context.graph.valConst(Int.getType(false, 31), tblnum);
-//		args = Arrays.prepend(tbl, args);
-
-//		call(i_old, funcRep, args);
 	}
 	def genCallClassSelector(i_old: SsaApplyOp, selector: IrSelector) {
 		var classType = selector.receiver;
@@ -2389,21 +2375,13 @@ class WasmGcLowering extends MachLowering {
 		mapMultiReturn(i_old, i_new, tn);
 	}
 	def genVariantGetTag(i_old: SsaApplyOp, nobj: SsaInstr) -> SsaInstr {
-		return normId(i_old);
-/*
-		var val = ptrLoad(mach.tagType, nobj, 0);
-		var root = V3.getRootType(i_old.op.typeArgs[0]);
-		var min = mach.classIdRange(root).0;
-		if (min != 0) {
-			val = apply(i_old.source, mach.tagType.opSub(), [val, context.graph.intConst(min)]);
+		var classType = i_old.op.sig.paramTypes[0];
+		var irClass = mach.prog.ir.getIrClass(classType);
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put1("genVariantGetTag: classType %q", classType.render).outln();
 		}
-		var shift = mach.code.addressSizeLog2;
-		if (shift > 0) {
-			val = apply(i_old.source, mach.tagType.opShr(), [val, context.graph.intConst(shift)]);
-		}
-		var conv = V3Op.newIntViewI(mach.tagType, i_old.op.sig.returnType());
-		return apply(i_old.source, conv, [val]);
-*/
+		if (irClass != null) wasm.gcTypeTable.addClass(irClass);
+		return apply(i_old.source, V3Op.newVariantGetTag(i_old.op.typeArgs[0]), [nobj]);
 	}
 	def genNullCheck0(source: Source, nobj: SsaInstr) {
 		if (SsaConst.?(nobj)) {

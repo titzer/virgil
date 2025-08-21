@@ -15,6 +15,7 @@ class NormalizerConfig {
 	var AnyRefOverflow: bool;
 	var NormalizeRange: bool;
 	var WrapFuncTypeSubsume: bool;
+	var ExplicitRefTypeCast: bool;
 
 	var GetScalar: (Compiler, Program, Type) -> Scalar.set = defaultGetScalar;
 	var GetBitWidth: (Compiler, Program, Type) -> byte = defaultGetBitWidth;
@@ -223,6 +224,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		if (ra.prog.functionTypeMapperRequestsVec.length > 0) {
 			methodsWithSig = HashMap<Signature, List<IrSpec>>.new(Signature.hash, Signature.equals);
 			for (i < ra.liveMethods.length) {
+				// Note: spec and sig are un-normalized
 				var spec = ra.liveMethods[i].getSpec();
 				var meth = spec.asMethod();
 				var mt = spec.instantiateType(meth.getMethodType());
@@ -235,6 +237,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				}
 			}
 			for (i < ra.prog.functionTypeMapperRequestsVec.length) {
+				// Types are un-normalized
 				var rqst = ra.prog.functionTypeMapperRequestsVec[i];
 				var ft = rqst.0, tt = rqst.1;
 				if (CLOptions.PRINT_RA.get()) {
@@ -264,6 +267,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			}
 		}
 		for (i < ra.prog.unmapperRequestsVec.length) {
+			// Types are un-normalized
 			var typ = ra.prog.unmapperRequestsVec[i];
 			var wrappers = ra.prog.wrappers[typ];
 			if (wrappers == null) {
@@ -284,6 +288,76 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		ra.classes.apply(layoutVtable);
 		Lists.apply(virtuals, layoutMtable);
+
+		// Request wrappers for method implementations whose signature
+		// does not match the root signature.  We update mtables so that
+		// the methods have a consistent type.
+		if (config.WrapFuncTypeSubsume) {
+			for (node = virtuals; node != null; node = node.tail) {
+				var virtual = node.head;
+				var mtable = virtual.mtable;
+				if (mtable == null) continue;
+				var rm = virtual.raMethod, rc = ra.getClass(rm.receiver);
+				var rootType = if(rm.spec == null, rm.orig.getMethodType(), rm.spec.getMethodType());
+				var rootSig = FuncType.!(rootType).sig();
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.green().puts("Examining virtual:").end()
+						.put3(" mtable %q method %q of type %q", mtable.render, rm.orig.render, rootType.render).outln();
+				}
+				// iterate similarly to layoutMtable
+				var replace = HashMap<IrSpec, IrSpec>.new(IrSpec.hash, IrSpec.equals);
+				for (l = rc.subtypes; l != null; l = l.tail) {
+					var impl = resolveMethodImpl(l.head, rm);
+					var orig = impl.orig;
+					var origType = if(impl.spec == null, impl.orig.getMethodType(), impl.spec.getMethodType());
+					var origSig = FuncType.!(origType).sig();
+					if (CLOptions.PRINT_RA.get()) {
+						Terminal.buf.put3("Virtual method %q.%q has type %q", orig.receiver.render, orig.render, origSig.funcType().render)
+							.outln();
+					}
+					if (!origSig.equals(rootSig)) {
+						if (CLOptions.PRINT_RA.get()) {
+							Terminal.buf.puts("  signature differs").outln();
+						}
+						var ft = origSig.funcType(), tt = rootSig.funcType();
+						var spec = IrSpec.new(orig.receiver, [orig.receiver], orig);
+						var wm = ra.prog.genWrappedFunctionRaMethod(ra, ft, tt, spec, norm(rm.receiver));
+						if (CLOptions.PRINT_RA.get()) {
+							Terminal.buf.put2("  wm.spec null %z  spec bound %q", wm.spec == null, spec.getBoundType().render).outln();
+						}
+						visitMethod(wm, rc);
+						wm.norm.index = rm.norm.index;
+						wm.normIndex = rm.normIndex;
+						if (rm.norm.facts.M_OVERRIDE) wm.norm.facts |= Fact.M_OVERRIDE;
+						if (rm.norm.facts.M_OVERRIDDEN) wm.norm.facts |= Fact.M_OVERRIDDEN;
+						mtable.table[wm.normIndex] = wm.norm;
+						// as in layoutMtable
+						var ta = Arrays.replace(impl.getSpec().typeArgs, 0, impl.norm.receiver);
+						var oldSpec = IrSpec.new(ta[0], ta, impl.norm);
+						var wta = Arrays.replace(wm.getSpec().typeArgs, 0, wm.norm.receiver);
+						var wspec = IrSpec.new(wta[0], wta, wm.norm);
+						replace[oldSpec] = wspec;
+						if (CLOptions.PRINT_RA.get()) {
+							Terminal.buf.put1("mtable wrapper %q", wspec.render).outln();
+						}
+					}
+				}
+				if (mtable.record != null) {
+					var vals = mtable.record.values;
+					for (i < vals.length) {
+						var val = vals[i];
+						if (val != null) {
+							var spec = FuncVal.!(val).memberRef;
+							if (replace.has(spec)) {
+								vals[i] = FuncVal.new(replace[spec]);
+							}
+						}
+					}
+				}
+			}
+		}
+
+
 		ra.classes.apply(createIrClass);
 		var classesVisited = ra.classes.length;
 
@@ -355,13 +429,18 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	def visitMethod(rm: RaMethod, rc: RaClass) {
 		var m = rm.orig;
 		if (rm.norm != null) return; // already done
-		var ftype = if(rm.spec == null, m.sig.funcType(), rm.spec.getMethodType());
+		var ftype = rm.getSpec().getMethodType();
+//		var ftype = if(rm.spec == null, m.sig.funcType(), rm.spec.getMethodType());
 		if (rc.isUnboxed()) {
 			// move flattened data type receiver to function sig
 			ftype = Function.prependParamTypes(rc.variantNorm.sub, ftype);
 		}
 		rm.funcNorm = FuncNorm.!(norm(ftype));
 		var typeParams = if(rm.spec != null, rm.spec.getTypes().methodTypeArgs);
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.green().puts("visitMethod: ").end()
+				.put3("ftype %q  norm ftype null %z  rm.spec null %z", ftype.render, norm(ftype) == null, rm.spec == null).outln();
+		}
 		rm.norm = IrMethod.new(rc.newIrType, typeParams, rm.funcNorm.sig());
 		rm.norm.facts = (m.facts & TRANSFERRABLE_FACTS) | Fact.M_NORM;
 		rm.norm.source = m.source;
@@ -834,10 +913,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			}
 			x: Closure => {
 				// normalize closure value as (funcval, val...) pair
-				var ref = normalizeMethodRef(x.memberRef).1;
-				var fval = normalizeFuncRef(tn, ref);  // EBM returns ref, possibly wrapped for subsumption
+//				var ref = normalizeMethodRef(x.memberRef).1;
+				var fval = normalizeFuncRef(tn, x.memberRef);
 				array[index] = fval;
-				normValIntoArray(x.val, norm(ref.receiver), array, index + 1);
+				normValIntoArray(x.val, norm(x.memberRef.receiver), array, index + 1);
 			}
 			x: BoxVal => {
 				// tuple: recursively normalize all of the sub
@@ -865,10 +944,12 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			_ => if (index < array.length) array[index] = v;
 		}
 	}
+	// Note: here, spec is the un-normalized IrSpec of the function
 	def normalizeFuncRef(tn: TypeNorm, spec: IrSpec) -> Val {
 		if (config.WrapFuncTypeSubsume) {
 			var ftn = FuncNorm.!(tn);
-			var tt: Type = if(ftn.oldType.typeCon.kind == Kind.CLOSURE,ftn.newType.nested.head,ftn.newType);
+			var oldType = ftn.oldType;
+			var tt: Type = if(oldType.typeCon.kind == Kind.CLOSURE, oldType.nested.head, oldType);
 			var meth = spec.asMethod();
 			var ft = Function.funcRefType(meth.getMethodType());  // actual type of method
 			if (CLOptions.PRINT_RA.get()) {
