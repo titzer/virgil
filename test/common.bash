@@ -433,6 +433,9 @@ function get_io_targets() {
 	    wasm)
 		result="$result wasm-wave" #TODO: wasm-linux
 		;;
+            wasm-gc)
+                result="$result wasm-gc-wasi1"
+                ;;
 	    *)
 		result="$result $target"
 	esac

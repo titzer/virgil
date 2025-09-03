@@ -57,7 +57,11 @@ function do_compiled() {
 
     print_status Running $target
     if [ -x $CONFIG/run-$target ]; then
-	$OUT/$target/main $TESTS | tee $R | $PROGRESS
+        if [ $target = wasm-gc-wasi1 ]; then
+	    $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-gc-wasi1/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
+        else
+	    $OUT/$target/main $TESTS | tee $R | $PROGRESS
+        fi
     else
 	printf "${YELLOW}skipped${NORM}\n"
     fi
