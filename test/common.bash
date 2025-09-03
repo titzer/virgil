@@ -37,7 +37,7 @@ PROGRESS="${VIRGIL_LOC}/test/config/progress $PROGRESS_ARGS"
 XARGS=${XARGS:=0}
 
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
-TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm x86-linux x86-64-linux x86-darwin x86-64-darwin"}
+TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm wasm-gc 86-linux x86-64-linux x86-darwin x86-64-darwin"}
 
 if [[ ! -x "$AENEAS_TEST" && "$AENEAS_TEST" != auto ]]; then
     echo $AENEAS_TEST: not found or not executable

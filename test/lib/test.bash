@@ -52,6 +52,11 @@ function do_compiled() {
     R=$OUT/$target/run.out
 
     print_compiling $target
+    # HACK until wasm-gc is in stable
+    if [ "$target" = wasm-gc-wasi1 ] && [ -z "${AENEAS_TEST##*/stable/*}" ]; then
+	printf "${YELLOW}skipped${NORM}\n"
+        return
+    fi
     run_v3c $target -output=$T $TESTS $LIB_FILES &> $C
     check_no_red $? $C
 
