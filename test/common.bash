@@ -220,7 +220,7 @@ function run_io_tests() {
     done
 }
 
-function run_or_skip_io_tests() {
+function get_io_runners() {
     local target=$1
     shift
 
@@ -230,17 +230,33 @@ function run_or_skip_io_tests() {
     if [ "$runners" = "${PREFIX}*" ]; then
 	runners=$CONFIG/run-$target
 	if [[ ! -x $runners ]]; then
-	    print_status Running $target
-	    echo "${YELLOW}skipped${NORM}"
+	    return 1
+	fi
+    fi
+    echo $runners
+    return 0
+}
+
+function run_or_skip_io_tests() {
+    local target=$1
+    shift
+    PREFIX=$CONFIG/run-$target
+    local runners=$(echo ${PREFIX}*)
+
+    if [ "$runners" = "${PREFIX}*" ]; then
+	runners=$CONFIG/run-$target
+	if [[ ! -x $runners ]]; then
+            print_status Running $target
+            echo "${YELLOW}skipped${NORM}"
 	    return 0
 	fi
     fi
 
     for runner in $runners; do
-	R=$CONFIG/run-
-	tname=${runner/$R/}
-	print_status Running $tname
-	run_io_tests $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS
+        R=$CONFIG/run-
+        tname=${runner/$R/}
+        print_status Running $tname
+        run_io_tests $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS
     done
 }
 

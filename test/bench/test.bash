@@ -50,10 +50,5 @@ for target in $(get_io_targets); do
     print_compiling $target
     compile_benchmarks $BENCHMARKS | tee $T/compile.out | $PROGRESS
 
-    print_status Running $target
-    if [ ! -x $CONFIG/run-$target ]; then
-	echo "${YELLOW}skipped${NORM}"
-    else
-	run_benchmarks $BENCHMARKS | tee $T/run.out | $PROGRESS
-    fi
+    run_or_skip_io_tests $target $BENCHMARKS
 done
