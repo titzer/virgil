@@ -10,8 +10,8 @@ In addition to simplifying the Virgil runtime, this allows interaction with the 
 
 When compiling Virgil to native targets, like `x86` (or to portable but low-level targets like `wasm`) the compiler and runtime system must work together to manage memory.
 Here, the compiler's primarily responsibility is to lay out objects and code to be inspectable to the garbage collector, while the runtime's system responsibility is to dynamically manage objects on the heap.
-While "the compiler" clearly refers to the program (`v3c`, aka `Aeneas`) that translates Virgil to machine code, "the runtime system" refers to additional code added to your program's binary that implements all of the runtime services, including garbage collection.
-The runtime is written in Virgil and lives in a separate directory in the repository (typically `rt/\<platform\>/`).
+While "the compiler" clearly refers to the program (`v3c`, aka `Aeneas`) that translates Virgil to machine code, "the runtime system" refers to additional code added to the program's binary that implements all of the runtime services, including garbage collection.
+The runtime is written in Virgil and is in a separate directory in the repository (typically `rt/\<platform\>/`).
 
 The interface between the compiler and runtime revolves around the two agreeing on:
 
@@ -20,14 +20,14 @@ The interface between the compiler and runtime revolves around the two agreeing 
  * the size and location of header information in each object
  * the encoding of header information
  * the minimum size and alignment of objects
- * whether tagged values in objects or the stack are supported
- * which, if any, registers can contain references at GC safepoints
+ * whether tagged pointers in objects or the stack are supported
+ * which registers contain references at GC safepoints
  * whether interior pointers in objects are supported
  * whether the runtime system always supplies zero-initialized memory for allocation
  * the exact sequence of operations to allocate on the heap
  * the exact sequence of operations for read/write barriers
  * write barrier optimizability
- * which routines in the runtime handle slowpaths
+ * which routines in the runtime handle slow paths
  * whether the runtime system supports threads
 
 Thus, even though the runtime is developed and maintained along with the compiler, it necessarily places certain constraints on compiler decisions.
@@ -36,13 +36,13 @@ Conversely, the runtime system is constrained by compiler capabilities.
 ## Compiler responsibilities
 
 The compiler makes representation decisions for a given program with consideration of the runtime's capabilities and assumptions.
-For example, if the runtime system supports tagged values, more choices for representing variants are possible.
-Otherwise, it may need to box variant values more often.
+For example, if the runtime system supports tagged pointers, more choices for representing variants are possible.
+Otherwise, the compiler may need to box variant values more often.
 Similarly, if the runtime system doesn't support references in registers at a GC safepoint, the compiler must spill them to the stack.
 
 Overall, the primary responsibility of the compiler is to produce metadata that guides the garbage collector on precisely finding references in code, on the stack, and in the heap.
 Additional metadata describes the layout of objects on the heap.
-Thus when making representation decisions, the compiler produces information that describes:
+Thus, when making representation decisions, the compiler produces information that describes:
 
  * the layout of all objects, both in the pre-initialized heap and in the runtime heap, including:
    * object size and location of references within objects
@@ -58,17 +58,17 @@ The runtime's responsibilities are almost all, well, at runtime.
 In particular it must:
 
  * allocate and initialize the arguments to the program's `main()` (e.g. box strings into `Array<string>`)
- * initialize the various memory regions (e.g. "from-space" and "to-space", according to collector algorithm)
- * handle slowpath allocation (e.g. is a GC necessary or is a local bump-pointer region exhausted, according to collector algorithm)
- * handle read/write barrier slowpath
- * allocate thread stacks and/or TLAB regions at thread creation (according to thread support)
+ * initialize the various memory regions (e.g. "from-space" and "to-space"), according to collector algorithm
+ * handle slow path allocation (e.g. is a GC necessary or is a local bump-pointer region exhausted), according to collector algorithm
+ * handle read/write barrier slow paths
+ * allocate thread stacks and/or TLAB regions at thread creation, according to thread support
  * invoke collector algorithm routines, including:
-  * mark, trace, copy and/or sweep regions
   * scan for roots in the stack
   * scan for roots in the pre-initialized heap
+  * mark, trace, copy and/or sweep objects and regions
   * recycle unused memory
 
-To accomplish each of these tasks, the runtime primarily processes metadata produced by the compiler.
+To accomplish each of these tasks, the runtime uses metadata produced by the compiler.
 This metadata is carefully laid out into a specific binary format, placed in a special read-only memory region, and pointers to specific data structures in that region are made available through the `CiRuntime` API.
 
 ## The `CiRuntime` component
@@ -76,7 +76,7 @@ This metadata is carefully laid out into a specific binary format, placed in a s
 `CiRuntime` stands for "(C)ompiler (I)interface to the (Runtime)".
 This means that it is an interface *provided by the compiler* to the runtime.
 This metadata is intended *only* for the runtime, and not meant for application code, though currently the compiler does not enforce this.
-This interface is not provided on targets like the JVM, so `CiRuntime` will be an unresolved type.
+This interface is *not* provided on targets like the JVM, so `CiRuntime` is an unresolved type.
 On native targets, however, the runtime system and garbage collector can refer to this interface as if it were a Virgil `component`.
 
 Fields of this component related to GC are detailed below.
@@ -119,8 +119,10 @@ Key primitive types are:
 
 ### Organization of GC stackmap metadata
 
-The GC stackmap metadata has many entries--one per GC safepoint--and is processed on every GC when walking the stack, thus making its performance critical for reducing pause time.
-Its purpose is to *precisely* locate all references on the stack at a safepoint, allowing the garbage collector to move objects if necessary, updating references.
+When an application thread is stopped for GC, each frame on its execution stack contains an instruction pointer representing at return address.
+Every instruction pointer for a valid Virgil frame must be a *safepoint* where the GC can *precisely* locate all references on the stack, allowing it to move objects if necessary and update references.
+The compiler generates GC stackmap metadata that has one entry per GC safepoint, necessitating a dense binary encoding to save memory.
+Since it may be used on every GC when walking the stack, its performance critical for reducing pause time.
 
 When the collector walks the stack of a thread, it begins at the topmost frame and loads the program counter (`pc`) from the frame.
 It uses the `pc` as a key into the stackmap table, where it will find an entry that contains a `length-bitmap#32`.
@@ -190,7 +192,7 @@ It assumes the header layout agreed to with the compiler and uses the metadata a
 Other than performance, the Virgil garbage collector is invisible to programs.
 However, there are some situations where the GC behavior needs to be extended.
 
-When managing native resources that *must not leak* by are specifically tied to an object, it is a good idea to use the GC has a backup plan for freeing the resource.
+When managing native resources that *must not leak* but are specifically tied to an object, it is a good idea to use the GC has a backup plan for freeing the resource.
 Sometimes called "finalizers", this amounts to behavior that should get invoked when an object is considered no longer reachable by the GC.
 
 Virgil has *no language support for finalizers*.
