@@ -61,14 +61,23 @@ function do_compiled() {
     check_no_red $? $C
 
     print_status Running $target
-    if [ -x $CONFIG/run-$target ]; then
-        if [ $target = wasm-gc-wasi1 ]; then
-	    $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-gc-wasi1/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
-        else
-	    $OUT/$target/main $TESTS | tee $R | $PROGRESS
-        fi
+    runners=$(get_io_runners $target)
+    if [ "$runners" = "" ]; then
+        printf "${YELLOW}skipped${NORM}\n"
     else
-	printf "${YELLOW}skipped${NORM}\n"
+        for runner in $runners; do
+            short="${runner##*/}"
+            if [ -x $runner ]; then
+                if [ "$short" = "run-wasm-gc-wasi1@node" ]; then
+	            $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-gc-wasi1/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
+                else
+	            $OUT/$target/main $TESTS | tee $R | $PROGRESS
+                fi
+            else
+	        printf "${YELLOW}skipped${NORM}\n"
+            fi
+            break
+        done
     fi
 }
 
