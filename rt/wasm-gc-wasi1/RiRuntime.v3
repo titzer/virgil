@@ -1,0 +1,493 @@
+// Copyright 2021 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+component RiRuntime {
+//	var badCheck = 0;
+//	var badAllocCount = 0;
+//	var badFreeCount = 0;
+//	var gcInit: void -> void;
+//	var gcCollect: (int, Pointer, Pointer) -> Pointer = noCollect;
+	// Called from the exported, generated "entry" stub and used to
+	// construct the arguments to pass to main.
+	def init() -> Array<string> {
+//		if (gcInit != null) gcInit();
+		
+		AllocFree.initialize();
+		System.initialize();
+		var sizes = allocRange<int>(2, 4);
+		wasi_snapshot_preview1.args_sizes_get(Pointer.atElement(sizes, 0), Pointer.atElement(sizes, 1));
+		var argc = sizes[0];
+		var argvptrs = allocRange<int>(argc, 4);
+		var argbuf = allocBytes(sizes[1]);
+		wasi_snapshot_preview1.args_get(Pointer.atContents(argvptrs), Pointer.atContents(argbuf));
+		// skip the first argument
+		var args = Array<string>.new(argc - 1);
+		for (i = 1; i < argvptrs.length; i++) {
+			var p = Pointer.NULL + argvptrs[i];
+			for (q = p; true; q++) {
+				if (q.load<byte>() == 0) {
+					var len = q - p;
+					var str = args[i - 1] = Array<byte>.new(len);
+					for (j < str.length) str[j] = (p + j).load<byte>();
+					break;
+				}
+			}
+		}
+		return args;
+	}
+	// Called from the generated allocation stub upon allocation failure.
+//	def gc(size: int, ip: Pointer, sp: Pointer) -> Pointer {
+//		return gcCollect(size, ip, sp);
+//	}
+	private def noCollect(size: int, ip: Pointer, sp: Pointer) -> Pointer {
+		System.error("HeapOverflow", "no garbage collector installed");
+		return Pointer.NULL; // unreachable
+	}
+	// Called when main() returns
+	def exit(code: int) -> int {
+//		if (badCheck != 0) {
+//			var s = Strings.builderOf("checkHeap bad return").put3(" %d  allocs %d  frees %d", badCheck, badAllocCount, badFreeCount)
+//				       .put1("  heapStart %d", AllocFree.heapStart - Pointer.NULL).ln().extract();
+//			System.puts(s);
+//		}
+		wasi_snapshot_preview1.proc_exit(code);
+		return code; // unreachable
+	}
+	def fatalException(ex: string, msg: string, ip: Pointer, sp: Pointer) {
+		System.err.putc('!').puts(ex);
+		if (msg != null) System.err.puts(": ").puts(msg).ln();
+		else System.err.ln();
+		System.error(ex, msg);
+	}
+	// Range-oriented alloc/free interfaces
+	def allocRange<T>(count: int, eltSize: int) -> Range<T> {
+		return CiRuntime.forgeRange<T>(AllocFree.alloc(count * eltSize), count);
+	}
+	def allocBytes(count: int) -> Range<byte> {
+		return allocRange<byte>(count, 1);
+	}
+	def freeRange<T>(r: Range<T>) {
+		AllocFree.free(Pointer.atContents(r));
+	}
+}
+// While AllocNode objects are in the Wasm Gc heap, they *describe* nodes of a free-list managed
+// alloc/free heap in the Wasm memory.  These are intended for uses such as I/O buffers, because
+// the WASI interface we currently use reads/writes only the Wasm memory.
+class AllocNode {
+	var address = Pointer.NULL;  // a marker
+	var size = 0;
+	var nextInOrder: AllocNode;
+	var prevInOrder: AllocNode;
+	var nextInList: AllocNode;
+	var prevInList: AllocNode;
+	var free = false;
+	def uid: int;
+
+	new(uid) { }
+
+	def setAddress(p: Pointer) {
+		address = p;
+		p.store<int>(uid);
+	}
+
+	def orderAddAfter(prev: AllocNode) {
+		var next = prev.nextInOrder;
+		this.prevInOrder = prev;
+		this.nextInOrder = next;
+		prev.nextInOrder = this;
+		next.prevInOrder = this;
+	}
+
+	def listAddAfter(prev: AllocNode) {
+		var next = prev.nextInList;
+		this.prevInList = prev;
+		this.nextInList = next;
+		prev.nextInList = this;
+		next.prevInList = this;
+	}
+
+	def orderRemove() {
+		var prev = this.prevInOrder;
+		var next = this.nextInOrder;
+		prev.nextInOrder = next;
+		next.prevInOrder = prev;
+		this.prevInOrder = null;
+		this.nextInOrder = null;
+	}
+
+	def listRemove() {
+		var prev = this.prevInList;
+		var next = this.nextInList;
+		prev.nextInList = next;
+		next.prevInList = prev;
+		this.prevInList = null;
+		this.nextInList = null;
+	}
+
+//	def render(s: StringBuilder) -> StringBuilder {
+//		s.put1("%q  ", this.renderShort);
+//		if (nextInOrder == null) s.puts("nextInOrder null");
+//		else s.put1("nextInOrder %d", nextInOrder.uid);
+//		s.puts("  ");
+//		if (prevInOrder == null) s.puts("prevInOrder null");
+//		else s.put1("prevInOrder %d", prevInOrder.uid);
+//		s.puts("  ");
+//		if (nextInList == null) s.puts("nextInList null");
+//		else s.put1("nextInList %d", nextInList.uid);
+//		s.puts("  ");
+//		if (prevInList == null) s.puts("prevInList null");
+//		else s.put1("prevInList %d", prevInList.uid);
+//		return s;
+//	}
+
+//	def renderShort(s: StringBuilder) -> StringBuilder {
+//		return s.put3("uid %d  address 0x%x  size %d", uid, address - Pointer.NULL, size)
+//			.put1("  free %z", free);
+//	}
+}
+component AllocFree {
+
+	var heapStart: Pointer; // set up by a global initializer in the module
+	var heapSize: int; // set up by a global initializer in the module
+	var heapEnd: Pointer;  // set up in initialize()
+
+	// Info about free AllocNode objects
+	def MAX_FREE_NODES = 10;
+	private var freeNodes = RTVector<AllocNode>.new();  // some AllocNode objects we can reuse
+	// Info related to uids
+	private var nextUid = 0;
+	private var freeUids = RTVector<int>.new();  // uids that we can reuse
+	private var nodeForUid = RTVector<AllocNode>.new();  // map uid to AllocNode; an free uid's entry will be null
+
+	// Sentinels are distinguished by size 0, and are always marked not free.
+	// They also have only their relevant chaining references set.
+	private var orderSentinel: AllocNode;
+	private var freeSentinel: AllocNode;
+
+	private def getUid() -> int {
+		if (freeUids.empty()) return nextUid++;
+		return freeUids.pop();
+	}
+
+	private def getNode() -> AllocNode {
+		if (freeNodes.empty()) {
+			// new node requires obtaining a uid
+			def uid = getUid();
+			def node = AllocNode.new(uid);
+			nodeForUid.set(uid, node);
+			return node;
+		}
+		return freeNodes.pop();  // still has its uid, still in nodeForUid
+	}
+
+	def freeNode(node: AllocNode) {
+		node.nextInOrder = null;
+		node.prevInOrder = null;
+		node.nextInList = null;
+		node.prevInList = null;
+		node.free = true;
+		node.address = Pointer.NULL;
+		if (freeNodes.length < MAX_FREE_NODES) freeNodes.put(node);  // keeps its uid
+		else freeUids.put(node.uid);  // uid can be reused
+	}
+
+//	private def lb = StringBuilder.new();
+//	private var iobuf: Range<int>;
+//	private var retbuf: Range<byte>;
+//	private var charbuf: Range<byte>;
+
+//	def log(s: string) {
+//		iobuf[0] = Pointer.atContents(charbuf) - Pointer.NULL;
+//		iobuf[1] = 1;
+//		for (i < s.length) {
+//			charbuf[0] = s[i];
+//			wasi_snapshot_preview1.fd_write(1, Pointer.atContents(iobuf), 1, Pointer.atContents(retbuf));
+//		}
+//	}
+
+	// Raw alloc/free interface, using pointers
+	// Heap struct is described using AllocNode objects (see class below).
+	// There is one doubly linked list of all heap blocks, in memory order,
+	// and one of free blocks only, also in memory order.  An AllocNode has
+	// a pointer to the start of its corresponding heap block.  It also has
+	// a unique id, that we store in the first slot of the heap block, which
+	// makes it faster to find an AllocNode from the block's address when
+	// freeing blocks.  The addresses returned by alloc and accepted by free
+	// refer to the slot after the uid.
+//	var allocCount = 0;
+//	var freeCount = 0;
+//	def logging = false;
+//	def checking = false;
+
+	def alloc(size: int) -> Pointer {
+//		if (logging) log(lb.put1("alloc: size %d", size).ln().extract());
+//		++allocCount;
+//		if (checking) checkHeap(1);
+		// round size up to a multiple of Pointer.SIZE, to maintain alignment
+		size = (size + Pointer.SIZE + Pointer.SIZE - 1) & ~(Pointer.SIZE - 1);
+//		if (logging) log(lb.put1("alloc: size rounded up %d", size).ln().extract());
+		for (node = freeSentinel.nextInList; node.free; node = node.nextInList) {	
+//			if (logging) log(lb.put1("alloc: checking node [%q]", node.render).ln().extract());
+			if (size > node.size) {
+//				if (logging) log(lb.puts("alloc: skipping").ln().extract());
+				continue;
+			}
+			if (size < node.size) { // split the node
+				var rest = getNode();
+				rest.orderAddAfter(node);
+				rest.listAddAfter(node);
+				rest.setAddress(node.address + size);
+				rest.size = node.size - size;
+				rest.free = true;
+				node.size = size;
+//				if (logging) log(lb.put1("alloc: split node now [%q]", node.render).ln().extract());
+//				if (logging) log(lb.put1("alloc: split rest is [%q]", rest.render).ln().extract());
+			}
+			node.listRemove();
+			node.free = false;
+//			if (logging) log(lb.put1("alloc: node as returned [%q]", node.render).ln().extract());
+
+			// no need to adjust uid stored in memory
+//			if (checking) checkHeap(2);
+//			if (logging) log(lb.put1("alloc: address returned 0x%x", (node.address + Pointer.SIZE) - Pointer.NULL).ln().extract());
+			return node.address + Pointer.SIZE;
+		}
+		// noCollect does not return ...
+		return RiRuntime.noCollect(size, Pointer.NULL, Pointer.NULL);
+	}
+	def free(p: Pointer) {
+//		if (logging) log(lb.put1("free: address 0x%x", p - Pointer.NULL).ln().extract());
+//		++freeCount;
+//		if (checking) checkHeap(3);
+		var addr = (p - Pointer.NULL) - Pointer.SIZE;
+		var uid = (Pointer.NULL + addr).load<int>();
+//		if (logging) log(lb.put1("free: uid %d", uid).ln().extract());
+		var node = nodeForUid[uid];
+		var prev = node.prevInOrder;
+		var next = node.nextInOrder;
+//		if (logging) log(lb.put1("free: node [%q]", node.render).ln().extract());
+		if (prev.free && next.free && false) {
+			// merge three blocks
+			next.orderRemove();
+			next.listRemove();
+			node.orderRemove();
+			node.free = true;
+			prev.size += (node.size + next.size);
+			freeNode(node);
+			freeNode(next);
+//			if (checking) checkHeap(4);
+			return;
+		} else if (prev.free && false) {
+			// merge with previous
+			node.orderRemove();
+			node.free = true;
+			prev.size += node.size;
+			freeNode(node);
+//			if (checking) checkHeap(5);
+			return;
+		} else if (next.free && false) {
+			// merge with next, keeping next
+			node.orderRemove();
+			node.free = true;
+			next.setAddress(node.address);
+			next.size += node.size;
+			freeNode(node);
+//			if (checking) checkHeap(6);
+			return;
+		} else {
+			// just insert in free list - requires finding a free node
+			while (true) {
+				if (prev.free) {
+					break;
+				} else if (prev == orderSentinel) {
+					prev = freeSentinel;
+					break;
+				} else {
+					prev = prev.prevInOrder;
+				}
+			}
+			// here, prev will be the previous free node in memory, or the free sentinel
+			node.listAddAfter(prev);
+			node.free = true;  // note: the AllocNode object is *not* necessarily free
+//			if (logging) log(lb.put1("free: node as freed [%q]", node.render).ln().extract());
+//			if (checking) checkHeap(if(prev == freeSentinel, 7, if(node.address == Pointer.NULL, 8, 9)));
+			return;
+		}
+	}
+
+//	var firstNode: AllocNode;
+	def initialize() {
+//		iobuf = CiRuntime.forgeRange<int>(Pointer.NULL + 0x40, 2);
+//		retbuf = CiRuntime.forgeRange<byte>(Pointer.NULL + 0x50, 8);
+//		charbuf = CiRuntime.forgeRange<byte>(Pointer.NULL + 0x80, 0x80);
+
+		heapStart = (Pointer.NULL + 4).load<Pointer>();
+		heapSize = (Pointer.NULL + 8).load<int>();
+		heapEnd = heapStart + heapSize;
+
+		// start doubly linked lists as empty (sentinel only)
+		orderSentinel = getNode();
+		orderSentinel.nextInOrder = orderSentinel;
+		orderSentinel.prevInOrder = orderSentinel;
+		orderSentinel.address = Pointer.NULL;
+		orderSentinel.size = 0;
+		freeSentinel = getNode();
+		freeSentinel.nextInList = freeSentinel;
+		freeSentinel.prevInList = freeSentinel;
+		freeSentinel.size = 0;
+
+		var first = getNode();  // the whole heap, as one free block
+		first.setAddress(heapStart);
+		first.size = heapEnd - heapStart;
+		first.orderAddAfter(orderSentinel);
+		first.listAddAfter(freeSentinel);
+		first.free = true;
+//		firstNode = first;
+//		if (checking) checkHeap(0);
+	}
+
+//	def checkHeap(source: int) {
+//		var result = checkHeap0();
+//		if (result != 0) {
+//			if (RiRuntime.badCheck == 0) {
+//				RiRuntime.badCheck = source * 1000 + result;
+//				RiRuntime.badAllocCount = allocCount;
+//				RiRuntime.badFreeCount = freeCount;
+//			}
+//		}
+//	}
+//
+//	def checkHeap0() -> int {
+//		// check ordered list structure and order
+//		var recent = Pointer.NULL;
+//		var prev = orderSentinel;
+//		var numFree = 0;
+//		var numUsed = 0;
+//		var assignedNodes = RTVector<AllocNode>.new();
+//		var uidsInUse = Array<bool>.new(nextUid);
+//		uidsInUse[orderSentinel.uid] = true;
+//		uidsInUse[freeSentinel.uid] = true;
+//		for (node = prev.nextInOrder; node != orderSentinel; node = node.nextInOrder) {
+//			if (node == null) return 10;
+//			if (assignedNodes.has(node)) return 11;
+//			assignedNodes.put(node);  // record that node is assigned space in the memory
+//			if (node.uid < 0) return 12;
+//			if (node.uid >= nextUid) return 13;
+//			if (uidsInUse[node.uid]) return 14;
+//			uidsInUse[node.uid] = true;
+//			if (node.address == Pointer.NULL) return 15;
+//			if (node.address <= recent) return 16;
+//			if (node.prevInOrder != prev) return 17;
+//			prev = node;
+//			recent = node.address;
+//			if (node.free) ++numFree;
+//			else ++numUsed;
+//		}
+//		if (orderSentinel.prevInOrder != prev) return 18;
+//
+//		// check free list structure and order
+//		recent = Pointer.NULL;
+//		prev = freeSentinel;
+//		var numFree2 = 0;
+//		for (node = prev.nextInList; node != freeSentinel; node = node.nextInList) {
+//			if (node == null) return 20;
+//			if (node.address == Pointer.NULL + 1) return 21;
+//			if (node.address <= recent) return 22;
+//			if (node.prevInList != prev) return 23;
+//			if (!node.free) return 24;
+//			prev = node;
+//			recent = node.address;
+//			++numFree2;
+//		}
+//		if (freeSentinel.prevInList != prev) return 25;
+//		if (numFree != numFree2) return 26;
+//
+//		// check free nodes
+//		var freeSet = RTVector<AllocNode>.new();
+//		for (i < freeNodes.length) {
+//			var freeNode = freeNodes[i];
+//			if (freeNode == null) return 30;
+//			if (freeSet.has(freeNode)) return 31;
+//			freeSet.put(freeNode);
+//			if (assignedNodes.has(freeNode)) return 32;
+//			if (freeNode.uid < 0) return 33;
+//			if (freeNode.uid >= nextUid) return 34;
+//			if (uidsInUse[freeNode.uid]) return 35;
+//			uidsInUse[freeNode.uid] = true;
+//		}
+//
+//		// check free uids
+//		for (i < freeUids.length) {
+//			var uid = freeUids[i];
+//			if (uid < 0) return 40;
+//			if (uid >= nextUid) return 41;
+//			if (uidsInUse[uid]) return 42;
+//			uidsInUse[uid] = true;  // to detect duplicates and omissions
+//		}
+//
+//		// check for lost uids
+//		for (i < nextUid) {
+//			if (!uidsInUse[i]) return 50;
+//		}
+//
+//		return 0;
+//	}
+}
+
+// A utility class which represents an efficient, growable, appendable array,
+// this is a stripped down, independent, version of Vector from lib/util.
+
+class RTVector<T> {
+	var array: Array<T>;
+	var length: int;
+
+	// Get the element at {index}.
+	def [index: int] -> T {
+		return array[index];
+	}
+	// Update the element at {index} to be {e}.
+	def [index: int] = e: T {
+		array[index] = e;
+	}
+	// Get the element at {index}, returning the default value for <T> if out of bounds.
+	def get(index: int) -> T {
+		return if(index >= 0 && index < length, array[index]);
+	}
+	// Set the element at {index} to {e}, growing if necessary.
+	def set(index: int, e: T) -> this {
+		if (index < 0) return;
+		grow(index + 1);
+		array[index] = e;
+		if (index >= length) length = index + 1;
+	}
+	// Add the element {e} to the end of this vector.
+	def put(e: T) -> this {
+		var a = array, s = length;
+		if (a == null) array = a = Array<T>.new(s + 10);
+		else if (s >= a.length) array = a = grow(a.length + 10 + s).array;
+		a[s] = e;
+		length = s + 1;
+	}
+	// Support stack-like behavior, with empty() and pop()
+	def empty() -> bool {
+		return length == 0;
+	}
+	def pop() -> T {
+		return if(length > 0, array[--length]);
+	}
+	// Grow the internal storage of this vector to the new length {nlength}.
+	def grow(nlength: int) -> this {
+		if (array == null) {
+			array = Array<T>.new(nlength);
+		} else if (nlength > array.length) {
+			var n = Array<T>.new(nlength);
+			for (i < length) n[i] = array[i];
+			array = n;
+		}
+	}
+	// Indicate if a particular value occurs in the vector
+	def has(v: T) -> bool {
+		for (i < length) if (array[i] == v) return true;
+		return false;
+	}
+}
