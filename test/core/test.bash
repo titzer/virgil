@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 . ../common.bash core
 if [ $# -gt 0 ]; then
