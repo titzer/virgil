@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 #Copyright 2024 Virgil Authors. All rights reserved.
 #See LICENSE for details of Apache 2.0 license.
