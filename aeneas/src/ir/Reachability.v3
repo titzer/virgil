@@ -47,18 +47,31 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	def arrays = Vector<RaArray>.new();
 	var defaultValues: HashMap<Type, Val>;
 	var liveMethods = Vector<RaMethod>.new();
+	var normalizer: ReachabilityNormalizer;
 
 	// perform the analysis, starting from the roots
 	def analyze() {
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.puts("reachability analysis starting").outln();
+		}
 		for (i < oldIr.roots.length) {
 			var meth = oldIr.roots[i].spec;
 			getMethod(null, makeMethod(meth.typeArgs, meth.asMethod(), null));
 			makeType(meth.receiver);
 		}
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.puts("reachability analysis roots scanned").outln();
+		}
 		queue.drain(); // do all work
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.puts("reachability analysis done").outln();
+		}
 	}
 	def transform(config: NormalizerConfig) {
-		ReachabilityNormalizer.new(config, this).normalize();
+		// make normalizer object available during normalization
+		normalizer = ReachabilityNormalizer.new(config, this);
+		normalizer.normalize();
+		normalizer = null;
 	}
 	def dump() {
 		liveMethods.apply(dumpMethod);
@@ -173,6 +186,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 				// analyze an array's elements
 				x.instances = List.new(record, x.instances);
 				if (x.primitive) return;
+				// EBM check for function subsumption to request wrappers
 				for (v in record.values) deferValue(v);
 			}
 		}
@@ -183,6 +197,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			var v = record.values[rf.orig.index];
 			rf.addValue(v);
 			deferValue(v);
+			// EBM check for function subsumption to request wrappers
 		}
 	}
 	// analyze a class that just became live
@@ -200,6 +215,10 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	// analyze a possible virtual dispatch of the given method on the given type
 	def analyzeVirtual(rc: RaClass, rm: RaMethod) {
 		var rv = rm.virtual;
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("analyzeVirtual: class %q method %q is virtual: %z",
+					  rc.orig.ctype.render, rm.orig.render, rv != null).outln();
+		}
 		if (rv == null) return;
 		var spec = oldIr.resolveMethodImpl(rc.oldType, rm.getSpec());
 		var impl = makeMethod(spec.typeArgs, IrMethod.!(spec.member), null);
@@ -299,9 +318,9 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	// analyze an operator
 	def analyzeOp(op: SsaApplyOp, context: IrSpec) {
 		match (op.op.opcode) {
-			OverloadedEq,
-			RefEq,
 			VariantEq => getEquality(mono(op.op.typeArgs[0], context), context);
+			OverloadedEq,
+			RefEq => getRefEquality(op, mono(op.op.typeArgs[0], context), context);
 			DefaultValue => {
 				var t = mono(op.op.typeArgs[0], context);
 				var v = prog.getDefaultValue(t);
@@ -309,8 +328,19 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 				if (defaultValues == null) defaultValues = TypeUtil.newTypeMap();
 				defaultValues[t] = v;
 			}
-			ArrayAlloc,
-			ArrayInit => allocation(makeType(mono(op.op.typeArgs[0], context)));
+			ArrayAlloc =>allocation(makeType(mono(op.op.typeArgs[0], context)));
+			ArrayInit => {
+				var typ = mono(op.op.typeArgs[0], context);
+				allocation(makeType(typ));
+				if (op.inputs != null) {
+					var inputs = op.inputs;
+					for (i < inputs.length) {
+						var input = inputs[i];
+						var ft = mono(input.getDest().getType(), context);
+						getTypeCast(op, ft, typ);
+					}
+				}
+			}
 			ClassAlloc(method) => {
 				var rm = opMethod(op, method, context);
 				if (rm != null) getMethod(op, rm);
@@ -351,6 +381,88 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			PtrAtComponentField(field) => if (op.useList != null) getPointerAtField(makeField(op, field, context), op, true);
 			PtrAtUnboxedObjectField(specs) => if (op.useList != null) getPointerAtUnboxedField(op, specs, context);
 			PtrAtUnboxedComponentField(specs) => if (op.useList != null) getPointerAtUnboxedField(op, specs, context);
+			TypeSubsume, TypeCast => {
+				if (compiler.NormConfig.WrapFuncTypeSubsume) {
+					var ft = mono(op.op.typeArgs[0], context);
+					var tt = mono(op.op.typeArgs[1], context);
+					return getTypeCast(op, ft, tt);
+				}
+			}
+			_ => ;
+		}
+	}
+	def getFuncTypeCast(op: SsaInstr, ft: Type, tt: Type) {
+		if (!compiler.NormConfig.WrapFuncTypeSubsume) return;
+		if (ft == tt) return;
+		if (CLOptions.PRINT_RA.get()) {
+			if (op == null) {
+				Terminal.buf.put2("getFuncTypeCast: ft %q  tt %q  op null", ft.render, tt.render).outln();
+			} else {
+				Terminal.buf.put3("getFuncTypeCast: ft %q  tt %q  op.getType() %q", ft.render, tt.render, op.getType().render).outln();
+			}
+		}
+		var cast = TypeSystem.newTypeCast(ft, tt);
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("getFuncTypeCast: ft %q  tt %q  cast %s", ft.render, tt.render, cast.name).outln();
+			if (op != null) Terminal.buf.put1("getFuncTypeCast: is SsaConst %z", SsaConst.?(op)).outln();
+		}
+		if (cast != TypeCast.UNKNOWN_CAST && SsaConst.?(op)) {
+			var sc = SsaConst.!(op);
+			var r = Eval.doCast(cast, ft, tt, sc.val);
+			if (r.0) {
+				var val = sc.val;
+				var fv = FuncVal.!(val);
+				var spec = fv.memberRef;
+				prog.genWrappedFunctionRA(this, ft, tt, spec);
+			}
+			return;
+		}
+		if (cast == TypeCast.TRUE) {
+			// make a reasonable effort to find a constant and avoid a mapper
+			var arg = op;
+			if (SsaApplyOp.?(op)) {
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.puts("getFuncTypeCast: op is SsaApplyop").outln();
+				}
+				var apply = SsaApplyOp.!(op);
+				arg = op.inputs[0].getDest();
+				if (tt == arg.getType()) return;  // no-work subsume
+				if (SsaApplyOp.?(arg)) {
+					if (CLOptions.PRINT_RA.get()) {
+						Terminal.buf.puts("getFuncTypeCast: first arg is SsaApplyOp").outln();
+					}
+					var sa = SsaApplyOp.!(arg);
+					if (Opcode.CreateClosure.?(sa.op.opcode)) {
+						if (CLOptions.PRINT_RA.get()) {
+							Terminal.buf.puts("getFuncTypeCast: first arg is CreateClosure").outln();
+						}
+						var opcode = Opcode.CreateClosure.!(sa.op.opcode);
+						var meth = opcode.method;
+						var spec = V3Op.extractIrSpec(sa.op, opcode.method);
+						prog.genWrappedFunctionRA(this, ft, tt, spec);
+						return;
+					}
+				}
+			}
+			if (tt == arg.getType()) return;  // no-work subsume
+			prog.requestMapper(ft, tt);
+		}
+	}
+	def getTypeCast(op: SsaInstr, ft: Type, tt: Type) {
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("getTypeCast: ft %q  tt %q  kind %s", ft.render, tt.render, tt.typeCon.kind.name).outln();
+			Terminal.buf.put1("getTypeCast: # inputs %d", if(op == null || op.inputs == null, 0, op.inputs.length)).outln();
+		}
+		match (tt.typeCon.kind) {
+			TUPLE => {
+				var fts = Tuple.toTypeArray(ft), tts = Tuple.toTypeArray(tt);
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put2("getTypeCast: # fts %d  # tts %d", fts.length, tts.length).outln();
+				}
+				if (fts.length != tts.length) return;  // cast will always fail
+				for (i < fts.length) getTypeCast(op, fts[i], tts[i]);
+			}
+			FUNCREF, CLOSURE => getFuncTypeCast(op, ft, tt);
 			_ => ;
 		}
 	}
@@ -386,6 +498,24 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			_ => for (l = t.nested; l != null; l = l.tail) getEquality(l.head, context);
 		}
 	}
+	// analyze a reference equality comparison
+	def getRefEquality(op: SsaApplyOp, t: Type, context: IrSpec) {
+		if (compiler.NormConfig.WrapFuncTypeSubsume &&
+		    (t.typeCon.kind == Kind.CLOSURE || t.typeCon.kind == Kind.FUNCREF)) {
+			var x = op.inputs[0].dest;
+			var y = op.inputs[1].dest;
+			var xconst = SsaConst.?(x);
+			var yconst = SsaConst.?(y);
+			// Two known functions can be compared at compile time
+			// so do not need a run-time unmapper
+			if (xconst && yconst) { }
+			// Comparison with null does not require unmapping
+			else if (xconst && (SsaConst.!(x).val == null)) { }
+			else if (yconst && (SsaConst.!(y).val == null)) { }
+			else prog.requestUnmapper(t);
+		}
+		getEquality(t, context);
+	}
 	// analyze an access of a field
 	def analyzeGetField(receiver: RaClass, rf: RaField) {
 		for (t = receiver.subtypes; t != null; t = t.tail) { // for all live subtypes
@@ -410,15 +540,104 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			analyzeVirtual(l.head, rm);
 		}
 	}
+	private def flattenTypes(input: Array<Type>, context: IrSpec) -> Vector<Type> {
+		var flat = Vector<Type>.new();
+		var stack = ArrayStack<Type>.new();
+		for (i = input.length; --i >= 0; ) {
+			var typ = input[i];
+			if (context != null) typ = context.instantiateType(typ);
+			stack.push(typ);
+		}
+		while (!stack.empty()) {
+			var types = Tuple.toTypeArray(stack.pop());
+			match (types.length) {
+				0 => continue;
+				1 => {
+					if (types[0] == Void.TYPE) continue;
+					flat.put(types[0]);
+				}
+				_ => {
+					for (i = types.length; --i >= 0; ) stack.push(types[i]);
+				}
+			}
+		}
+		return flat;
+	}
+	def getCall(rm: RaMethod, op: SsaApplyOp, context: IrSpec) {
+		if (true) return;
+		var mtype = FuncType.!(rm.spec.getBoundType());
+		var sig = mtype.sig();
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("getCall: type %q  # param types %d  # inputs %d", mtype.render, sig.paramTypes.length, op.inputs.length).outln();
+			Terminal.buf.put2("  receiver %q  isComponent %z", rm.receiver.render, V3.isComponent(rm.receiver)).outln();
+			Terminal.buf.put1("  op %q", op.op.render).outln();
+		}
+		var atype = FuncType.!(op.op.sig.funcType());
+		var asig = atype.sig();
+//		def offset = if(V3.isComponent(rm.receiver), 0, 1);
+//		def offset = if(V3.isComponent(rm.orig.receiver), 0, 1);
+		// flatten tuple types
+		def flatParams = flattenTypes(sig.paramTypes, rm.spec);
+		def argTypes = asig.paramTypes;
+		def flatArgs = flattenTypes(argTypes, context);
+		def offset = flatParams.length - flatArgs.length;
+		for (i < flatParams.length) {
+			var paramType = flatParams[i];
+			var argType = flatArgs[i];
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf.put1("getCall: arg %d", i).outln();
+				if (paramType == null) {
+					Terminal.buf.puts("  param type null").outln();
+				} else {
+					Terminal.buf.put1("  param type %q", paramType.render).outln();
+				}
+				if (argType == null) {
+					Terminal.buf.puts("  arg type null").outln();
+				} else {
+					Terminal.buf.put1("  arg type %q", argType.render).outln();
+				}
+			}
+			if (argType == paramType || argType == null) continue;
+			getTypeCast(null, argType, paramType);
+		}
+		var callTypes = flattenTypes([op.getType()], context);
+		var retTypes = flattenTypes(sig.returnTypes, context);
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("getCall: type %q  # call types %d  # ret type %d", mtype.render, callTypes.length, retTypes.length).outln();
+		}
+		for (i < retTypes.length) {
+			var returnType = retTypes[i];
+			var callType = callTypes[i];
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf.put1("getCall: ret %d", i).outln();
+				if (returnType == null) {
+					Terminal.buf.puts("  return type null").outln();
+				} else {
+					Terminal.buf.put1("  return type %q", returnType.render).outln();
+				}
+				if (callType == null) {
+					Terminal.buf.puts("  call type null").outln();
+				} else {
+					Terminal.buf.put1("  call type %q", callType.render).outln();
+				}
+			}
+			if (callType == returnType || callType == null) continue;
+			getTypeCast(null, returnType, callType);
+		}
+	}
 	def getMethod(op: SsaApplyOp, rm: RaMethod) {
-		if (rm.setFact(RaFact.RM_LIVE)) return;
-		liveMethods.put(rm);
-		queue.add(analyzeMethod, rm);
-		if (V3.isVariant(rm.receiver)) { // XXX: this is because of variant null replacement
-			var rc = makeClass(V3.getDefaultVariantCaseType(prog, rm.receiver));
-			var newlyLive = !live(rc.raFacts);
-			rc.raFacts |= RaFact.RC_LIVE;
-			if (newlyLive) analyzeLiveClass(rc);
+		if (!rm.setFact(RaFact.RM_LIVE)) {
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf.put1("getMethod: adding orig %q to liveMethods", rm.orig.render).outln();
+			}
+			liveMethods.put(rm);
+			queue.add(analyzeMethod, rm);
+			if (V3.isVariant(rm.receiver)) { // XXX: this is because of variant null replacement
+				var rc = makeClass(V3.getDefaultVariantCaseType(prog, rm.receiver));
+				var newlyLive = !live(rc.raFacts);
+				rc.raFacts |= RaFact.RC_LIVE;
+				if (newlyLive) analyzeLiveClass(rc);
+			}
 		}
 	}
 	def getField(rf: RaField) {
@@ -545,7 +764,22 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	}
 	def opMethod(op: SsaApplyOp, m: IrMethod, context: IrSpec) -> RaMethod {
 		if (m == null) return null;
-		return makeMethod(op.op.typeArgs, m, context);
+		var rm = makeMethod(op.op.typeArgs, m, context);
+		if (CLOptions.PRINT_RA.get()) {
+			if (rm.spec == null) {
+				Terminal.buf.put3("opMethod spec is null, orig: %q{%d/%d}", m.render, m.index, m.uid).outln();
+			} else {
+				Terminal.buf.put3("opMethod returning: %q{%d/%d", rm.spec.render, rm.spec.asMethod().index, rm.spec.asMethod().uid)
+					.put1("/%d}", rm.uid).outln();
+			}
+		}
+		if (rm != null && compiler.NormConfig.WrapFuncTypeSubsume) {
+			match (op.op.opcode) {
+				CallMethod, CallClassMethod => getCall(rm, op, context);
+				_ => ;
+			}
+		}
+		return rm;
 	}
 	def makeMethod(typeArgs: Array<Type>, m: IrMethod, context: IrSpec) -> RaMethod {
 		var rm = m.raMethod;
@@ -558,14 +792,27 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			return rm.orig.raMethod = rm;
 		}
 		// search for existing specialization
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("makeMethod: instantiating %q{%d/%d}", m.render, m.index, m.uid).outln();
+		}
 		if (context != null) typeArgs = context.instantiateTypes(typeArgs);
 		var rc = makeClass(typeArgs[0]);
 		rm = rc.findMethod(m.index, typeArgs);
+		if (rm != null) {
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf.put3("makeMethod: found %q{%d/%d", rm.spec.render, rm.spec.asMethod().index, rm.spec.asMethod().uid)
+					.put1("/%d}", rm.uid).outln();
+			}
+		}
 		if (rm != null) return rm;  // specialization found
 
 		// not found; fully specialize and normalize the method
 		var spec = IrSpec.new(rc.oldType, typeArgs, m);
 		rm = rc.makeMethod(m, spec);
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("makeMethod: instantiated %q{%d/%d", spec.render, spec.asMethod().index, spec.asMethod().uid)
+				.put1("/%d}", rm.uid).outln();
+		}
 		return rm;
 	}
 	def makeClass(t: Type) -> RaClass {
@@ -696,18 +943,86 @@ class RaClass extends RaType {
 	def makeMethod(m: IrMethod, spec: IrSpec) -> RaMethod {
 		if (m.index >= methods.length) methods = Arrays.grow(methods, methods.length + m.index + 1);
 		var rm = RaMethod.new(oldType, m, spec);
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("makeMethod: %q.%q{%d}", m.receiver.render, m.render, m.index).outln();
+		}
 		methods[m.index] = List.new(rm, methods[m.index]);
 		return rm;
 	}
 	def findMethod(index: int, typeArgs: Array<Type>) -> RaMethod {
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put2("findMethod: index %d  length %d", index, methods.length).outln();
+			for (i < typeArgs.length) {
+				Terminal.buf.put2("findMethod: typeArgs[%d] = %q", i, typeArgs[i].render).outln();
+			}
+		}
 		if (index >= methods.length) return null;
 		for (l = methods[index]; l != null; l = l.tail) {
+			if (CLOptions.PRINT_RA.get()) {
+				var rm = l.head;
+				var spec = rm.spec;
+				if (spec == null) Terminal.buf.puts("findMethod: spec is null").outln();
+				else {
+					Terminal.buf.put1("findMethod: considering spec %q", spec.render).outln();
+					for (i < spec.typeArgs.length) {
+						Terminal.buf.put2("findMethod: spec.typeArgs[%d] = %q", i, spec.typeArgs[i].render).outln();
+					}
+				}
+			}
 			if (compareTypeArgs(l.head, typeArgs)) return l.head;
+		}
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.puts("findMethod: not found").outln();
 		}
 		return null;
 	}
 	def findRaMethod(rm: RaMethod) -> RaMethod {
 		return findMethod(rm.orig.index, if(rm.spec == null, MONO_TYPEARGS, rm.spec.typeArgs));
+	}
+	def replaceRaMethod(rm: RaMethod, rmNew: RaMethod) {
+		var index = rm.orig.index;
+		var typeArgs = if(rm.spec == null, MONO_TYPEARGS, rm.spec.typeArgs);
+		if (CLOptions.PRINT_RA.get()) {
+			Terminal.buf.put3("replaceRaMethod: class %q  index %d  length %d", orig.ctype.render, index, methods.length).outln();
+			for (i < typeArgs.length) {
+				Terminal.buf.put2("replaceRaMethod: typeArgs[%d] = %q", i, typeArgs[i].render).outln();
+			}
+		}
+		if (index >= methods.length) return;
+		var prevs: List<RaMethod>;
+		for (l = methods[index]; l != null; l = l.tail) {
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf.put1("replaceRaMethod: considering method %q", l.head.orig.render).outln();
+			}
+			if (l.head == rm) {
+				if (CLOptions.PRINT_RA.get()) {
+					Terminal.buf.put2("replaceRaMethod: replacing %q with %q", rm.orig.render, rmNew.orig.render).outln();
+				}
+				var newList = List<RaMethod>.new(rmNew, l.tail);
+				while (prevs != null) {
+					newList = List<RaMethod>.new(prevs.head, newList);
+					prevs = prevs.tail;
+				}
+				methods[index] = newList;
+				return;
+			}
+			prevs = List<RaMethod>.new(l.head, prevs);
+		}
+		if (parent == null) {
+			if (CLOptions.PRINT_RA.get()) {
+				Terminal.buf.puts("replaceRaMethod: not found").outln();
+			}
+			return;
+		}
+		parent.replaceRaMethod(rm, rmNew);
+	}
+	def findNormedMethod(meth: IrMethod) -> RaMethod {
+		for (i < methods.length) {
+			for (l = methods[i]; l != null; l = l.tail) {
+				if (l.head.norm == meth) return l.head;
+			}
+		}
+		return null;
 	}
 	def compareTypeArgs(rm: RaMethod, typeArgs: Array<Type>) -> bool {
 		if (rm.spec == null) return typeArgs.length == 1;
@@ -786,6 +1101,9 @@ class RaField(receiver: Type, orig: IrField, fieldType: Type) extends RaItem {
 		return if(fieldType == null, orig.fieldType, fieldType);
 	}
 }
+component RaMethods {
+	var uid = 0;
+}
 // Information about a method, including any specialization, whether it is reusable
 // across normalization, etc.
 class RaMethod(receiver: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
@@ -794,6 +1112,7 @@ class RaMethod(receiver: Type, orig: IrMethod, spec: IrSpec) extends RaItem {
 	var normIndex = -1;
 	var virtual: RaVirtual;
 	private var cachedSpec: IrSpec;
+	def uid = RaMethods.uid++;
 
 	def getSpec() -> IrSpec {
 		if (cachedSpec != null) return cachedSpec;
@@ -850,7 +1169,7 @@ class VariantComparatorGen(context: SsaContext, root: IrClass, receiver: IrClass
 		if (tag > 0) p0.facts |= Fact.V_NON_ZERO;
 		method.ssa = context.graph = graph = SsaGraph.new(params, Bool.TYPE);
 
-		if (tag == -1) genCompareTag();
+		if (tag == -1) genCompareTag();  // has no additional fields
 		else genCompareFields(tag);
 
 		context.printSsa("Generated");
@@ -871,6 +1190,10 @@ class VariantComparatorGen(context: SsaContext, root: IrClass, receiver: IrClass
 	}
 	def genCompareFields(tag: int) {
 		var b = newBuilder(graph.startBlock);
+
+//		if (root != receiver) {
+//			p0 = b.add(V3Op.newTypeSubsume(root.ctype, receiver.ctype), [p0], p0.facts);
+//		}
 
 		var tblock = SsaBlock.new(), fblock = SsaBlock.new();
 		b.addIf(b.pure(V3Op.newRefEq(root.ctype), [p0, p1]), tblock, fblock);
@@ -898,7 +1221,7 @@ class VariantComparatorGen(context: SsaContext, root: IrClass, receiver: IrClass
 			b.addIf(cmp, eqTag, falseBlock);
 			b = newBuilder(eqTag);
 		}
-		p1 = b.opTypeSubsume(root.ctype, receiver.ctype, p1); // safe cast
+		p1 = b.opTypeSubsume0(root.ctype, receiver.ctype, p1, null); // safe cast
 		p1.setFact(Fact.O_NO_NULL_CHECK | Fact.V_NON_ZERO);
 		genFieldComparisons(b, falseBlock);
 	}
