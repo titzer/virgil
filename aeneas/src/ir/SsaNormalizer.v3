@@ -2,6 +2,8 @@
 // Copyright 2020 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+def printWrap() -> TerminalBuffer { return Reachability.printWrap(); }
+
 // Normalizes SSA code by performing polymorphic specialization and expanding all
 // tuples. Note that SSA form supports returns with multiple values.
 class SsaRaNormalizer extends SsaRebuilder {
@@ -131,8 +133,8 @@ class SsaRaNormalizer extends SsaRebuilder {
 		params.put(i_new);
 		map1(i_old, i_new);
 	}
-	def genSimpleVal(tn: TypeNorm, v: Val) -> Val {
-		return norm.normSimpleVal(tn, v);
+	def genSimpleVal(tn: TypeNorm, t: Type, v: Val) -> Val {
+		return norm.normSimpleVal(tn, t, v);
 	}
 	def genValN(i_old: SsaConst, tn: TypeNorm, vec: Vector<SsaInstr>) {
 		vec.puta(mapValueN(i_old, i_old.val, tn));
@@ -142,7 +144,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		if (tn.sub == null) {
 			// simple normalization
 			if (tn.size == 0) map0(i_old); // void
-			else map1(i_old, val = newGraph.valConst(tn.newType, norm.normSimpleVal(tn, v)));
+			else map1(i_old, val = newGraph.valConst(tn.newType, norm.normSimpleVal(tn, null, v)));
 		} else {
 			// complex normalization
 			mapValueN(i_old, v, tn);
@@ -252,6 +254,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var t = extractMethodRef(orig, method), funcNorm = t.0, m = t.1;
 				var newOp = V3Op.newCallMethod(m);
 				var ai_new = normArgs(funcNorm, genRefs(i_old.inputs));
+				if (method.facts.M_NORM && V3.isComponent(method.receiver)) {
+					// add back void for component
+					ai_new = Arrays.prepend(context.graph.nullConst(m.receiver), ai_new);
+				}
 				if (V3.isVariant(rc.oldType)) {
 					if (rc.isUnboxed()) {
 						// flattened data type becomes component call and needs new receiver
@@ -264,6 +270,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var t = extractMethodRef(orig, method), funcNorm = t.0, m = t.1;
 				var newOp = V3Op.newCallClassMethod(m);
 				var ai_new = normArgs(funcNorm, genRefs(i_old.inputs));
+				if (method.facts.M_NORM && V3.isComponent(method.receiver)) {
+					// add back void for component
+					ai_new = Arrays.prepend(context.graph.nop(), ai_new);
+				}
 				var i = normCall(i_old, funcNorm, newOp, ai_new);
 				if (ai_new[0].facts.V_NON_ZERO) i.setFact(Fact.O_NO_NULL_CHECK);
 			}
@@ -612,6 +622,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			var ovfRets = Arrays.range(vals, maxR, vals.length);
 			vals = Arrays.range(vals, 0, maxR);
 			var funcNorm = normFuncType(context.method.sig.funcType());
+			var ftype = context.method.sig.funcType();
 			var nullConst = newGraph.nullConst(funcNorm.ovfReturnFields[0].receiver);
 			for (i < ovfRets.length) {
 				curBlock.opComponentSetField(funcNorm.ovfReturnFields[i], nullConst, ovfRets[i]);
@@ -636,7 +647,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			var nullConst = newGraph.nullConst(funcNorm.ovfReturnFields[0].receiver);
 			for (i < funcNorm.ovfReturnTypes.length) {
 				var load = curBlock.opGetField(funcNorm.ovfReturnFields[i], nullConst);
-				var cast = curBlock.opTypeSubsume(funcNorm.ovfReturnFields[i].getFieldType(), funcNorm.ovfReturnTypes[i], load);
+				var cast = curBlock.opTypeSubsume0(funcNorm.ovfReturnFields[i].getFieldType(), funcNorm.ovfReturnTypes[i], load, norm.ra);
 				rvals.put(cast);
 			}
 			mapN(i_old, rvals.extract());
@@ -663,7 +674,8 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var atn = normTypeArg(op, 0), rtn = normTypeArg(op, 1);
 		if (rtn.sub == null) {
 			// common case 1-1 mapping
-			return map1(i_old, curBlock.opTypeSubsume(atn.newType, rtn.newType, genRef1(i_old.inputs[0])));
+			var i_new = curBlock.opTypeSubsume0(atn.newType, rtn.newType, genRef1(i_old.inputs[0]), norm.ra);
+			return map1(i_old, i_new);
 		}
 		var width = rtn.size;
 		if (width > 0) {
@@ -672,7 +684,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			var vals = Array<SsaInstr>.new(width);
 			for (i < width) {
 				var ft = if(atn.sub == null, atn.newType, atn.sub[i]);
-				vals[i] = curBlock.opTypeSubsume(ft, rtn.sub[i], ai_new[i]);
+				vals[i] = curBlock.opTypeSubsume0(ft, rtn.sub[i], ai_new[i], norm.ra);
 			}
 			mapNnf(i_old, vals);
 		}
@@ -689,6 +701,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def normEqual1(i_old: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		if (V3.isVariant(t)) return normVariantEqual(i_old, t, x, y);
+		if (t.typeCon.kind == Kind.FUNCREF) return normSimpleEqualOp0(i_old, null, t, x, y);
 		return curBlock.opEqual(t, x, y);
 	}
 	def normEqual(i_old: SsaApplyOp, tn: TypeNorm, refs: Array<SsaInstr>) -> SsaInstr {
@@ -702,10 +715,86 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		return expr;
 	}
+	private def getWrappee(x: SsaInstr, val: Val) -> SsaInstr {
+		if (FuncVal.?(val)) {
+			var spec = FuncVal.!(val).memberRef;
+			if (spec.asMethod().facts.M_WRAPPER) {
+				var wrappee = spec;
+				while (norm.ra.wrappeeForWrapper.has(wrappee))
+					wrappee = norm.ra.wrappeeForWrapper[wrappee];
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().put3("substituting wrappee %q{%d/%d}", wrappee.render,
+							 wrappee.asMethod().index, wrappee.asMethod().uid)
+						   .put3(" for %q{%d/%d}", spec.render, spec.asMethod().index, spec.asMethod().uid).outln();
+				}
+				return funcRef(wrappee);
+			}
+		}
+		return x;
+	}
+	def normSimpleEqualOp0(i_old: SsaApplyOp, op: Operator, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+		if (norm.config.WrapFuncTypeSubsume&&
+		    t.typeCon.kind == Kind.FUNCREF &&
+		    (norm.context.method.facts & Facts.M_MAP_UNMAP) == Facts.NONE) {
+			if (CLOptions.PRINT_WRAP.get()) {
+				printWrap().put1("normalizing function comparison @%d", i_old.uid).outln();
+				SsaPrinter.new().printInstrLn(x).printInstrLn(y).buf.outln();
+			}
+			// unmap any constant arguments
+			var xconst = SsaConst.?(x);
+			var xval = if(xconst, SsaConst.!(x).val, null);
+			var xnull = xconst && xval == null;
+
+			var yconst = SsaConst.?(y);
+			var yval = if(yconst, SsaConst.!(y).val, null);
+			var ynull = yconst && yval == null;
+
+			if (xconst && !xnull) x = getWrappee(x, xval);
+			if (yconst && !ynull) y = getWrappee(y, yval);
+
+			var unmapper: IrSpec;
+			// Two known functions do not need a run-time unmapper
+			if (xconst && yconst) {
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().puts("Comparing two known functions, no unmapper needed");
+				}
+			}
+			// Comparison with null does not require unmapping
+			else if (xnull || ynull) {
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().puts("Comparing with null, no unmapper needed");
+				}
+			}
+			else if ((unmapper = norm.ra.getUnmapper(t)) != null) {
+				// insert unmapping for non-const argument(s)
+				// (if unmapper is null, unmapping is not needed for this type)
+				if (!xconst) {
+					if (CLOptions.PRINT_WRAP.get()) {
+						printWrap().puts("first comparand needs unmapping");
+					}
+					var op = V3Op.newCallMethod(unmapper);
+					var args = [curBlock.graph.nullReceiver(), x];
+					x = curBlock.addApply(null, op, args);
+				}
+				if (!yconst) {
+					if (CLOptions.PRINT_WRAP.get()) {
+						printWrap().puts("second comparand needs unmapping");
+					}
+					var op = V3Op.newCallMethod(unmapper);
+					var args = [curBlock.graph.nullReceiver(), y];
+					y = curBlock.addApply(null, op, args);
+				}
+				return curBlock.opEqualOf(V3Op.newRefEq(AnyFunction.TYPE), x, y);
+			}
+		}
+		if (op == null) op = V3Op.newEqual(t);
+		return curBlock.opEqualOf(op, x, y);
+	}
 	def normSimpleEqualOp(i_old: SsaApplyOp, op: Operator) {
 		var refs = genRefs(i_old.inputs);
-		var tn = normTypeArg(op, 0), size = if(tn == null, 1, tn.size);
-		return map1(i_old, curBlock.opEqualOf(op, refs[0], refs[size]));
+		var tn = normTypeArg(op, 0);
+		var i_new = normSimpleEqualOp0(i_old, op, tn.newType, refs[0], refs[tn.size]);
+		return map1(i_old, i_new);
 	}
 	def normVariantEqual(i_old: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		var rc = norm.ra.getClass(t);
@@ -721,6 +810,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 		if (t.1) {
 			newOp = V3Op.newCallVariantSelector(m);
 		} else {
+			if (tn.newType != m.receiver) {
+				// for some targets, the type must match
+				var subsumeOp = V3Op.newTypeSubsume(tn.newType, m.receiver);
+				x = curBlock.addApply(i_old.source, subsumeOp, [x]);
+			}
 			newOp = V3Op.newCallMethod(m);
 			facts |= Fact.O_NO_NULL_CHECK;
 		}
@@ -804,12 +898,34 @@ class SsaRaNormalizer extends SsaRebuilder {
 	def normTypeCastRec(ai_old: Array<SsaInstr>, offset: int, atn: TypeNorm, rtn: TypeNorm, result: Vector<SsaInstr>) {
 		match (TypeSystem.newTypeCast(atn.oldType, rtn.oldType)) {
 			TRUE => {
+				if (atn != rtn && FuncType.?(atn.oldType) && context.compiler.NormConfig.WrapFuncTypeSubsume) {
+					// Leave incoming function type as un-normalized FuncRef type so that mapping works
+					if (atn.sub == null) result.put(curBlock.opNormFuncTypeSubsume(atn.oldType, rtn.oldType, atn.newType, rtn.newType, ai_old[offset], norm.ra));
+					else for (i < rtn.size) {
+						if (FuncType.?(atn.sub[i])) {
+							result.put(curBlock.opNormFuncTypeSubsume(atn.oldType, rtn.oldType, atn.sub[i], rtn.sub[i], ai_old[offset + i], norm.ra));
+						} else {
+							result.put(curBlock.opTypeSubsume0(atn.sub[i], rtn.sub[i], ai_old[offset + i], norm.ra));
+						}
+					}
+					return;
+				}
+				if (atn != rtn && context.compiler.NormConfig.ExplicitRefTypeCast) {
+					match (atn.oldType.typeCon.kind) {
+						ARRAY, CLASS, VARIANT, ANYREF => {
+							// assumes rtn.size is 1
+							result.put(curBlock.opTypeCast0(atn.newType, rtn.newType, ai_old[offset], norm.ra));
+							return;
+						}
+						_ => ;
+					}
+				}
 				for (i < rtn.size) result.put(ai_old[offset + i]);
 				return;
 			}
 			SUBSUME => {
-				if (atn.sub == null) result.put(curBlock.opTypeSubsume(atn.newType, rtn.newType, ai_old[offset]));
-				else for (i < rtn.size) result.put(curBlock.opTypeSubsume(atn.sub[i], rtn.sub[i], ai_old[offset + i]));
+				if (atn.sub == null) result.put(curBlock.opTypeSubsume0(atn.newType, rtn.newType, ai_old[offset], norm.ra));
+				else for (i < rtn.size) result.put(curBlock.opTypeSubsume0(atn.sub[i], rtn.sub[i], ai_old[offset + i], norm.ra));
 				return;
 			}
 			TUPLE_CAST => {
@@ -866,9 +982,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 			_ => ; // break
 		}
 		if (atn.size > 1) {
-			for (i < atn.size) result.put(curBlock.opTypeCast(atn.sub[i], rtn.sub[i], ai_old[offset + i]));
+			for (i < atn.size) result.put(curBlock.opTypeCast0(atn.sub[i], rtn.sub[i], ai_old[offset + i], norm.ra));
 		} else {
-			result.put(curBlock.opTypeCast(atn.newType, rtn.newType, ai_old[offset]));
+			result.put(curBlock.opTypeCast0(atn.newType, rtn.newType, ai_old[offset], norm.ra));
 		}
 	}
 	def normTypeCast(i_old: SsaApplyOp, op: Operator) {
@@ -1429,7 +1545,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 		}
 		if (newType == AnyRef.TYPE) return i_scalar;
-		return curBlock.opTypeSubsume(oldType, newType, i_scalar);
+		return curBlock.opTypeSubsume0(oldType, newType, i_scalar, norm.ra);
 	}
 	def normVariantAlloc(i_old: SsaInstr, op: Operator) {
 		var ai_inputs = genRefs(i_old.inputs);
