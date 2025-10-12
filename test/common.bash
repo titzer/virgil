@@ -17,7 +17,8 @@ RED='[0;31m'
 NORM='[0;00m'
 
 SUITE=$1
-export VIRGIL_TEST_OUT=/tmp/$USER/virgil-test
+# CI_DIR is so that CI tests can use separate directories and run in parallel
+export VIRGIL_TEST_OUT=/tmp/$USER/virgil-test${CI_DIR:+/$CI_DIR}
 OUT=$VIRGIL_TEST_OUT/$SUITE
 mkdir -p $OUT
 

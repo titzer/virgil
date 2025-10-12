@@ -110,7 +110,8 @@ function run_test_dirs() {
 # Init test framework
 #######################################################################
 # Clean up results of any previous tests
-rm -rf /tmp/$USER/virgil-test
+rm -rf /tmp/$USER/virgil-test${CI_DIR:+/$CI_DIR}
+# CI_DIR allows multiple CI tests to run concurrently
 
 . $DIR/common.bash all
 

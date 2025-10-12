@@ -26,13 +26,45 @@ component WasmGcComponent {
 		return false;
 	}
 
+	def printInfo(section: string) -> TerminalBuffer {
+		return Terminal.buf.red().puts(section).puts(": ").end();
+	}
+
 	def printSectionInfo(section: string, detail: string) {
-		Terminal.buf.red().puts(section).puts(": ").end().puts(detail).outln();
+		printInfo(section).puts(detail).outln();
 	}
 
 	def printDetail() -> TerminalBuffer {
 		return Terminal.buf.green().puts("WasmGC: ").end();
 	}
+
+	// initialized from CLOptions
+	def var canonicalizeRecursionGroups: bool;
+	def var minimizeRecursionGroups: bool;
+	def var oneRecursionGroup: bool;
+
+	// insures consistency, depending on setting of USE_REF_TEST
+	def initialize() {
+		if (CLOptions.WASM_GC_USE_REF_TEST.get()) {
+			// requires single group without minimization
+			minimizeRecursionGroups = false;
+			oneRecursionGroup = true;
+		} else {
+			canonicalizeRecursionGroups = CLOptions.WASM_GC_CANON_TYPES.get();
+			minimizeRecursionGroups = CLOptions.WASM_GC_MIN_GROUPS.get();
+			oneRecursionGroup = CLOptions.WASM_GC_ONE_GROUP.get();
+		}
+	}
+
+	def classNeedsTag(ctype: Type) -> bool {
+		if (ctype == null) return true;
+		match (ctype.typeCon.kind) {
+			// these need a tag for discrimination / dispatch
+			CLASS, ENUM, VARIANT => return true;
+			_ => return false;
+		}
+	}
+
 }
 
 // Records are (fictionally) placed in one region, numbered 0, 1, 2, ...
@@ -126,8 +158,8 @@ class WasmGcTarget extends Target {
 	}
 
 	def configureCompiler(compiler: Compiler) {
-		WasmComponent.includeSection = WasmComponent.getSectionFlags(CLOptions.WASMGC_SECTIONS.get());
-		WasmComponent.printSection = WasmComponent.getSectionFlags(CLOptions.PRINT_WASMGC_SECTIONS.get());
+		WasmComponent.includeSection = WasmComponent.getSectionFlags(CLOptions.WASM_GC_SECTIONS.get());
+		WasmComponent.printSection = WasmComponent.getSectionFlags(CLOptions.PRINT_WASM_GC_SECTIONS.get());
 
 		compiler.Reachability = true;
 		compiler.NormConfig.setSignatureLimits(10000, if(CLOptions.WASM_MULTI_VALUE.val, 1000, 1));
@@ -146,6 +178,8 @@ class WasmGcTarget extends Target {
 		// compiler.DisableBoundsChecks = true;	// leave since there can be residual checks
 		// compiler.DisableNullChecks = true;	// leave since there can be residual checks
 		// compiler.DisableLengthChecks = true;	// leave since there can be residual checks
+
+		WasmGcComponent.initialize();
 	}
 	private def getScalar(compiler: Compiler, prog: Program, t: Type) -> Scalar.set {
 		match (t) {
@@ -390,7 +424,7 @@ class WasmGcTarget extends Target {
 			for (m in mtable.table) {
 				if (m == null) continue;
 				if (rootSig == null) rootSig = m.sig;
-				if (CLOptions.PRINT_WASMGC.get()) {
+				if (CLOptions.PRINT_WASM_GC.get()) {
 					printDetail().put3("Request indirect adapter for mtable for %q.%q{%d}",
 							   m.receiver.render, m.render, m.index).outln();
 				}
@@ -1127,7 +1161,7 @@ class WasmGcTarget extends Target {
 			// This serves to insure an indirect adapter is requested and Addr created
 			x: FuncVal => {
 				var method = x.memberRef.asMethod();
-				if (CLOptions.PRINT_WASMGC.get()) {
+				if (CLOptions.PRINT_WASM_GC.get()) {
 					printDetail().put3("Request indirect adapter for record val for %q.%q{%d}",
 							   method.receiver.render, method.render, method.index).outln();
 				}
@@ -1434,7 +1468,7 @@ class WasmGcProgram(mach: MachProgram, context: SsaContext, test: bool) {
 
 	def requestIndirectAdapter(m: IrMethod) {
 		if (!indirectAdapterFor.has(m)) {
-			if (CLOptions.PRINT_WASMGC.get()) {
+			if (CLOptions.PRINT_WASM_GC.get()) {
 				printDetail().put3("Adding indirect adapter request for %q.%q{%d}", m.receiver.render, m.render, m.index).outln();
 			}
 			indirectAdapterFor[m] = -1;
@@ -1830,6 +1864,9 @@ class WasmGcLowering extends MachLowering {
 			}
 			return addThrow(i_old.source, V3Exception.TypeCheck);
 		}
+		if (CLOptions.WASM_GC_USE_REF_TEST.get()) {
+			return apply(i_old.source, V3Op.newTypeCast(ft, tt), [nobj]);
+		}
 		return genIfNull(i_old, mach.machType(tt), nobj, null, genClassIdCheckAndCast(i_old, low, high, _));
 	}
 	def genClassIdCheckAndCast(i_old: SsaApplyOp, low: int, high: int, i_new: SsaInstr) -> SsaInstr {
@@ -1854,9 +1891,12 @@ class WasmGcLowering extends MachLowering {
 				// no live classes can match, and null is not an instance of
 				return context.graph.falseConst();
 			}
-			// Note: use first return to demo why REF_TEST does not work
-			// return normId(i_old);
-			return genIfNull(i_old, Bool.TYPE, nobj, null, genClassIdQuery(i_old, low, high, _));
+			if (CLOptions.WASM_GC_USE_REF_TEST.get()) {
+				return normId(i_old);
+			} else {
+				// use tag range comparison
+				return genIfNull(i_old, Bool.TYPE, nobj, null, genClassIdQuery(i_old, low, high, _));
+			}
 		}
 		return context.graph.trueConst();
 	}
@@ -1919,7 +1959,7 @@ class WasmGcLowering extends MachLowering {
 		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
 		var itype = IntType.!(i_old.op.typeArgs[1]);
 		var i_new: SsaInstr;
-		if (CLOptions.PRINT_WASMGC.get()) {
+		if (CLOptions.PRINT_WASM_GC.get()) {
 			var sp = SsaPrinter.new();
 			sp.buf.green().puts("WasmGC: ").end();
 			sp.buf.put3("genRangeStartPlusIndex: rangeType %q  etype %q  itype %q", rangeType.render, etype.render, itype.render)
@@ -2004,7 +2044,7 @@ class WasmGcLowering extends MachLowering {
 		// cases encodes whether to generate pointer only (1), array only (2), or run-time discriminated (3) code
 		var etype = V3Array.elementType(rangeType);
 		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
-		if (CLOptions.PRINT_WASMGC.get()) {
+		if (CLOptions.PRINT_WASM_GC.get()) {
 			var sp = SsaPrinter.new();
 			sp.buf.green().puts("WasmGC: ").end();
 			sp.buf.put3("rangeLoad: rangeType %q  itype %q  loadType %q", rangeType.render, itype.render, loadType.render)
@@ -2108,7 +2148,7 @@ class WasmGcLowering extends MachLowering {
 			      ) -> SsaInstr {
 		var etype = V3Array.elementType(rangeType);
 		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
-		if (CLOptions.PRINT_WASMGC.get()) {
+		if (CLOptions.PRINT_WASM_GC.get()) {
 			var sp = SsaPrinter.new();
 			sp.buf.green().puts("WasmGC: ").end();
 			sp.buf.put3("rangeStore: rangeType %q  itype %q  storeType %q", rangeType.render, itype.render, storeType.render)
@@ -2246,7 +2286,7 @@ class WasmGcLowering extends MachLowering {
 		var ai_results = Array<SsaInstr>.new(accesses.length);
 		var zeroIdx = context.graph.valConst(itype, null);
 		var kind = if(isPointer, RangeKind.PtrOnly, RangeKind.ArrayOnly);
-		if (CLOptions.PRINT_WASMGC.get()) {
+		if (CLOptions.PRINT_WASM_GC.get()) {
 			var sp = SsaPrinter.new();
 			sp.buf.green().puts("WasmGC: ").end();
 			sp.buf.put3("genByteArrayLoads: rangeType %q  itype: %q  kind %s", rangeType.render, itype.render, kind.name)
@@ -2300,7 +2340,7 @@ class WasmGcLowering extends MachLowering {
 				       isPointer: bool // whether base is a pointer
 				      ) {
 		var kind = if(isPointer, RangeKind.PtrOnly, RangeKind.ArrayOnly);
-		if (CLOptions.PRINT_WASMGC.get()) {
+		if (CLOptions.PRINT_WASM_GC.get()) {
 			var sp = SsaPrinter.new();
 			sp.buf.green().puts("WasmGC: ").end();
 			sp.buf.put3("genByteArrayStores: rangeType %q  itype: %q  kind %s", rangeType.render, itype.render, kind.name)
@@ -2380,7 +2420,7 @@ class WasmGcLowering extends MachLowering {
 		var zeroIdx = context.graph.valConst(itype, null);
 		var kind = encodeRangeKind(cases);
 
-		if (CLOptions.PRINT_WASMGC.get()) {
+		if (CLOptions.PRINT_WASM_GC.get()) {
 			var sp = SsaPrinter.new();
 			sp.buf.green().puts("WasmGC: ").end();
 			sp.buf.put2("genByteArrayGetField: rangeType %q  itype %q", rangeType.render, itype.render)
@@ -2492,7 +2532,7 @@ class WasmGcLowering extends MachLowering {
 		var zeroIdx = context.graph.valConst(itype, null);
 		var kind = encodeRangeKind(cases);
 		
-		if (CLOptions.PRINT_WASMGC.get()) {
+		if (CLOptions.PRINT_WASM_GC.get()) {
 			var sp = SsaPrinter.new();
 			sp.buf.green().puts("WasmGC: ").end();
 			sp.buf.put3("genByteArraySetField: rangeType %q  etype %q  itype %q", rangeType.render, etype.render, itype.render)
@@ -2588,7 +2628,7 @@ class WasmGcLowering extends MachLowering {
 		var rangeStart = inputs[1];
 
 		var i_new: SsaInstr;
-		if (CLOptions.PRINT_WASMGC.get()) {
+		if (CLOptions.PRINT_WASM_GC.get()) {
 			var sp = SsaPrinter.new();
 			sp.buf.green().puts("WasmGC: ").end();
 			sp.buf.put1("genPtrAddRangeStart: rangeType %q", rangeType.render).ln();
