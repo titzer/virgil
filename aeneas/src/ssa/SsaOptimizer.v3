@@ -3,6 +3,9 @@
 
 // Coordinates optimizations of SSA graphs, blocks, and individual instructions.
 // Provides a facade to the outside that hides details of reduction, analysis, etc.
+
+def printWrapExtra = Reachability.printWrapExtra;
+
 class SsaOptimizer(context: SsaContext) {
 	var marker = SsaInternalMarker.new();
 	def iopt = SsaInstrReducer.new(context);
@@ -675,7 +678,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (ft == tt) return x; // fold TypeSubsume<T, T>(x)
 				if (tt == x.getType()) return x; // fold TypeSubsume<F, T>(x: T)
 				match (tt.typeCon.kind) {
-					CLASS => {
+					CLASS, VARIANT => {
 						if (ft == Null.TYPE) return graph.nullConst(tt);
 						if (TypeSystem.isSubtype(ft, tt)) return x; // remove redundant subsume of class
 					}
@@ -692,6 +695,11 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			TypeCast => {
 				var ft = i.op.sig.paramTypes[0], tt = i.op.sig.returnType();
 				var cast = TypeSystem.newTypeCast(ft, tt);
+				if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+					printWrapExtra()
+						.put3("SsaOptimizer TypeCast from %q  to %q  cast %s", ft.render, tt.render, cast.name)
+						.put2("  xconst %z  # inputs %d", xconst, i.inputs.length).outln();
+				}
 				if (i.inputs.length == 0) {
 					// special cast of casting void -> X
 					if (cast == TypeCast.THROW) return addThrow(i.source, V3Exception.TypeCheck); // fold TypeCast
@@ -705,7 +713,12 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				}
 
 				match (cast) {
-					TRUE, SUBSUME => return x; // fold TypeCast
+					TRUE, SUBSUME => {
+						// TODO consider using TypeSystem.computeCast
+						if (ft != tt && context.compiler.NormConfig.WrapFuncTypeSubsume &&
+						    Function_TypeCon.?(tt.typeCon)) return i;
+						return x; // fold TypeCast
+					}
 					THROW => {
 						return addThrow(i.source, V3Exception.TypeCheck); // fold TypeCast
 					}
@@ -775,7 +788,13 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (!i.facts.O_PURE) return i;
 				var yval = norm_binop(i);
 				// ArrayGetElem(#array, #index) => K
-				if (fold) return graph.valConst(i.getType(), Record.!(xval).values[V3.unboxI32(yval)]);
+				var values: Array<Val>;
+				match (xval) {
+					x: Record => values = x.values;
+					x: Address<Record> => values = x.val.values;
+					_ => ;
+				}
+				if (fold) return graph.valConst(i.getType(), values[V3.unboxI32(yval)]);
 			}
 			ArraySetElem => {
 				var receiver = boundscheck(i);
@@ -1069,8 +1088,8 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					var d = FuncVal.!(xval);
 					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
 					// CallFunction(#K) => CallMethod
-					var inputs = copyInputs(i, null, 1);
-					return add(i.source, V3Op.newCallMethod(d.memberRef), inputs).setFact(Fact.O_NO_NULL_CHECK);
+					adaptKnownFunctionInputs(i, d);  // add any needed subsumptions / casts
+					return add(i.source, V3Op.newCallMethod(d.memberRef), copyInputs(i, null, 1)).setFact(Fact.O_NO_NULL_CHECK);
 				}
 			}
 			CallAddress => {
@@ -1155,6 +1174,30 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		}
 		return i;
 	}
+	def adaptKnownFunctionInputs(i: SsaApplyOp, d: FuncVal) {
+		var ftype = i.op.typeArgs[0];
+		var fsig = FuncType.!(ftype).sig();
+		var xtype = Function.prependParamType(AnyRef.TYPE, d.memberRef.getMethodType());
+		var xsig = FuncType.!(xtype).sig();
+		var rcvr = d.memberRef.asMethod().receiver;
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			var in0type = i.inputs[0].dest.getType();
+			printWrapExtra()
+				.put3("SsaOptimizer: adaptCallKnownFunctionInputs const type %q.%q  arg type %q", rcvr.render, xtype.render, in0type.render)
+				.put2("  call type %q.%q", AnyRef.TYPE.render, ftype.render).outln();
+		}
+		if (xtype == ftype) return;
+		for (j = 1; j < xsig.paramTypes.length; ++j) {
+			var input = i.inputs[j].dest;
+			var ft = fsig.paramTypes[j], tt = xsig.paramTypes[j], atype = input.getType();
+			if (SsaConst.?(input)) atype = SsaConst.!(input).vtype;
+			if (ft != tt && atype != tt) {
+				// add subsume/cast if argument type is different from the static type
+				var i_new = add(i.source, V3Op.newTypeSubsume(atype, tt), [input]);
+				i.inputs[j].update(i_new);
+			}
+		}
+	}
 	def normSingleArg(op: Operator, args: Array<SsaInstr>) -> Array<SsaInstr> {
 		if (op.sig.paramTypes.length == 1 && args.length > 1) return [args[0]];
 		return args;
@@ -1231,7 +1274,11 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		// Compute the constant length of the array if possible.
 		var length = -1;
 		if (xconst) {
-			length = Record.!(xval).values.length;
+			match (xval) {
+				x: Record => length = x.values.length;
+				x: Address<Record> => length = x.val.values.length;
+				_ => return receiver;
+			}
 		} else if (x.optag() == Opcode.ArrayAlloc.tag) {
 			var l = x.inputs[0].dest;
 			if (!SsaConst.?(l)) return receiver;

@@ -12,6 +12,7 @@ def checkNoTypeVars(t: Type) {
 def checkInputs(inputs: Array<SsaInstr>) {
 	for (i in inputs) if (i == null) return V3.fail("null input");
 }
+def printWrapExtra = Reachability.printWrapExtra;
 
 def N = Facts.NONE;
 // Support class for constructing SSA instruction-by-instruction.
@@ -450,17 +451,90 @@ class SsaBuilder {
 	}
 	// TypeCast<F, T>(x)
 	def opTypeCast(ft: Type, tt: Type, x: SsaInstr) -> SsaInstr {
+		return opTypeCast0(ft, tt, x, null);
+	}
+	// opTypeCast0 allows indication of whether we are normalizing;
+	// when normalizing, we may request function wrappers / mappers
+	def opTypeCast0(ft: Type, tt: Type, x: SsaInstr, analyzer: ReachabilityAnalyzer) -> SsaInstr {
+		var oldType = ft;
+		if (ft != null && FuncType.?(ft) && context.compiler.NormConfig.WrapFuncTypeSubsume) {
+			ft = x.getType();
+		}
 		if (ft == tt) return x; // fold TypeCast<T, T>
 		if (tt == x.getType()) return x; // fold TypeCast<F, T>(x: T)
-		var cast = TypeSystem.newTypeCast(ft, tt);
+		var cast = TypeSystem.newTypeCast(ft, tt);	
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			printWrapExtra()
+				.put3("opTypeCast0: from %q  to %q  arg %q", ft.render, tt.render, x.getType().render)
+				.put2("  cast %s  analyzer null %z", cast.name, analyzer == null).ln().puts("   ").outt();
+			SsaPrinter.new().printInstrLn(x).flush();
+		}
 		if (cast != TypeCast.UNKNOWN_CAST && SsaConst.?(x)) {
 			var r = Eval.doCast(cast, ft, tt, SsaConst.!(x).val);
-			if (r.0) return graph.valConst(tt, r.1);
+			if (r.0) {
+				if (context.compiler.NormConfig.WrapFuncTypeSubsume) {
+					if (analyzer != null && analyzer.normalizer != null) {
+						match (tt.typeCon.kind) {
+							FUNCREF => {
+								var val = SsaConst.!(x).val;
+								if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+									printWrapExtra()
+										.put1("opTypeCast0: FUNCREF val %q", V3.render(val)).outln();
+								}
+								if (val != null) {
+									var fv = FuncVal.!(val);
+									var spec = fv.memberRef;
+									spec = analyzer.genWrappedFunction(ft, tt, spec, null);
+									return graph.valConst(tt, FuncVal.new(spec));
+								}
+							}
+							CLOSURE => {
+								var val = Closure.!(SsaConst.!(x).val);
+								if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+									printWrapExtra()
+										.put1("opTypeCast0: CLOSURE val %q", V3.render(val)).outln();
+								}
+								if (val != null) {
+									var spec = analyzer.genWrappedFunction(ft, tt, val.memberRef, null);
+									return graph.valConst(tt, Closure.new(val.val, spec));
+								}
+							}
+							_ => ;
+						}
+					} else {
+						return add(V3Op.newTypeCast(ft, tt), [x], x.facts);
+					}
+				}
+				return graph.valConst(tt, r.1);
+			}
 			else return addThrow(source, V3Exception.TypeCheck);
 		}
 
 		match (cast) {
-			TRUE => return x; // fold TypeCast
+			TRUE => {
+				if (cast != TypeCast.UNKNOWN_CAST &&
+				    context.compiler.NormConfig.WrapFuncTypeSubsume) {
+					var kind = tt.typeCon.kind;
+					if (kind == Kind.CLOSURE || (kind == Kind.FUNCREF && analyzer == null)) {
+						// we're early in the process, so request a mapper
+						context.prog.requestMapper(ft, tt);
+						// and insert a TypeCast
+						return add(V3Op.newTypeCast(ft, tt), [x], x.facts);
+					}
+					if (kind == Kind.FUNCREF) {
+						// convert to call to mapper
+						var spec = analyzer.getMapper(ft, tt);
+						var op = V3Op.newCallMethod(spec);
+						var args = [graph.nullReceiver(), x];
+						return addApply(null, op, args);
+					}
+					if (analyzer == null) {
+						// if early in the process, make cast explicit
+						return add(V3Op.newTypeCast(ft, tt), [x], x.facts);
+					}
+				}
+				return x; // fold TypeCast
+			}
 			THROW => {
 				return addThrow(source, V3Exception.TypeCheck); // fold TypeCast
 			}
@@ -534,6 +608,19 @@ class SsaBuilder {
 	}
 	// TypeSubsume<F, T>(x)
 	def opTypeSubsume(ft: Type, tt: Type, x: SsaInstr) -> SsaInstr {
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			printWrapExtra()
+				.put2("opTypeSubsume: ft %q  tt %q", ft.render, tt.render).outln();
+		}
+		return opTypeSubsume0(ft, tt, x, null);
+	}
+	// opTypeSubsume0 allows indication of whether we are normalizing;
+	// when normalizing, we may request function wrappers / mappers
+	def opTypeSubsume0(ft: Type, tt: Type, x: SsaInstr, analyzer: ReachabilityAnalyzer) -> SsaInstr {
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			printWrapExtra()
+				.put2("opTypeSubsume0: ft %q  tt %q", ft.render, tt.render).outln();
+		}
  		if (ft == tt) return x; // fold TypeSubsume<T, T>(x)
  		if (tt == x.getType()) return x; // fold TypeSubsume<F, T>(x: T)
 		match (tt.typeCon.kind) {
@@ -542,19 +629,22 @@ class SsaBuilder {
 				if (TypeSystem.isSubtype(ft, tt)) return x; // remove redundant subsume of class
 			}
 			INT => {
-				if (ft.typeCon.kind != Kind.VARIANT && ft.typeCon.kind != Kind.ENUM) return opTypeCast(ft, tt, x);
+				if (ft.typeCon.kind != Kind.VARIANT && ft.typeCon.kind != Kind.ENUM) return opTypeCast0(ft, tt, x, null);
 			}
 			TUPLE => {
-				return opTypeCast(ft, tt, x);
+				return opTypeCast0(ft, tt, x, analyzer);
 			}
 			ENUM_SET => {
 				return EnumSetType.!(tt).genEnumToSet(x, this);
 			}
 			FLOAT => {
-				return opTypeCast(ft, tt, x);
+				return opTypeCast0(ft, tt, x, null);
 			}
 			RANGE => {
-				return opTypeCast(ft, tt, x);
+				return opTypeCast0(ft, tt, x, null);
+			}
+			FUNCREF, CLOSURE => {
+				if (context.compiler.NormConfig.WrapFuncTypeSubsume && ft != Null.TYPE) return opTypeCast0(ft, tt, x, analyzer);
 			}
 			_ => ;
 		}

@@ -14,6 +14,8 @@ class NormalizerConfig {
 	var NonRefClosureReceiver: bool;
 	var AnyRefOverflow: bool;
 	var NormalizeRange: bool;
+	var WrapFuncTypeSubsume: bool;
+	var ExplicitRefTypeCast: bool;
 
 	var GetScalar: (Compiler, Program, Type) -> Scalar.set = defaultGetScalar;
 	var GetBitWidth: (Compiler, Program, Type) -> byte = defaultGetBitWidth;
@@ -39,12 +41,16 @@ def defaultGetBitWidth(compiler: Compiler, prog: Program, t: Type) -> byte {
 	}
 }
 
+def printWrap      = Reachability.printWrap;
+def printWrapExtra = Reachability.printWrapExtra;
+
 // Normalizes a program based on the results of reachability analysis.
-def TRANSFERRABLE_FACTS = (Fact.M_ABSTRACT | Fact.M_INLINE | Fact.M_ENUM_INIT | Fact.M_NEW | Fact.M_EMPTY | Fact.M_EQUALS);
+def TRANSFERRABLE_FACTS = (Fact.M_ABSTRACT | Fact.M_INLINE | Fact.M_ENUM_INIT | Fact.M_NEW | Fact.M_EMPTY | Fact.M_EQUALS | Fact.M_WRAPPER | Fact.M_MAPPER | Fact.M_UNMAPPER);
 class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer) {
 	def liveClasses = Vector<RaClass>.new();
 	def context = SsaContext.new(ra.compiler, ra.prog);
 	def typeMap = TypeUtil.newTypeMap<TypeNorm>();
+	def normQueue = WorkQueue.new();
 	var recordMap = V3.newRecordMap<Record>(); // XXX: canonicalize equivalent variant records
 	var complexRecordMap = V3.newRecordMap<Array<Val>>();
 	var newIr = IrModule.new();
@@ -58,8 +64,421 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 
 	new() { vn = VariantNormalizer.new(config, this, CLOptions.PRINT_RA.get()); }
 
+	def normWrappingTables() {
+		// maps contents of wrapping, mapping, and unmapping tables to normed keys and values
+		{
+			{
+				var newWrappers = Vector<(Type, Type, IrSpec, IrSpec)>.new().grow(ra.wrappedFunctionWrapperVec.length);
+				var newWrapperMap = TypeUtil.newTypePairMap<HashMap<IrSpec,IrSpec>>();
+				for (i < ra.wrappedFunctionWrapperVec.length) {
+					var entry = ra.wrappedFunctionWrapperVec[i];
+					var ft = entry.0, tt = entry.1, wrappee = entry.2, wrapper = entry.3;
+					var nft = ft, ntt = tt;
+					var nwrappee = normalizeMethodRef(wrappee).1;
+					var nwrapper = normalizeMethodRef(wrapper).1;
+					if (CLOptions.PRINT_WRAP.get()) {
+						printWrap().put2("normWrappingTables: old ft %q tt %q", ft.render, tt.render)
+							   .put3(" wrappee %q{%d/%d}", wrappee.render, wrappee.asMethod().index, wrappee.asMethod().uid)
+							   .put3(" wrapper %q{%d/%d}", wrapper.render, wrapper.asMethod().index, wrapper.asMethod().uid).outln();
+						printWrap().put2("normWrappingTables: new ft %q tt %q", nft.render, ntt.render)
+							   .put3(" wrappee %q{%d/%d}", nwrappee.render, nwrappee.asMethod().index, nwrappee.asMethod().uid)
+							   .put3(" wrapper %q{%d/%d}", nwrapper.render, nwrapper.asMethod().index, nwrapper.asMethod().uid).outln();
+					}
+					newWrappers.put((nft, ntt, nwrappee, nwrapper));
+					var ht = newWrapperMap[(nft, ntt)];
+					if (ht == null) {
+						newWrapperMap[(nft, ntt)] = ht = HashMap<IrSpec,IrSpec>.new(IrSpec.hash, IrSpec.equals);
+					}
+					ht[nwrappee] = nwrapper;
+				}
+				ra.wrappedFunctionWrapper = newWrapperMap;
+				ra.wrappedFunctionWrapperVec = newWrappers;
+			}
+			var newMapperMap = TypeUtil.newTypePairMap<IrSpec>();
+			var newMappers = Vector<(Type, Type, IrSpec)>.new().grow(ra.wrappedFunctionTypeMapperVec.length);
+			for (i < ra.wrappedFunctionTypeMapperVec.length) {
+				var entry = ra.wrappedFunctionTypeMapperVec[i];
+				var ft = entry.0, tt = entry.1, spec = entry.2;
+				var nft = ft, ntt = tt;
+				var nspec = normalizeMethodRef(spec).1;
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().put2("normWrappingTables: old mapper ft %q tt %q", ft.render, tt.render)
+						   .put3(" spec %q{%d/%d}", spec.render, spec.asMethod().index, spec.asMethod().uid)
+						   .outln();
+					printWrap().put2("normWrappingTables: new mapper ft %q tt %q", nft.render, ntt.render)
+						   .put3(" spec %q{%d/%d}", nspec.render, nspec.asMethod().index, nspec.asMethod().uid)
+						   .outln();
+				}
+				newMappers.put((nft, ntt, nspec));
+				newMapperMap[(nft, ntt)] = nspec;
+			}
+			ra.wrappedFunctionTypeMapper = newMapperMap;
+			ra.wrappedFunctionTypeMapperVec = newMappers;
+		}
+
+		{
+			var unmapperTypes = Maps.keyList(ra.unmapper);
+			var newUnmapper = TypeUtil.newTypeMap<IrSpec>();
+			var newUnmapperVec = Vector<(Type, IrSpec)>.new();
+			for (node = unmapperTypes; node != null; node = node.tail) {
+				var typ = node.head;
+				var ntyp = typ;
+				var unmapperSpec = ra.unmapper[typ];
+				var nspec = normalizeMethodRef(unmapperSpec).1;
+				newUnmapper[typ] = nspec;
+				newUnmapperVec.put((typ, nspec));
+			}
+			ra.unmapper = newUnmapper;
+			ra.unmapperVec = newUnmapperVec;
+		}
+
+		{
+			var wrapperTypes = Maps.keyList(ra.wrappers);
+			var newWrappers = TypeUtil.newTypeMap<List<IrSpec>>();
+			for (node = wrapperTypes; node != null; node = node.tail) {
+				var wrapperType = node.head;
+				var ntyp = wrapperType;
+				var wrappees = ra.wrappers[wrapperType];
+				var nwrappees: List<IrSpec>;
+				for (wnode = wrappees; wnode != null; wnode = wnode.tail) {
+					var spec = wnode.head;
+					var nspec = normalizeMethodRef(spec).1;
+					nwrappees = List.new(nspec, nwrappees);
+				}
+				newWrappers[ntyp] = nwrappees;
+			}
+			ra.wrappers = newWrappers;
+		}
+
+		{
+			var nwrappeeForWrapper = HashMap<IrSpec, IrSpec>.new(IrSpec.hash, IrSpec.equals);
+			for (wnode = Maps.keyList(ra.wrappeeForWrapper); wnode != null; wnode = wnode.tail) {
+				var wrapper = wnode.head;
+				var wrappee = ra.wrappeeForWrapper[wrapper];
+				var nwrapper = normalizeMethodRef(wrapper).1;
+				var nwrappee = normalizeMethodRef(wrappee).1;
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().put3("normWrappingTables: wrapper %q{%d/%d}", wrapper.render, wrapper.asMethod().index, wrapper.asMethod().uid)
+						   .put3(" => wrappee %q{%d/%d}", wrappee.render, wrappee.asMethod().index, wrappee.asMethod().uid).outln();
+					printWrap().put3("normWrappingTables: norm wrapper %q{%d/%d}", nwrapper.render, nwrapper.asMethod().index, nwrapper.asMethod().uid)
+						   .put3(" => norm wrappee %q{%d/%d}", nwrappee.render, nwrappee.asMethod().index, nwrappee.asMethod().uid).outln();
+				}
+				nwrappeeForWrapper[nwrapper] = nwrappee;
+			}
+			ra.wrappeeForWrapper = nwrappeeForWrapper;
+		}
+	}
+
+	def populateMapper(ftype: Type, ttype: Type, spec: IrSpec, pairs: Vector<(IrSpec, IrSpec)>) {
+		var ft = FuncType.!(ftype), tt = FuncType.!(ttype);
+		if (CLOptions.PRINT_WRAP.get()) {
+			printWrap().put2("populateMapper: from %q  to %q", ft.render, tt.render).outln();
+		}
+		var meth = spec.asMethod();
+		context.enterMethod(meth);
+
+		var receiver = spec.receiver;
+
+		// this block of code is from IrOpMethodBuilder.createSsa
+		var params = Array<SsaParam>.new(meth.sig.paramTypes.length + 1);
+		params[0] = SsaParam.new(0, receiver);
+		for (i = 1; i < params.length; i++) {
+			params[i] = SsaParam.new(i, meth.sig.paramTypes[i - 1]);
+		}
+		meth.ssa = SsaGraph.new(params, meth.sig.returnType());
+		context.graph = meth.ssa;
+		var block = SsaBuilder.new(context, meth.ssa, meth.ssa.startBlock);
+
+		// get wrappee / wrapper pairs
+		for (i < pairs.length) {
+			var pair = pairs[i], wrappee = pair.0, wrapper = pair.1;
+			if (CLOptions.PRINT_WRAP.get()) {
+				printWrap().put2("populateMapped: map %q to %q", wrappee.render, wrapper.render).outln();
+			}
+			var compOp = V3Op.newRefEq(ft);
+			var fconst = context.graph.valConst(ft, FuncVal.new(wrappee));
+			var args: Array<SsaInstr> = [SsaInstr.!(params[1]), fconst];
+			var comp = block.addApply(null, compOp, args);
+			var retBlock = SsaBlock.new();
+			var rest = SsaBlock.new();
+			block.addIf(comp, retBlock, rest);
+			block.set(retBlock);
+			var wrapperConst = context.graph.valConst(tt, FuncVal.new(wrapper));
+			block.addReturn([wrapperConst]);
+			block.set(rest);
+		}
+		block.addReturn([context.graph.nullConst(tt)]);
+		context.printSsa("Populate mapper");
+		context.enterMethod(null);
+	}
+
+	def genMapper(ft: Type, tt: Type) -> IrSpec {
+		if (CLOptions.PRINT_WRAP.get()) {
+			printWrap().put2("genMapper: ft %q  tt %q", ft.render, tt.render).outln();
+		}
+		def receiver = ra.prog.opBuilder.createGlobalIrClass();
+		def raClass = ra.makeClass(receiver);
+		if (!raClass.raFacts.RC_LIVE) {
+			raClass.raFacts |= RaFact.RC_LIVE;
+		}
+
+		var inner = SsaContext.new(context.compiler, context.prog);
+		def ftype = FuncType.!(ft);
+		def ttype = FuncType.!(tt);
+		def mapperType = FuncType.!(Function.newType(ftype, ttype));
+		var meth = ra.prog.opBuilder.createIrMethod(receiver, null, mapperType.sig());
+		meth.setFact(Fact.M_MAPPER);
+
+		var ta: Array<Type> = [receiver];
+		var spec = IrSpec.new(receiver, ta, meth);
+		ra.wrappedFunctionTypeMapper[(ft, tt)] = spec;
+		ra.wrappedFunctionTypeMapperVec.put(ft, tt, spec);
+		if (CLOptions.PRINT_WRAP.get()) {
+			printWrap().put2("genMapper: created mapper %q.%q", receiver.render, meth.render)
+				   .put2("{%d/%d}", meth.index, meth.uid)
+				   .put1("  with type %q", mapperType.render).outln();
+		}
+
+		var rm = ra.makeMethod(spec.typeArgs, spec.asMethod(), null);
+		ra.getMethod(null, rm);
+		return rm.getSpec();
+	}
+
+	def genUnmapper(t: Type, wrappers: List<IrSpec>) -> IrSpec {
+		def receiver = ra.prog.opBuilder.createGlobalIrClass();
+		def raClass = ra.makeClass(receiver);
+		if (!raClass.raFacts.RC_LIVE) {
+			raClass.raFacts |= RaFact.RC_LIVE;
+		}
+
+		var inner = SsaContext.new(context.compiler, context.prog);
+		def ftype = FuncType.!(t);
+		def mapperType = FuncType.!(Function.newType(ftype, AnyFunction.TYPE));
+		var meth = ra.prog.opBuilder.createIrMethod(receiver, null, mapperType.sig());
+		meth.setFact(Fact.M_UNMAPPER);
+
+		var ta: Array<Type> = [receiver];
+		var spec = IrSpec.new(receiver, ta, meth);
+		ra.unmapper[t] = spec;
+		ra.unmapperVec.put((t, spec));
+		if (CLOptions.PRINT_WRAP.get()) {
+			printWrap().put2("genUnmapper: meth %q.%q", receiver.render, meth.render)
+				   .put2("{%d/%d}", meth.index, meth.uid)
+				   .put2(" for type %q  mapper type %q", t.render, mapperType.render).outln();
+		}
+
+		var rm = ra.makeMethod(spec.typeArgs, spec.asMethod(), null);
+		ra.getMethod(null, rm);
+
+		spec = rm.getSpec();
+
+		inner.enterMethod(meth);
+
+		// this block of code is from IrOpMethodBuilder.createSsa
+		var params = Array<SsaParam>.new(meth.sig.paramTypes.length + 1);
+		params[0] = SsaParam.new(0, receiver);
+		for (i = 1; i < params.length; i++) {
+			params[i] = SsaParam.new(i, meth.sig.paramTypes[i - 1]);
+		}
+		meth.ssa = SsaGraph.new(params, meth.sig.returnType());
+		inner.graph = meth.ssa;
+		var block = SsaBuilder.new(inner, meth.ssa, meth.ssa.startBlock);
+
+		// get wrapper / wrappee pairs
+		for (node = wrappers; node != null; node = node.tail) {
+			var wrapper = node.head;
+			var wrappee = wrapper;
+			// find ultimate unwrapped version of the method
+			while (ra.wrappeeForWrapper.has(wrappee)) {
+				wrappee = ra.wrappeeForWrapper[wrappee];
+			}
+			if (CLOptions.PRINT_WRAP.get()) {
+				printWrap().put2("genUnmapper: unmap %q to %q", wrapper.render, wrappee.render).outln();
+			}
+			var compOp = V3Op.newRefEq(t);
+			var fconst = inner.graph.valConst(t, FuncVal.new(wrapper));
+			var args: Array<SsaInstr> = [SsaInstr.!(params[1]), fconst];
+			var comp = block.addApply(null, compOp, args);
+			var retBlock = SsaBlock.new();
+			var rest = SsaBlock.new();
+			block.addIf(comp, retBlock, rest);
+			block.set(retBlock);
+			var wrappeeConst = inner.graph.valConst(t, FuncVal.new(wrappee));
+			block.addReturn([wrappeeConst]);
+			block.set(rest);
+		}
+		block.addReturn([params[1]]);
+		inner.printSsa("Generate unmapper");
+		inner.enterMethod(null);
+
+		return spec;
+	}
+
+	// create requested mappers / unmappers
+	def createMappersUnmappers() {
+		var methodsWithSig: HashMap<Signature, List<IrSpec>>;
+		if (ra.prog.functionTypeMapperRequestsVec.length > 0) {
+			methodsWithSig = HashMap<Signature, List<IrSpec>>.new(Signature.hash, Signature.equals);
+			for (i < ra.liveMethods.length) {
+				// Note: spec and sig are un-normalized
+				var spec = ra.liveMethods[i].getSpec();
+				var meth = spec.asMethod();
+				var mt = spec.instantiateType(meth.getMethodType());
+				var sig = FuncType.!(Function.funcRefType(mt)).sig();
+				var lst = methodsWithSig[sig];
+				methodsWithSig[sig] = List.new(spec, lst);
+			}
+			for (i < ra.prog.functionTypeMapperRequestsVec.length) {
+				// Types are un-normalized
+				var rqst = ra.prog.functionTypeMapperRequestsVec[i];
+				var ft = rqst.0, tt = rqst.1;
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().put2("createMappersUnmappers: Processing mapper request: from %q to %q",
+							 ft.render, tt.render).outln();
+				}
+				var spec = genMapper(ft, tt);
+				var wrappers = Vector<(IrSpec, IrSpec)>.new();
+				for (l = methodsWithSig[FuncType.!(ft).sig()]; l != null; l = l.tail) {
+					var wrappee = l.head;
+					if (CLOptions.PRINT_WRAP.get()) {
+						printWrap().put3("createMappersUnmappers: Insuring wrapper exists for wrappee: %q{%d/%d}",
+								 wrappee.render, wrappee.asMethod().index, wrappee.asMethod().uid).outln();
+					}
+					var wrapper = ra.genWrappedFunctionRaMethod(ft, tt, wrappee, null).getSpec();
+					wrappers.put((wrappee, wrapper));
+					if (CLOptions.PRINT_WRAP.get()) {
+						printWrap().put3("createMappersUnmappers: Wrapper is %q{%d/%d}",
+								 wrapper.render, wrapper.asMethod().index, wrapper.asMethod().uid).outln();
+					}
+				}
+				populateMapper(ft, tt, spec, wrappers);
+			}
+		}
+		for (i < ra.unmapperRequestsVec.length) {
+			// Types are un-normalized
+			var typ = ra.unmapperRequestsVec[i];
+			var wrappers = ra.wrappers[typ];
+			if (wrappers == null) {
+				// no wrappers of this type, so unmapper not required
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().put1("createMappersUnmappers: unmapperRequest for type %q ignored: no wrappers", typ.render).outln();
+				}
+				continue;
+			}
+			var spec = genUnmapper(typ, wrappers);
+			ra.unmapper[typ] = spec;
+			ra.unmapperVec.put((typ, spec));
+		}
+	}
+	def createVirtualWrappers() {
+		// Request wrappers for method implementations whose signature
+		// does not match the root signature.  We update mtables so that
+		// the methods have a consistent type.
+		if (config.WrapFuncTypeSubsume) {
+			for (node = virtuals; node != null; node = node.tail) {
+				var virtual = node.head;
+				var mtable = virtual.mtable;
+				if (mtable == null) continue;
+				var rm = virtual.raMethod, rc = ra.getClass(rm.receiver);
+				var rootType = if(rm.spec == null, rm.orig.getMethodType(), rm.spec.getMethodType());
+				var rootSig = FuncType.!(rootType).sig();
+				// iterate similarly to layoutMtable
+				var replace = HashMap<IrSpec, IrSpec>.new(IrSpec.hash, IrSpec.equals);
+				for (l = rc.subtypes; l != null; l = l.tail) {
+					var rcThis = l.head;
+					var impl = resolveMethodImpl(rcThis, rm);
+					var orig = impl.orig;
+					var origType = if(impl.spec == null, impl.orig.getMethodType(), impl.spec.getMethodType());
+					var origSig = FuncType.!(origType).sig();
+					if (!origSig.equals(rootSig)) {
+						if (CLOptions.PRINT_WRAP.get()) {
+							printWrap().put2("createVirtualWrappers: signature %q differs from root %q",
+									 origSig.funcType().render, rootSig.funcType().render).outln();
+						}
+						var ft = origSig.funcType(), tt = rootSig.funcType();
+						var spec = impl.getSpec(); // IrSpec.new(impl.receiver, [impl.receiver], orig);
+						var wm = ra.genWrappedFunctionRaMethod(ft, tt, spec, norm(impl.receiver));
+						visitMethod(wm, rcThis);
+						if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+							printWrapExtra().put2("createVirtualWrappers: wm.orig.index %d  wm.norm.index %d",
+									      wm.orig.index, wm.norm.index)
+									.put2("  impl.orig.index %d  impl.norm.index %d",
+									      impl.orig.index, impl.norm.index)
+									.put2("  rm.orig.index %d  rm.norm.index %d",
+									      rm.orig.index, rm.norm.index)
+									.put3("  mtable size %d  rcThis orig method count %d  norm method count %d",
+									      mtable.table.length, rcThis.orig.methods.length,
+									      rcThis.normMethods.length).outln();
+						}
+						if (wm.norm.index < 0) {
+							// need a new slot; this will be beyond the end of the current method array
+							wm.norm.index = wm.normIndex = rcThis.normMethods.length;
+						}
+						if (wm.norm.index >= rc.normMethods.length) {
+							rcThis.normMethods = Arrays.grow(rcThis.normMethods, wm.norm.index + 1);
+						}
+						// swap impl and wm
+						var wslot = wm.norm.index;
+						var islot = impl.norm.index;
+						rcThis.normMethods[wslot] = impl.norm;
+						rcThis.normMethods[islot] = wm.norm;
+						impl.norm.index = impl.normIndex = wslot;
+						wm.norm.index = wm.normIndex = islot;
+						var wsrc = wm.orig.source;
+						var isrc = impl.orig.source;
+						wm.orig.source = isrc;
+						impl.orig.source = wsrc;
+						wsrc = wm.norm.source;
+						isrc = impl.norm.source;
+						wm.norm.source = isrc;
+						impl.norm.source = wsrc;
+
+						if (rm.norm.facts.M_OVERRIDE) wm.norm.facts |= Fact.M_OVERRIDE;
+						if (rm.norm.facts.M_OVERRIDDEN) wm.norm.facts |= Fact.M_OVERRIDDEN;
+						impl.norm.facts -= Fact.M_OVERRIDE;
+						impl.norm.facts -= Fact.M_OVERRIDDEN;
+
+						var index = l.head.minClassId - mtable.rootId;
+						if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+							printWrapExtra().put3("createVirtualMappers: mtable %q  wm.normIndex %d  wm.norm.index %d",
+									      mtable.render, wm.normIndex, wm.norm.index)
+									.put1(" slot %d", index).outln();
+						}
+						rcThis.replaceRaMethod(impl, wm);
+						mtable.table[index] = wm.norm;
+						// as in layoutMtable
+						var ta = Arrays.replace(impl.getSpec().typeArgs, 0, impl.norm.receiver);
+						var oldSpec = IrSpec.new(ta[0], ta, impl.norm);
+						var wta = Arrays.replace(wm.getSpec().typeArgs, 0, wm.norm.receiver);
+						var wspec = IrSpec.new(wta[0], wta, wm.norm);
+						replace[oldSpec] = wspec;
+					}
+				}
+				if (mtable.record != null) {
+					var vals = mtable.record.values;
+					for (i < vals.length) {
+						var val = vals[i];
+						if (val != null) {
+							var spec = FuncVal.!(val).memberRef;
+							if (replace.has(spec)) {
+								vals[i] = FuncVal.new(replace[spec]);
+								if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+									printWrapExtra().put2("createVirtualMappers: updated mtable record slot %d to hold %q",
+											      i, mtable.render).outln();
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	def normalize() {
 		if (CLOptions.PRINT_DEAD_CODE.get()) DeadCodeAnalyzer.new(ra).report();
+
+		createMappersUnmappers();
+
 		ra.prog.resetComponentRecords();
 		// layout fields into classes
 		ra.arrays.apply(visitArrayType);
@@ -70,7 +489,15 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		ra.classes.apply(layoutVtable);
 		Lists.apply(virtuals, layoutMtable);
+
+		createVirtualWrappers();
+
 		ra.classes.apply(createIrClass);
+		var classesVisited = ra.classes.length;
+
+		// normalize mapping info before normalizing code
+		normWrappingTables();
+
 		// create new roots for the new IrModule
 		var old = ra.oldIr.roots;
 		newIr.roots.grow(old.length);
@@ -81,8 +508,13 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		ra.prog.ir = newIr;
 		// do remaining work; normalize record instances
-		ra.queue.drain();
-		ra.liveMethods.apply(normCode);
+		normQueue.drain();
+		// normalize code; may generate more wrappers, etc.
+		for (i < ra.liveMethods.length) {
+			var rm = ra.liveMethods[i];
+			normCode(rm);
+		}
+		normQueue.drain();  // may run wrapper/mapper normalization updates
 		if (ovfAlloc != null) allocOverflowFieldRecord();
 	}
 	def visitClassType(rc: RaClass) {
@@ -103,9 +535,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			if (rc.instances != null) {
 				// normalize component record
 				var oldRecord = rc.instances.head;
-				newRecord = ra.prog.newRecord(tn.newType, rc.liveFields.length);
+				// New type is "void" for components, so use old type
+				newRecord = ra.prog.newRecord(rc.oldType, rc.liveFields.length);
 				complexRecordMap[oldRecord] = NO_VALUES;
-				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord)); // XXX: inline normClassRecord
+				normQueue.add(normClassRecord, (rc, oldRecord, newRecord)); // XXX: inline normClassRecord
 			}
 			ra.prog.setComponentRecord(comp, newRecord);
 		} else if (!rc.isUnboxed()) {
@@ -113,7 +546,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			for (l = rc.instances; l != null; l = l.tail) {
 				var oldRecord = l.head, newRecord = ra.prog.newRecord(tn.newType, rc.liveFields.length);
 				recordMap[oldRecord] = newRecord;
-				ra.queue.add(normClassRecord, (rc, oldRecord, newRecord)); // XXX: inline normClassRecord
+				normQueue.add(normClassRecord, (rc, oldRecord, newRecord)); // XXX: inline normClassRecord
 			}
 		} else {
 			// synthesize a component type for flattened data types and variants
@@ -126,21 +559,22 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		for (ml in rc.methods) {
 			// Create IrMethods for all methods
-			for (l = ml; l != null; l = l.tail) {
-				var rm = l.head, m = rm.orig;
-				if (rm.norm != null) continue; // already done
-				var ftype = if(rm.spec == null, m.sig.funcType(), rm.spec.getMethodType());
-				if (rc.isUnboxed()) {
-					// move flattened data type receiver to function sig
-					ftype = Function.prependParamTypes(rc.variantNorm.sub, ftype);
-				}
-				rm.funcNorm = FuncNorm.!(norm(ftype));
-				var typeParams = if(rm.spec != null, rm.spec.getTypes().methodTypeArgs);
-				rm.norm = IrMethod.new(rc.newIrType, typeParams, rm.funcNorm.sig());
-				rm.norm.facts = m.facts & TRANSFERRABLE_FACTS;
-				rm.norm.source = m.source;
-			}
+			for (l = ml; l != null; l = l.tail) visitMethod(l.head, rc);
 		}
+	}
+	def visitMethod(rm: RaMethod, rc: RaClass) {
+		var m = rm.orig;
+		if (rm.norm != null) return; // already done
+		var ftype = rm.getSpec().getMethodType();
+		if (rc.isUnboxed()) {
+			// move flattened data type receiver to function sig
+			ftype = Function.prependParamTypes(rc.variantNorm.sub, ftype);
+		}
+		rm.funcNorm = FuncNorm.!(norm(ftype));
+		var typeParams = if(rm.spec != null, rm.spec.getTypes().methodTypeArgs);
+		rm.norm = IrMethod.new(rc.newIrType, typeParams, rm.funcNorm.sig());
+		rm.norm.facts = (m.facts & TRANSFERRABLE_FACTS) | Fact.M_NORM;
+		rm.norm.source = m.source;
 	}
 	def visitArrayType(rt: RaArray) {
 		var tn = ArrayNorm.!(norm(rt.oldType));
@@ -149,7 +583,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			for (l = rt.instances; l != null; l = l.tail) {
 				var newRecord = ra.prog.newRecord(tn.newType, l.head.values.length);
 				recordMap[l.head] = newRecord;
-				ra.queue.add(normMixedArrayRecord, (tn, l.head, newRecord));
+				normQueue.add(normMixedArrayRecord, (tn, l.head, newRecord));
 			}
 			return;
 		}
@@ -157,7 +591,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		// map complex arrays to arrays of records
 		for (l = rt.instances; l != null; l = l.tail) {
 			var newRecords = createComplexArrayRecord(l.head, tn);
-			ra.queue.add(normComplexArrayRecord, (tn, l.head, newRecords));
+			normQueue.add(normComplexArrayRecord, (tn, l.head, newRecords));
 		}
 	}
 	def createComplexArrayRecord(r: Record, rt: ArrayNorm) -> Array<Record> {
@@ -227,6 +661,13 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				var ta = [ft, AnyRef.TYPE];
 				tn = FuncNorm.new(t, Tuple.newType(Lists.cons2(ft, AnyRef.TYPE)), pt.1, rt.1, ta);
 			}
+			FUNCREF => {
+				var pt = limit(Function.getParamType(t), config.MaxParams);
+				var rt = limit(Function.getReturnType(t), config.MaxReturnValues);
+				var ft = Function.FUNCREF.create(Lists.cons2(pt.0, rt.0));
+				var ta = [ft];
+				tn = FuncNorm.new(t, Tuple.newType(Lists.cons1(ft)), pt.1, rt.1, ta);
+			}
 			TUPLE => {
 				// flatten tuples
 				var seq = NormFlattener.new(context, norm);
@@ -254,12 +695,17 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				tn = TypeNorm.new(t, t, null);
 			}
 		}
-		if (CLOptions.PRINT_RA.get()) {
-			if (tn == null) Terminal.put1("normalize: %q\n", t.render);
-			else Terminal.put1("normalize: %q\n", tn.render);
-		}
 		typeMap[t] = tn;
 		return tn;
+	}
+	def renderTypes(buffer: StringBuilder, types: Array<Type>) -> StringBuilder {
+		buffer.putc('[');
+		for (i < types.length) {
+			if (i > 0) buffer.puts(", ");
+			buffer.put1("%q", types[i].render);
+		}
+		buffer.putc(']');
+		return buffer;
 	}
 	def limit(t: Type, len: int) -> (Type, Array<Type>) {
 		var tn = norm(t);
@@ -427,7 +873,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			var rf = rfs[i];
 			if (rf != null && rf.normIndices.0 >= 0) {
 				var v = oldVals[i];
-				if (rf.fieldType == null) newVals[rf.normIndices.0] = normSimpleVal(null, v);
+				if (rf.fieldType == null) newVals[rf.normIndices.0] = normSimpleVal(norm(rf.getClosedType()), v);
 				else normValIntoArray(v, rf.typeNorm, newVals, rf.normIndices.0);
 			}
 		}
@@ -450,14 +896,22 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			}
 		}
 	}
-	// map a record 1-1
 	def normSimpleVal(tn: TypeNorm, v: Val) -> Val {
+	// map a record 1-1
 		match (v) {
 			x: Record => {
 				var r = recordMap[x];
 				if (r != null) return r;
 				if (VariantNorm.?(tn)) return normVariantRecord(VariantNorm.!(tn), x)[0];
 				return x;
+			}
+			x: Closure => {
+				var fval = FuncVal.!(normalizeFuncRef(FuncNorm.!(tn), x.memberRef));
+				return if(fval.memberRef == x.memberRef, v, Closure.new(x.val, fval.memberRef));
+			}
+			x: FuncVal => {
+				var fval = normalizeFuncRef(FuncNorm.!(tn), x.memberRef); // maybe wrap function
+				return fval;
 			}
 			_ => return v;
 		}
@@ -478,6 +932,16 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			for (l = ml; l != null; l = l.tail) addMethod(vtable, rc, l.head);
 		}
 		rc.normMethods = vtable.extract();
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			printWrapExtra().put2("layoutVtable: class %q  size %d", rc.orig.ctype.render, rc.normMethods.length).ln();
+			for (i < rc.normMethods.length) {
+				var m = rc.normMethods[i];
+				printWrapExtra().put1("layoutVtable:  entry %d", i);
+				if (m == null) Terminal.buf.puts("  null");
+				else Terminal.put3("  %q{%d/%d}", m.render, m.index, m.uid);
+				Terminal.buf.outln();
+			}
+		}
 	}
 	def addMethod(vtable: Vector<IrMethod>, rc: RaClass, rm: RaMethod) {
 		var m = rm.orig;
@@ -523,6 +987,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				var impl = resolveMethodImpl(l.head, rm);
 				var index = l.head.minClassId - mtable.rootId;
 				mtable.table[index] = impl.norm;
+				if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+					printWrapExtra().put3("layoutMtable: slot %d  class %q  subclass %q", index, rc.orig.ctype.render, l.head.orig.ctype.render)
+							.put3("  impl %q{%d/%d}", impl.norm.render, impl.norm.index, impl.norm.uid).outln();
+				}
 				if (mtable.record != null) {
 					var ta = Arrays.replace(impl.getSpec().typeArgs, 0, impl.norm.receiver);
 					var spec = IrSpec.new(ta[0], ta, impl.norm);
@@ -560,15 +1028,21 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 					for (i < result.length) array[index + i] = result[i];
 				} else {
 					var result = complexRecordMap[x];
+					// The Record itself will be processed as an instance of some type,
+					// so we do not need to recurse into it.
 					if (result == null) array[index] = x; // assume 1-1
 					else for (i < result.length) array[index + i] = result[i]; // complex array
 				}
 			}
 			x: Closure => {
 				// normalize closure value as (funcval, val...) pair
-				var ref = normalizeMethodRef(x.memberRef).1;
-				array[index] = FuncVal.new(ref);
-				normValIntoArray(x.val, norm(ref.receiver), array, index + 1);
+				var fval = normalizeFuncRef(FuncNorm.!(tn), x.memberRef);
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().put3("normValIntoArray: Closure tn %q spec %q fval %q",
+							 tn.render, x.memberRef.asMethod().render, V3.render(fval)).outln();
+				}
+				array[index] = fval;
+				normValIntoArray(x.val, norm(x.memberRef.receiver), array, index + 1);
 			}
 			x: BoxVal => {
 				// tuple: recursively normalize all of the sub
@@ -589,16 +1063,81 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				normValIntoArray(x.array, an, array, index);
 				array[index + an.size] = ArrayRangeStart.new(x.offset, V3.arrayByteType);
 			}
+			x: FuncVal => {
+				var fn = normalizeFuncRef(FuncNorm.!(tn), x.memberRef);  // maybe wrap function
+				if (index < array.length) array[index] = fn;
+			}
 			_ => if (index < array.length) array[index] = v;
 		}
+	}
+	// Note: here, spec is the un-normalized IrSpec of the function
+	def normalizeFuncRef(ftn: FuncNorm, spec: IrSpec) -> Val {
+		if (!config.WrapFuncTypeSubsume) {
+			var normed = normalizeMethodRef(spec);
+			return FuncVal.new(normed.1);
+		}
+		var oldType = ftn.oldType;
+		var newType = ftn.newType;
+		var tt: Type = if(oldType.typeCon.kind == Kind.CLOSURE, Function.funcRefType(oldType), oldType);
+		var nt: Type = if(newType.typeCon.kind == Kind.TUPLE, newType.nested.head, newType);
+		var meth = spec.asMethod();
+		var ft = Function.funcRefType(meth.getMethodType());  // actual type of method
+		def inMeth = context.method;
+		def inMapper = (inMeth != null) && (inMeth.facts & Facts.M_MAP_UNMAP) != Facts.NONE;
+		if (!inMapper && // don't wrap references in mappers/unmappers
+		    TypeSystem.computeConversion(ft, tt) == Conversion.SUBSUME_FUNCTION) {
+			var normed = normalizeMethodRef(spec);  // need to look up normed version
+			spec = ra.getWrappedFunction(ft, tt, normed.1);
+			if (spec == null) {
+				spec = ra.genWrappedFunction(ft, tt, normed.1, norm(normed.0.receiver));
+				if (CLOptions.PRINT_WRAP.get()) {
+					printWrap().put2("normalizeFuncRef: ft = %q  tt = %q", ft.render, tt.render)
+							.put3("  meth = %q{%d/%d}", meth.render, meth.index, meth.uid)
+							.outln();
+				}
+				// insure the wrapper is visited, etc.
+				var rm = ra.makeMethod(spec.typeArgs, IrMethod.!(spec.member), null);
+				var rc = ra.getClass(rm.receiver);
+				if (!rm.setFact(RaFact.RM_LIVE)) {
+					ra.liveMethods.put(rm);
+				}
+				visitMethod(rm, rc);
+				if (rm.norm.index < 0) {
+					// need to add to vtable
+					var oldVtable = rc.normMethods;
+					rm.norm.index = oldVtable.length;
+					rc.normMethods = Arrays.append(rm.norm, oldVtable);
+					if (rc.normClass != null) {
+						// must add to normed class methods as well
+						var nc = rc.normClass;
+						if (rm.norm.index >= nc.methods.length) {
+							nc.methods = Arrays.grow(nc.methods, rm.norm.index + 1);
+						}
+						nc.methods[rm.norm.index] = rm.norm;
+					}
+				}
+			}
+		}
+		var normed = normalizeMethodRef(spec);
+		return FuncVal.new(normed.1);
 	}
 	def normalizeMethodRef(spec: IrSpec) -> (RaMethod, IrSpec) {
 		// XXX: canonicalize normalized IrSpecs
 		var rm = spec.asMethod().raMethod;
 		var ta = spec.typeArgs;
 		if (rm == null) {
-			var rc = ra.getClass(spec.receiver);
-			rm = rc.findMethod(spec.member.index, ta);
+			var receiver = spec.receiver;
+			var rc = ra.getClass(receiver);
+			var meth = spec.asMethod();
+			if (meth.facts.M_NORM) {
+				rm = rc.findNormedMethod(meth);
+			} else {
+				rm = rc.findMethod(spec.member.index, ta);
+				if (rm == null) {
+					rm = ra.makeMethod(ta, meth, null);
+					visitMethod(rm, rc);
+				}
+			}
 			if (rm == null) return V3.fail1("ReachabilityError: method %q not found", spec.render);
 		}
 		ta = Arrays.replace(ta, 0, rm.norm.receiver);
