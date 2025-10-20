@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 BIN=$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)
 V3C_LINK=$BIN/v3c

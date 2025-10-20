@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 S=$1
 O=$1.out
