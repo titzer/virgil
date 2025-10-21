@@ -1041,50 +1041,44 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				var target = nullcheck(i);
 				state.kill();
 				if (SsaThrow.?(target)) return target;
-				var xval = unop(i);
+				var xval = unop(i), xop: Operator;
+				var i_recvr: SsaInstr, newOp: Operator, newFacts: Fact.set;
 				if (xconst) {
 					var d = Closure.!(xval);
 					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
-					// CallClosure(K) => CallMethod
-					var const = graph.valConst(d.memberRef.getClosureReceiver(), d.val);
-					var op = V3Op.newCallMethod(d.memberRef);
-					var inputs = normSingleArg(op, copyInputs(i, const, 1));
-					return add(i.source, op, inputs).setFact(Fact.O_NO_NULL_CHECK);
-				}
-				if (!SsaApplyOp.?(x)) return i;
-				var xop = SsaApplyOp.!(x).op;
-				match (xop.opcode) {
+					// CallClosure(K) => CallMethod[K.m]
+					i_recvr = graph.valConst(d.memberRef.getClosureReceiver(), d.val);
+					newOp = V3Op.newCallMethod(d.memberRef);
+					newFacts = Fact.O_NO_NULL_CHECK;
+				} else if (SsaApplyOp.?(x)) match ((xop = SsaApplyOp.!(x).op).opcode) {
+					// XXX: look through TypeCast / TypeSubsume of functions
 					ClassGetMethod(method) => {
-						// CallClosure(GetClassMethod) => CallMethod
-						var op = V3Op.newCallMethod(V3Op.extractIrSpec(xop, method));
-						var inputs = normSingleArg(op, copyInputs(i, x.input0(), 1));
-						var ni = add(i.source, op, inputs);
-						ni.facts |= i.facts & Fact.O_NO_NULL_CHECK;
-						return ni;
+						// CallClosure(GetClassMethod[m]) => CallMethod[m]
+						var spec = V3Op.extractIrSpec(xop, method);
+						newOp = V3Op.newCallMethod(spec);
+						i_recvr = x.input0();
+						newFacts = i.facts & Fact.O_NO_NULL_CHECK;
 					}
 					ClassGetVirtual(method) => {
-						// CallClosure(GetClassVirtual) => CallClassVirtual
-						var op = V3Op.newCallClassVirtual(V3Op.extractIrSpec(xop, method));
-						var inputs = normSingleArg(op, copyInputs(i, x.input0(), 1));
-						var ni = add(i.source, op, inputs);
-						ni.facts |= i.facts & Fact.O_NO_NULL_CHECK;
-						return ni;
+						// CallClosure(GetClassVirtual[m]) => CallClassVirtual[m]
+						var spec = V3Op.extractIrSpec(xop, method);
+						newOp = V3Op.newCallClassVirtual(spec);
+						i_recvr = x.input0();
+						newFacts = i.facts & Fact.O_NO_NULL_CHECK;
 					}
 					CreateClosure(method) => {
+						// CallClosure(CreateClosure[m](p), ...) => CallMethod[m](p, ...);
 						var spec = V3Op.extractIrSpec(xop, method);
-						// CallClosure(CreateClosure[m](p), ...) => CallMethod(p, ...);
-						var receiver = if (V3.isComponent(spec.receiver), graph.nullReceiver(), x.input0());
-						var op = V3Op.newCallMethod(spec);
-						var inputs = normSingleArg(op, copyInputs(i, receiver, 1));
-						var ni = add(i.source, op, inputs);
-						if (V3.isComponent(spec.receiver)) ni.facts |= Fact.O_NO_NULL_CHECK;
-						else ni.facts |= x.facts & Fact.O_NO_NULL_CHECK;
-						return ni;
+						newOp = V3Op.newCallMethod(spec);
+						i_recvr = if (V3.isComponent(spec.receiver), graph.nullReceiver(), x.input0());
+						if (V3.isComponent(spec.receiver)) newFacts |= Fact.O_NO_NULL_CHECK;
+						else newFacts |= x.facts & Fact.O_NO_NULL_CHECK;
 					}
 					_ => {
 						if (!i.facts.O_PURE) state.kill();
 					}
 				}
+				if (newOp != null) return replaceWithDirectCall(i, newOp, i_recvr, i.inputs[1 ...]).setFact(newFacts);
 			}
 			CallFunction => {
 				var target = nullcheck(i);
@@ -1095,8 +1089,9 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					var d = FuncVal.!(xval);
 					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
 					// CallFunction(#K) => CallMethod
-					adaptKnownFunctionInputs(i, d);  // add any needed subsumptions / casts
-					return add(i.source, V3Op.newCallMethod(d.memberRef), copyInputs(i, null, 1)).setFact(Fact.O_NO_NULL_CHECK);
+					var newOp = V3Op.newCallMethod(d.memberRef);
+					var i_recvr: SsaInstr = null;
+					return replaceWithDirectCall(i, newOp, i_recvr, i.inputs[1 ...]).setFact(Fact.O_NO_NULL_CHECK);
 				}
 			}
 			CallAddress => {
@@ -1104,10 +1099,11 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (SsaConst.?(t)) {
 					var target = SsaConst.!(t).val;
 					if (target == null) return addThrow(i.source, V3Exception.NullCheck);
+					// XXX: CallAddress(#K) => CallMethod
 				}
 				state.kill();
 			}
-			CallVariantSelector, SystemCall, CallKernel => {
+			CallVariantSelector, SystemCall, CallKernel => { // XXX: optimize CallVariantSelector
 				state.kill();
 			}
 			CreateClosure(method) => {
@@ -1181,30 +1177,6 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		}
 		return i;
 	}
-	def adaptKnownFunctionInputs(i: SsaApplyOp, d: FuncVal) {
-		var ftype = i.op.typeArgs[0];
-		var fsig = FuncType.!(ftype).sig();
-		var xtype = Function.prependParamType(AnyRef.TYPE, d.memberRef.getMethodType());
-		var xsig = FuncType.!(xtype).sig();
-		var rcvr = d.memberRef.asMethod().receiver;
-		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
-			var in0type = i.inputs[0].dest.getType();
-			printWrapExtra()
-				.put3("SsaOptimizer: adaptCallKnownFunctionInputs const type %q.%q  arg type %q", rcvr.render, xtype.render, in0type.render)
-				.put2("  call type %q.%q", AnyRef.TYPE.render, ftype.render).outln();
-		}
-		if (xtype == ftype) return;
-		for (j = 1; j < xsig.paramTypes.length; ++j) {
-			var input = i.inputs[j].dest;
-			var ft = fsig.paramTypes[j], tt = xsig.paramTypes[j], atype = input.getType();
-			if (SsaConst.?(input)) atype = SsaConst.!(input).vtype;
-			if (ft != tt && atype != tt) {
-				// add subsume/cast if argument type is different from the static type
-				var i_new = add(i.source, V3Op.newTypeSubsume(atype, tt), [input]);
-				i.inputs[j].update(i_new);
-			}
-		}
-	}
 	def normSingleArg(op: Operator, args: Array<SsaInstr>) -> Array<SsaInstr> {
 		if (op.sig.paramTypes.length == 1 && args.length > 1) return [args[0]];
 		return args;
@@ -1238,6 +1210,50 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return if(wide, l_const(sl(xlong, ylong)), i_const(s(xint, yint)));
 	}
 
+	def replaceWithDirectCall(i_old: SsaApplyOp, newOp: Operator, i_recvr: SsaInstr, ai_old: Range<SsaDfEdge>) -> SsaInstr {
+		var oldRetType = i_old.getType();
+		var paramTypes = newOp.sig.paramTypes;
+		var ai_new = Array<SsaInstr>.new(paramTypes.length);
+		var i = 0;
+		if (i_recvr != null) ai_new[i++] = i_recvr;
+		var numParams = paramTypes.length - i;
+		match (numParams) {
+			0 => ; // nothing to do
+			1 => {
+				if (ai_old.length == 0) ai_new[i++] = graph.nullConst(paramTypes[i]);
+				else if (ai_old.length == 1) ai_new[i++] = ai_old[0].dest;
+				else {
+					var tt = TupleType.!(paramTypes[i]);
+					var args = Ranges.map(ai_old, SsaDfEdge.dest);
+					ai_new[i++] = add(i_old.source, V3Op.newTupleCreate(tt), args);
+				}
+			}
+			_ => {
+				if (ai_old.length == numParams) {
+					for (j < ai_old.length) ai_new[i++] = ai_old[j].dest;
+				} else {
+					var tt = TupleType.!(ai_old[0].dest.getType());
+					for (j < numParams) ai_new[i++] = add(i_old.source, V3Op.newTupleGetElem(tt, j), [ai_old[0].dest]);
+				}
+			}
+		}
+
+		for (i < paramTypes.length) {
+			var arg = ai_new[i];
+			var op = opSubsume(arg.getType(), paramTypes[i]);
+			if (op != null) ai_new[i] = add(i_old.source, op, [arg]);
+		}
+		var i_new = add(i_old.source, newOp, ai_new);
+		var op = opSubsume(newOp.sig.returnType(), oldRetType);
+		if (op != null) i_new = add(i_old.source, op, [i_new]);
+		return i_new;
+	}
+	def opSubsume(ft: Type, tt: Type) -> Operator { // TODO: refactor to use SsaBuilder
+		if (ft == tt) return null;
+		if (FuncType.?(ft) || FuncType.?(tt)) return V3Op.newTypeSubsume(ft, tt);
+		if (TupleType.?(ft) || TupleType.?(tt)) return V3Op.newTypeSubsume(ft, tt);
+		return null;
+	}
 	def copyInputs(i: SsaInstr, prepend: SsaInstr, start: int) -> Array<SsaInstr> {
 		var extra = if(prepend != null, 1);
 		var inputs = Array<SsaInstr>.new(i.inputs.length - start + extra);
