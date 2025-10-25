@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 PROGRESS_PIPE=1
 if [ "$1" = "-fatal" ]; then
