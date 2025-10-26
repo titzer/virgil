@@ -24,25 +24,37 @@ class WasmGcLowering extends MachLowering {
 	}
 	def genApplyOp(i_old: SsaApplyOp) {
 		match(i_old.op.opcode) {
+			// Pointer operations that are definitely allowed
 			PtrAdd, // allow
 			PtrSub, // allow
 			PtrLt, // allow
 			PtrLteq, // allow
-			PtrAtContents, // allow on off-heap objects
+			PtrCmpSwp, // allow
+			PtrLoad, // allow
+			PtrStore, // allow
+			// Pointer operations that are allowed on off-heap objects
+			// and that will throw Unimplmented on WASM heap objects
+			PtrAtRef, // allow on off-heap objects
+			PtrAtRefLayoutField // allow on off-heap objects
+				// note that we may refer to Wasm memory, so it
+				// needs to be present in the run time
+				=> wasm.usesMemory = true;
+			// Pointer operations that are never allowed
+			PtrAtEnd, // disallow
 			PtrAtLength, // disallow
 			PtrAtObject, // disallow
 			PtrAtArrayElem, // disallow
-			PtrAtEnd, // allow on off-heap objects
-			PtrAtRef, // allow on off-heap objects
 			PtrAtComponentField, // disallow
 			PtrAtObjectField, // disallow
-			PtrAtRefLayoutField, // allow on off-heap objects
 			PtrAtUnboxedObjectField, // disallow
-			PtrAtUnboxedComponentField, // disallow
-			PtrCmpSwp, // allow
-			PtrLoad, // allow
-			PtrStore // allow
-				=> wasm.usesMemory = true;
+			PtrAtUnboxedComponentField // disallow
+				=> {
+					addThrow(i_old.source, V3Exception.Unimplemented);
+					var ptrType = i_old.op.sig.returnType();
+					var result = context.graph.nullConst(ptrType);
+					return void(map1(i_old, result));
+				}
+			// PtrAtContents: removed during normalization
 			// PtrAtRangeElem: removed during normalization
 			PtrAddRangeStart => return void(genPtrAddRangeStart(i_old)); // allow on off-heap objects
 			_ => ;
@@ -253,7 +265,6 @@ class WasmGcLowering extends MachLowering {
 				}
 			}
 		}
-		map1(i_old, i_new);
 		return i_new;
 	}
 	private def rangeLoad(source: Source, // for tagging generated instrs
@@ -263,9 +274,8 @@ class WasmGcLowering extends MachLowering {
 			      rangeType: Type, // type of the array/range
 			      itype: IntType,  // type for indexing that array/pointer (int now, but maybe long in the future)
 			      loadType: Type,  // type of value to load (for pointers it may differ from the range element type)
-			      kind: RangeKind // whethwr the range is array-only, pointer-only, or unknown at compile time
+			      kind: RangeKind // whether the range is array-only, pointer-only, or unknown at compile time
 			     ) -> SsaInstr {
-		// cases encodes whether to generate pointer only (1), array only (2), or run-time discriminated (3) code
 		var etype = V3Array.elementType(rangeType);
 		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
 		if (CLOptions.PRINT_WASM_GC.get()) {
@@ -368,7 +378,7 @@ class WasmGcLowering extends MachLowering {
 			       rangeType: Type, // type of the array/range
 			       itype: IntType,  // type for indexing that array/pointer (int now, but maybe long in the future)
 			       storeType: Type,  // type of value to store (for pointers it may differ from the range element type)
-			       kind: RangeKind // whethwr the range is array-only, pointer-only, or unknown at compile time
+			       kind: RangeKind // whether the range is array-only, pointer-only, or unknown at compile time
 			      ) -> SsaInstr {
 		var etype = V3Array.elementType(rangeType);
 		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
@@ -474,6 +484,7 @@ class WasmGcLowering extends MachLowering {
 		var etype = V3Array.elementType(rangeType);
 		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
 		var itype = IntType.!(i_old.op.typeArgs[1]);
+		// cases encodes whether to generate pointer only (1), array only (2), or run-time discriminated (3) code
 		var cases: byte;
 		if (!narr.facts.V_NON_ZERO) cases |= 1;  // not known to be array, so need pointer case
 		if (!narr.facts.V_ZERO    ) cases |= 2;  // not known to be pointer, so need array case
@@ -487,6 +498,7 @@ class WasmGcLowering extends MachLowering {
 		var etype = V3Array.elementType(rangeType);
 		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
 		var itype = IntType.!(i_old.op.typeArgs[1]);
+		// cases encodes whether to generate pointer only (1), array only (2), or run-time discriminated (3) code
 		var cases: byte;
 		if (!narr.facts.V_NON_ZERO) cases |= 1;  // not known to be array, so need pointer case
 		if (!narr.facts.V_ZERO    ) cases |= 2;  // not known to be pointer, so need array case
@@ -840,8 +852,6 @@ class WasmGcLowering extends MachLowering {
 		i_old.kill();
 		i_old.remove();
 	}
-	def genPtrAtRangeElem(i_old: SsaApplyOp) {
-	}
 	def genPtrAddRangeStart(i_old: SsaApplyOp) {
 		// allow only on off-heap objects
 
@@ -865,18 +875,18 @@ class WasmGcLowering extends MachLowering {
 		
 		if (narr.facts.V_NON_ZERO) {
 			// Pointers into the Wasm heap are illegal
-			curBlock.addThrow(curBlock.source, V3Exception.Unimplemented);
-			i_old.kill();
-			i_old.remove();
+			addThrow(curBlock.source, V3Exception.Unimplemented);
+			i_new = context.graph.nullConst(i_old.op.sig.returnType());
 		} else {
 			if (!narr.facts.V_ZERO) {
 				var t = narr.getType();
 				var cmp = apply(i_old.source, V3Op.newRefEq(t), [narr, context.graph.nullConst(t)]);
 				curBlock.opConditionalThrow(V3Exception.Unimplemented, curBlock.opBoolNot(cmp));
 			}
+			i_new = rangeStart;
 			// The sum is simply rangeStart
-			map1(i_old, inputs[1]);
 		}
+		map1(i_old, i_new);
 	}
 	def genArrayGetLength(i_old: SsaApplyOp) -> SsaInstr {
 		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
@@ -1039,6 +1049,81 @@ class WasmGcLowering extends MachLowering {
 		var irClass = mach.prog.ir.getIrClass(classType);
 		if (irClass != null) wasm.gcTypeTable.addClass(irClass);
 		return apply(i_old.source, V3Op.newVariantGetTag(i_old.op.typeArgs[0]), [nobj]);
+	}
+	def genPtrAtRef(i_old: SsaApplyOp) {
+		// allow only on off-heap objects
+
+		var rangeType = i_old.op.typeArgs[0];
+		var size = mach.getObjectSize(rangeType, null);
+		wasm.gcTypeTable.addHeapType(rangeType);
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0];
+		var rangeStart = inputs[1];
+
+		var i_new: SsaInstr;
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put1("genPtrAtRef: rangeType %q", rangeType.render).ln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(narr);
+			sp.buf.puts("  start: ");
+			sp.flush();
+		}
+		
+		if (narr.facts.V_NON_ZERO) {
+			// Pointers into the Wasm heap are illegal
+			curBlock.addThrow(i_old.source, V3Exception.Unimplemented);
+			i_old.kill();
+			i_old.remove();
+			return;
+		}
+		if (!narr.facts.V_ZERO) {
+			// conditional throw before return
+			var t = narr.getType();
+			var cmp = apply(i_old.source, V3Op.newRefEq(t), [narr, context.graph.nullConst(t)]);
+			curBlock.opConditionalThrow(V3Exception.Unimplemented, curBlock.opBoolNot(cmp));
+			// fall through to add
+		}
+		map1(i_old, rangeStart);
+	}
+	def genPtrAtRefLayoutField(i_old: SsaApplyOp, offset: int) {
+		// allow only on off-heap objects
+
+		var rangeType = i_old.op.typeArgs[0];
+		wasm.gcTypeTable.addHeapType(rangeType);
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0];
+		var rangeStart = inputs[1];
+
+		var i_new: SsaInstr;
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put2("genPtrAtRefLayoutField: rangeType %q  offset %d", rangeType.render, offset).ln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(narr);
+			sp.buf.puts("  start: ");
+			sp.printInstrLn(rangeStart);
+			sp.flush();
+		}
+		
+		if (narr.facts.V_NON_ZERO) {
+			// Pointers into the Wasm heap are illegal
+			curBlock.addThrow(i_old.source, V3Exception.Unimplemented);
+			i_old.kill();
+			i_old.remove();
+			return;
+		}
+		if (!narr.facts.V_ZERO) {
+			// conditional throw before add
+			var t = narr.getType();
+			var cmp = apply(i_old.source, V3Op.newRefEq(t), [narr, context.graph.nullConst(t)]);
+			curBlock.opConditionalThrow(V3Exception.Unimplemented, curBlock.opBoolNot(cmp));
+			// fall through to add
+		}
+		i_new = ptrAdd(rangeStart, context.graph.intConst(offset));
+		map1(i_old, i_new);
 	}
 	def genNullCheck0(source: Source, nobj: SsaInstr) {
 		if (SsaConst.?(nobj)) {
