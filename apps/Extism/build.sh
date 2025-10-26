@@ -1,4 +1,5 @@
-#!/bin/bash -ex
+#!/usr/bin/env bash
+set -ex
 v3c \
   -entry-export=_initialize \
   -heap-size=500m \

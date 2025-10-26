@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 src="${BASH_SOURCE[0]}"
 base_dir="$( cd -P "$( dirname "$src" )/.." >/dev/null 2>&1 && pwd )"
 test_dir="${base_dir}/test"

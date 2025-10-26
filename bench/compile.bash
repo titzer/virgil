@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [ $# = 0 ]; then
 	echo "Usage: compile.bash <target> [benchmarks]"
@@ -66,13 +66,13 @@ function do_compile() {
 			return $?
     elif [ "$target" = "v3i" ]; then
 	# v3i is a special target that runs the V3C interpreter
-	echo "#!/bin/bash" > $EXE
+	echo "#!/usr/bin/env bash" > $EXE
 	echo "exec v3i $files \"$@\"" >> $EXE
 	chmod 755 $EXE
 	return 0
     elif [ "$target" = "v3i-ra" ]; then
 	# v3i is a special target that runs the V3C interpreter (with -ra)
-	echo "#!/bin/bash" > $EXE
+	echo "#!/usr/bin/env bash" > $EXE
 	echo "exec v3i -ra $files \"$@\"" >> $EXE
 	chmod 755 $EXE
 	return 0

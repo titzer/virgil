@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 . ../common.bash fsi32
 if [ $# -gt 0 ]; then
