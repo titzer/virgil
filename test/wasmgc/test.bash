@@ -15,25 +15,23 @@ fi
 LAST=0
 for target in $TEST_TARGETS; do
     if [ "$target" = v3i ]; then
-        TESTS=$(ls $TEST_LIST | grep -v _pn)
-#	continue # skip because not native target
+        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _gc)
     elif [[ "$target" = jvm || "$target" = jar ]]; then
-        TESTS=$(ls $TEST_LIST | grep -v _pn)
-#	continue # skip because not native
+        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _gc)
     elif [ "$target" = wasm ]; then
-        TESTS=$(ls $TEST_LIST)
+        TESTS=$(ls $TEST_LIST | grep -v _gc)
     elif [ "$target" = wasm-gc ]; then
         TESTS=$(ls $TEST_LIST)
     elif [ "$target" = x86-linux ]; then
-        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64)
-        TESTS=$(ls $TESTS | grep -v ranges) # temporary, because of reg alloc issue
+#       TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc)
+        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc | grep -v ranges) # temporary, because of reg alloc issue
     elif [ "$target" = x86-darwin ]; then :
-        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64)
-        TESTS=$(ls $TESTS | grep -v ranges) # temporary, because of reg alloc issue
+#       TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc)
+        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc | grep -v ranges) # temporary, because of reg alloc issue
     elif [ "$target" = x86-64-linux ]; then
-        TESTS=$(ls $TEST_LIST | grep -v _pn)
+        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _gc)
     elif [ "$target" = x86-64-darwin ]; then
-        TESTS=$(ls $TEST_LIST | grep -v _pn)
+        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _gc)
     else
 	continue;
     fi

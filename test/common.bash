@@ -27,7 +27,7 @@ RT_LOC=$VIRGIL_LOC/rt
 GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
-V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
+V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=1500m"}
 TEST_GC_WASM=${TEST_GC_WASM:=1}
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
