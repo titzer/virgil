@@ -18,6 +18,8 @@ for target in $TEST_TARGETS; do
 	continue # skip because not native
     elif [ "$target" = wasm ]; then
 	TESTS=$(ls $TEST_LIST | grep -v _64.v3)
+    elif [ "$target" = wasm-gc ]; then
+        continue # skip because only certain operations work
     elif [ "$target" = x86-linux ]; then
 	TESTS=$(ls $TEST_LIST | grep -v _64.v3)
     elif [ "$target" = x86-darwin ]; then

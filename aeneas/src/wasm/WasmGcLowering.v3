@@ -1,0 +1,1150 @@
+// Copyright 2016-2025 Virgil authors.  All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class WasmGcLowering extends MachLowering {
+
+	def wasm: WasmGcProgram;
+	def target: WasmGcTarget;
+
+	new(wasm, target, mach: MachProgram, compiler: Compiler, config: MachLoweringConfig)
+		super(mach, compiler, config) {	}
+
+	def classIdRange(t: Type) -> (int, int) {
+		var r = mach.prog.ir.getIrClass(t);
+		if (r == null) return (0, 0);
+		return (r.minClassId, r.maxClassId);
+	}
+	def genSimpleVal(val: Val, tn: TypeNorm) -> Val {
+		if (val == null) return null;
+		match (val) {
+			x: ArrayRangeStart => return Int.box(x.start);
+			x: PointerRangeStart => return x.start;
+		}
+		return mach.machVal(val);
+	}
+	def genApplyOp(i_old: SsaApplyOp) {
+		match(i_old.op.opcode) {
+			// Pointer operations that are definitely allowed
+			PtrAdd, // allow
+			PtrSub, // allow
+			PtrLt, // allow
+			PtrLteq, // allow
+			PtrCmpSwp, // allow
+			PtrLoad, // allow
+			PtrStore, // allow
+			// Pointer operations that are allowed on off-heap objects
+			// and that will throw Unimplmented on WASM heap objects
+			PtrAtRef, // allow on off-heap objects
+			PtrAtRefLayoutField // allow on off-heap objects
+				// note that we may refer to Wasm memory, so it
+				// needs to be present in the run time
+				=> wasm.usesMemory = true;
+			// Pointer operations that are never allowed
+			PtrAtEnd, // disallow
+			PtrAtLength, // disallow
+			PtrAtObject, // disallow
+			PtrAtArrayElem, // disallow
+			PtrAtComponentField, // disallow
+			PtrAtObjectField, // disallow
+			PtrAtUnboxedObjectField, // disallow
+			PtrAtUnboxedComponentField // disallow
+				=> {
+					addThrow(i_old.source, V3Exception.Unimplemented);
+					var ptrType = i_old.op.sig.returnType();
+					var result = context.graph.nullConst(ptrType);
+					return void(map1(i_old, result));
+				}
+			// PtrAtContents: removed during normalization
+			// PtrAtRangeElem: removed during normalization
+			PtrAddRangeStart => return void(genPtrAddRangeStart(i_old)); // allow on off-heap objects
+			_ => ;
+		}
+		genApplyOp0(i_old);
+	}
+	def genTypeCast(i_old: SsaApplyOp, castOp: TypeCast) {
+		var ft = i_old.op.typeArgs[0], tt = i_old.op.typeArgs[1];
+		var i_new: SsaInstr;
+		match (castOp) {
+			TRUE => i_new = normRef1(i_old.inputs[0]);  // XXX: maybe dead?
+			SUBSUME => return void(normId(i_old));  // XXX: maybe dead?
+			CLASS_CAST, VARIANT_CAST => i_new = genClassCast(ft, tt, i_old);
+			THROW => i_new = addThrow(i_old.source, V3Exception.TypeCheck);
+			INT_VIEW_I => return genIntViewI(i_old);
+			_ => {
+				// other kinds of casts should have been removed
+				context.fail1("unexpected cast %s", castOp.name);
+				i_new = context.graph.nop();
+			}
+		}
+		return map1(i_old, i_new);
+	}
+	def genClassCast(ft: Type, tt: Type, i_old: SsaApplyOp) -> SsaInstr {
+		if (V3.isClass(ft)) {
+			var fromIrClass = mach.prog.ir.makeIrClass(ft);
+			wasm.gcTypeTable.addClass(fromIrClass);
+		}
+		if (V3.isClass(tt)) {
+			var toIrClass = mach.prog.ir.makeIrClass(tt);  // sometimes not otherwise present
+			wasm.gcTypeTable.addClass(toIrClass);
+		}
+
+		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
+		if (context.compiler.DisableTypeChecks) return nobj;
+		var t = classIdRange(tt), low = t.0, high = t.1;
+		if (low == high) {
+			// no live classes can match, only null
+			if (V3Op.needsNullCheck(i_old, oobj.dest)) {
+				var cmp = curBlock.opNotEqual(ft, nobj, context.graph.nullConst(ft));
+				apply(i_old.source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp]);
+				return context.graph.nullConst(tt);
+			}
+			return addThrow(i_old.source, V3Exception.TypeCheck);
+		}
+		if (CLOptions.WASM_GC_USE_REF_TEST.get()) {
+			return apply(i_old.source, V3Op.newTypeCast(ft, tt), [nobj]);
+		}
+		return genIfNull(i_old, mach.machType(tt), nobj, null, genClassIdCheckAndCast(i_old, low, high, _));
+	}
+	def genClassIdCheckAndCast(i_old: SsaApplyOp, low: int, high: int, i_new: SsaInstr) -> SsaInstr {
+		// get right structural type, which will allow loading the tag
+		var fromType = i_old.op.typeArgs[0];
+		var toType = i_old.op.typeArgs[1];
+		var i_cast = apply(i_old.source, V3Op.newTypeCast(fromType, toType), [i_new]);
+		var tagType = mach.tagType;
+		var field = IrField.new(toType, tagType);
+		field.machOffset = 0;  // flags a tag field
+		var spec = IrSpec.new(toType, null, field);
+		var i_tid = apply(i_old.source, V3Op.newClassGetField(spec), [i_cast]);
+		curBlock.opIntRangeCheck(1, low, high, i_tid);
+		return i_cast;
+	}
+	def genTypeQuery(i_old: SsaApplyOp, query: TypeQuery) -> SsaInstr {
+		var ft = i_old.op.typeArgs[0], tt = i_old.op.typeArgs[1];
+		if (V3.isClass(ft) && V3.isClass(tt)) {
+			var oobj = i_old.inputs[0], nobj = normRef1(oobj);
+			var t = classIdRange(tt), low = t.0, high = t.1;
+			if (low == high) {
+				// no live classes can match, and null is not an instance of
+				return context.graph.falseConst();
+			}
+			if (CLOptions.WASM_GC_USE_REF_TEST.get()) {
+				return normId(i_old);
+			} else {
+				// use tag range comparison
+				return genIfNull(i_old, Bool.TYPE, nobj, null, genClassIdQuery(i_old, low, high, _));
+			}
+		}
+		return context.graph.trueConst();
+	}
+	def genClassIdQuery(i_old: SsaApplyOp, low: int, high: int, nobj: SsaInstr) -> SsaInstr {
+		var tagType = mach.tagType;
+		var fromType = i_old.op.typeArgs[0];
+		var field = IrField.new(fromType, tagType);
+		field.machOffset = 0;  // flags a tag field
+		var spec = IrSpec.new(fromType, null, field);
+		var i_tid = apply(i_old.source, V3Op.newClassGetField(spec), [i_old.input0()]);
+		return genRangeQuery(i_old, low, high, i_tid);
+	}
+	def genRangeQuery(i_old: SsaApplyOp, low: int, high: int, val: SsaInstr) -> SsaInstr {
+		if (high == low + 1) { // XXX: better factoring of degenerate range checks
+			return apply(i_old.source, V3Op.newEqual(Int.TYPE), [val, context.graph.intConst(low)]);
+		} else {
+			var cmp1 = curBlock.opIntGteq(val, context.graph.intConst(low));
+			var cmp2 = curBlock.opIntLt(val, context.graph.intConst(high));
+			return apply(i_old.source, V3Op.opBoolAnd, [cmp1, cmp2]);
+		}
+	}
+	def genTypeSubsume(i_old: SsaApplyOp) {
+		var fromIrClass = mach.prog.ir.makeIrClass(i_old.op.typeArgs[0]);
+		if (fromIrClass != null) wasm.gcTypeTable.addClass(fromIrClass);
+		var toIrClass = mach.prog.ir.makeIrClass(i_old.op.typeArgs[1]);  // sometimes not otherwise present
+		if (toIrClass != null) wasm.gcTypeTable.addClass(toIrClass);
+		// Actually need the (static) type to change in Wasm code, so need a cast
+		void(normId(i_old));
+	}
+	def genArrayAlloc(i_old: SsaApplyOp) -> SsaInstr {
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.returnTypes[0]);
+		return normId(i_old);
+	}
+	def genArrayInit(i_old: SsaApplyOp) -> SsaInstr {
+		var arrayType = i_old.op.typeArgs[0];
+		wasm.gcTypeTable.addHeapType(arrayType);
+		return normId(i_old);
+	}
+	def genArrayTupleInit(i_old: SsaApplyOp, elems: int, length: int) -> SsaInstr {
+		// should not happen since MixedArrays is turned off
+		wasm.context.fail("genArrayTupleInit called but MixedArrays is false");
+		return normId(i_old);	// satisfy compiler
+	}
+	def genArrayGetElem(i_old: SsaApplyOp, elem: int) {
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
+		return void(normId(i_old));
+	}
+	def genArraySetElem(i_old: SsaApplyOp, elem: int) {
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
+		return void(normId(i_old));
+	}
+	def genRangeStartPlusIndex(i_old: SsaApplyOp) -> SsaInstr {
+		var rangeType = i_old.op.typeArgs[0];
+		wasm.gcTypeTable.addHeapType(rangeType);
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0];
+		var rangeStart = inputs[1];
+		var nindex = inputs[2]; // XXX: discarding upper words for normalized integers
+		var etype = V3Array.elementType(rangeType);
+		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
+		var itype = IntType.!(i_old.op.typeArgs[1]);
+		var i_new: SsaInstr;
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put3("genRangeStartPlusIndex: rangeType %q  etype %q  itype %q", rangeType.render, etype.render, itype.render)
+			      .put1("  wst %q", wst.render).ln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(narr);
+			sp.buf.puts("  index: ");
+			sp.printInstrLn(nindex);
+			sp.flush();
+		}
+
+		if (wst.pack == WasmPacking.PACKED_8) {
+			// byte: null ok, no scaling so can add start and index early, then if
+			if (narr.facts.V_ZERO) {
+				i_new = ptrAdd(rangeStart, nindex);
+			} else if (narr.facts.V_NON_ZERO) {
+				i_new = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+			} else {
+				var t = addIfNull(narr);
+				var tblock = t.0, fblock = t.1, merge = t.2;
+				curBlock = fblock;
+				// if (nobj != null) generate the nonnull (array) case
+				var aresult = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+				fblock.addGoto(merge.block);
+
+				// if (nobj == null) generate the null (memory) case
+				curBlock = tblock;
+				var mresult = ptrAdd(rangeStart, nindex);
+				tblock.addGoto(merge.block);
+
+				curBlock = merge;
+				i_new = curBlock.addPhi(itype, [aresult, mresult]);
+			}
+		} else {
+			match (wst.valType) {
+				I32, I64, F32, F64 => {
+					var ptype = PrimType.!(etype);
+					var scale = ptype.byteSize;
+					if (narr.facts.V_ZERO) {
+						var i_scale = context.graph.intConst(scale);
+						var prod = apply(i_old.source, itype.opMul(), [nindex, i_scale]);
+						i_new = ptrAdd(rangeStart, prod);
+					} else if (narr.facts.V_NON_ZERO) {
+						i_new = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+					} else {
+						var t = addIfNull(narr);
+						var tblock = t.0, fblock = t.1, merge = t.2;
+						curBlock = fblock;
+						// if (nobj != null) generate the nonnull (array) case
+						var aresult = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+						fblock.addGoto(merge.block);
+
+						// if (nobj == null) generate the null (memory) case
+						curBlock = tblock;
+						var i_scale = context.graph.intConst(scale);
+						var mprod = apply(i_old.source, itype.opMul(), [nindex, i_scale]);
+						var mresult = ptrAdd(rangeStart, mprod);
+						tblock.addGoto(merge.block);
+
+						curBlock = merge;
+						i_new = curBlock.addPhi(itype, [aresult, mresult]);
+					}
+				}
+				_ => {
+					// no explicit null check needed
+					i_new = apply(i_old.source, itype.opAdd(), [rangeStart, nindex]);
+				}
+			}
+		}
+		return i_new;
+	}
+	private def rangeLoad(source: Source, // for tagging generated instrs
+			      narr: SsaInstr, // the array to access, null for pointer-based accesses
+			      rangeStart: SsaInstr, // the pointer for pointer-based accesses, otherwise the array index where the range starts
+			      nindex: SsaInstr, // index in the range of the item to access
+			      rangeType: Type, // type of the array/range
+			      itype: IntType,  // type for indexing that array/pointer (int now, but maybe long in the future)
+			      loadType: Type,  // type of value to load (for pointers it may differ from the range element type)
+			      kind: RangeKind // whether the range is array-only, pointer-only, or unknown at compile time
+			     ) -> SsaInstr {
+		var etype = V3Array.elementType(rangeType);
+		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put3("rangeLoad: rangeType %q  itype %q  loadType %q", rangeType.render, itype.render, loadType.render)
+			      .put1("  kind %s", kind.name).outln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(narr);
+			sp.buf.puts("  rangeStart: ");
+			sp.printInstrLn(rangeStart);
+			sp.buf.puts("  index: ");
+			sp.printInstrLn(nindex).flush();
+		}
+		// op is usually needed
+		var ta = [rangeType, itype];
+		var op = Operator.new(Opcode.ArrayGetElem, ta, Function.siga(ta, etype));
+		if (wst.pack == WasmPacking.PACKED_8) {
+			// byte: null ok, no scaling so can add start and index early, then if
+			var sum = apply(source, itype.opAdd(), [rangeStart, nindex]);
+			match (kind) {
+				PtrOnly => {
+					wasm.usesMemory = true;
+					return apply(null, V3Op.newPtrLoad(mach.data.ptrType, loadType), [sum]);
+				}
+				ArrayOnly => {
+					return apply(null, op, [narr, sum]);
+				}
+				Unknown => {
+					wasm.usesMemory = true;
+					var t = addIfNull(narr);
+					var tblock = t.0, fblock = t.1, merge = t.2;
+					curBlock = fblock;
+					// if (nobj != null) generate the nonnull (array) case
+					var aresult = apply(null, op, [narr, sum]);
+					fblock.addGoto(merge.block);
+
+					// if (nobj == null) generate the null (memory) case
+					curBlock = tblock;
+					var mresult = apply(null, V3Op.newPtrLoad(mach.data.ptrType, loadType), [sum]);
+					tblock.addGoto(merge.block);
+
+					curBlock = merge;
+					return curBlock.addPhi(etype, [aresult, mresult]);
+				}
+			}
+		} else {
+			match (wst.valType) {
+				I32, I64, F32, F64 => {
+					var ptype = PrimType.!(etype);
+					var scale = ptype.byteSize;
+					var i_scale = context.graph.intConst(scale);
+					// int/float: null ok, scaling so add start and index*scale later (within if)
+					match (kind) {
+						PtrOnly => {
+							wasm.usesMemory = true;
+							var prod = apply(source, itype.opMul(), [nindex, i_scale]);
+							var sum = apply(source, itype.opAdd(), [rangeStart, prod]);
+							return apply(source, V3Op.newPtrLoad(mach.data.ptrType, loadType), [sum]);
+						}
+						ArrayOnly => {
+							var sum = apply(source, itype.opAdd(), [rangeStart, nindex]);
+							return apply(source, op, [narr, sum]);
+						}
+						Unknown => {
+							wasm.usesMemory = true;
+							var t = addIfNull(narr);
+							var tblock = t.0, fblock = t.1, merge = t.2;
+							curBlock = fblock;
+							// if (nobj != null) generate the nonnull (array) case
+							var asum = apply(source, itype.opAdd(), [rangeStart, nindex]);
+							var aresult = apply(source, op, [narr, asum]);
+							fblock.addGoto(merge.block);
+
+							// if (nobj == null) generate the null (memory) case
+							curBlock = tblock;
+							var mprod = apply(source, itype.opMul(), [nindex, i_scale]);
+							var msum = apply(source, itype.opAdd(), [rangeStart, mprod]);
+							var mresult = apply(source, V3Op.newPtrLoad(mach.data.ptrType, loadType), [msum]);
+							tblock.addGoto(merge.block);
+
+							curBlock = merge;
+							return curBlock.addPhi(etype, [aresult, mresult]);
+						}
+					}
+				}
+				_ => {
+					// no explicit null check needed
+					var sum = apply(source, itype.opAdd(), [rangeStart, nindex]);
+					return apply(null, op, [narr, sum]);
+				}
+			}
+		}
+	}
+	private def rangeStore(source: Source, // for tagging generated instrs
+			       narr: SsaInstr, // the array to access, null for pointer-based accesses
+			       rangeStart: SsaInstr, // the pointer for pointer-based accesses, otherwise the array index where the range starts
+			       nindex: SsaInstr, // index in the range of the item to access
+			       nval: SsaInstr, // the value to store
+			       rangeType: Type, // type of the array/range
+			       itype: IntType,  // type for indexing that array/pointer (int now, but maybe long in the future)
+			       storeType: Type,  // type of value to store (for pointers it may differ from the range element type)
+			       kind: RangeKind // whether the range is array-only, pointer-only, or unknown at compile time
+			      ) -> SsaInstr {
+		var etype = V3Array.elementType(rangeType);
+		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put3("rangeStore: rangeType %q  itype %q  storeType %q", rangeType.render, itype.render, storeType.render)
+			      .put1("  kind %s", kind.name).outln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(narr);
+			sp.buf.puts("  rangeStart: ");
+			sp.printInstrLn(rangeStart);
+			sp.buf.puts("  index: ");
+			sp.printInstrLn(nindex);
+			sp.buf.puts("  val: ");
+			sp.printInstrLn(nval).flush();
+		}
+		// op is usually needed
+		var ta = [rangeType, itype, etype];
+		var op = Operator.new(Opcode.ArraySetElem, ta, Signature.new(null, ta, []));
+		if (wst.pack == WasmPacking.PACKED_8) {
+			// byte: null ok, no scaling so can add start and index early, then if
+			var sum = apply(source, itype.opAdd(), [rangeStart, nindex]);
+			match (kind) {
+				PtrOnly => {
+					wasm.usesMemory = true;
+					return apply(null, V3Op.newPtrStore(mach.data.ptrType, storeType), [sum, nval]);
+				}
+				ArrayOnly => {
+					return apply(null, op, [narr, sum, nval]);
+				}
+				Unknown => {
+					wasm.usesMemory = true;
+					var t = addIfNull(narr);
+					var tblock = t.0, fblock = t.1, merge = t.2;
+					curBlock = fblock;
+					// if (nobj != null) generate the nonnull (array) case
+					var aresult = apply(null, op, [narr, sum, nval]);
+					fblock.addGoto(merge.block);
+
+					// if (nobj == null) generate the null (memory) case
+					curBlock = tblock;
+					var mresult = apply(null, V3Op.newPtrStore(mach.data.ptrType, storeType), [sum, nval]);
+					tblock.addGoto(merge.block);
+
+					curBlock = merge;
+					return null;  // caller should use remove instead of map1
+				}
+			}
+		} else {
+			match (wst.valType) {
+				I32, I64, F32, F64 => {
+					var ptype = PrimType.!(etype);
+					var scale = ptype.byteSize;
+					var i_scale = context.graph.intConst(scale);
+					// int/float: null ok, scaling so add start and index*scale later (within if)
+					match (kind) {
+						PtrOnly => {
+							wasm.usesMemory = true;
+							var prod = apply(source, itype.opMul(), [nindex, i_scale]);
+							var sum = apply(source, itype.opAdd(), [rangeStart, prod]);
+							return apply(source, V3Op.newPtrStore(mach.data.ptrType, storeType), [sum, nval]);
+						}
+						ArrayOnly => {
+							var sum = apply(source, itype.opAdd(), [rangeStart, nindex]);
+							return apply(source, op, [narr, sum, nval]);
+						}
+						Unknown => {
+							wasm.usesMemory = true;
+							var t = addIfNull(narr);
+							var tblock = t.0, fblock = t.1, merge = t.2;
+							curBlock = fblock;
+							// if (nobj != null) generate the nonnull (array) case
+							var asum = apply(source, itype.opAdd(), [rangeStart, nindex]);
+							var aresult = apply(source, op, [narr, asum, nval]);
+							fblock.addGoto(merge.block);
+
+							// if (nobj == null) generate the null (memory) case
+							curBlock = tblock;
+							var mprod = apply(source, itype.opMul(), [nindex, i_scale]);
+							var msum = apply(source, itype.opAdd(), [rangeStart, mprod]);
+							var mresult = apply(source, V3Op.newPtrStore(mach.data.ptrType, storeType), [msum, nval]);
+							tblock.addGoto(merge.block);
+
+							curBlock = merge;
+							return null;  // caller should use remove instead of map1
+						}
+					}
+				}
+				_ => {
+					// no explicit null check needed
+					var sum = apply(source, itype.opAdd(), [rangeStart, nindex]);
+					return apply(null, op, [narr, sum, nval]);
+				}
+			}
+		}
+	}
+
+	def genNormRangeGetElem(i_old: SsaApplyOp, elem: int) {
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], rangeType = i_old.op.typeArgs[0];
+		var etype = V3Array.elementType(rangeType);
+		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
+		var itype = IntType.!(i_old.op.typeArgs[1]);
+		// cases encodes whether to generate pointer only (1), array only (2), or run-time discriminated (3) code
+		var cases: byte;
+		if (!narr.facts.V_NON_ZERO) cases |= 1;  // not known to be array, so need pointer case
+		if (!narr.facts.V_ZERO    ) cases |= 2;  // not known to be pointer, so need array case
+		var i_new = rangeLoad(i_old.source, narr, rangeStart, nindex, rangeType, itype, etype, encodeRangeKind(cases));
+		map1(i_old, i_new);
+	}
+	def genNormRangeSetElem(i_old: SsaApplyOp, elem: int) {
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], nval = inputs[3], rangeType = i_old.op.typeArgs[0];
+		var etype = V3Array.elementType(rangeType);
+		var wst = wasm.gcTypeTable.getStorageTypeFor(etype, true);
+		var itype = IntType.!(i_old.op.typeArgs[1]);
+		// cases encodes whether to generate pointer only (1), array only (2), or run-time discriminated (3) code
+		var cases: byte;
+		if (!narr.facts.V_NON_ZERO) cases |= 1;  // not known to be array, so need pointer case
+		if (!narr.facts.V_ZERO    ) cases |= 2;  // not known to be pointer, so need array case
+		var i_new = rangeStore(i_old.source, narr, rangeStart, nindex, nval, rangeType, itype, etype, encodeRangeKind(cases));
+		if (i_new == null) {
+			i_old.remove();
+		} else {
+			map1(i_old, i_new);
+		}
+	}
+	private def genByteArrayLoads(source: Source, // for tagging generated instrs
+				      accesses: Array<Access>, // accesses developed by decomposeByteArrayAccess
+				      base: SsaInstr, // pointer- or array-based byte range
+				      index: SsaInstr, // place in the range from which to load
+				      rangeType: Type, // type of the range (base)
+				      itype: IntType, // index type
+				      tn: TypeNorm, // needed results
+				      fieldType: Type, // type of field being loaded
+				      isPointer: bool // whether base is a pointer
+				      ) -> Array<SsaInstr> {
+		var ai_results = Array<SsaInstr>.new(accesses.length);
+		var zeroIdx = context.graph.valConst(itype, null);
+		var kind = if(isPointer, RangeKind.PtrOnly, RangeKind.ArrayOnly);
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put3("genByteArrayLoads: rangeType %q  itype: %q  kind %s", rangeType.render, itype.render, kind.name)
+			      .put1("  fieldType: %q", fieldType.render).ln();
+			if (tn == null) sp.buf.puts("  tn: null").ln();
+			else sp.buf.put1("  tn: %q", tn.render).ln();
+			sp.buf.puts("  base: ");
+			sp.printInstrLn(base);
+			sp.buf.puts("  index: ");
+			sp.printInstrLn(index);
+			for (i < accesses.length) {
+				sp.buf.put2("  accesses[%d]: %q", i, accesses[i].render).ln();
+			}
+			sp.flush();
+		}
+		for (i < accesses.length) {
+			var a = accesses[i];
+			match (a) {
+				Simple(t, offset) => {
+					var off = context.graph.valConst(itype, Box<int>.new(offset));
+					var load = rangeLoad(source, base, index, off, rangeType, itype, t, kind);
+					ai_results[i] = load;
+				}
+				Compound(t, wordType, datums) => {
+					var d: SsaInstr, or = wordType.opOr(), shl = wordType.opShl();
+					for (datum in datums) {
+						var offset = context.graph.valConst(itype, Box<int>.new(datum.offset));
+						var l = rangeLoad(source, base, index, offset, rangeType, itype, datum.t, kind);
+						if (datum.t != wordType) l = curBlock.pure(V3Op.newIntViewI(datum.t, wordType), [l]);
+						if (datum.shift > 0) l = curBlock.pure(shl, [l, context.graph.intConst(datum.shift)]);
+						if (d != null) d = curBlock.pure(or, [d, l]);
+						else d = l;
+					}
+					var op = getAccessViewOp(t, wordType);
+					if (op != null) d = curBlock.pure(op, [d]);
+					ai_results[i] = d;
+				}
+			}
+		}
+		return ai_results;
+	}
+	private def genByteArrayStores(source: Source, // source tag for generated code
+				       accesses: Array<Access>, // accesses generated by ...
+				       base: SsaInstr, // pointer or array
+				       index: SsaInstr, // place from which to load
+				       rangeType: Type,
+				       itype: IntType, // index type
+				       tn: TypeNorm, // needed results
+				       fieldType: Type, // type of field being loaded
+				       vals: Array<SsaInstr>, // values to store
+				       isPointer: bool // whether base is a pointer
+				      ) {
+		var kind = if(isPointer, RangeKind.PtrOnly, RangeKind.ArrayOnly);
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put3("genByteArrayStores: rangeType %q  itype: %q  kind %s", rangeType.render, itype.render, kind.name)
+			      .put1("  fieldType: %q", fieldType.render).ln();
+			if (tn == null) sp.buf.puts("  tn: null").ln();
+			else sp.buf.put1("  tn: %q", tn.render).ln();
+			sp.buf.puts("  base: ");
+			sp.printInstrLn(base);
+			sp.buf.puts("  index: ");
+			sp.printInstrLn(index);
+			for (i < vals.length) {
+				sp.buf.put1("  vals[%d]: ", i);
+				sp.printInstrLn(vals[i]);
+			}
+			for (i < accesses.length) {
+				sp.buf.put2("  accesses[%d]: %q", i, accesses[i].render).ln();
+				sp.printInstrLn(vals[i]);
+			}
+			sp.flush();
+		}
+		for (i < accesses.length) {
+			var a = accesses[i], i_val = vals[i];
+			match (a) {
+				Simple(t, offset) => {
+					var offset = context.graph.intConst(offset);
+					rangeStore(source, base, index, offset, i_val, rangeType, itype, t, kind);
+				}
+				Compound(t, wordType, datums) => {
+					var shr = wordType.opShr();
+					if (t != wordType) match (t) {
+						x: FloatType => i_val = curBlock.pure(if(x.is64, V3Op.opIntViewF64, V3Op.opIntViewF32), [i_val]);
+					}
+					for (datum in datums) {
+						var v = if(datum.shift == 0, i_val, curBlock.pure(shr, [i_val, context.graph.intConst(datum.shift)]));
+						if (v.getType() != datum.t) match (v.getType()) {
+							x: IntType => v = curBlock.pure(V3Op.newIntViewI(v.getType(), datum.t), [v]);
+						}
+						var offset = context.graph.intConst(datum.offset);
+						rangeStore(source, base, index, offset, v, rangeType, itype, datum.t, kind);
+					}
+				}
+			}
+		}
+	}
+	def genByteArrayGetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) {
+		var inputs = normRefs(i_old.inputs);
+		var ni_arr = inputs[0], ni_start = inputs[1];
+		var fieldType = i_old.op.typeArgs[0];
+
+		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
+
+		var tptr: (TypeNorm, Array<Access>);
+		var tnptr: TypeNorm;
+		var accessesPtr: Array<Access>;
+		var tarr: (TypeNorm, Array<Access>);
+		var tnarr: TypeNorm;
+		var accessesArr: Array<Access>;
+		var cases: byte;
+		var numAccesses: int;
+		if (!ni_arr.facts.V_NON_ZERO) {
+			// we need the pointer case
+			tptr = MachLowerings.decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder, false);
+			tnptr = tptr.0;
+			accessesPtr = tptr.1;
+			cases |= 1;
+		}
+		if (!ni_arr.facts.V_ZERO) {
+			// we need the array case
+			tarr = MachLowerings.decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder, true);
+			tnarr = tarr.0;
+			accessesArr = tarr.1;
+			cases |= 2;
+		}
+		var ai_results: Array<SsaInstr>;
+		var rangeType = ni_arr.getType();
+		var itype = Int.TYPE;
+		var zeroIdx = context.graph.valConst(itype, null);
+		var kind = encodeRangeKind(cases);
+
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put2("genByteArrayGetField: rangeType %q  itype %q", rangeType.render, itype.render)
+			      .put3("  fieldType %q  kind %s  offset %d", fieldType.render, kind.name, offset)
+			      .put1("  order %s", memoryOrder.name).ln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(ni_arr);
+			sp.buf.puts("  start: ");
+			sp.printInstrLn(ni_start);
+			if (accessesPtr != null) {
+				if (tnptr != null) sp.buf.put1("  tnptr: %q", tnptr.render).ln();
+				for (i < accessesPtr.length) {
+					sp.buf.put2("  accessesPtr[%d]: %q", i, accessesPtr[i].render).ln();
+				}
+			}
+			if (accessesArr != null) {
+				if (tnarr != null) sp.buf.put1("  tnarr: %q", tnarr.render).ln();
+				for (i < accessesArr.length) {
+					sp.buf.put2("  accessesArr[%d]: %q", i, accessesArr[i].render).ln();
+				}
+			}
+			sp.flush();
+		}
+
+		match (kind) {
+			PtrOnly => {
+				var base = ni_start;
+				var nullity = context.compiler.nullity(i_old, base);
+				if (!nullity.O_NO_NULL_CHECK) genNullCheck0(i_old.source, base);
+				ai_results = genByteArrayLoads(i_old.source, accessesPtr, base, zeroIdx, rangeType, itype, tnptr, fieldType, true);
+				if (tnptr != null && tnptr.newType != fieldType) {
+					var op = getAccessViewOp(fieldType, tnptr.newType);
+					if (op != null) ai_results = [wideInputs(op, if(tnptr.size > 1, tnptr), ai_results, Fact.O_PURE)];
+				}
+			}
+			ArrayOnly => {
+				ai_results = genByteArrayLoads(i_old.source, accessesArr, ni_arr, ni_start, rangeType, itype, tnarr, fieldType, false);
+				if (tnarr != null && tnarr.newType != fieldType) {
+					var op = getAccessViewOp(fieldType, tnarr.newType);
+					if (op != null) ai_results = [wideInputs(op, if(tnarr.size > 1, tnarr), ai_results, Fact.O_PURE)];
+				}
+			}
+			Unknown => {
+				var t = addIfNull(ni_arr);
+				var tblock = t.0, fblock = t.1, merge = t.2;
+				curBlock = fblock;
+				// if (nobj != null) generate the nonnull (array) case
+				var resultsArr = genByteArrayLoads(i_old.source, accessesArr, ni_arr, ni_start, rangeType, itype, tnptr, fieldType, false);
+				if (tnarr != null && tnarr.newType != fieldType) {
+					var op = getAccessViewOp(fieldType, tnarr.newType);
+					if (op != null) resultsArr = [wideInputs(op, if(tnarr.size > 1, tnarr), resultsArr, Fact.O_PURE)];
+				}
+				fblock.addGoto(merge.block);
+
+				// if (nobj == null) generate the null (memory) case
+				curBlock = tblock;
+				var base = ni_start;
+				var nullity = context.compiler.nullity(i_old, base);
+				if (!nullity.O_NO_NULL_CHECK) genNullCheck0(i_old.source, base);
+				var resultsPtr = genByteArrayLoads(i_old.source, accessesPtr, base, zeroIdx, rangeType, itype, tnarr, fieldType, true);
+				if (tnptr != null && tnptr.newType != fieldType) {
+					var op = getAccessViewOp(fieldType, tnptr.newType);
+					if (op != null) resultsPtr = [wideInputs(op, if(tnptr.size > 1, tnptr), resultsPtr, Fact.O_PURE)];
+				}
+				tblock.addGoto(merge.block);
+
+				curBlock = merge;
+				ai_results = Array<SsaInstr>.new(resultsArr.length);
+				for (i < resultsArr.length) {
+					ai_results[i] = curBlock.addPhi(resultsArr[i].getType(), [resultsArr[i], resultsPtr[i]]);
+				}
+			}
+		}
+		mapN(i_old, ai_results);
+	}
+	def genByteArraySetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) { // TODO: byte order
+		var inputs = normRefs(i_old.inputs);
+		var ni_arr = inputs[0], ni_start = inputs[1], vals = Arrays.range(inputs, 2, inputs.length);
+		var fieldType = i_old.op.typeArgs[0];
+
+		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
+
+		var tptr: (TypeNorm, Array<Access>);
+		var tnptr: TypeNorm;
+		var accessesPtr: Array<Access>;
+		var tarr: (TypeNorm, Array<Access>);
+		var tnarr: TypeNorm;
+		var accessesArr: Array<Access>;
+		var cases: byte;
+		var numAccesses: int;
+		if (!ni_arr.facts.V_NON_ZERO) {
+			// we need the pointer case
+			tptr = MachLowerings.decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder, false);
+			tnptr = tptr.0;
+			accessesPtr = tptr.1;
+			cases |= 1;
+		}
+		if (!ni_arr.facts.V_ZERO) {
+			// we need the array case
+			tarr = MachLowerings.decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder, true);
+			tnarr = tarr.0;
+			accessesArr = tarr.1;
+			cases |= 2;
+		}
+		var ai_results: Array<SsaInstr>;
+		var rangeType = ni_arr.getType();
+		var etype = V3Array.elementType(rangeType);
+		var itype = Int.TYPE;
+		var zeroIdx = context.graph.valConst(itype, null);
+		var kind = encodeRangeKind(cases);
+		
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put3("genByteArraySetField: rangeType %q  etype %q  itype %q", rangeType.render, etype.render, itype.render)
+			      .put3("  fieldType %q  kind %s  offset %d", fieldType.render, kind.name, offset)
+			      .put1("  order %s", memoryOrder.name).ln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(ni_arr);
+			sp.buf.puts("  start: ");
+			sp.printInstrLn(ni_start);
+			for (i < vals.length) {
+				sp.buf.put1("  vals[%d]: ", i);
+				sp.printInstrLn(vals[i]);
+			}
+			if (accessesPtr != null) {
+				if (tnptr!= null) sp.buf.put1("  tnptr: %q", tnptr.render).ln();
+				for (i < accessesPtr.length) {
+					sp.buf.put2("  accessesPtr[%d]: %q", i, accessesPtr[i].render).ln();
+				}
+			}
+			if (accessesArr != null) {
+				if (tnarr != null) sp.buf.put1("  tnarr: %q", tnarr.render).ln();
+				for (i < accessesArr.length) {
+					sp.buf.put2("  accessesArr[%d]: %q", i, accessesArr[i].render).ln();
+				}
+			}
+			sp.flush();
+		}
+
+		match (kind) {
+			PtrOnly => {
+				var base = ni_start;
+				var nullity = context.compiler.nullity(i_old, base);
+				if (!nullity.O_NO_NULL_CHECK) genNullCheck0(i_old.source, base);
+				if (tnptr != null && tnptr.newType != fieldType) {
+					var op = getAccessViewOp(tnptr.oldType, fieldType);
+					var atn = if(tnptr.size > 1, tnptr);
+					if (op != null) vals = wideOutputs(op, atn, vals, Fact.O_PURE);
+				}
+				genByteArrayStores(i_old.source, accessesPtr, base, zeroIdx, rangeType, itype, tnptr, fieldType, vals, true);
+			}
+			ArrayOnly => {
+				if (tnarr != null && tnarr.newType != fieldType) {
+					var op = getAccessViewOp(tnarr.oldType, fieldType);
+					var atn = if(tnarr.size > 1, tnarr);
+					if (op != null) vals = wideOutputs(op, atn, vals, Fact.O_PURE);
+				}
+				genByteArrayStores(i_old.source, accessesArr, ni_arr, ni_start, rangeType, itype, tnarr, fieldType, vals, false);
+			}
+			Unknown => {
+				var t = addIfNull(ni_arr);
+				var tblock = t.0, fblock = t.1, merge = t.2;
+				var nvals = vals;
+
+				curBlock = fblock;
+				// if (nobj != null) generate the nonnull (array) case
+				if (tnarr != null && tnarr.newType != fieldType) {
+					var op = getAccessViewOp(tnarr.oldType, fieldType);
+					var atn = if(tnarr.size > 1, tnarr);
+					if (op != null) nvals = wideOutputs(op, atn, vals, Fact.O_PURE);
+				}
+				genByteArrayStores(i_old.source, accessesArr, ni_arr, ni_start, rangeType, itype, tnptr, fieldType, nvals, false);
+				fblock.addGoto(merge.block);
+
+				nvals = vals;
+				// if (nobj == null) generate the null (memory) case
+				curBlock = tblock;
+				if (tnptr != null && tnptr.newType != fieldType) {
+					var op = getAccessViewOp(tnptr.oldType, fieldType);
+					var atn = if(tnptr.size > 1, tnptr);
+					if (op != null) nvals = wideOutputs(op, atn, vals, Fact.O_PURE);
+				}
+				var base = ni_start;
+				var nullity = context.compiler.nullity(i_old, base);
+				if (!nullity.O_NO_NULL_CHECK) genNullCheck0(i_old.source, base);
+				genByteArrayStores(i_old.source, accessesPtr, base, zeroIdx, rangeType, itype, tnarr, fieldType, nvals, true);
+				tblock.addGoto(merge.block);
+
+				curBlock = merge;
+			}
+		}
+		i_old.kill();
+		i_old.remove();
+	}
+	def genPtrAddRangeStart(i_old: SsaApplyOp) {
+		// allow only on off-heap objects
+
+		var rangeType = i_old.op.typeArgs[0];
+		wasm.gcTypeTable.addHeapType(rangeType);
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0];
+		var rangeStart = inputs[1];
+
+		var i_new: SsaInstr;
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put1("genPtrAddRangeStart: rangeType %q", rangeType.render).ln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(narr);
+			sp.buf.puts("  start: ");
+			sp.printInstrLn(rangeStart);
+			sp.flush();
+		}
+		
+		if (narr.facts.V_NON_ZERO) {
+			// Pointers into the Wasm heap are illegal
+			addThrow(curBlock.source, V3Exception.Unimplemented);
+			i_new = context.graph.nullConst(i_old.op.sig.returnType());
+		} else {
+			if (!narr.facts.V_ZERO) {
+				var t = narr.getType();
+				var cmp = apply(i_old.source, V3Op.newRefEq(t), [narr, context.graph.nullConst(t)]);
+				curBlock.opConditionalThrow(V3Exception.Unimplemented, curBlock.opBoolNot(cmp));
+			}
+			i_new = rangeStart;
+			// The sum is simply rangeStart
+		}
+		map1(i_old, i_new);
+	}
+	def genArrayGetLength(i_old: SsaApplyOp) -> SsaInstr {
+		wasm.gcTypeTable.addHeapType(i_old.op.sig.paramTypes[0]);
+		return normId(i_old);
+	}
+	def genClassAlloc(i_old: SsaApplyOp, method: IrMethod) {
+		// Leave the ClassAlloc for code gen, which will set the tag
+		// If method is non-null, add call to the graph
+		var classType = i_old.op.sig.returnTypes[0];
+		var irClass = mach.prog.ir.getIrClass(classType);
+		wasm.gcTypeTable.addClass(irClass);
+		normId(i_old);
+		// insert a copy of the current instr (so we can add *after*)
+		var dests = Arrays.map(i_old.inputs, SsaDfEdge.getDest);
+		var i_new = curBlock.addApply(i_old.source, i_old.op, dests);
+		if (method != null) {
+			var methodRef = V3Op.extractIrSpec(i_old.op, method);
+			var funcRep = mach.funcRep(methodRef);
+			var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+			var args = Arrays.prepend(func, Arrays.prepend(i_new, normRefs(i_old.inputs)));
+			apply(i_old.source, V3Op.newCallClassMethod(methodRef), args);
+		}
+		map1(i_old, i_new);
+	}
+	def genVariantAlloc(i_old: SsaApplyOp) {
+		// Leave the VariantAlloc for code gen, which adds the tag itself
+		var classType = i_old.op.sig.returnTypes[0];
+		var irClass = mach.prog.ir.getIrClass(classType);
+		wasm.gcTypeTable.addClass(irClass);
+		normId(i_old);
+	}
+	def genClassGetField(isVariant: bool, i_old: SsaApplyOp, field: IrField) {
+		// Leave the ClassGetField for code gen
+		var classType = i_old.op.sig.paramTypes[0];
+		var irClass = mach.prog.ir.getIrClass(classType);
+		wasm.gcTypeTable.addClass(irClass);
+		normId(i_old);
+		// Multiple-types for a field should not happen on Wasm Gc;
+		// it is for handing 64-bit numbers on 32-bit platformsm etc.
+	}
+	def genClassSetField(i_old: SsaApplyOp, field: IrField, init: bool) {
+		// Leave the ClassGetField for code gen
+		var classType = i_old.op.sig.paramTypes[0];
+		var irClass = mach.prog.ir.getIrClass(classType);
+		wasm.gcTypeTable.addClass(irClass);
+		return void(normId(i_old));
+	}
+	def genClassGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
+		genNullCheck(i_old);
+		wasm.requestIndirectAdapter(method);
+		var methodRef = V3Op.extractIrSpec(i_old.op, method);
+		var funcRep = mach.funcRep(methodRef);
+		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+	}
+	def genClassGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
+		// insure class is recorded
+		var classType = selector.receiver;
+		var irClass = mach.prog.ir.getIrClass(classType);
+		wasm.gcTypeTable.addClass(irClass);
+
+		// insure mtable is recorded and indirect adapters requested
+		wasm.requestIndirectTable(selector.mtable);
+
+		// pass through to code gen, after any required null check
+		genNullCheck(i_old);
+		return i_old;
+	}
+	def genVariantGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
+		wasm.requestIndirectAdapter(method);
+		var methodRef = V3Op.extractIrSpec(i_old.op, method);
+		var funcRep = mach.funcRep(methodRef);
+		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+	}
+	def genVariantGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
+		// insure class is recorded
+		var classType = selector.receiver;
+		var irClass = mach.prog.ir.getIrClass(classType);
+		wasm.gcTypeTable.addClass(irClass);
+
+		// insure mtable is recorded and indirect adapters requested
+		wasm.requestIndirectTable(selector.mtable);
+
+		// pass through to code gen, after any required null check
+		genNullCheck(i_old);
+		return i_old;
+	}
+	def genComponentGetField(i_old: SsaApplyOp, field: IrField) {
+		// Leave the ComponentGetField for code gen
+		return void(normId(i_old));
+	}
+	def genComponentSetField(i_old: SsaApplyOp, field: IrField) {
+		// Leave the ComponentSetField for code gen
+		return void(normId(i_old));
+	}
+	def genBoundsCheck0(i_old: SsaApplyOp, nullity: Fact.set, narr: SsaInstr) -> (SsaInstr, Fact.set) {
+		return (normId(i_old), nullity);
+	}
+	def genCallMethod(i_old: SsaApplyOp, method: IrMethod) {
+		var methodRef = V3Op.extractIrSpec(i_old.op, method);
+		var funcRep = mach.funcRep(methodRef);
+		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+		var args = Arrays.prepend(func, normRefs(i_old.inputs));
+
+		var i_new = apply(i_old.source, i_old.op, args);
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
+	}
+	def genCallClassMethod(i_old: SsaApplyOp, method: IrMethod) {
+		genNullCheck(i_old);
+		var methodRef = V3Op.extractIrSpec(i_old.op, method);
+		var funcRep = mach.funcRep(methodRef);
+		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
+		var args = Arrays.prepend(func, normRefs(i_old.inputs));
+
+		var i_new = apply(i_old.source, i_old.op, args);
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
+	}
+	def genCallClassSelector(i_old: SsaApplyOp, selector: IrSelector) {
+		var classType = selector.receiver;
+		var irClass = mach.prog.ir.getIrClass(classType);
+		// insure class type is entered
+		wasm.gcTypeTable.addClass(irClass);
+
+		// insure mtable is recorded and dispatch adapters requested
+		wasm.requestDispatchTable(selector.mtable);
+
+		var args = normRefs(i_old.inputs);
+		var i_new = apply(i_old.source, i_old.op, args);
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
+	}
+	def genCallVariantSelector(i_old: SsaApplyOp, selector: IrSelector) {
+		var classType = selector.receiver;
+		var irClass = mach.prog.ir.getIrClass(classType);
+		// insure class type is entered
+		wasm.gcTypeTable.addClass(irClass);
+
+		// insure mtable is recorded and dispatch adapters requested
+		wasm.requestDispatchTable(selector.mtable);
+
+		var args = normRefs(i_old.inputs);
+		var i_new = apply(i_old.source, i_old.op, args);
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
+	}
+	def genCallFunction(i_old: SsaApplyOp) {
+		var funcRep = mach.getFuncRep(i_old.op.typeArgs[0]);
+		var ptype = funcRep.machType;
+		var args = normRefs(i_old.inputs);
+		// essentially the same instruction; helps code below work
+		var i_new = apply(i_old.source, i_old.op, args);
+		wasm.anyCallFunctions = true;
+		i_new.facts = i_new.facts | i_old.facts;
+		var tn = normType(i_old.op.sig.returnType());
+		mapMultiReturn(i_old, i_new, tn);
+	}
+	def genVariantGetTag(i_old: SsaApplyOp, nobj: SsaInstr) -> SsaInstr {
+		var classType = i_old.op.sig.paramTypes[0];
+		var irClass = mach.prog.ir.getIrClass(classType);
+		if (irClass != null) wasm.gcTypeTable.addClass(irClass);
+		return apply(i_old.source, V3Op.newVariantGetTag(i_old.op.typeArgs[0]), [nobj]);
+	}
+	def genPtrAtRef(i_old: SsaApplyOp) {
+		// allow only on off-heap objects
+
+		var rangeType = i_old.op.typeArgs[0];
+		var size = mach.getObjectSize(rangeType, null);
+		wasm.gcTypeTable.addHeapType(rangeType);
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0];
+		var rangeStart = inputs[1];
+
+		var i_new: SsaInstr;
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put1("genPtrAtRef: rangeType %q", rangeType.render).ln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(narr);
+			sp.buf.puts("  start: ");
+			sp.flush();
+		}
+		
+		if (narr.facts.V_NON_ZERO) {
+			// Pointers into the Wasm heap are illegal
+			curBlock.addThrow(i_old.source, V3Exception.Unimplemented);
+			i_old.kill();
+			i_old.remove();
+			return;
+		}
+		if (!narr.facts.V_ZERO) {
+			// conditional throw before return
+			var t = narr.getType();
+			var cmp = apply(i_old.source, V3Op.newRefEq(t), [narr, context.graph.nullConst(t)]);
+			curBlock.opConditionalThrow(V3Exception.Unimplemented, curBlock.opBoolNot(cmp));
+			// fall through to add
+		}
+		map1(i_old, rangeStart);
+	}
+	def genPtrAtRefLayoutField(i_old: SsaApplyOp, offset: int) {
+		// allow only on off-heap objects
+
+		var rangeType = i_old.op.typeArgs[0];
+		wasm.gcTypeTable.addHeapType(rangeType);
+		var inputs = normRefs(i_old.inputs);
+		var narr = inputs[0];
+		var rangeStart = inputs[1];
+
+		var i_new: SsaInstr;
+		if (CLOptions.PRINT_WASM_GC.get()) {
+			var sp = SsaPrinter.new();
+			sp.buf.green().puts("WasmGC: ").end();
+			sp.buf.put2("genPtrAtRefLayoutField: rangeType %q  offset %d", rangeType.render, offset).ln();
+			sp.buf.puts("  arr: ");
+			sp.printInstrLn(narr);
+			sp.buf.puts("  start: ");
+			sp.printInstrLn(rangeStart);
+			sp.flush();
+		}
+		
+		if (narr.facts.V_NON_ZERO) {
+			// Pointers into the Wasm heap are illegal
+			curBlock.addThrow(i_old.source, V3Exception.Unimplemented);
+			i_old.kill();
+			i_old.remove();
+			return;
+		}
+		if (!narr.facts.V_ZERO) {
+			// conditional throw before add
+			var t = narr.getType();
+			var cmp = apply(i_old.source, V3Op.newRefEq(t), [narr, context.graph.nullConst(t)]);
+			curBlock.opConditionalThrow(V3Exception.Unimplemented, curBlock.opBoolNot(cmp));
+			// fall through to add
+		}
+		i_new = ptrAdd(rangeStart, context.graph.intConst(offset));
+		map1(i_old, i_new);
+	}
+	def genNullCheck0(source: Source, nobj: SsaInstr) {
+		if (SsaConst.?(nobj)) {
+			var oval = SsaConst.!(nobj).val;
+			if (oval == null) addThrow(source, V3Exception.NullCheck);
+			return; // constant is non-null
+		}
+		explicitNullCheck(source, nobj.getType(), nobj);
+	}
+}
+
+type RangeKind {
+	case PtrOnly; // range statically known to be pointer-based
+	case ArrayOnly; // range statically known to be array-based
+	case Unknown; // range needs run-time discrimination
+}
+def encodeRangeKind(b : byte) -> RangeKind {
+	// The encoding is:
+	// 1: PtrOnly
+	// 2: ArrayOnly
+	// 3: Unknown (conveniently the OR of 1 and 2)
+	def encoding = [RangeKind.PtrOnly, RangeKind.ArrayOnly, RangeKind.Unknown];
+	return encoding[b - 1];
+}

@@ -17,7 +17,8 @@ RED='[0;31m'
 NORM='[0;00m'
 
 SUITE=$1
-export VIRGIL_TEST_OUT=/tmp/$USER/virgil-test
+# CI_DIR is so that CI tests can use separate directories and run in parallel
+export VIRGIL_TEST_OUT=/tmp/$USER/virgil-test${CI_DIR:+/$CI_DIR}
 OUT=$VIRGIL_TEST_OUT/$SUITE
 mkdir -p $OUT
 
@@ -26,7 +27,7 @@ RT_LOC=$VIRGIL_LOC/rt
 GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
-V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=500m"}
+V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=1500m"}
 TEST_GC_WASM=${TEST_GC_WASM:=1}
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
@@ -37,7 +38,7 @@ PROGRESS="${VIRGIL_LOC}/test/config/progress $PROGRESS_ARGS"
 XARGS=${XARGS:=0}
 
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
-TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm x86-linux x86-64-linux x86-darwin x86-64-darwin"}
+TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm wasm-gc x86-linux x86-64-linux x86-darwin x86-64-darwin"}
 
 if [[ ! -x "$AENEAS_TEST" && "$AENEAS_TEST" != auto ]]; then
     echo $AENEAS_TEST: not found or not executable
@@ -220,7 +221,7 @@ function run_io_tests() {
     done
 }
 
-function run_or_skip_io_tests() {
+function get_io_runners() {
     local target=$1
     shift
 
@@ -230,17 +231,33 @@ function run_or_skip_io_tests() {
     if [ "$runners" = "${PREFIX}*" ]; then
 	runners=$CONFIG/run-$target
 	if [[ ! -x $runners ]]; then
-	    print_status Running $target
-	    echo "${YELLOW}skipped${NORM}"
+	    return 1
+	fi
+    fi
+    echo $runners
+    return 0
+}
+
+function run_or_skip_io_tests() {
+    local target=$1
+    shift
+    PREFIX=$CONFIG/run-$target
+    local runners=$(echo ${PREFIX}*)
+
+    if [ "$runners" = "${PREFIX}*" ]; then
+	runners=$CONFIG/run-$target
+	if [[ ! -x $runners ]]; then
+            print_status Running $target
+            echo "${YELLOW}skipped${NORM}"
 	    return 0
 	fi
     fi
 
     for runner in $runners; do
-	R=$CONFIG/run-
-	tname=${runner/$R/}
-	print_status Running $tname
-	run_io_tests $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS
+        R=$CONFIG/run-
+        tname=${runner/$R/}
+        print_status Running $tname
+        run_io_tests $target $runner $@ | tee $OUT/$target/run-$tname.out | $PROGRESS
     done
 }
 
@@ -384,6 +401,8 @@ function execute_tests() {
             (execute_v3i_tests "v3i" "") || exit $?
             (execute_v3i_tests "v3i-ra" "-ra -ma=false") || exit $?
             (execute_v3i_tests "v3i-ra-ma" "-ra -ma=true") || exit $?
+#            (execute_v3i_tests "v3i-ra-wfts" "-ra -ma=false -wfts=true") || exit $?
+#            (execute_v3i_tests "v3i-ra-ma-wfts" "-ra -ma=true -wfts=true") || exit $?
 	elif [[ "$target" = "jvm" || "$target" = "jar" ]]; then
             (compile_target_tests jvm -jvm.script=false) || exit $?
             (execute_target_tests jvm) || exit $?
@@ -431,6 +450,9 @@ function get_io_targets() {
 	    wasm)
 		result="$result wasm-wave" #TODO: wasm-linux
 		;;
+            wasm-gc)
+                result="$result wasm-gc-wasi1"
+                ;;
 	    *)
 		result="$result $target"
 	esac
