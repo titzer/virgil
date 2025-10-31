@@ -64,14 +64,12 @@ class Compiler(target: Target) {
 	def level = if(CLOptions.O3.val, 3, if(CLOptions.O2.val, 2, if(CLOptions.O1.val, 1, if(CLOptions.O0.val, 0, 1))));
 	def DebugSymbol = CLOptions.DEBUG.get() || ((CLOptions.DWARF.get() || CLOptions.DWARF_LINE.get()) && LinuxTarget.?(target));
 	def printSsaMatcher = CLOptions.PRINT_SSA.get();
-	def printIcMatcher = CLOptions.PRINT_IC.get();
 	def printMachMatcher = CLOptions.PRINT_MACH.get();
 	def statsMatcher = CLOptions.PRINT_SSA_STATS.get();
 	def printOptMatcher = CLOptions.PRINT_OPT.get();
-	def useGlobalRegAllocMatcher = if(CLOptions.DWARF.get(), VstMatcher.None, if(level >= 2, VstMatcher.All, CLOptions.USE_GLOBALREGALLOC.get()));
+	def useGlobalRegAllocMatcher = if(CLOptions.DWARF.get(), VstMatcher.None, if(level >= 2 /* EBM */, VstMatcher.All, CLOptions.USE_GLOBALREGALLOC.get()));
 	def unboxVariantsOpt = CLOptions.UNBOX_VARIANTS.get();
 	def variantUnboxMatcher = if(unboxVariantsOpt != null, GlobMatcher.new(unboxVariantsOpt));
-	var icMon: (IrSpec, IcMethod) -> void;	 // monitor for IC generation
 	var ssaMon: IrSpec -> void;
 	// major phases of compilation
 	var Trace			= CLOptions.TRACE.get();
@@ -100,6 +98,12 @@ class Compiler(target: Target) {
 	var NormOptimize		= flags.get("NormOptimize", level >= 2);
 	var MachOptimize		= flags.get("MachOptimize", level >= 2);
 	var IrAlloc			= CLOptions.IR_ALLOC.get();
+	var firstEnabled		= CLOptions.FIRST_ENABLED.get();
+	var lastEnabled			= CLOptions.LAST_ENABLED.get();
+	var firstDisabled		= CLOptions.FIRST_DISABLED.get();
+	var lastDisabled		= CLOptions.LAST_DISABLED.get();
+	var optCount			= 0;  // count of optimization decision points
+	private var doOptEnabledCheck = false;
 	// XXX: flags for folding, reduction, typechecks, dead code, phi simplification
 	// XXX: implement CSE and code motion
 	// unsafe optimization settings; for performance testing only
@@ -119,10 +123,64 @@ class Compiler(target: Target) {
 		NormConfig.MaxFlatDataValues		= CLOptions.MAXD.get();
 		NormConfig.MaxFlatVariantValues		= CLOptions.MAXV.get();
 		NormConfig.NonRefClosureReceiver	= true;
-		NormConfig.AnyRefOverflow		= true;
 		NormConfig.NormalizeRange		= CLOptions.NR.get();
+		NormConfig.WrapFuncTypeSubsume		= CLOptions.WFTS.get();
+		NormConfig.AnyRefOverflow		= !CLOptions.WFTS.get();  // turn off when WFTS is on
+		NormConfig.ExplicitRefTypeCast		= CLOptions.WFTS.get();   // turn on when WFTS is on
+
 		// target configures the compiler only once
 		if (target != null) target.configureCompiler(this);
+		doOptEnabledCheck = !(firstEnabled == CLOptions.FIRST_ENABLED.init &&
+				      lastEnabled == CLOptions.LAST_ENABLED.init &&
+				      firstDisabled == CLOptions.FIRST_DISABLED.init &&
+				      lastDisabled == CLOptions.LAST_DISABLED.init);
+	}
+
+	def optEnabledAt(count: int) -> bool {
+		if (count < firstEnabled || count > lastEnabled) return false;
+		if (count < firstDisabled || count > lastDisabled) return true;
+		return false;
+	}
+	def optEnabled(print: StringBuilder -> void) -> bool {
+		if (!doOptEnabledCheck) return true;
+		// want to identify enabled / disabled and transitions
+		var prev = optCount++;
+		var prevEnabled = optEnabledAt(prev);
+		var nowEnabled = optEnabledAt(optCount);
+		if (nowEnabled && !prevEnabled) {
+			print(Terminal.buf.yellow().put1("First enabled after disabled optimization #%d: ", optCount).end());
+			Terminal.buf.outln();
+		} else if (prevEnabled && !nowEnabled) {
+			print(Terminal.buf.yellow().put1("First disabled after enabled optimization #%d: ", optCount).end());
+			Terminal.buf.outln();
+		}
+		return nowEnabled;
+	}
+
+	def showPoint(sb: StringBuilder, s: string, meth: IrMethod, block: SsaBlock, inst: SsaInstr) {
+		var sep = "";
+		if (s != null && s.length > 0) {
+			sb.put1("%s", s);
+			sep = "  ";
+		}
+		if (meth != null) {
+			sb.put3("%sMethod %q.%q", sep, meth.receiver.render, meth.render);
+			sep = "  ";
+		}
+		if (block != null) {
+			sb.put2("%sBlock #%d", sep, block.uid);
+			sep = "  ";
+		}
+		if (inst != null) {
+			sb.put2("%sSsaInst #%d", sep, inst.uid);
+		}
+	}
+
+	def showOptCount() -> bool {
+		if (doOptEnabledCheck) {
+			Terminal.buf.yellow().put1("Number of optimization decision points: %d", optCount).end().outln();
+		}
+		return true;
 	}
 
 	def getOutputFileName(fileName: string, ext: string) -> string {
@@ -147,16 +205,13 @@ class Compiler(target: Target) {
 	def filter(matcher: VstMatcher, spec: IrSpec, f: IrSpec -> void) {
 		if (matcher.matches(spec.asMethod().source)) f(spec);
 	}
-	def filterIc(matcher: VstMatcher, spec: IrSpec, icm: IcMethod, f: (IrSpec, IcMethod) -> void) {
-		if (matcher.matches(spec.asMethod().source)) f(spec, icm);
-	}
 	def unboxVariantEarly(decl: VstClass) -> bool {
 		return variantUnboxMatcher != null &&
 			(Strings.equal(unboxVariantsOpt, "") ||  variantUnboxMatcher.matches(decl.token.image));
 	}
 }
 def BASH_HEADER = [
-	"#!/bin/bash\n",
+	"#!/usr/bin/env bash\n",
 	"S=${BASH_SOURCE[0]}\n",
 	"while [ -h \"$S\" ]; do\n",
 	"  DIR=$(cd -P $(dirname \"$S\") >/dev/null 2>&1 && pwd)\n",
@@ -182,6 +237,7 @@ class Compilation(compiler: Compiler, prog: Program) {
 			&& (!compiler.VstInit || init())
 			&& (!compiler.Reachability || reachability())
 			&& emit()
+			&& compiler.showOptCount()
 			&& prog.ERROR.noErrors;
 	}
 	def parse() -> bool {
@@ -253,6 +309,25 @@ class Compilation(compiler: Compiler, prog: Program) {
 		}
 		return true;
 	}
+	private def printWrappedFunctionTypeInfo(pair: (Type, Type), mapper: IrSpec) {
+		Terminal.buf.purple().puts("Wrapped function type mapper:").end()
+			.put2(" from: %q  to: %q ", pair.0.render, pair.1.render);
+		if (mapper == null) Terminal.put("(null)");
+		else Terminal.put1("%q", mapper.render);
+		Terminal.ln();
+	}
+	private def printFunctionAndWrapped(func: IrSpec, wrapped: IrSpec) {
+		Terminal.buf.purple().puts("    Wrapping:").end()
+			.put1(" orig: %q  to: ", func.asMethod().render);
+		if (wrapped == null) Terminal.put("(null)");
+		else Terminal.put1("%q", wrapped.asMethod().render);
+		Terminal.ln();
+	}
+	private def printWrappedFunctionInfo(pair: (Type, Type), map: PartialMap<IrSpec, IrSpec>) {
+		Terminal.buf.purple().puts("Wrapped function info:").end()
+			.put2(" from: %q  to %q", pair.0.render, pair.1.render).ln();
+		map.apply(printFunctionAndWrapped);
+	}
 	def reachability() -> bool {
 		var main = prog.getMain();
 		if (compiler.target != null) compiler.target.addRoots(compiler, prog);
@@ -260,6 +335,11 @@ class Compilation(compiler: Compiler, prog: Program) {
 		ra.analyze();
 		if (CLOptions.PRINT_RA.get()) ra.dump();
 		ra.transform(compiler.NormConfig);
+		if (CLOptions.PRINT_WRAP.get()) {
+			Terminal.buf.purple().puts("Wrapped functions and function types report:").end().ln();
+			ra.wrappedFunctionWrapper.apply(printWrappedFunctionInfo);
+			ra.wrappedFunctionTypeMapper.apply(printWrappedFunctionTypeInfo);
+		}
 		return prog.ERROR.noErrors;
 	}
 	def emit() -> bool {
@@ -295,32 +375,14 @@ class Compilation(compiler: Compiler, prog: Program) {
 			var interp = SsaInterpreter.new(prog, genSsa);
 			var debugger = SsaDebugger.new(prog, genSsa, interp);
 			return debugger.invoke;
-		} if (CLOptions.SSA_INT.val) {
-			var interp = SsaInterpreter.new(prog, genSsa);
-			interp.setTrace(compiler.Trace);
-			if (compiler.TraceCalls != VstMatcher.None) {
-				var tracer = SsaCallTracer.new(compiler.TraceCalls, compiler.TraceParent);
-				compiler.ssaMon = tracer.onGen;
-			}
-			return interp.invoke;
-		} else {
-			var interp = IcInterpreter.new(prog, genIc);
-			if (compiler.Trace) IcTracer.new(interp);
-			if (compiler.TraceCalls != VstMatcher.None) {
-				var tracer = IcCallTracer.new(compiler.TraceCalls, compiler.TraceParent);
-				compiler.icMon = tracer.onGen;
-			}
-			return interp.invoke;
 		}
-	}
-	def genIc(memberRef: IrSpec) -> IcMethod {
-		var icm: IcMethod;
-		genSsa(memberRef, 0);
-		// XXX: cache the SsaContext for creating IC?
-		icm = SsaIcGen.new(SsaContext.new(compiler, prog).enterSpec(memberRef)).generate();
-		if (compiler.icMon != null) compiler.icMon(memberRef, icm);
-		if (compiler.printIcMatcher.matches(memberRef.source())) IrPrinter.new(prog).doIc(icm);
-		return icm;
+		var interp = SsaInterpreter.new(prog, genSsa);
+		interp.setTrace(compiler.Trace);
+		if (compiler.TraceCalls != VstMatcher.None) {
+			var tracer = SsaCallTracer.new(compiler.TraceCalls, compiler.TraceParent);
+			compiler.ssaMon = tracer.onGen;
+		}
+		return interp.invoke;
 	}
 	def genSsa(memberRef: IrSpec, depth: int) -> SsaGraph {
 		var meth = memberRef.asMethod();
@@ -331,7 +393,7 @@ class Compilation(compiler: Compiler, prog: Program) {
 			var graph = gen.generate();
 			context.verify();
 			meth.ssa = graph;
-			if (gen.directCallBlocks != null) {
+			if (gen.directCallBlocks != null && !meth.facts.M_ENUM_INIT) { // don't early-inline into enum inits
 				// Perform inlining.
 				// TODO: -inline=foo also enables heuristic-based early inlining
 				SsaEarlyInliner.new(context, this, gen).inline(depth);
@@ -341,15 +403,12 @@ class Compilation(compiler: Compiler, prog: Program) {
 				SsaCfOptimizer.new(context).optimize();
 				context.printSsa("Control Optimized");
 			}
-			if (compiler.LoadOptimize) {
-				// Perform load elimination.
-				if (SsaLoadOptimizer.new(context).optimize()) {
-					context.printSsa("Load Optimized");
-				}
-			}
-			if (compiler.PostpassOptimize) {
+			if (compiler.PostpassOptimize &&
+			    compiler.optEnabled(compiler.showPoint(_, "(gen)", meth, null, null))) {
 				// Run the post-pass optimizer.
 				var opt = SsaOptimizer.new(context);
+				opt.iopt.optimize_loads = compiler.LoadOptimize &&
+							  compiler.optEnabled(compiler.showPoint(_, "(gen loads)", meth, null, null));
 				opt.optGraph();
 				context.printSsa("Postpass Optimized");
 			}
@@ -376,10 +435,10 @@ class Target(name: string) {
 		if (paramType != Void.TYPE && paramType != V3.stringArrayType) {
 			error(main.token.range(), "Main method parameter type must be void|Array<string>");
 		}
-		var returnType = main.getReturnType();
+		var returnType = main.func.getReturnType();
 		match (returnType.typeCon.kind) {
 			INT, BOOL, VOID => ;
-			_ => error(main.getReturnRange(), "Main method return type must be void|bool|byte|int");
+			_ => error(main.func.getReturnRange(), "Main method return type must be void|bool|byte|int");
 		} 
 	}
 }

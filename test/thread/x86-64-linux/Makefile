@@ -1,0 +1,2 @@
+RiThreadRuntime.x86-64-linux: RiThreadedRuntime.v3
+	v3c -stack-size=1m -heap-size=100k -symbols -target=x86-64-linux -runtime-code-size=16K -program-name=RiThreadedRuntime.x86-64-linux ${VIRGIL_LOC}/rt/gc/*.v3 ${VIRGIL_LOC}/rt/native/NativeStack*.v3 ${VIRGIL_LOC}/rt/native/NativeFileStream.v3 ${VIRGIL_LOC}/rt/x86-64-linux/*.v3 ${VIRGIL_LOC}/lib/asm/x86-64/*.v3 ${VIRGIL_LOC}/lib/util/*.v3 ${VIRGIL_LOC}/lib/x86-64-linux/*.v3 RiThreadedRuntime.v3

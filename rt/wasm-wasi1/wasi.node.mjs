@@ -5,6 +5,8 @@ import { argv, env } from 'node:process';
 var program_args = argv.slice(2);
 
 const wasi = new WASI({
+  returnOnExit: false,
+  version: 'preview1',
   args: program_args,
   env,
   preopens: {

@@ -3,6 +3,21 @@
 
 def INITIAL_MSIZE = 16;
 
+def opHash(op: Operator) -> int {
+	var hash = int.!(op.opcode.tag);
+	for (i < op.typeArgs.length) {
+		hash = hash * 37 + op.typeArgs[i].hash;
+	}
+	hash = hash * 37 + op.sig.hash();
+	return hash;
+}	
+
+def opEquals(op: Operator, other: Operator) -> bool {
+	return op.equals(other) && op.sig.equals(other.sig);
+}
+
+def opMethodCache = HashMap<Operator, IrSpec>.new(opHash, Operator.equals);
+
 // Creates methods to wrap operators so they can be used as closures
 class IrOpMethodBuilder(prog: Program) {
 	var closures: Array<IrClass>;
@@ -15,11 +30,13 @@ class IrOpMethodBuilder(prog: Program) {
 			op = op.subst(abstracter.substitute);
 			typeArgs = abstracter.getTypeArgs();
 		}
+		var cacheable = Opcode.CallClassMethod.?(op.opcode);
+		if (cacheable && opMethodCache.has(op)) return opMethodCache[op];
 		// build SSA params and types
 		def receiver = createGlobalIrClass();
 		var context = SsaContext.new(compiler, prog);
 		var meth = createIrMethod(receiver, typeArgs, op.sig);
-		meth.setFact(Fact.M_INLINE | Fact.M_OPERATOR);
+		meth.setFact(Fact.M_INLINE);
 		context.enterMethod(meth);
 		var block = createSsa(context, receiver, meth);
 		// build block
@@ -32,17 +49,20 @@ class IrOpMethodBuilder(prog: Program) {
 		context.printSsa("Generated");
 		// create the IrSpec
 		var ta = if(typeArgs != null, Arrays.prepend(receiver, typeArgs.types), [receiver]);
-		return IrSpec.new(receiver, ta, meth);
+		var spec = IrSpec.new(receiver, ta, meth);
+		if (cacheable) opMethodCache[op] = spec;
+		return spec;
 	}
 	// build an operator capable of creating a closure for the given operator and args
 	def buildOpClosure(context: SsaContext, ssa: SsaBuilder, op: Operator, args: Array<SsaInstr>, indexMap: Array<int>) -> SsaInstr {
 		// get the closure type
 		var ic = createClosureClass(context, indexMap.length);
 		var closureType = getClosureType(ic, op, indexMap);
-		var newSpec = IrSpec.new(closureType, [closureType], ic.methods[0]);
+		var ftypes = Array<Type>.new(ic.fields.length);
+		for (i < ftypes.length) ftypes[i] = ic.fields[i].fieldType;
 		// create the closure object
 		// XXX: fold the closure creation if possible
-		var closure = ssa.addApply(null, V3Op.newClassAlloc(newSpec), args);
+		var closure = ssa.addApply(null, V3Op.newVariantAlloc(closureType, ftypes), args);
 		closure.facts |= Fact.O_PURE;
 		// create the closure method
 		var abstracter = TypeParamAbstracter.new(prog);
@@ -75,7 +95,7 @@ class IrOpMethodBuilder(prog: Program) {
 			if (ia < indexMap.length && i == indexMap[ia]) {
 				// the argument is bound in the closure
 				var spec = IrSpec.new(closureType, [closureType], ic.fields[ia]);
-				var load = block.addApply(null, V3Op.newClassGetField(spec), [receiver]);
+				var load = block.addApply(null, V3Op.newVariantGetField(spec), [receiver]);
 				load.setFact(Fact.O_PURE | Fact.O_NO_NULL_CHECK);
 				args[i] = load;
 				ia++;
@@ -104,6 +124,7 @@ class IrOpMethodBuilder(prog: Program) {
 		var decl = VstClass.new(false, Token.new("<generated>", name, 0, 0), typeParams, null, null, null, null);
 		decl.typeEnv = TypeEnv.new(null, typeParams, null);
 		decl.typeCon = V3Class_TypeCon.new(decl, prog.typeCache);
+		decl.kind = Kind.VARIANT;
 		var classType = decl.getDeclaredType();
 
 		// add a constructor that initializes the fields
@@ -149,15 +170,17 @@ class IrOpMethodBuilder(prog: Program) {
 	}
 	def createIrMethod(receiver: Type, typeArgs: TypeArgs, sig: Signature) -> IrMethod {
 		// XXX: ugly hack; add another method to an existing IrClass by recreating it if necessary
+		// For other reasons, method vector is now mutable, so it can simply be grown ...
 		var ic = prog.ir.getIrClass(receiver);
 		var m = IrMethod.new(receiver, typeArgs, sig);
 		// search for an empty slot
 		var length = ic.methods.length;
 		for (i = 1; i < length; i++) {
-			if (ic.methods[i] == null) return setIrMethod(ic, i, m);
+			if (ic.methods[i] == null) {
+				return setIrMethod(ic, i, m);
+			}
 		}
-		ic = IrClass.new(receiver, ic.typeArgs, ic.parent, ic.fields, Arrays.grow(ic.methods, length * 4));
-		prog.ir.classMap[receiver] = ic;
+		ic.methods = Arrays.grow(ic.methods, length * 4);
 		return setIrMethod(ic, length, m);
 	}
 	private def setIrMethod(ic: IrClass, i: int, m: IrMethod) -> IrMethod {

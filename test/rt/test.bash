@@ -1,6 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 . ../common.bash rt
+
+EXIT=0
 
 function compile_target_tests_with_flags() {
     target=$1
@@ -43,12 +45,14 @@ for target in $TEST_TARGETS; do
     mkdir -p $T
     
     if [ -d $target ]; then
-        TESTS=$(ls *.v3 $target/*.v3)
-        print_compiling $target
-        compile_target_tests_with_flags $target $TESTS | $PROGRESS
-        run_or_skip_io_tests $target $TESTS
-        print_status Running $target "reserved_code"
-        run_reserved_code_test | $PROGRESS
+	TESTS=$(ls *.v3 $target/*.v3)
+	print_compiling $target
+	compile_target_tests_with_flags $target $TESTS | $PROGRESS
+	fail_fast
+	run_or_skip_io_tests $target $TESTS
+	fail_fast
+	print_status Running $target "reserved_code"
+	run_reserved_code_test | $PROGRESS
+	fail_fast
     fi
 done
-

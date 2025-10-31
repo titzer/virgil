@@ -1,36 +1,52 @@
-// Copyright 2017 Google Inc. All rights reserved.
+// Copyright 2016-2025 Virgil authors.  All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
 def XXX: Terminal;
 def REGS = MachRegSet.new(1, [[1]], ["tos"], [1], [1], 1000, 2000);
+
+// some helper types for heap init code generation
+class HeapInitLocalInfo(wvt: WasmValueType, var base: int, var count: int) {}
+class HeapInitRecordInfo(rec: Record, wvt: WasmValueType, localOffset: int) {}
+
 class WasmCodeGen extends SsaMachGen {
 	def wasm: WasmProgram;
+	def GC = (WasmGcProgram.?(wasm));
+	def wasmGc = if(GC, WasmGcProgram.!(wasm));
+	def getWasmType: (Type -> WasmValueType) = if(GC, wasmGc.wasmGcType, wasm.wasmType);
 	def rt: MachRuntime;
-	def stackgen = WasmStackInstrGen.new(wasm);
+	def stackgen = if(GC, WasmGcStackInstrGen.new(wasmGc), WasmStackInstrGen.new(wasm));
 	var stackifier: MachStackifier;
 	def matcher = SsaInstrMatcher.new();
 	def spiller = ShadowStackSpiller.new();
 	def cfgr = CfgRestructurer.new();
 	def stackBlocks = Vector<(int, ArchInstr, ArchInstr)>.new();
-	def useShadowStack = !CLOptions.WASM_GC.val && rt.shadowStackSize > 0;
+	def useShadowStack = rt.shadowStackSize > 0;
+	def printDetail = WasmGcComponent.printDetail;
 
-	new(context: SsaContext, wasm: WasmProgram, rt, w: MachDataWriter) super(context, wasm.mach, REGS, w) {
+	new(context: SsaContext, wasm, rt, w: MachDataWriter)
+	    super(context, wasm.mach, REGS, w) {
 		stackgen.context = context;
 		stackifier = MachStackifier.new(this);
 	}
 	def emitWasm(m: IrMethod, funcNum: int) {
 		context.enterMethod(m);
 		stackBlocks.length = 0;
-		if (useShadowStack) Ssa.splitCriticalEdges(m.ssa);
-		var order = SsaBlockOrder.new(m.ssa);
+		var order = Ssa.computeBlockOrder(m.ssa, useShadowStack, true);
 		reset(m.ssa, order, null);
+		if (CLOptions.PRINT_CFG.get()) {
+			var buf = TerminalBuffer.new();
+			context.method.renderLong(buf);
+			buf.puts(": ").putd(blocks.order.length);
+			buf.outln();
+			blocks.print();
+		}
 		cfgr.context = context;
 		var code = cfgr.gen(order);
 
 		var out = if(context.shouldPrintMach(), this.getOutput());
 		stackifier.out = if(CLOptions.PRINT_STACKIFY.get(), out);
 		if (out != null) cfgr.print(out, context, regSet, code);
-		if (Debug.PARANOID) cfgr.verify();
+		if (Debug.PARANOID) cfgr.verify(order);
 
 		// Reset locals and assign parameter spill slots.
 		stackgen.reset(m, m.ssa.params, getVReg);
@@ -85,10 +101,10 @@ class WasmCodeGen extends SsaMachGen {
 			}
 			Block(t, bi) => {
 				blockEnd = cursor;
-				emit1(WasmOp.BLOCK.opcode, useInt(wasm.wasmType(t).toInt()));
+				emit1(WasmOp.BLOCK.opcode, useInt(getWasmType(t).toInt()));
 			}
 			Loop(bi) => {
-				emit1(WasmOp.LOOP.opcode, useInt(WasmType.Void.toInt()));
+				emit1(WasmOp.LOOP.opcode, useInt(WasmValueType.Void.toInt()));
 				blockEnd = cursor;
 			}
 			Body(bi) => {
@@ -106,7 +122,7 @@ class WasmCodeGen extends SsaMachGen {
 			If(split, val, t, join) => {
 				context.block = split;
 				blockEnd = cursor;
-				emit2(WasmOp.IF.opcode, useInt(wasm.wasmType(t).toInt()), use(val));
+				emit2(WasmOp.IF.opcode, useInt(getWasmType(t).toInt()), use(val));
 			}
 			Else => {
 				emit0(WasmOp.ELSE.opcode);
@@ -181,8 +197,8 @@ class WasmCodeGen extends SsaMachGen {
 			FloatFloor(isDouble) => emitFloatUnop(i, isDouble, WasmOp.F32_FLOOR, WasmOp.F64_FLOOR);
 			FloatSqrt(isDouble) => emitFloatUnop(i, isDouble, WasmOp.F32_SQRT, WasmOp.F64_SQRT);
 			BoolEq,
-			RefEq,
 			IntEq	=> emitEq(i);
+			RefEq	=> if (GC) emitRefEq(i); else emitEq(i);
 			IntLt	=> emitIntBinopSU(i, WasmOp.I32_LT_S, WasmOp.I32_LT_U, WasmOp.I64_LT_S, WasmOp.I64_LT_U);
 			IntLteq => emitIntBinopSU(i, WasmOp.I32_LE_S, WasmOp.I32_LE_U, WasmOp.I64_LE_S, WasmOp.I64_LE_U);
 			PtrLt => emitBinop(i, WasmOp.I32_LT_U);
@@ -233,11 +249,11 @@ class WasmCodeGen extends SsaMachGen {
 			PtrAdd => emitBinop(i, WasmOp.I32_ADD);
 			PtrSub => emitBinop(i, WasmOp.I32_SUB);
 			ConditionalThrow => {
-				emit2(WasmOp.IF.opcode, useInt(WasmType.Void.toInt()), use(i.inputs[0].dest));
+				emit2(WasmOp.IF.opcode, useInt(WasmValueType.Void.toInt()), use(i.inputs[0].dest));
 				emitN(WasmOp.UNREACHABLE.opcode);
 				emitN(WasmOp.END.opcode);
 			}
-			CallAddress => {
+			CallAddress => { // Not used by WasmGc
 				dfnAll(i);
 				if (useShadowStack) refmap(null);
 				var target = i.inputs[0].dest;
@@ -260,24 +276,462 @@ class WasmCodeGen extends SsaMachGen {
 					useAll(i.inputs, 1);   // use arguments, except target
 					use(i.inputs[0].dest); // target of the call comes last
 					useInt(int.view(sigIndex));
+					useInt(0);  // table number
 					emitN(WasmOp.CALL_INDIRECT.opcode);
 					wasm.containsCallIndirect = true;
 				}
 				// XXX: match Call(PtrLoad(PtrAdd(#meta, x))
 			}
-			Alloc => {
+			Alloc => { // Not used by WasmGc
 				dfn(i);
 				if (useShadowStack) refmap(null);
 				use(i.inputs[0].dest);
 				useInt(wasm.allocateStubFuncIndex);
 				emitN(WasmOp.CALL.opcode);
 			}
-			CallerSp => {
+			CallerSp => { // Not used by WasmGc
 				emit2(WasmOp.I32_CONST.opcode, dfn(i), useImm(Int.ZERO)); // TODO: only needed for RiRuntime.gc call
 			}
-			CallerIp => {
+			CallerIp => { // Not used by WasmGc
 				emit2(WasmOp.I32_CONST.opcode, dfn(i), useImm(Int.ZERO)); // TODO: only needed for RiRuntime.gc call
 			}
+			WasmFunctionTypeId => { // Not tested for WasmGc
+				var paramType = i.op.typeArgs[0];
+				var resultType = i.op.typeArgs[1];
+				var funcType = FuncType.!(Function.newFuncRefType(paramType, resultType));
+				var sigIndex = wasm.addSig(Void.TYPE, funcType.sig());
+				dfn(i);
+				useInt(int.view(sigIndex));
+				emitN(WasmOp.I32_CONST.opcode);
+			}
+			//
+			// Opcodes only for WasmGc
+			//
+			CallMethod => {
+				// first arg is function
+				if (useShadowStack) refmap(null);
+				var target = SsaConst.!(i.input0());
+				var val = target.val, m: IrMethod;
+				if (val == null) {  // call of a null address => always throws
+					emitN(WasmOp.UNREACHABLE.opcode);
+					return;
+				}
+				if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+				else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+				else context.fail("constant target is not an address or function value");
+				var start: int;  // defines how many args to skip (always target, sometimes rcvr)
+				if (V3.isComponent(m.receiver)) {
+					start = 2;
+					dfnAll(i);
+				} else {
+					var rt = i.input1().getType();
+					if (rt == m.receiver) {
+						start = 1;  // just push the receiver as is
+						dfnAll(i);
+					} else {
+						// it can happen that its *static* type is a supertype of m's, but reachability
+						// knows it will always be a subtype (hence m.receiver); for WasmGc, we cast
+						// the receiver's type.  (We *could* call a dispatch adapter, but that adds a call.)
+						var mwht = wasmGc.gcTypeTable.addHeapType(m.receiver);
+						var rcvrTmp = newTmpVReg(WasmValueType.RefNull(mwht));
+						emit3(WasmExtOp.REF_CAST_NULL.extopcode, dfnv0(rcvrTmp), use(i.input1()), useInt(int.!(mwht.index - 1)));
+						start = 2;
+						dfnAll(i);
+						usev0(rcvrTmp);
+					}
+				}
+				useAll(i.inputs, start); // skip target, and maybe receiver
+				useInt(m.machIndex);
+				emitN(WasmOp.CALL.opcode);
+			}
+			CallClassMethod => {
+				// first arg is function
+				if (useShadowStack) refmap(null);
+				var target = SsaConst.!(i.input0());
+				var val = target.val, m: IrMethod;
+				if (val == null) {  // call of a null address => always throws
+					dfnAll(i);
+					emitN(WasmOp.UNREACHABLE.opcode);
+					return;
+				}
+				if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+				else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+				else context.fail("constant target is not an address or function value");
+				var start: int;  // defines how many args to skip (always target, sometimes rcvr)
+				if (V3.isComponent(m.receiver)) {
+					start = 2;
+					dfnAll(i);
+				} else {
+					var rt = i.input1().getType();
+					if (rt == m.receiver) {
+						start = 1;  // just push the receiver as is
+						dfnAll(i);
+					} else {
+						// it can happen that its *static* type is a supertype of m's, but reachability
+						// knows it will always be a subtype (hence m.receiver); for WasmGc, we cast
+						// the receiver's type.  (We *could* call a dispatch adapter, but that adds a call.)
+						var mwht = wasmGc.gcTypeTable.addHeapType(m.receiver);
+						var rcvrTmp = newTmpVReg(WasmValueType.RefNull(mwht));
+						emit3(WasmExtOp.REF_CAST_NULL.extopcode, dfnv0(rcvrTmp), use(i.input1()), useInt(int.!(mwht.index - 1)));
+						start = 2;
+						dfnAll(i);
+						usev0(rcvrTmp);
+					}
+				}
+				useAll(i.inputs, start); // skip target, and maybe receiver
+				useInt(m.machIndex);
+				emitN(WasmOp.CALL.opcode);
+			}
+			CallFunction => {
+				// first arg is ref to function
+				var funcType = FuncType.!(i.op.typeArgs[0]);
+				var sig = funcType.sig();
+				var sigIndex = wasmGc.addSig(Void.TYPE, sig);
+
+				dfnAll(i);
+				if (useShadowStack) refmap(null);
+				useAll(i.inputs, 1);   // use arguments, except target
+				use(i.input0());  // target: index into indirect table
+				useInt(int.!(sigIndex - 1));  // type index
+				useInt(0);  // table number
+				emitN(WasmOp.CALL_INDIRECT.opcode);
+			}
+			TypeCast(cast) => {
+				// only the CLASS and VARIANT cases get here; lowering did the tag range check (if needed)
+				var toType = i.op.typeArgs[1];
+				var wht = wasmGc.gcTypeTable.addHeapType(toType);
+				emit3(WasmExtOp.REF_CAST_NULL.extopcode, dfn(i), use(i.input0()), useInt(int.!(wht.index - 1)));
+			}
+			// REF_TEST does not do *Virgil* subclass checking, only Wasm *structural* type comparison;
+			// so this works only with appropriate -wasm-gc compilation flags.  Otherwise, lowering converts
+			// into a range comparison on Virgil type ids.
+			TypeQuery => {
+				var toType = i.op.typeArgs[1];
+				var wht = wasmGc.gcTypeTable.addHeapType(toType);
+				emit3(WasmExtOp.REF_TEST.extopcode, dfn(i), use(i.input0()), useInt(int.!(wht.index - 1)));
+			}
+			TypeSubsume => {
+				// An explicit cast is required to get the type right for subsequent uses
+				var toType = i.op.typeArgs[1];
+				var wht = wasmGc.gcTypeTable.addHeapType(toType);
+				if (CLOptions.PRINT_WASM_GC.get()) {
+					printDetail().put3("code gen TypeSubsume: toType %q  wht %q  type code %d", toType.render, wht.render, wht.index - 1).outln();
+				}
+				emit3(WasmExtOp.REF_CAST_NULL.extopcode, dfn(i), use(i.input0()), useInt(int.!(wht.index - 1)));
+			}
+			CallVariantSelector(selector) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+
+				var tagTmp = newTmpVReg(WasmValueType.I32);
+				// fetch tag (field 0)
+				dfnv0(tagTmp);
+				use(i.input0());
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+				// subtract minClassId to get offset
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				var minClassId = irClass.minClassId;
+				var offsetTmp: VReg;
+				if (minClassId == 0) {
+					offsetTmp = tagTmp;
+				} else {
+					offsetTmp = newTmpVReg(WasmValueType.I32);
+					var tagType = mach.tagType;
+					var minIdVal = context.graph.valConst(tagType, Int.box(irClass.minClassId));
+					emit3(WasmOp.I32_SUB.opcode, dfnv0(offsetTmp), usev0(tagTmp), use(minIdVal));
+				}
+
+				// obtain type index
+				var mtable = selector.mtable;
+				var root = mtable.root;
+				var sigIdx = wasmGc.addSig(root.receiver, root.sig);	// make sure signature is present
+
+				// obtain table number
+				if (!wasmGc.dispatchTableFor.has(mtable))
+					context.fail1("no dispatch table for mtable %q", mtable.render);
+				var tabnum = int.!(wasmGc.dispatchTableFor[mtable]);
+
+				// do the call
+				dfnAll(i);
+				if (useShadowStack) refmap(null);
+				useAll(i.inputs, 0);   // use arguments, including receiver
+				usev0(offsetTmp);
+				useInt(int.!(sigIdx - 1));  // type index
+				useInt(tabnum);  // table number
+				emitN(WasmOp.CALL_INDIRECT.opcode);
+			}
+			VariantGetTag => {
+				// need type for STRUCT_GET
+				var root = V3.getRootType(i.op.sig.paramTypes[0]);
+				var wht = wasmGc.gcTypeTable.addHeapType(root);
+				var irClass = mach.prog.ir.getIrClass(root);
+				var minClassId = if(irClass == null, 0, irClass.minClassId);
+
+				if (minClassId == 0)  {
+					// fetch tag (field 0)
+					dfn(i);
+					use(i.input0());
+					useInt(int.!(wht.index - 1));
+					useInt(0);
+					emitN(WasmExtOp.STRUCT_GET.extopcode);
+				} else {
+					// fetch tag (field 0)
+					var tagTmp = newTmpVReg(WasmValueType.I32);
+					dfnv0(tagTmp);
+					use(i.input0());
+					useInt(int.!(wht.index - 1));
+					useInt(0);
+					emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+					// subtract minClassId to get offset
+					var tagType = mach.tagType;
+					var minIdVal = context.graph.valConst(tagType, Int.box(minClassId));
+					emit3(WasmOp.I32_SUB.opcode, dfn(i), usev0(tagTmp), use(minIdVal));
+				}
+			}
+			ClassGetField(field) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+				dfn(i);
+				use(i.input0());
+				useInt(int.!(wht.index - 1));
+				useInt(field.machOffset);
+				var wst = WasmStructType.!(wht).fields[field.machOffset];
+				var wop = WasmExtOp.STRUCT_GET;
+				if (wst.pack != WasmPacking.NONE) {
+					match (op.sig.returnTypes[0]) {
+						x: BoolType => { wop = WasmExtOp.STRUCT_GET_U; }
+						x: IntType => {
+							wop = if(x.signed, WasmExtOp.STRUCT_GET_S, WasmExtOp.STRUCT_GET_U);
+						}
+					}
+				}
+				emitN(wop.extopcode);
+			}
+			ClassInitField(field) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+				use(i.input0());
+				use(i.input1());
+				useInt(int.!(wht.index - 1));
+				useInt(field.machOffset);
+				emitN(WasmExtOp.STRUCT_SET.extopcode);
+			}
+			ClassSetField(field) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+				use(i.input0());
+				use(i.input1());
+				useInt(int.!(wht.index - 1));
+				useInt(field.machOffset);
+				emitN(WasmExtOp.STRUCT_SET.extopcode);
+			}
+			ClassGetSelector(selector) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+
+				// fetch tag (field 0)
+				var tagTmp = newTmpVReg(WasmValueType.I32);
+				dfnv0(tagTmp);
+				use(i.input0());
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+				// adjust by subtracting mtable root id and adding mtable base in table 0
+				var mtable = selector.mtable;
+				var adjust = mtable.rootId - wasmGc.indirectTableBase[mtable];
+
+				emit3(WasmOp.I32_SUB.opcode, dfn(i), usev0(tagTmp), use(context.graph.intConst(adjust)));
+			}
+			VariantGetField(field) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+				dfn(i);
+				use(i.input0());
+				useInt(int.!(wht.index - 1));
+				useInt(field.machOffset);
+				var wst = WasmStructType.!(wht).fields[field.machOffset];
+				var wop = WasmExtOp.STRUCT_GET;
+				if (wst.pack != WasmPacking.NONE) {
+					match (op.sig.returnTypes[0]) {
+						x: BoolType => { wop = WasmExtOp.STRUCT_GET_U; }
+						x: IntType => {
+							wop = if(x.signed, WasmExtOp.STRUCT_GET_S, WasmExtOp.STRUCT_GET_U);
+						}
+					}
+				}
+				emitN(wop.extopcode);
+			}
+			VariantGetSelector(selector) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+
+				var tagTmp = newTmpVReg(WasmValueType.I32);
+				// fetch tag (field 0)
+				dfnv0(tagTmp);
+				use(i.input0());
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+				// adjust by subtracting min class id and adding mtable base in table 0
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				var minClassId = irClass.minClassId;
+				var mtable = selector.mtable;
+				var adjust = minClassId - wasmGc.indirectTableBase[mtable];
+
+				emit3(WasmOp.I32_SUB.opcode, dfn(i), usev0(tagTmp), use(context.graph.intConst(adjust)));
+			}
+			ComponentGetField(field) => {
+				if (!wasmGc.globalVarForField.has(field))
+					context.fail1("no global var for field %q", field.render);
+				emit2(WasmOp.GET_GLOBAL.opcode, dfn(i), useInt(wasmGc.globalVarForField[field]));
+			}
+			ComponentSetField(field) => {
+				if (!wasmGc.globalVarForField.has(field))
+					context.fail1("no global var for field %q", field.render);
+				emit2(WasmOp.SET_GLOBAL.opcode, use(i.input1()), useInt(wasmGc.globalVarForField[field]));
+			}
+			CallClassSelector(selector) => {
+				var op = i.op;
+				var clsType = op.sig.paramTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+
+				var tagTmp = newTmpVReg(WasmValueType.I32);
+				// fetch tag (field 0)
+				dfnv0(tagTmp);
+				use(i.input0());
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_GET.extopcode);
+
+				// subtract rootId to get offset
+				var mtable = selector.mtable;
+				var rootId = mtable.rootId;
+
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				var offsetTmp: VReg;
+				if (rootId == 0) {
+					offsetTmp = tagTmp;
+				} else {
+					offsetTmp = newTmpVReg(WasmValueType.I32);
+					var tagType = mach.tagType;
+					var minIdVal = context.graph.valConst(tagType, Int.box(rootId));
+					emit3(WasmOp.I32_SUB.opcode, dfnv0(offsetTmp), usev0(tagTmp), use(minIdVal));
+				}
+
+				// obtain type index
+				var root = mtable.root;
+				var sigIdx = wasmGc.addSig(root.receiver, root.sig);	// make sure signature is present
+
+				// obtain table number
+				if (!wasmGc.dispatchTableFor.has(mtable))
+					context.fail1("no dispatch table for mtable %q", mtable.render);
+				var tabnum = int.!(wasmGc.dispatchTableFor[mtable]);
+
+				// do the call
+				dfnAll(i);
+				if (useShadowStack) refmap(null);
+				useAll(i.inputs, 0);   // use arguments, including receiver
+				usev0(offsetTmp);
+				useInt(int.!(sigIdx - 1));  // type index
+				useInt(tabnum);  // table number
+				emitN(WasmOp.CALL_INDIRECT.opcode);
+			}
+			ArrayAlloc => {
+				var arrType = i.op.sig.returnTypes[0];
+				var wat = wasmGc.gcTypeTable.addHeapType(arrType);
+				emit3(WasmExtOp.ARRAY_NEW_DEFAULT.extopcode, dfn(i), use(i.input0()), useInt(i32.!(wat.index - 1)));
+			}
+			ArrayInit => {
+				var arrType = i.op.sig.returnTypes[0];
+				var wat = wasmGc.gcTypeTable.addHeapType(arrType);
+				dfn(i);
+				useAll(i.inputs, 0);
+				useInt(i32.!(wat.index - 1));
+				useInt(i32.!(i.inputs.length));
+				emitN(WasmExtOp.ARRAY_NEW_FIXED.extopcode);
+			}
+			ArrayGetElem => {
+				var op = i.op;
+				var arrType = op.sig.paramTypes[0];
+				var wat = wasmGc.gcTypeTable.addHeapType(arrType);
+				var wst = WasmArrayType.!(wat).elem;
+				var wop = WasmExtOp.ARRAY_GET;
+				if (wst.pack != WasmPacking.NONE) {
+					match (op.sig.returnTypes[0]) {
+						x: BoolType => { wop = WasmExtOp.ARRAY_GET_U; }
+						x: IntType => {
+							wop = if(x.signed, WasmExtOp.ARRAY_GET_S, WasmExtOp.ARRAY_GET_U);
+						}
+					}
+				}
+				dfn(i);
+				use(i.input0());
+				use(i.input1());
+				useInt(i32.!(wat.index - 1));
+				emitN(wop.extopcode);
+			}
+			ArraySetElem => {
+				var op = i.op;
+				var arrType = op.sig.paramTypes[0];
+				var wat = wasmGc.gcTypeTable.addHeapType(arrType);
+				use(i.input0());
+				use(i.input1());
+				use(i.inputs[2].dest);
+				useInt(i32.!(wat.index - 1));
+				emitN(WasmExtOp.ARRAY_SET.extopcode);
+			}
+			ArrayGetLength => {
+				emit2(WasmExtOp.ARRAY_LEN.extopcode, dfn(i), use(i.input0()));
+			}
+			BoundsCheck => {
+				var lenTmp = newTmpVReg(WasmValueType.I32);
+				emit2(WasmExtOp.ARRAY_LEN.extopcode, dfnv0(lenTmp), use(i.input0()));
+
+				var badTmp = newTmpVReg(WasmValueType.I32);
+				emit3(WasmOp.I32_GE_U.opcode, dfnv0(badTmp), use(i.input1()), usev0(lenTmp));
+
+				emit2(WasmOp.IF.opcode, useInt(WasmValueType.Void.toInt()), usev0(badTmp));
+				emitN(WasmOp.UNREACHABLE.opcode);
+				emitN(WasmOp.END.opcode);
+			}
+			ClassAlloc => {
+				var op = i.op;
+				var clsType = op.sig.returnTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+				emit2(WasmExtOp.STRUCT_NEW_DEFAULT.extopcode, dfn(i), useInt(i32.!(wht.index - 1)));
+				// set tag
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				use(i);
+				useIntConst(irClass.minClassId);
+				useInt(int.!(wht.index - 1));
+				useInt(0);
+				emitN(WasmExtOp.STRUCT_SET.extopcode);
+			}
+			VariantAlloc => {
+				var op = i.op;
+				var clsType = op.sig.returnTypes[0];
+				var wht = wasmGc.gcTypeTable.addHeapType(clsType);
+				var irClass = wasm.mach.prog.ir.getIrClass(clsType);
+				dfn(i);
+				useIntConst(irClass.minClassId);  // include tag
+				useAll(i.inputs, 0);
+				useInt(i32.!(wht.index - 1));
+				emitN(WasmExtOp.STRUCT_NEW.extopcode);
+			}
+
 			_ => return context.fail1("unexpected opcode %s in WASM codegen", i.op.opcode.name);
 		}
 	}
@@ -291,15 +745,15 @@ class WasmCodeGen extends SsaMachGen {
 	}
 	def emitFloatBitEq(i: SsaApplyOp, isDouble: bool) {
 		if (isDouble) {
-			var ia = newTmpVReg(WasmType.I64);
+			var ia = newTmpVReg(WasmValueType.I64);
 			emit2(WasmOp.I64_REINTERPRET_F64.opcode, dfnv0(ia), use(i.input0()));
-			var ib = newTmpVReg(WasmType.I64);
+			var ib = newTmpVReg(WasmValueType.I64);
 			emit2(WasmOp.I64_REINTERPRET_F64.opcode, dfnv0(ib), use(i.input1()));
 			emit3(WasmOp.I64_EQ.opcode, dfn(i), usev0(ia), usev0(ib));
 		} else {
-			var ia = newTmpVReg(WasmType.I32);
+			var ia = newTmpVReg(WasmValueType.I32);
 			emit2(WasmOp.I32_REINTERPRET_F32.opcode, dfnv0(ia), use(i.input0()));
-			var ib = newTmpVReg(WasmType.I32);
+			var ib = newTmpVReg(WasmValueType.I32);
 			emit2(WasmOp.I32_REINTERPRET_F32.opcode, dfnv0(ib), use(i.input1()));
 			emit3(WasmOp.I32_EQ.opcode, dfn(i), usev0(ia), usev0(ib));
 		}
@@ -350,6 +804,23 @@ class WasmCodeGen extends SsaMachGen {
 			emit3(op.opcode, dfn(i), use(matcher.x), use(matcher.y));
 		}
 	}
+	def emitRefEq(i: SsaApplyOp) {
+		matcher.binop(i);
+		match (i.op.typeArgs[0]) {
+			x: FuncType => emitEq(i);
+			x: AnyFuncType => emitEq(i);
+			x: RangeStartType => emitEq(i);
+			x: IntType => emitEq(i);
+			x: PointerType => emitEq(i);
+			_ => {
+				if (matcher.yzero) {
+					emit2(WasmOp.REF_IS_NULL.opcode, dfn(i), use(matcher.x));
+				} else {
+					emit3(WasmOp.REF_EQ.opcode, dfn(i), use(matcher.x), use(matcher.y));
+				}
+			}
+		}
+	}
 	def visitThrow(block: SsaBlock, i: SsaThrow) {
 		emitN(WasmOp.UNREACHABLE.opcode); // TODO: record exception location
 	}
@@ -366,12 +837,12 @@ class WasmCodeGen extends SsaMachGen {
 		// do nothing; handled by CfgRestructurer
 	}
 	def emitShiftShiftL(i: SsaApplyOp, op1: WasmOp, op2: WasmOp, width: int) {
-		var t = newTmpVReg(WasmType.I64);
+		var t = newTmpVReg(WasmValueType.I64);
 		emit3(op1.opcode, dfnv0(t), use(i.input0()), useLongConst(width));
 		emit3(op2.opcode, dfn(i), usev0(t), useLongConst(width));
 	}
 	def emitShiftShiftI(i: SsaApplyOp, op1: WasmOp, op2: WasmOp, width: int) {
-		var t = newTmpVReg(WasmType.I64);
+		var t = newTmpVReg(WasmValueType.I64);
 		emit3(op1.opcode, dfnv0(t), use(i.input0()), useIntConst(width));
 		emit3(op2.opcode, dfn(i), usev0(t), useIntConst(width));
 	}
@@ -390,14 +861,14 @@ class WasmCodeGen extends SsaMachGen {
 					emit2(WasmOp.I32_WRAP_I64.opcode, dfn(i), use(i.input0()));
 				}
 				SUBI32 => {
-					var t1 = newTmpVReg(WasmType.I32);
+					var t1 = newTmpVReg(WasmValueType.I32);
 					emit2(WasmOp.I32_WRAP_I64.opcode, dfnv0(t1), use(i.input0()));
-					var t2 = newTmpVReg(WasmType.I32);
+					var t2 = newTmpVReg(WasmValueType.I32);
 					emit3(WasmOp.I32_SHL.opcode, dfnv0(t2), usev0(t1), useIntConst(tt.ishift));
 					emit3(WasmOp.I32_SHR_S.opcode, dfn(i), usev0(t2), useIntConst(tt.ishift));
 				}
 				SUBU32 => {
-					var t1 = newTmpVReg(WasmType.I32);
+					var t1 = newTmpVReg(WasmValueType.I32);
 					emit2(WasmOp.I32_WRAP_I64.opcode, dfnv0(t1), use(i.input0()));
 					emit3(WasmOp.I32_AND.opcode, dfn(i), usev0(t1), use(context.graph.valConst(Int.TYPE, tt.max)));
 				}
@@ -414,7 +885,7 @@ class WasmCodeGen extends SsaMachGen {
 					// int-long conversion.
 					var op = if(ft.signed, WasmOp.I64_EXTEND_S_I32, WasmOp.I64_EXTEND_U_I32);
 					if (!tt.signed && ft.signed && tt.width < 64) {
-						var t1 = newTmpVReg(WasmType.I64), t2 = newTmpVReg(WasmType.I64);
+						var t1 = newTmpVReg(WasmValueType.I64), t2 = newTmpVReg(WasmValueType.I64);
 						emit2(op.opcode, dfnv0(t1), use(i.input0()));
 						emit3(WasmOp.I64_SHL.opcode, dfnv0(t2), usev0(t1), useLongConst(tt.lshift));
 						emit3(WasmOp.I64_SHR_U.opcode, dfn(i), usev0(t2), useLongConst(tt.lshift));
@@ -446,11 +917,11 @@ class WasmCodeGen extends SsaMachGen {
 		return (null, a);
 	}
 	def emitShift(i: SsaApplyOp, op32: WasmOp, op64: WasmOp) {
-		if (IntType.!(i.op.typeArgs[0]).width <= 32) {
+		if (PrimType.!(i.op.typeArgs[0]).width <= 32) {
 			emit3(op32.opcode, dfn(i), use(i.input0()), use(i.input1()));
 		} else {
 			// wasm requires a 64-bit shiftend
-			var t = newTmpVReg(WasmType.I64);
+			var t = newTmpVReg(WasmValueType.I64);
 			emit2(WasmOp.I64_EXTEND_U_I32.opcode, dfnv0(t), use(i.input1()));
 			emit3(op64.opcode, dfn(i), use(i.input0()), usev0(t));
 		}
@@ -466,7 +937,7 @@ class WasmCodeGen extends SsaMachGen {
 	def emitBinop(i: SsaApplyOp, op: WasmOp) {
 		emit3(op.opcode, dfn(i), use(i.input0()), use(i.input1()));
 	}
-	def newTmpVReg(wasmType: WasmType) -> VReg {
+	def newTmpVReg(wasmType: WasmValueType) -> VReg {
 		return stackgen.allocSlot(newVReg(null), wasmType);
 	}
 	// Assembling support
@@ -523,12 +994,17 @@ class WasmCodeGen extends SsaMachGen {
 				w.put_sleb32(slot);
 			}
 
+			WasmOp.GET_GLOBAL.opcode,
+			WasmOp.SET_GLOBAL.opcode => {
+				emitUint(a[a.length - 1]); // global index
+			}
+
 			WasmOp.LOOP.opcode,
 			WasmOp.BLOCK.opcode,
 			WasmOp.IF.opcode => {
 				var val = toInt(a[0]); // XXX: introduce a toBlockType() helper?
 				if (val < 0) w.put_sleb32(val);
-				else w.putb(WasmTypeConCode.REF_NULL.code).put_uleb32(u32.view(val));
+				else w.putb(WasmTypeConCode.REF_NULL.code).put_sleb32(val - 1);
 			}
 
 			WasmOp.BR.opcode => w.put_uleb32(u32.!(toInt(a[0])));
@@ -590,8 +1066,39 @@ class WasmCodeGen extends SsaMachGen {
 				else w.put_b64(i64.view(Float64Val.!(val).bits));
 			}
 			WasmOp.CALL_INDIRECT.opcode => {
-				emitUint(a[a.length - 1]); // type_index
-				w.putb(0);	 // reserved
+				emitUint(a[a.length - 2]); // type_index
+				emitUint(a[a.length - 1]); // table number
+			}
+			// opcodes below were added for WasmGc
+			WasmOp.TABLE_GET.opcode => {
+				emitUint(a[a.length - 1]); // table number
+			}
+			WasmExtOp.REF_TEST.extopcode,
+			WasmExtOp.REF_TEST_NULL.extopcode,
+			WasmExtOp.REF_CAST_NULL.extopcode,
+			WasmExtOp.REF_CAST.extopcode,
+			WasmOp.REF_NULL.opcode => {
+				emitInt(a[a.length - 1]); // type code
+			}
+			WasmExtOp.STRUCT_NEW.extopcode,
+			WasmExtOp.STRUCT_NEW_DEFAULT.extopcode,
+			WasmExtOp.ARRAY_NEW_DEFAULT.extopcode,
+			WasmExtOp.ARRAY_GET.extopcode,
+			WasmExtOp.ARRAY_GET_S.extopcode,
+			WasmExtOp.ARRAY_GET_U.extopcode,
+			WasmExtOp.ARRAY_SET.extopcode => {
+				emitUint(a[a.length - 1]); // type index
+			}
+			WasmExtOp.ARRAY_NEW_FIXED.extopcode => {
+				emitUint(a[a.length - 2]); // type index
+				emitUint(a[a.length - 1]); // size
+			}
+			WasmExtOp.STRUCT_GET.extopcode,
+			WasmExtOp.STRUCT_GET_S.extopcode,
+			WasmExtOp.STRUCT_GET_U.extopcode,
+			WasmExtOp.STRUCT_SET.extopcode => {
+				emitUint(a[a.length - 2]); // type index
+				emitUint(a[a.length - 1]); // field index
 			}
 		}
 	}
@@ -606,7 +1113,7 @@ class WasmCodeGen extends SsaMachGen {
 		w.put_sleb32(offset);
 	}
 	def emitAddr(addr: Addr) {
-		w.recordPatch(addr, w.pos);
+		w.recordPatch(PatchKind.ABS_SLEB32, addr, w.pos);
 		w.skipN(5);
 	}
 	def emitInt(o: Operand) {
@@ -641,10 +1148,32 @@ class WasmCodeGen extends SsaMachGen {
 		b(/*locals_count=*/0);
 
 		// ============ entrypoint stub code =========================
+
+		if (GC) {
+			// if we have a heap init function, call it
+			var hiIndex = wasmGc.heapInitFuncIndex;
+			if (hiIndex >= 0) {
+				b(WasmOp.CALL.opcode); w.put_sleb32(hiIndex);
+			}
+		}
+
 		var ri_init = rt.getRiInit();
 		var main = mach.prog.getMain();
 		var mainMeth = if(main != null, main.asMethod());
 		var mainSig = if(mainMeth != null, mainMeth.sig);
+
+		if (GC && (rt.heapSize != 0)) {
+			// Set up heap start and heap size, which are I32's and
+			// are stored at offsets 4 and 8 in the memory.
+			var start = CLOptions.HEAP_START_ADDR.get();
+			b(WasmOp.I32_CONST.opcode); b(4);
+			b(WasmOp.I32_CONST.opcode); w.put_sleb32(int.!(start));
+			b(WasmOp.I32_STORE.opcode); b(2); b(0);
+
+			b(WasmOp.I32_CONST.opcode); b(8);
+			b(WasmOp.I32_CONST.opcode); w.put_sleb32(int.!(rt.heapSize));
+			b(WasmOp.I32_STORE.opcode); b(2); b(0);
+		}
 
 		if (test) {
 			if (ri_init != null) {
@@ -698,6 +1227,341 @@ class WasmCodeGen extends SsaMachGen {
 		var bodysize = w.pos - start;
 		w.at(sizepos).putb(bodysize);
 		w.atEnd();
+	}
+	//
+	// support functions for emitHeapInit
+	//
+	def pushDefaultValue(wvt: WasmValueType) {
+		def b = w.putb;
+		match (wvt) {
+			Void,
+			I32 => { b(WasmOp.I32_CONST.opcode).put_sleb32(0); } 
+			I64 => { b(WasmOp.I64_CONST.opcode).put_sleb32(0); } 
+			F32 => { b(WasmOp.F32_CONST.opcode).put_sleb32(0); } 
+			F64 => { b(WasmOp.F64_CONST.opcode).put_sleb32(0); } 
+			FuncRef => { b(WasmOp.I32_CONST.opcode).put_sleb32(0); }
+			AnyRef => { b(WasmOp.REF_NULL.opcode).putb(WasmTypeConCode.ANYREF.code); }
+			EqRef => { b(WasmOp.REF_NULL.opcode).put_sleb32(int.!(WasmTypeConCode.EQREF.val)); }
+			RefNull(ht) => { b(WasmOp.REF_NULL.opcode).put_sleb32(int.!(ht.index - 1)); }
+			_ => {}
+		}
+	}
+	def pushValue(t: Type, val: Val) {
+		def b = w.putb;
+		def imm = Operand.Immediate(val);
+		match (t.typeCon.kind) {
+			ENUM,
+			ENUM_SET,
+			INT => {
+				if (isLong(t)) {
+					var signed = IntType.?(t) && IntType.!(t).signed;
+					val = Long.box(Long.unboxSU(val, signed));
+					assemble(WasmOp.I64_CONST.opcode, [Operand.Immediate(val)]);
+				} else {
+					assemble(WasmOp.I32_CONST.opcode, [imm]);
+				}
+			}
+			RANGE_START => {
+				var start = if(val == null, 0, ArrayRangeStart.!(val).start);
+				assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(Int.box(start))]);
+			}
+			BOOL => {
+				var truth = if(Values.equal(Bool.TRUE, val), Int.ONE);
+				assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(truth)]);
+			}
+			FLOAT => {
+				var opcode = if(V3.isDouble(t), WasmOp.F64_CONST.opcode, WasmOp.F32_CONST.opcode);
+				assemble(opcode, [imm]);
+			}
+			POINTER => {
+				if (t.nested == null || t.nested.head == null) {
+					assemble(WasmOp.I32_CONST.opcode, [imm]);
+				} else {
+					var targetType = t.nested.head;
+					match(targetType.typeCon.kind) {
+						FUNCREF => {
+							if (val == null) {
+								assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(Int.box(0))]);
+								return;
+							} 
+							var m: IrMethod;
+							if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+							else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+							else context.fail("constant function is not null or an address or function value");
+							if (!wasmGc.indirectAdapterIndexFor.has(m))
+								context.fail1("constant function %d has no indirect adapter index", m.machIndex);
+							assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(Int.box(wasmGc.indirectAdapterIndexFor[m]))]);
+						}
+						_ => assemble(WasmOp.I32_CONST.opcode, [imm]);
+					}
+				}
+			}
+			ANYFUNC,
+			FUNCREF => {
+				if (val == null) {
+					assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(Int.box(0))]);
+					return;
+				} 
+				var m: IrMethod;
+				if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+				else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+				else context.fail("constant function is not null or an address or function value");
+				if (!wasmGc.indirectAdapterIndexFor.has(m))
+					context.fail1("constant function %d has no indirect adapter index", m.machIndex);
+				assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(Int.box(wasmGc.indirectAdapterIndexFor[m]))]);
+			}
+			ANYREF,
+			CLASS,
+			ARRAY,
+			VARIANT => {
+				if (val == null) {
+					var wht = wasmGc.gcTypeTable.addHeapType(t);
+					var i: int = if(wht == null, int.!(WasmTypeConCode.EQREF.val), int.!(wht.index - 1));
+					assemble(WasmOp.REF_NULL.opcode, [Operand.Immediate(Int.box(i))]);
+				} else {
+					match (val) {
+						x: Record => {
+							if (!wasmGc.globalVarForRecord.has(x)) {
+								context.fail1("pushValue() no global for Record of type %q", t.render);
+							} else {
+								assemble(WasmOp.GET_GLOBAL.opcode, [Operand.Immediate(Int.box(wasmGc.globalVarForRecord[x]))]);
+							}
+						}
+						x: Addr => {
+							var abs = x.absolute;
+							if (abs < 0) {
+								context.fail1("pushValue() no global for Addr of type %q", t.render);
+							} else {
+								assemble(WasmOp.GET_GLOBAL.opcode, [Operand.Immediate(Int.box(abs))]);
+							}
+						}
+						_ => context.fail1("pushValue() no global for value of type %q", t.render);
+					}
+				}
+			}
+			VOID => {
+				assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(Int.box(0))]);
+			}
+			_ => context.fail1("unimplemented pushValue() of type %q", t.render);
+		}
+	}
+	// push a value, which may be a reference to an already allocated Record;
+	// return true if done, false if the field needs to be filled in later
+	def pushMaybeAllocated(wasm: WasmGcProgram, t: Type, val: Val, wvt: WasmValueType, allocated: PartialMap<Record,u32>) -> bool {
+		if (val == null) {
+			pushValue(t, val);
+			return true;
+		}
+		def b = w.putb;
+		if (Record.?(val)) {
+			var r = Record.!(val);
+			if (allocated.has(r)) {
+				b(WasmOp.GET_LOCAL.opcode).put_uleb32(allocated[r]);
+				return true;
+			} else {
+				var rt = r.rtype;
+				var wht = wasmGc.gcTypeTable.addHeapType(rt);
+				assemble(WasmOp.REF_NULL.opcode, [Operand.Immediate(Int.box(int.!(wht.index - 1)))]);
+				return false;
+			}
+		}
+		pushValue(t, val);
+		return true;
+	}
+	//
+	// While plain Wasm can build a heap in the Wasm memory, initialized from the data
+	// segment, WasmGc must emit Wasm code to construct and fill in the necessary Wasm
+	// struct and array objects in the WasmGc heap.
+	//
+	def emitHeapInit(prog: WasmGcProgram, compRecords: Vector<Record>,
+			 recordInfo: HashMap<int,IrClass>, otherRecords: Vector<Record>) {
+		// otherRecords are ones that need to be heap allocated
+		// We allocate them, in an order we determine, using STRUCT_NEW / ARRAY_NEW_FIXED,
+		// giving on the stack all the fields we can, and deferring references to records
+		// not yet allocated.  We then go back and fill in the deferred entries.
+
+		// After processing all of this, we do assignments to fields of compRecords
+		// that do not have the default value of their type.  These may include references
+		// to the otherRecord objects allocated.
+		def b = w.putb;
+
+		def localsInfoMap = HashMap<WasmValueType, HeapInitLocalInfo>.new(WasmValueType.hash, WasmValueType.equals2);
+		def localInfos = Vector<HeapInitLocalInfo>.new();
+		def othersInfoMap = HashMap<Record, HeapInitRecordInfo>.new(Record.id, Record.==);
+		def localVarMap = HashMap<Record, u32>.new(Record.id, Record.==);
+
+		var allocRecords = Vector<Record>.new();  // in allocation order
+		// for now, just copy from otherRecords
+		for (i < otherRecords.length) allocRecords.put(otherRecords[i]);
+
+		// figure out all types for locals and use a hash map to count how many of each
+		for (i < allocRecords.length) {
+			var r = allocRecords[i];
+			var rt = r.rtype;
+			var wht = wasmGc.gcTypeTable.addHeapType(rt);
+			if (wht == null) {
+				context.fail1("rtype is %q (not a heap type)", rt.render);
+			}
+			var wvt = WasmValueType.RefNull(wht);
+			var linfo = localsInfoMap[wvt];
+			if (linfo == null) {
+				localsInfoMap[wvt] = linfo = HeapInitLocalInfo.new(wvt, -1, 0);
+				localInfos.put(linfo);
+				if (CLOptions.PRINT_WASM_GC.get()) {
+					printDetail().put1("emitHeapInit: added linfo for %q", wvt.render).outln();
+				}
+			}
+			othersInfoMap[r] = HeapInitRecordInfo.new(r, wvt, linfo.count++);
+			if (CLOptions.PRINT_WASM_GC.get()) {
+				printDetail().put2("emitHeapInit: added/updated info for %q  count is %d", wvt.render, linfo.count).outln();
+			}
+		}
+		// assign base local # to each group of locals
+		var localsCount = 0;
+		for (i < localInfos.length) {
+			var li = localInfos[i];
+			li.base = localsCount;
+			localsCount += li.count;
+			if (CLOptions.PRINT_WASM_GC.get()) {
+				printDetail().put3("emitHeapInit: type %q  base is %d  count is %d", li.wvt.render, li.base, li.count).outln();
+			}
+		}
+		// assign local # to each record
+		for (i < allocRecords.length) {
+			var r = allocRecords[i];
+			var recInfo = othersInfoMap[r];
+			var li = localsInfoMap[recInfo.wvt];
+			var localNum = li.base + recInfo.localOffset;
+			if (CLOptions.PRINT_WASM_GC.get()) {
+				printDetail().put2("emitHeapInit: record %d  type %q", i, recInfo.wvt.render).outln();
+				printDetail().put3("  base is %d  offset is %d  local is %d", li.base, recInfo.localOffset, localNum).outln();
+			}
+			localVarMap[r] = u32.!(localNum);
+		}
+
+		var sizepos = w.skip_leb32(); /*body_size*/
+		var start = w.pos;
+
+		// output local var decls
+		w.put_uleb32(u32.!(localInfos.length));
+		for (i < localInfos.length) {
+			var li = localInfos[i];
+			w.put_uleb32(u32.!(li.count));
+			li.wvt.put(w);
+		}
+
+		// emit code to build non-component objects
+		var allocated = HashMap<Record,u32>.new(Record.id, Record.==);
+		// tuple is (which local, heap type, which field, which Val)
+		var deferredStructFields = Vector<(u32,Type,WasmStructType,u32,Val)>.new();
+		var deferredArrayFields = Vector<(u32,Type,WasmArrayType,u32,Val)>.new();
+		for (i < allocRecords.length) {
+			var r = allocRecords[i];
+			var wht = wasmGc.gcTypeTable.addHeapType(r.rtype);
+			if (CLOptions.PRINT_WASM_GC.get()) {
+				printDetail().put2("emitHeapInit: alloc record %d type %q", i, wht.render).outln();
+			}
+			match (wht) {
+				x: WasmStructType => {
+					// push class tag
+					var rt = r.rtype;
+					var irClass = prog.mach.prog.ir.getIrClass(rt);
+					var needsTag = WasmGcComponent.classNeedsTag(irClass.ctype);
+					var offset = 0;
+					if (needsTag) {
+						assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(Int.box(irClass.minClassId))]);
+						offset = 1;
+					}
+					// push remaining values
+					// Note: Record does not have class tag, but x.fields takes it into account
+					for (j < r.values.length) {
+						var fldType = irClass.fields[j].fieldType;
+						if (!pushMaybeAllocated(wasmGc, fldType, r.values[j], x.fields[j+offset].valType, allocated)) {
+							deferredStructFields.put(localVarMap[r], fldType, x, u32.!(j+offset), r.values[j]);
+						}
+					}
+					assemble(WasmExtOp.STRUCT_NEW.extopcode, [Operand.Immediate(Int.box(int.!(wht.index - 1)))]);
+				}
+				x: WasmArrayType => {
+					var eltType = ArrayType.!(r.rtype).elementType();
+					for (j < r.values.length) {
+						if (!pushMaybeAllocated(wasmGc, eltType, r.values[j], x.elem.valType, allocated)) {
+							deferredArrayFields.put(localVarMap[r], eltType, x, u32.!(j), r.values[j]);
+						}
+					}
+					assemble(WasmExtOp.ARRAY_NEW_FIXED.extopcode, [Operand.Immediate(Int.box(int.!(wht.index - 1))),
+										       Operand.Immediate(Int.box(r.values.length))]);
+				}
+				_ => {
+					context.fail1("emitHeapInit Record has unexpected Wasm type %q", wht.render);
+				}
+			}
+			if (wasmGc.globalVarForRecord.has(r)) {
+				// save to local and global
+				b(WasmOp.TEE_LOCAL.opcode).put_uleb32(localVarMap[r]);
+				assemble(WasmOp.SET_GLOBAL.opcode, [Operand.Immediate(Int.box(int.!(wasmGc.globalVarForRecord[r])))]);
+			} else {
+				b(WasmOp.SET_LOCAL.opcode).put_uleb32(localVarMap[r]);
+			}
+			allocated[r] = localVarMap[r];
+		}
+		// fill deferred fields
+		for (i < deferredStructFields.length) {
+			var dsf = deferredStructFields[i];
+			var lv = dsf.0, t = dsf.1, st = dsf.2, findex = dsf.3, val = dsf.4;
+			b(WasmOp.GET_LOCAL.opcode).put_uleb32(lv);
+			if (!pushMaybeAllocated(wasmGc, t, val, st.fields[findex].valType, allocated))
+				context.fail("emitHeapInit: Record (struct field) should have been allocated");
+			assemble(WasmExtOp.STRUCT_SET.extopcode, [Operand.Immediate(Int.box(int.!(st.index - 1))), Operand.Immediate(Int.box(int.!(findex)))]);
+		}
+		for (i < deferredArrayFields.length) {
+			var daf = deferredArrayFields[i];
+			var lv = daf.0, t = daf.1, at = daf.2, index = daf.3, val = daf.4;
+			b(WasmOp.GET_LOCAL.opcode).put_uleb32(lv);
+			assemble(WasmOp.I32_CONST.opcode, [Operand.Immediate(Int.box(int.!(index)))]);
+			if (!pushMaybeAllocated(wasmGc, t, val, at.elem.valType, allocated))
+				context.fail("emitHeapInit: Record (array element) should have been allocated");
+			assemble(WasmExtOp.ARRAY_SET.extopcode, [Operand.Immediate(Int.box(int.!(at.index - 1)))]);
+		}
+
+		// emit code to set globals - including default values (to reset if heapInit is called again)
+		for (i < compRecords.length) {
+			var cr = compRecords[i];
+			if (CLOptions.PRINT_WASM_GC.get() && cr.values == null) {
+				printDetail().put1("emitHeapInit: record %d values is null", i).outln();
+			}
+			if (cr.values == null) continue;  // shouldn't happen, but be safe
+			var rt = cr.rtype;
+			var wst = WasmStructType.!(wasmGc.gcTypeTable.addHeapType(rt));
+			if (CLOptions.PRINT_WASM_GC.get()) {
+				printDetail().put3("emitHeapInit: record %d  type %q  wasm type %q", i, rt.render, wst.render).outln();
+			}
+			var irClass = recordInfo[cr.id];
+			var flds = irClass.fields;
+			var vals = cr.values;
+			for (j < flds.length) {
+				var fld = flds[j];
+				var val = vals[fld.index];
+				if (CLOptions.PRINT_WASM_GC.get()) {
+					printDetail().put2("emitHeapInit: field index %d  value %q", fld.index, V3.render(val)).outln();
+				}
+
+				// emit code to push the constant
+				if (!pushMaybeAllocated(wasmGc, fld.fieldType, val, wst.fields[j].valType, allocated)) {
+					context.fail1("Record not allocated for field %q", fld.render);
+				}
+
+				// emit code to set global
+				if (!wasmGc.globalVarForField.has(fld))
+					context.fail1("no global var for field %q", fld.render);
+				assemble(WasmOp.SET_GLOBAL.opcode, [Operand.Immediate(Int.box(wasmGc.globalVarForField[fld]))]);
+			}
+		}
+
+		assemble(WasmOp.END.opcode, []); // Leave main's results on the stack and fall-through return
+
+		var bodysize = w.pos - start;
+		w.at(sizepos).overwrite_uleb32(bodysize).atEnd();
 	}
 	def emitDefaultConst(w: DataWriter, t: Type) {
 		def b = w.putb;
@@ -759,16 +1623,54 @@ class WasmCodeGen extends SsaMachGen {
 		w.at(sizepos).putb(bodysize);
 		w.atEnd();
 	}
-	def emitIndirectAdapter(sig: Signature, index: u32, m: IrMethod) {
+	def emitIndirectAdapter(m: IrMethod) {
 		def b = w.putb;
 
 		var sizepos = w.skip_leb32(); /*body_size*/
 		var start = w.pos;
 		b(/*locals_count=*/0);
 
-		// indirect adapters just drop the first parameter, so just load
-		// all arguments except the first one and call the target
+		// Wasm indirect adapters just drop the first parameter, so they
+		// just load all arguments except the first one and call the target.
+		// WasmGc indirect adapters are also used for methods with receivers,
+		// which must load and cast the first argument.
 		// ============ indirect adapter code ========================
+		if (GC) {
+			var rcvr = m.receiver;
+			if (rcvr != Void.TYPE && !V3.isComponent(rcvr)) {
+				// get the receiver and cast it
+				b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(0);
+				w.put_b16be(WasmExtOp.REF_CAST_NULL.extopcode);
+				var wht = wasmGc.gcTypeTable.addHeapType(rcvr);
+				w.put_sleb32(int.!(wht.index - 1));
+			}
+		}
+
+		for (i = 1; i < m.ssa.params.length; i++) {
+			b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(i);
+		}
+		b(WasmOp.CALL.opcode);
+		w.put_sleb32(m.machIndex);
+		b(WasmOp.END.opcode);
+		// ===========================================================
+		var bodysize = w.pos - start;
+		w.at(sizepos).overwrite_uleb32(bodysize).atEnd();
+	}
+	// Only in WASM GC
+	def emitDispatchAdapter(m: IrMethod) {
+		def b = w.putb;
+
+		var sizepos = w.skip_leb32(); /*body_size*/
+		var start = w.pos;
+		b(/*locals_count=*/0);
+
+		// dispatch adapters down-cast their first arguments and pass all
+		// arguments to the target function
+		// ============ dispatch adapter code ========================
+		b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(0);
+		w.put_b16be(WasmExtOp.REF_CAST_NULL.extopcode);
+		var wht = wasmGc.gcTypeTable.addHeapType(m.receiver);
+		w.put_sleb32(int.!(wht.index - 1));
 		for (i = 1; i < m.ssa.params.length; i++) {
 			b(WasmOp.GET_LOCAL.opcode); w.put_sleb32(i);
 		}
@@ -799,7 +1701,8 @@ class WasmCodeGen extends SsaMachGen {
 		match (t.typeCon.kind) {
 			ENUM,
 			ENUM_SET,
-			INT => {
+			INT,
+			RANGE_START => {
 				if (isLong(t)) {
 					var signed = IntType.?(t) && IntType.!(t).signed;
 					val = Long.box(Long.unboxSU(val, signed));
@@ -816,21 +1719,90 @@ class WasmCodeGen extends SsaMachGen {
 				var opcode = if(V3.isDouble(t), WasmOp.F64_CONST.opcode, WasmOp.F32_CONST.opcode);
 				emit1(opcode, useImm(val));
 			}
-			POINTER,
-			RANGE_START,
-			FUNCREF,
+			POINTER => {
+				if (!GC || t.nested == null || t.nested.head == null) {
+					emit1(WasmOp.I32_CONST.opcode, useImm(val));
+				} else {
+					var targetType = t.nested.head;
+					match(targetType.typeCon.kind) {
+						FUNCREF => {
+							if (val == null) {
+								emit1(WasmOp.I32_CONST.opcode, useInt(0));
+								return;
+							} 
+							var m: IrMethod;
+							if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+							else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+							else context.fail("constant function is not null or an address or function value");
+							if (!wasmGc.indirectAdapterIndexFor.has(m))
+								context.fail1("constant function %d has no indirect adapter index", m.machIndex);
+							if (CLOptions.PRINT_WASM_GC.get()) {
+								printDetail().put1("POINTER to FUNCREF indirect index is %d", wasmGc.indirectAdapterIndexFor[m]).outln();
+							}
+							emit1(WasmOp.I32_CONST.opcode, useImm(Int.box(wasmGc.indirectAdapterIndexFor[m])));
+						}
+						_ => emit1(WasmOp.I32_CONST.opcode, useImm(val));
+					}
+				}
+			}
 			ANYFUNC,
+			FUNCREF => {
+				if (!GC || val == null) {
+					emit1(WasmOp.I32_CONST.opcode, useInt(0));
+					return;
+				} 
+				var m: IrMethod;
+				if (FuncVal.?(val)) m = FuncVal.!(val).memberRef.asMethod();
+				else if (Address<IrMethod>.?(val)) m = Address<IrMethod>.!(val).val;
+				else context.fail("constant function is not null or an address or function value");
+				if (!wasmGc.indirectAdapterIndexFor.has(m))
+					context.fail1("constant function %d has no indirect adapter index", m.machIndex);
+				if (CLOptions.PRINT_WASM_GC.get()) {
+					printDetail().put1("ANYREF/FUNCREF indirect index is %d", wasmGc.indirectAdapterIndexFor[m]).outln();
+				}
+				emit1(WasmOp.I32_CONST.opcode, useImm(Int.box(wasmGc.indirectAdapterIndexFor[m])));
+			}
+			ANYREF,
 			CLASS,
 			ARRAY,
 			VARIANT => {
-				emit1(WasmOp.I32_CONST.opcode, useImm(val));
+				if (!GC) {
+					emit1(WasmOp.I32_CONST.opcode, useImm(val));
+				} else if (val == null) {
+					var wht = wasmGc.gcTypeTable.addHeapType(t);
+					if (wht != null) {
+						useInt(i32.!(wht.index - 1));
+					} else {
+						useInt(int.!(WasmTypeConCode.EQREF.val));
+					}
+					emitN(WasmOp.REF_NULL.opcode);
+				} else {
+					match (val) {
+						x: Record => {
+							if (!wasmGc.globalVarForRecord.has(x)) {
+								context.fail1("genLoadConst() no global for Record of type %q", t.render);
+							} else {
+								emit1(WasmOp.GET_GLOBAL.opcode, useInt(wasmGc.globalVarForRecord[x]));
+							}
+						}
+						x: Addr => {
+							var abs = x.absolute;
+							if (abs < 0) {
+								context.fail1("genLoadConst() no global for Addr of type %q", t.render);
+							} else {
+								emit1(WasmOp.GET_GLOBAL.opcode, useInt(abs));
+							}
+						}
+						_ => context.fail1("genLoadConst() no global for value of type %q", t.render);
+					}
+				}
 			}
 			_ => context.fail1("unimplemented insertLoadConst() of type %q", t.render);
 		}
 	}
 	// Used by ShadowStackSpiller
 	def newShadowSpTmp() -> VReg {
-		return newTmpVReg(WasmType.I32);
+		return newTmpVReg(WasmValueType.I32);
 	}
 	def getOutput() -> ArchInstrBuffer {
 		if (out != null) return out;
@@ -841,7 +1813,7 @@ class WasmInstrBuffer extends ArchInstrBuffer {
 	new(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) super(codegen, prog, regSet) { }
 	def putArchInstr(indent: int, i: ArchInstr) -> int {
 		var opcode = int.view(i.opcode()), a = i.operands;
-		var name = if(opcode > 255, WasmOpNames.extarray[opcode & 0xFF], WasmOpNames.array[opcode]);
+		var name = WasmOpNames.getName(opcode);
 		match (opcode) {
 			WasmOp.IF.opcode,
 			WasmOp.BLOCK.opcode,
@@ -942,9 +1914,7 @@ class WasmInstrBuffer extends ArchInstrBuffer {
 	}
 }
 def isLong(t: Type) -> bool {
-	if (IntType.?(t)) return IntType.!(t).width > 32;
-	if (EnumSetType.?(t)) return EnumSetType.!(t).repType.width > 32;
-	return false;
+	return PrimType.?(t) && PrimType.!(t).width > 32;
 }
 // A stack instruction generator specifically for WASM.
 // Since it may dynamically assign locals for machine variables, it manages this mapping
@@ -956,7 +1926,7 @@ class WasmStackInstrGen(wasm: WasmProgram) {
 	var i64_count = 0;
 	var f32_count = 0;
 	var f64_count = 0;
-	def other = Vector<WasmType>.new();
+	def other = Vector<WasmValueType>.new();
 
 	def reset(m: IrMethod, params: Array<SsaParam>, getVReg: SsaInstr -> VReg) {
 		i32_count = 0;
@@ -977,13 +1947,13 @@ class WasmStackInstrGen(wasm: WasmProgram) {
 		if (v.hint != 0) return v;
 		return allocSlot(v, wasm.wasmType(v.ssa.getType()));
 	}
-	def allocSlot(v: VReg, wasmType: WasmType) -> VReg {
+	def allocSlot(v: VReg, wasmType: WasmValueType) -> VReg {
 		var index = 0;
 		match (v.hint = wasmType.tag) {
-			WasmType.I32.tag => index = ++i32_count;
-			WasmType.I64.tag => index = ++i64_count;
-			WasmType.F32.tag => index = ++f32_count;
-			WasmType.F64.tag => index = ++f64_count;
+			WasmValueType.I32.tag => index = ++i32_count;
+			WasmValueType.I64.tag => index = ++i64_count;
+			WasmValueType.F32.tag => index = ++f32_count;
+			WasmValueType.F64.tag => index = ++f64_count;
 			_ => {
 				other.put(wasmType);
 				index = other.length;
@@ -996,13 +1966,13 @@ class WasmStackInstrGen(wasm: WasmProgram) {
 		var slot = v.spill - 1;
 		if (v.spill < 0) return -1;
 		if (slot < params) return slot;
-		if (v.hint == WasmType.I32.tag) return slot;
+		if (v.hint == WasmValueType.I32.tag) return slot;
 		slot += i32_count;
-		if (v.hint == WasmType.I64.tag) return slot;
+		if (v.hint == WasmValueType.I64.tag) return slot;
 		slot += i64_count;
-		if (v.hint == WasmType.F32.tag) return slot;
+		if (v.hint == WasmValueType.F32.tag) return slot;
 		slot += f32_count;
-		if (v.hint == WasmType.F64.tag) return slot;
+		if (v.hint == WasmValueType.F64.tag) return slot;
 		slot += f64_count;
 		return slot;
 	}
@@ -1020,6 +1990,84 @@ class WasmStackInstrGen(wasm: WasmProgram) {
 		if (f64_count > 0) { w.put_sleb32(f64_count); w.putb(WasmTypeConCode.F64.code); }
 		for (i < other.length) {
 			// TODO: encode other type
+		}
+	}
+}
+
+def VRegHash(v: VReg) -> int {
+	return v.varNum;
+}
+def VRegEquals(v1: VReg, v2: VReg) -> bool {
+	return v1.varNum == v2.varNum;
+}
+
+// A stack instruction generator specifically for WASM GC.
+// Since it may dynamically assign locals for machine variables, it manages this mapping
+// as well.  Because of the need to deal with more complicated typing of variables, this
+// is split off WasmStackInstrGen.  It also needs a WasmGcProgram field, which is distinct
+// from WasmStackInstrGen's WasmProgram field.
+class WasmGcStackInstrGen extends WasmStackInstrGen {
+	var counts: HashMap<WasmValueType, (int, int)>;  // (base, count)
+	var types: HashMap<VReg, WasmValueType>;
+	def var wasmGc: WasmGcProgram;
+
+	new(wasm: WasmGcProgram) super(wasm) { wasmGc = wasm; }
+
+	def reset(m: IrMethod, params: Array<SsaParam>, getVReg: SsaInstr -> VReg) {
+		counts = HashMap<WasmValueType, (int, int)>.new(WasmValueType.hash, WasmValueType.equals2);  // easiest way ...
+		types = HashMap<VReg, WasmValueType>.new(VRegHash, VRegEquals);
+
+		var curr = if(V3.isComponent(m.receiver), 1, 0);
+		var slot = 0;
+		while (curr < params.length) {
+			var p = params[curr++];
+			var v = getVReg(p);
+			v.spill = slot++;
+			v.hint = wasmGc.wasmGcType(p.vtype).tag;
+		}
+		this.params = slot;
+	}
+	def mapVar(v: VReg) -> VReg {
+		if (v.hint != 0) return v;
+		return allocSlot(v, wasmGc.wasmGcType(v.ssa.getType()));
+	}
+	def allocSlot(v: VReg, wasmType: WasmValueType) -> VReg {
+		v.hint = wasmType.tag;
+		var entry = counts[wasmType];
+		var index = entry.1;
+		counts[wasmType] = (-1, index + 1);
+		types[v] = wasmType;
+		v.spill = params + index;
+		// spill - params == index within same-type locals
+		return v;
+	}
+	def slotOf(v: VReg) -> int {
+		var slot = v.spill;
+		if (v.spill < 0) return -1;
+		if (slot < params) return slot;
+		var wvt = types[v];
+		var entry = counts[wvt];
+		return int.!(entry.0) + (slot - params);
+	}
+	private var total: int;
+	private var ntypes: int;
+	private var decls: Vector<(WasmValueType, int, int)>;
+	private def addToTotal(key: WasmValueType, val: (int, int)) {
+		decls.put((key, total, val.1));
+		total += val.1;
+		ntypes += 1;
+	}
+	def emitVarDecls(w: MachDataWriter) {
+		total = params;
+		ntypes = 0;
+		decls = Vector<(WasmValueType, int, int)>.new();
+		counts.apply(addToTotal);
+		w.put_sleb32(ntypes);
+		for (i < decls.length) {
+			var decl = decls[i];
+			w.put_sleb32(decl.2);
+			decl.0.put(w);
+			counts[decl.0] = (decl.1, decl.2);
 		}
 	}
 }

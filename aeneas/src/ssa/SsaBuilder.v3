@@ -12,17 +12,18 @@ def checkNoTypeVars(t: Type) {
 def checkInputs(inputs: Array<SsaInstr>) {
 	for (i in inputs) if (i == null) return V3.fail("null input");
 }
+def printWrapExtra = Reachability.printWrapExtra;
 
-def NEW_OPTIMIZER = false;
 def N = Facts.NONE;
 // Support class for constructing SSA instruction-by-instruction.
-class SsaBuilder extends SsaBlockState {
+class SsaBuilder {
 	def context: SsaContext;
 	def graph: SsaGraph;
 	var block: SsaBlock;
 	var pt: SsaLink;
 	var opt: SsaOptimizer;
 	var source: Source;
+	var end: bool;
 
 	new(context, graph, block) { }
 
@@ -37,7 +38,6 @@ class SsaBuilder extends SsaBlockState {
 		var i = SsaApplyOp.new(source, op, args);
 		i.setFact(Opcodes.facts(op.opcode));
 		append(i);
-		if (NEW_OPTIMIZER && opt != null) return opt.reduceApply(this, i);
 		return i;
 	}
 	def addApplyF(op: Operator, args: Array<SsaInstr>, facts: Fact.set) -> SsaInstr {
@@ -50,7 +50,6 @@ class SsaBuilder extends SsaBlockState {
 		var i = SsaApplyOp.new(source, op, args);
 		i.setFact(Opcodes.facts(op.opcode) | facts);
 		append(i);
-		if (NEW_OPTIMIZER && opt != null) return opt.reduceApply(this, i);
 		return i;
 	}
 	def addApplyVst(source: Source, op: Operator, vst: VstOperator, args: Array<SsaInstr>) -> SsaInstr {
@@ -76,9 +75,15 @@ class SsaBuilder extends SsaBlockState {
 			IntMixedLteq => return opIntCompare(false, IntType.opLtEq, pt[0], pt[1], args[0], args[1]);
 			IntBitwiseNeg => return opBitwiseNeg(IntType.!(op.typeArgs[0]), args[0]);
 			IntView => return opIntView(op.typeArgs[0], IntType.!(op.typeArgs[1]), args[0]);
+			IntPack => {
+				var it = IntType.!(op.typeArgs[1]);
+				var packer = SsaPacker.new(this, it);
+				packer.flatten(op.typeArgs[0], args[0]);
+				return packer.finish();
+			}
 			FloatSign => {
 				var ft = FloatType.!(op.typeArgs[0]);
-				return opFloatBitField(op, ft, ft.total_width - byte.!(1), 0, args[0]);
+				return opFloatBitField(op, ft, ft.width - byte.!(1), 0, args[0]);
 			}
 			FloatExponent => {
 				var ft = FloatType.!(op.typeArgs[0]);
@@ -376,7 +381,6 @@ class SsaBuilder extends SsaBlockState {
 		end = true;
 		var i = SsaIf.new(cond, tblock, fblock);
 		append(i);
-		if (NEW_OPTIMIZER && opt != null) opt.reduceIf(this, i);
 	}
 	def addSelect(t: Type, cond: SsaInstr, tval: SsaInstr, fval: SsaInstr) -> SsaInstr {
 		if (Debug.PARANOID) { checkInputs([cond, tval, fval]); }
@@ -447,17 +451,87 @@ class SsaBuilder extends SsaBlockState {
 	}
 	// TypeCast<F, T>(x)
 	def opTypeCast(ft: Type, tt: Type, x: SsaInstr) -> SsaInstr {
+		return opTypeCast0(ft, tt, x, null);
+	}
+	// opTypeCast0 allows indication of whether we are normalizing;
+	// when normalizing, we may request function wrappers / mappers
+	def opTypeCast0(ft: Type, tt: Type, x: SsaInstr, analyzer: ReachabilityAnalyzer) -> SsaInstr {
+		if (FuncType.?(ft) && context.compiler.NormConfig.WrapFuncTypeSubsume) {
+			ft = x.getType();
+		}
 		if (ft == tt) return x; // fold TypeCast<T, T>
 		if (tt == x.getType()) return x; // fold TypeCast<F, T>(x: T)
-		var cast = TypeSystem.newTypeCast(ft, tt);
+		var cast = TypeSystem.newTypeCast(ft, tt);	
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			printWrapExtra()
+				.put3("opTypeCast0: from %q  to %q  arg %q", ft.render, tt.render, x.getType().render)
+				.put2("  cast %s  analyzer null %z", cast.name, analyzer == null).ln().puts("   ").outt();
+			SsaPrinter.new().printInstrLn(x).flush();
+		}
 		if (cast != TypeCast.UNKNOWN_CAST && SsaConst.?(x)) {
 			var r = Eval.doCast(cast, ft, tt, SsaConst.!(x).val);
-			if (r.0) return graph.valConst(tt, r.1);
+			if (r.0) {
+				if (context.compiler.NormConfig.WrapFuncTypeSubsume) {
+					if (analyzer != null && analyzer.normalizer != null) {
+						match (tt.typeCon.kind) {
+							FUNCREF => {
+								var val = SsaConst.!(x).val;
+								if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+									printWrapExtra()
+										.put1("opTypeCast0: FUNCREF val %q", V3.render(val)).outln();
+								}
+								if (val != null) {
+									var fv = FuncVal.!(val);
+									var spec = fv.memberRef;
+									spec = analyzer.genWrappedFunction(ft, tt, spec, null);
+									return graph.valConst(tt, FuncVal.new(spec));
+								}
+							}
+							CLOSURE => {
+								var val = Closure.!(SsaConst.!(x).val);
+								if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+									printWrapExtra()
+										.put1("opTypeCast0: CLOSURE val %q", V3.render(val)).outln();
+								}
+								if (val != null) {
+									var spec = analyzer.genWrappedFunction(ft, tt, val.memberRef, null);
+									return graph.valConst(tt, Closure.new(val.val, spec));
+								}
+							}
+							_ => ;
+						}
+					}
+				}
+				return graph.valConst(tt, r.1);
+			}
 			else return addThrow(source, V3Exception.TypeCheck);
 		}
 
 		match (cast) {
-			TRUE => return x; // fold TypeCast
+			TRUE => {
+				if (context.compiler.NormConfig.WrapFuncTypeSubsume) {
+					var kind = tt.typeCon.kind;
+					if (kind == Kind.CLOSURE || (kind == Kind.FUNCREF && analyzer == null)) {
+						// we're early in the process, so request a mapper
+						context.prog.requestMapper(ft, tt);
+						// and insert a TypeCast
+						return add(V3Op.newTypeCast(ft, tt), [x], x.facts);
+					}
+					if (kind == Kind.FUNCREF) {
+						// convert to call to mapper
+						var spec = analyzer.getMapper(ft, tt);
+						var op = V3Op.newCallMethod(spec);
+						var args = [graph.nullReceiver(), x];
+						return addApply(null, op, args);
+					}
+					if (analyzer == null) {
+						// if early in the process, make cast explicit
+						return add(V3Op.newTypeCast(ft, tt), [x], x.facts);
+					}
+				}
+				if (FuncType.?(ft)) Terminal.put2("folded opTypeCast0(%q, %q)\n", ft.render, tt.render);
+				return x; // fold TypeCast
+			}
 			THROW => {
 				return addThrow(source, V3Exception.TypeCheck); // fold TypeCast
 			}
@@ -531,6 +605,19 @@ class SsaBuilder extends SsaBlockState {
 	}
 	// TypeSubsume<F, T>(x)
 	def opTypeSubsume(ft: Type, tt: Type, x: SsaInstr) -> SsaInstr {
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			printWrapExtra()
+				.put2("opTypeSubsume: ft %q  tt %q", ft.render, tt.render).outln();
+		}
+		return opTypeSubsume0(ft, tt, x, null);
+	}
+	// opTypeSubsume0 allows indication of whether we are normalizing;
+	// when normalizing, we may request function wrappers / mappers
+	def opTypeSubsume0(ft: Type, tt: Type, x: SsaInstr, analyzer: ReachabilityAnalyzer) -> SsaInstr {
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			printWrapExtra()
+				.put2("opTypeSubsume0: ft %q  tt %q", ft.render, tt.render).outln();
+		}
  		if (ft == tt) return x; // fold TypeSubsume<T, T>(x)
  		if (tt == x.getType()) return x; // fold TypeSubsume<F, T>(x: T)
 		match (tt.typeCon.kind) {
@@ -539,19 +626,22 @@ class SsaBuilder extends SsaBlockState {
 				if (TypeSystem.isSubtype(ft, tt)) return x; // remove redundant subsume of class
 			}
 			INT => {
-				if (ft.typeCon.kind != Kind.VARIANT && ft.typeCon.kind != Kind.ENUM) return opTypeCast(ft, tt, x);
+				if (ft.typeCon.kind != Kind.VARIANT && ft.typeCon.kind != Kind.ENUM) return opTypeCast0(ft, tt, x, null);
 			}
 			TUPLE => {
-				return opTypeCast(ft, tt, x);
+				return opTypeCast0(ft, tt, x, analyzer);
 			}
 			ENUM_SET => {
 				return EnumSetType.!(tt).genEnumToSet(x, this);
 			}
 			FLOAT => {
-				return opTypeCast(ft, tt, x);
+				return opTypeCast0(ft, tt, x, null);
 			}
 			RANGE => {
-				return opTypeCast(ft, tt, x);
+				return opTypeCast0(ft, tt, x, null);
+			}
+			FUNCREF, CLOSURE => {
+				if (context.compiler.NormConfig.WrapFuncTypeSubsume && ft != Null.TYPE) return opTypeCast0(ft, tt, x, analyzer);
 			}
 			_ => ;
 		}
@@ -590,8 +680,8 @@ class SsaBuilder extends SsaBlockState {
 		if (!facts.O_NO_BOUNDS_CHECK) facts |= tryElimBoundsCheck(x, y);
 		return add(V3Op.newArraySetElem(arrayType, indexType), [x, y, z], facts);
 	}
-	def opRangeStartPlusIndex(rangeType: Type, indexType: IntType, facts: Fact.set, x: SsaInstr, y: SsaInstr) -> SsaInstr {
-		return add(V3Op.newRangeStartPlusIndex(rangeType, indexType), [x, y], facts);
+	def opRangeStartPlusIndex(rangeType: Type, indexType: IntType, facts: Fact.set, r: SsaInstr, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+		return add(V3Op.newRangeStartPlusIndex(rangeType, indexType), [r, x, y], facts);
 	}
 	def opRangeStartFromPointer(rangeType: Type, ptrType: PointerType, facts: Fact.set, x: SsaInstr) -> SsaInstr {
 		return add(V3Op.newRangeStartFromPointer(rangeType, ptrType), [x], facts);
@@ -650,8 +740,10 @@ class SsaBuilder extends SsaBlockState {
 	}
 	// ClassAlloc[new](args)
 	def opClassAlloc(m: IrSpec, x: Array<SsaInstr>) -> SsaInstr {
-		if (m.member == null) return add(V3Op.newEmptyClassAlloc(m.receiver), Ssa.NO_INSTRS, Fact.V_NON_ZERO);
-		return add(V3Op.newClassAlloc(m), x, Fact.V_NON_ZERO);
+		var facts: Fact.set = Fact.V_NON_ZERO;
+		if (m.member == null) return add(V3Op.newEmptyClassAlloc(m.receiver), Ssa.NO_INSTRS, facts);
+		recordDirectCall(m);
+		return add(V3Op.newClassAlloc(m), x, facts);
 	}
 	// (Component|Class|Variant)GetField[f](x)
 	def opGetField(f: IrSpec, x: SsaInstr) -> SsaInstr {
@@ -716,7 +808,12 @@ class SsaBuilder extends SsaBlockState {
 	def opCallVirtual(m: IrSpec, x: Array<SsaInstr>) -> SsaInstr {
 		var facts = m.member.facts & Fact.O_PURE;
 		if(x[0].facts.V_NON_ZERO) facts |= Fact.O_NO_NULL_CHECK;
-		return add(V3Op.bestCallVirtual(m), x, facts); // XXX: devirtualize based on x's type as well
+		var op = V3Op.bestCallVirtual(m);
+		match (op.opcode) {
+			CallClassMethod(m) => recordDirectCall(V3Op.extractIrSpec(op, m));
+			_ => ;
+		}
+		return add(op, x, facts); // XXX: devirtualize based on x's type as well
 	}
 	// CallClosure(args)
 	def opCallClosure(ftype: Type, x: Array<SsaInstr>) -> SsaInstr {
@@ -878,12 +975,13 @@ class SsaIfCascade {
 		fblock = null;
 	}
 	def endCase(val: SsaInstr) {
-		if (builder.end) return;
-		if (varType != null) {
-			if (val == null) builder.context.fail("SsaIfCascade variable must be non-null on this path");
-			phiInputs.put(val);
+		if (!builder.end) {
+			if (varType != null) {
+				if (val == null) builder.context.fail("SsaIfCascade variable must be non-null on this path");
+				phiInputs.put(val);
+			}
+			builder.addGoto(merge);
 		}
-		builder.addGoto(merge);
 		at(fblock);
 	}
 	private def addIf0(cond: SsaInstr, not: bool) {
@@ -891,16 +989,8 @@ class SsaIfCascade {
 		var tb = SsaBlock.new(), fb = SsaBlock.new();
 		if (not) builder.addIf(cond, fb, tb);
 		else builder.addIf(cond, tb, fb);
-		if (tb.preds.length == 0) { // true case eliminated
-			at(fb);
-			fblock = null;
-		} else if (fb.preds.length == 0) { // false case eliminated
-			at(tb);
-			fblock = null;
-		} else {
-			at(tb);
-			fblock = fb;
-		}
+		at(tb);
+		fblock = fb;
 	}
 	def finish() -> SsaInstr {
 		if (fblock != null) builder.context.fail("SsaIfCascade: ended before else clause");

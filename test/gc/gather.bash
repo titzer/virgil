@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-for f in core cast variants large; do
-    v3c -test -test.gc=/tmp/$f.gc ../$f/*.v3
+for f in core cast variants range large; do
+    v3c $V3C_OPTS -test -test.gc=/tmp/$f.gc ../$f/*.v3
     sort /tmp/$f.gc > $f.gc
 done

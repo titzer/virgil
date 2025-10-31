@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 . ../common.bash lib
 
@@ -21,10 +21,9 @@ else
   TESTS=*.v3
 fi
 
-LIB_FILES="$VIRGIL_LOC/lib/util/*.v3 $VIRGIL_LOC/lib/math/*.v3"
+LIB_FILES="$VIRGIL_LOC/lib/util/*.v3 $VIRGIL_LOC/lib/math/*.v3 $VIRGIL_LOC/lib/file/csv/*.v3 $VIRGIL_LOC/lib/file/json/*.v3"
 
 function do_v3i() {
-    print_status Running v3i
     P=$OUT/run.out
     run_v3c "" $TESTS $LIB_FILES
     if [ "$?" != 0 ]; then
@@ -33,9 +32,15 @@ function do_v3i() {
     fi
 
     if [ "$PROGRESS_PIPE" = 1 ]; then
+	print_status Running v3i
 	run_v3c "" -run $TESTS $LIB_FILES | tee $P | $PROGRESS
+	print_status Running "v3i -ra"
+	run_v3c "" -ra -run $TESTS $LIB_FILES | tee $P | $PROGRESS
     else
+	print_status Running v3i
 	run_v3c "" -run $TESTS $LIB_FILES | tee $P
+	print_status Running "v3i -ra"
+	run_v3c "" -ra -run $TESTS $LIB_FILES | tee $P
     fi
 }
 
@@ -47,14 +52,32 @@ function do_compiled() {
     R=$OUT/$target/run.out
 
     print_compiling $target
+    # HACK until wasm-gc is in stable
+    if [ "$target" = wasm-gc-wasi1 ] && [ -z "${AENEAS_TEST##*/stable/*}" ]; then
+	printf "${YELLOW}skipped${NORM}\n"
+        return
+    fi
     run_v3c $target -output=$T $TESTS $LIB_FILES &> $C
     check_no_red $? $C
 
     print_status Running $target
-    if [ -x $CONFIG/run-$target ]; then
-	$OUT/$target/main $TESTS | tee $R | $PROGRESS
+    runners=$(get_io_runners $target)
+    if [ "$runners" = "" ]; then
+        printf "${YELLOW}skipped${NORM}\n"
     else
-	printf "${YELLOW}skipped${NORM}\n"
+        for runner in $runners; do
+            short="${runner##*/}"
+            if [ -x $runner ]; then
+                if [ "$short" = "run-wasm-gc-wasi1@node" ]; then
+	            $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-gc-wasi1/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
+                else
+	            $OUT/$target/main $TESTS | tee $R | $PROGRESS
+                fi
+            else
+	        printf "${YELLOW}skipped${NORM}\n"
+            fi
+            break
+        done
     fi
 }
 

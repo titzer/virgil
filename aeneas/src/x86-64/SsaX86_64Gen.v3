@@ -110,8 +110,6 @@ def Conds: X86_64Conds;
 class SsaX86_64Gen extends SsaMachGen {
 	def asm: X86_64MacroAssembler;
 	def m = SsaInstrMatcher.new();
-	var labelUses: List<(int, Label)>;
-	var kernel: Kernel;
 	def dwarf: Dwarf;
 
 	new(context: SsaContext, mach: MachProgram, asm, w: MachDataWriter, dwarf) super(context, mach, Regs.SET, w) {
@@ -488,22 +486,13 @@ class SsaX86_64Gen extends SsaMachGen {
 		return X86_64CondPair.new(cond, false, null);
 	}
 	def selectWidth(i: SsaApplyOp, op: int) -> int {
-		return if(intOpWidth(i) > 32, op + I_QD_DIFF, op);
-	}
-	def intOpWidth(i: SsaApplyOp) -> byte {
-		// XXX: factor this out and clean it up
-		var t = i.op.typeArgs[0];
-		if (IntType.?(t)) return IntType.!(t).width;
-		if (t.typeCon.kind == Kind.ENUM) return V3.getVariantTagType(t).width;
-		if (t.typeCon.kind == Kind.ENUM_SET) return V3.getEnumSetType(t).width;
-		return 64;
+		return if(PrimType.!(i.op.typeArgs[0]).width > 32, op + I_QD_DIFF, op);
 	}
 	def intCmpOpcode(i: SsaApplyOp) -> int {
-		match ((7 + intOpWidth(i)) >> 3) {
-			1 => return I_CMPB;
-			2, 3, 4 => return I_CMPD;
-			_ => return I_CMPQ;
-		}
+		var width = PrimType.!(i.op.typeArgs[0]).width;
+		if (width <= 8) return I_CMPB;
+		if (width <= 32) return I_CMPD;
+		return I_CMPQ;
 	}
 	def emitCall(call: SsaApplyOp, funcRep: Mach_FuncRep) {
 		var func = call.input0(), mi: MachInstr;
@@ -724,10 +713,9 @@ class SsaX86_64Gen extends SsaMachGen {
 		emit2(opcode | (AM_REG_OP << AM_SHIFT), op(Operand.Def(null, reg)), op(Operand.Use(v, v.spill)));
 	}
 	def genLoadLongConstIntoReg(val: long, reg: int) {
-		var addr = mach.getLongConstAddr(val);
 		op(Operand.Def(null, reg));
-		useMrrsd(null, null, 1, addr);
-		emitN(I_MOVQ | (AM_REG_MRRSD << AM_SHIFT));
+		useImm(Box<long>.new(val));
+		emitN(I_MOVQ | (AM_OP_IMM << AM_SHIFT));
 	}
 	def genRestoreLocal(v: VReg, loc: int) {
 		var from: int;
@@ -756,14 +744,6 @@ class SsaX86_64Gen extends SsaMachGen {
 			}
 		} else {
 			genLoadLocalIntoReg(v, loc);
-		}
-	}
-	def genRegRegMove(src: int, dst: int) {
-		var xmmd = Regs.toXmmr(dst);
-		if (xmmd != null) {
-			emit2(I_MOVSD | (AM_XMM_OP << AM_SHIFT), op(Operand.Def(null, dst)), op(Operand.Use(null, src)));
-		} else {
-			emit2(I_MOVQ | (AM_REG_OP << AM_SHIFT), op(Operand.Def(null, dst)), op(Operand.Use(null, src)));
 		}
 	}
 
@@ -824,16 +804,15 @@ class SsaX86_64Gen extends SsaMachGen {
 				} else {
 					var val = SsaConst.!(src.ssa).val;
 					var bits: long;
-					match (val) { // XXX: use 64-bit constant move here
+					match (val) {
 						x: Box<long> => bits = x.val;
 						x: Float64Val => bits = long.view(x.bits);
 						_ => return emit2(I_MOVD | (AM_OP_IMM << AM_SHIFT), op(Operand.Def(dst)), op(Operand.Immediate(val)));
 
 					}
-					var addr = mach.getLongConstAddr(bits);
 					op(Operand.Def(dst));
-					useMrrsd(null, null, 1, addr);
-					emitN(I_MOVQ | (AM_REG_MRRSD << AM_SHIFT));
+					useImm(Box<long>.new(bits));
+					emitN(I_MOVQ | (AM_OP_IMM << AM_SHIFT));
 				}
 			}
 		}
@@ -858,6 +837,10 @@ class SsaX86_64Gen extends SsaMachGen {
 			match (opcode) {
 				ArchInstrs.ARCH_ENTRY => {
 					var adjust = frameAdjust();
+					if (CLOptions.RT_FP.val) {
+						asm.pushq_r(X86_64Regs.RBP);
+						asm.movq_r_r(X86_64Regs.RBP, X86_64Regs.RSP);
+					}
 					if (adjust > 0) asm.sub_r_i(X86_64Regs.RSP, adjust); // allocate frame
 					return;
 				}
@@ -876,9 +859,10 @@ class SsaX86_64Gen extends SsaMachGen {
 				ArchInstrs.ARCH_NEWVAR => {
 					var newvar = toNewVar(a[0]);
 					var index = -1, start = 1;
-					match (a[start]) {
+					var first = if(start < a.length, a[start]);
+					match (first) {
 						Immediate(val) => {
-							index = toInt(a[1]);
+							index = toInt(first);
 							start++;
 						}
 						_ => ;
@@ -906,7 +890,9 @@ class SsaX86_64Gen extends SsaMachGen {
 				}
 				ArchInstrs.ARCH_RET => {
 					var adjust = frameAdjust();
+					// XXX: use mov %rsp, %rbp if %rbp is properly handled as callee-saved
 					if (adjust > 0) asm.add_r_i(X86_64Regs.RSP, adjust); // deallocate frame
+					if (CLOptions.RT_FP.val) asm.popq_r(X86_64Regs.RBP);
 					asm.ret();
 					return;
 				}
@@ -1274,6 +1260,11 @@ class SsaX86_64Gen extends SsaMachGen {
 		recordAddr(val);
 	}
 	def assemble_r_i(opcode: int, a: X86_64Gpr, val: Val) {
+		if ((opcode & 0xFF) == I_MOVQ && Box<long>.?(val)) {
+			asm.movq_r_l(a, Box<long>.!(val).val);
+			return;
+		}
+
 		var b = toB32(val);
 		match (opcode & 0xFF) {
 			I_ADDD => asm.d.add_r_i(a, b);
@@ -1351,7 +1342,7 @@ class SsaX86_64Gen extends SsaMachGen {
 				asm.ijmp_r(scratch);
 				// align and emit the jump table
 				w.align(4);
-				jtAddr.absolute = w.endAddr();
+				w.bind(jtAddr);
 				// emit (32-bit) jump table
 				for (i = 2; i < a.length; i++) {
 					w.zeroN(4);
@@ -1388,7 +1379,7 @@ class SsaX86_64Gen extends SsaMachGen {
 				return recordReturnSource(a);
 			}
 			I_CALLER_IP => {
-				asm.movq_r_m(toGpr(a[0]), X86_64Regs.RSP.plus(frameAdjust()));
+				asm.movq_r_m(toGpr(a[0]), X86_64Regs.RSP.plus(frame.size() - mach.data.addressSize));
 			}
 			I_CALLER_SP => {
 				asm.lea(toGpr(a[0]), X86_64Regs.RSP.plus(frame.size()));
@@ -1497,7 +1488,8 @@ class SsaX86_64Gen extends SsaMachGen {
 
 	def frameAdjust() -> int {
 		// assumes return address already pushed
-		return frame.size() - mach.code.addressSize;
+		var fpSize = if(CLOptions.RT_FP.val, mach.data.addressSize);
+		return frame.size() - fpSize - mach.code.addressSize;
 	}
 	def toGpr(o: Operand) -> X86_64Gpr {
 		return loc_r(toLoc(o));

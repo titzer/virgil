@@ -1,0 +1,596 @@
+// Copyright 2024 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Copyright 2018 Ulf Adams (see below).
+
+component Floats {
+	private def FLOAT_EXP_WIDTH: byte = 8;
+	private def FLOAT_SIGN_WIDTH: byte = 1;
+	private def FLOAT_MANTISSA_BITS: byte = 23;
+	private def FLOAT_BIAS: byte = 127;
+
+	// Render {val} into the array {a} starting at {pos}.
+	def renderFloat(val: float, a: Array<byte>, pos: int) -> int {
+		var length: int = 0;
+		if (renderNegativeSign(val, a, pos)) {
+			length += 1;
+			pos += 1;
+		}
+		return length + renderPosFloat(val, a, pos, -1);
+	}
+	// Render {val} to {dd} decimal digits into the array {a} starting at {pos}.
+	def renderFloatDecimalDigits(val: float, dd: u32, a: Array<byte>, pos: int) -> int {
+		var length: int = 0;
+		if (renderNegativeSign(val, a, pos)) {
+			length += 1;
+			pos += 1;
+		}
+		return length + renderPosFloat(val, a, pos, int.!(dd));
+	}
+	private def renderNegativeSign(val: float, a: Array<byte>, pos: int) -> bool {
+		if (val.sign != 0) {
+			a[pos] = '-';
+			return true;
+		}
+		return false;
+	}
+	// Render {dd_optional} digits after the decimal point, if non-negative.
+	// Otherwise, render the shortest representation.
+	def renderPosFloat(val: float, a: Array<byte>, pos: int, dd_optional: int) -> int {
+		var bits = u32.view(val);
+		var exponent: u32 = (bits >> FLOAT_MANTISSA_BITS) & ((1u << FLOAT_EXP_WIDTH) - 1); // XXX: use unbiased val.exponent
+		var mantissa: u32 = val.fraction;
+
+		if (exponent == 0b11111111u || (exponent == 0 && mantissa == 0)) {
+			return renderFloatSpecial(exponent, mantissa, a, pos);
+		}
+
+		var fd: (u32, int) = convertToFloatingDecimal(exponent, mantissa);
+		if (dd_optional < 0) {
+			return renderFloatingDecimal(fd.0, fd.1, a, pos);
+		}
+		return renderFloatingDecimalFixed(fd.0, fd.1, a, pos, u32.!(dd_optional));
+	}
+	def renderFloatSpecial(exponent: u32, mantissa: u32, a: Array<byte>, pos: int) -> int { // XXX: inline?
+		if (mantissa != 0) {
+			Arrays.copyInto("NaN", a, pos);
+			return 3;
+		}
+		if (exponent != 0) {
+			Arrays.copyInto("Infinity", a, pos);
+			return 8;
+		}
+		a[pos] = '0';
+		return 1;
+	}
+	def convertToFloatingDecimal(exponent: u32, mantissa: u32) -> (u32, int) {
+		// Step 1: Decode
+		var e_f: int;
+		var m_f: u32;
+
+		if (exponent == 0) {
+			m_f = mantissa;
+			e_f = int.!(1 - FLOAT_BIAS - FLOAT_MANTISSA_BITS);
+		} else {
+			m_f = (1u << FLOAT_MANTISSA_BITS) + mantissa;
+			e_f = int.!(exponent) - FLOAT_BIAS - FLOAT_MANTISSA_BITS;
+		}
+
+		var e_2: int = e_f - 2;
+
+		// Step 2: Determine interval of information preserving outputs
+		var v: u32 = 4u * m_f;
+		var w: u32 = 4u * m_f + 2u;
+		var u: u32 = 4u * m_f;
+		if (mantissa == 0 && exponent > 1) u -= 1u;
+		else u -= 2u;
+		
+		// Step 3: Convert (u,v,w) * 2^(e_2) to a decimal power base.
+		// partially based on code by Ulf Adams to handle overflow
+		var e_10: int;
+		var a: (u32, u32, u32, u32);
+		var b: (u32, u32, u32, u32);
+		var c: (u32, u32, u32, u32);
+		var digit: u32 = 0; // last removed digit
+		var all_a_zero = false;
+		var all_b_zero = false;
+		var acceptBounds = mantissa % 2 == 0;
+		var q: int;
+
+		if (e_2 >= 0) {
+			// u128 will not be overflowed here as shown both empirically and theoretically.
+			// We don't have to implement clever arithemtics here
+			// The resulting a, b, and c are guaranteed to be within u32 range
+			e_10 = 0;
+			q = log10Pow2(u32.!(e_2));
+			a = u128Shift((0u, 0u, 0u, u), e_2);
+			b = u128Shift((0u, 0u, 0u, v), e_2);
+			c = u128Shift((0u, 0u, 0u, w), e_2);
+
+			for (i = 0; i < q; i++)
+			{
+				digit = u128Mod10(b);
+				a = u128Div10(a);
+				b = u128Div10(b);
+				c = u128Div10(c);
+			}
+			e_10 += q;
+
+			if (q <= 9) {
+				all_b_zero = multipleOfPowerOf5(v, u32.!(q));
+			} else if (acceptBounds) {
+				all_a_zero = multipleOfPowerOf5(u, u32.!(q));
+			}
+		} else {
+			// u128 can be overflowed here. As a result, clever tricks are needed
+			// See https://github.com/ulfjack/ryu/blob/master/ryu/f2s.c for more details
+			// The resulting a, b, and c are guaranteed to be within u32 range
+			q = log10Pow5(u32.!(-e_2));
+			var i: int = -e_2 - q;
+			var factor: (u32, u32, u32, u32) = pow5(u32.!(i));
+			e_10 = e_2 + q;
+			a = multAndShift(u, factor, q);
+			b = multAndShift(v, factor, q);
+			c = multAndShift(w, factor, q);
+
+			digit = u128Mod10(multAndShift(v, pow5(u32.!(i + 1)), q - 1));
+			if (q <= 1) {
+				all_b_zero = true;
+				if (acceptBounds) {
+					all_a_zero = mantissa != 0 || exponent <= 1;
+				}
+			} else {
+				all_b_zero = multipleOfPowerOf2(v, u32.!(q - 1));
+			}
+		}
+
+		var t = computeShortest(a.3, b.3, c.3, digit, all_a_zero, all_b_zero, acceptBounds);
+		return (t.0, t.1 + e_10);
+	}
+
+	def computeShortest(a: u32, b: u32, c: u32, digit: u32,
+		all_a_zero: bool, all_b_zero: bool, acceptBounds: bool) -> (u32, int) {
+
+		var i = 0;
+		if (!acceptBounds) c -= 1u;
+		
+		while (a / 10 < c / 10) {
+			all_a_zero = all_a_zero && (a % 10 == 0);
+			a = a / 10;
+			c = c / 10;
+
+			all_b_zero = all_b_zero && (digit == 0);
+			digit = b % 10;
+			b = b / 10;
+
+			i += 1;
+		}
+		if (acceptBounds && all_a_zero) {
+			while (a % 10 == 0) {
+				a = a / 10;
+				c = c / 10;
+
+				all_b_zero = all_b_zero && (digit == 0);
+				digit = b % 10;
+				b = b / 10;
+				i += 1;
+			}
+		}
+
+		var break_tie_down = (b % 2 == 0);
+		var is_tie = (digit == 5 && all_b_zero);
+		var want_round_down = (digit < 5) || (is_tie && break_tie_down);
+		var round_down = (want_round_down && (a != b || all_a_zero)) || (b + 1 > c);
+
+		// the resulting b is guaranteed to be within u32 range
+		if (round_down) return (b, i);
+		return (b + 1, i);
+	}
+	// Render the floating decimal using either fixed or scientific notation.
+	def renderFloatingDecimal(d: u32, e: int, a: Array<byte>, pos: int) -> int {
+		var startingPos = pos;
+		var length = 0;
+
+		var useFixedNotation = this.useFixedNotation(d, e);
+		if (useFixedNotation) {
+			var trailingZeros: u32 = 0u;
+			if (e >= 0) trailingZeros = 1u;
+			length = renderFixed(d, e, a, pos, trailingZeros);
+		} else {
+			length = renderScientific(d, e, a, pos);
+		}
+
+		return length;
+	}
+	// Render {dd} decimal digits. (special case of renderFixed).
+	def renderFloatingDecimalFixed(d: u32, e: int, a: Array<byte>, pos: int, dd: u32) -> int {
+		var length = 0;
+		var diff = int.!(dd) + e;
+		if (e >= 0) {
+			length = renderFixed(d, e, a, pos, dd);
+		} else if (diff >= 0) {
+			length = renderFixed(d, e, a, pos, u32.!(diff));
+		} else {
+			// truncate
+			var t: (u32, int);
+			for (i = 0; i < -diff; i++) {
+				t = getLastDecimalDigit(d);
+				d = t.0;
+			}
+			if (t.1 >= 5) {
+				d += 1;
+			}
+			length = renderFixed(d, e - diff, a, pos, 0);
+		}
+		return length;
+	}
+	// Render floating decimal in fixed notation with {trailingZeros} trailing zeros.
+	private def renderFixed(d: u32, e: int, a: Array<byte>, pos: int, trailingZeros: u32) -> int {
+		var length = int.!(trailingZeros);
+		var isZeroPointX = false;
+		var digitWidth = getDigitWidth(d);
+		var digitsRight = Ints.min(Ints.max(0, -e), digitWidth);
+
+		if (e >= 0) {
+			length += digitWidth + e;
+			if (trailingZeros > 0) {
+				length += 1;  // decimal point
+			}
+		} else if (digitWidth + e <= 0) {
+			isZeroPointX = true;
+			length += 2;  // "0."
+			length += -e;
+		} else {
+			length += digitWidth + 1; // decimal point in the middle
+		}
+
+		pos += length - 1; // start from to right, move to the left
+
+		// render trailing zeros 
+		for (i = 0; i < trailingZeros; i++) {
+			a[pos--] = '0';
+		}
+
+		// render digits right of decimal point
+		var n: u32 = d;
+		for (i = 0; i < digitsRight; i++) {
+			var t = getLastDecimalDigit(n);
+			a[pos--] = byte.!(t.1 + '0');
+			n = t.0;
+		}
+
+		// render leading zeros right of decimal point
+		for (i = digitWidth + e; i < 0; i++)
+			a[pos--] = '0';
+
+		// render "0."" or "."
+		if (isZeroPointX) {
+			Arrays.copyInto("0.", a, pos - 1);
+			pos -= 2;
+		} else if (trailingZeros != 0 || e < 0) {
+			a[pos--] = '.';
+		}
+
+		// render zeros contributed by the exponent left of decimal point
+		for (i = 0; i < e; i++) {
+			a[pos--] = '0';
+		} 
+
+		// render digits left of decimal point
+		for (i = 0; i < digitWidth - digitsRight; i++) {
+			var t = getLastDecimalDigit(n);
+			a[pos--] = byte.!(t.1 + '0');
+			n = t.0;
+		}
+
+		return length;
+	}
+	private def renderScientific(d: u32, e: int, a: Array<byte>, pos: int) -> int {
+		// render fixed part first
+		var digitWidth = getDigitWidth(d);
+		var fixedLength = renderFixed(d, -(digitWidth - 1), a, pos, 0);
+		pos += fixedLength;
+
+		// then render decimal exponent (e.g. E123, E-321)
+		var normalizedE = e + (digitWidth - 1);
+		var normalizedEWidth = getDigitWidth(Ints.abs(normalizedE));
+		var scientificLength: int = 1 + normalizedEWidth;
+		if (normalizedE < 0)
+			scientificLength += 1;
+		
+		pos += scientificLength - 1;
+
+		var n = u32.!(Ints.abs(normalizedE));
+		
+		for (i = 0; i < normalizedEWidth; i++) {
+			var t = getLastDecimalDigit(n);
+			a[pos--] = byte.!(t.1 + '0');
+			n = t.0;
+		}
+
+		if (normalizedE < 0) a[pos--] = '-';
+		
+		a[pos--] = 'E';
+		
+		return fixedLength + scientificLength;
+	}
+	// Determines which decimal notation to use. Java style limits are used.
+	private def useFixedNotation(d: u32, e: int) -> bool {
+		if (d == 0) return true;
+		if (e > 10) return false;
+		if (e > 0) {
+			for (i = 0; i < e; i++)
+			{
+				d = d * 10;
+				// check inside to prevent overflow of u32
+				if (d >= 10000000)
+					return false;
+			}
+			return true;
+		}
+		if (e == 0) return d < 10000000;
+		var digitWidth = getDigitWidth(d);
+		return digitWidth + e >= -2;
+	}
+	// Returns how many decimal digits {d} has.
+	private def getDigitWidth(d: u32) -> int {
+		var digitWidth = 0;
+		if (d == 0) return 1;
+		var n = d;
+		while (n != 0) {
+			n = n / 10;
+			digitWidth += 1;
+		}
+		return digitWidth;
+	}
+	// O(n) naive operation
+	// Can use precomputed table in the future
+	def pow5(n: u32) -> (u32, u32, u32, u32) {
+		if (n == 0) return (0u, 0u, 0u, 1u);
+		var result: (u32, u32, u32, u32) = (0u, 0u, 0u, 1u);
+		for (i = 0; i < n; i++) {
+			result = u128Mult(result, (0u, 0u, 0u, 5u));
+		}
+		return result;
+	}
+	// Returns (d without last decimal digit, d's last decimal digit).
+	private def getLastDecimalDigit(d: u32) -> (u32, int) {
+		return (d / 10, int.view(d % 10));
+	}
+	// Numerical approximation method based on code by Ulf Adams.
+	private def pow5bits(e: u32) -> int {
+		return  int.!(((e * 1217359) >> 19) + 1);
+	}
+	// Numerical approximation method based on code by Ulf Adams. (requires 0 <= e <= 3528)
+	private def log10Pow5(e: u32) -> int {
+		return int.!((e * 732923u) >> 20);
+	}
+	// Numerical approximation method based on code by Ulf Adams. (requires 0 <= e <= 2620)
+	private def log10Pow2(e: u32) -> int {
+		return int.!((e * 78913) >> 18);
+	}
+	// Shifting algorithm based on code by Ulf Adams.
+	// Determine if value is a multiple of power of 2.
+	private def multipleOfPowerOf2(value: u32, p: u32) -> bool {
+		return (value & ((1u << byte.!(p)) - 1)) == 0;
+	}
+	// Determine if value is a multiple of power of 5.
+	private def multipleOfPowerOf5(value: u32, p: u32) -> bool {
+		var current_value = value;
+		for (i = 0; i < p; i = i + 1) {
+			if (current_value % 5 != 0) {
+				return false;
+			}
+			current_value = current_value / 5;
+		}
+		return true;
+	}
+	// u128 operations:
+	// u128 is represented by 4 u32, intermediate operations are performed
+	// using u64 to prevent overflow
+
+	// Multiply u32 by u128 and shift right by {q} bits.
+	private def multAndShift(val: u32, factor: (u32, u32, u32, u32), q: int) -> (u32, u32, u32, u32) {
+		var factor_low = (0u, 0u, factor.2, factor.3);
+		var factor_high = (0u, 0u, factor.0, factor.1);
+	
+		// result = (factor_low + factor_high << 64) >> p
+		var p_low = u128Mult((0u, 0u, 0u, val), factor_low);
+		var p_high = u128Mult((0u, 0u, 0u, val), factor_high);
+		
+		var p_low_shifted = u128Shift(p_low, -q);
+		var p_high_shifted: (u32, u32, u32, u32);
+
+		// remainder here is the values discarded by the shift operations
+		// the summed discarded values can create a carry 
+		var p_low_remainder = u128Shift(u128Shift(p_low, 128 - q), -(128 - q));
+		var p_high_remainder: (u32, u32, u32, u32);
+	
+		if (q < 64) {
+			p_high_shifted = u128Shift(p_high, 64 - q);
+			p_high_remainder = (0u, 0u, 0u, 0u);
+		} else {
+			var n_shift: int = q - 64;
+			p_high_shifted = u128Shift(p_high, -n_shift);
+			p_high_remainder = u128Shift(u128Shift(p_high, 128 - n_shift), -(128 - n_shift));
+		}
+	
+		var result = u128Add(p_low_shifted, p_high_shifted);
+		var carry = u128Shift(u128Add(u128Shift(p_high_remainder, 64), p_low_remainder), -q);
+		return u128Add(result, carry);
+	}
+	private def u128Add(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+		var carry: u64 = 0;
+		
+		var sum3: u64 = u64.view(a.3) + u64.view(b.3) + carry;
+		var res3 = u32.view(sum3);
+		carry = sum3 >> 32;
+		
+		var sum2: u64 = u64.view(a.2) + u64.view(b.2) + carry;
+		var res2 = u32.view(sum2);
+		carry = sum2 >> 32;
+		
+		var sum1: u64 = u64.view(a.1) + u64.view(b.1) + carry;
+		var res1 = u32.view(sum1);
+		carry = sum1 >> 32;
+		
+		var sum0: u64 = u64.view(a.0) + u64.view(b.0) + carry;
+		var res0 = u32.view(sum0);
+		
+		return (res0, res1, res2, res3);
+	}
+	private def u128Mult(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+		var r0: u64 = 0;
+		var r1: u64 = 0;
+		var r2: u64 = 0;
+		var r3: u64 = 0;
+		
+		r3 += u64.view(a.3) * u64.view(b.3);
+		
+		r2 += u64.view(a.2) * u64.view(b.3);
+		r2 += u64.view(a.3) * u64.view(b.2);
+		
+		r1 += u64.view(a.1) * u64.view(b.3);
+		r1 += u64.view(a.2) * u64.view(b.2);
+		r1 += u64.view(a.3) * u64.view(b.1);
+		
+		r0 += u64.view(a.0) * u64.view(b.3);
+		r0 += u64.view(a.1) * u64.view(b.2);
+		r0 += u64.view(a.2) * u64.view(b.1);
+		r0 += u64.view(a.3) * u64.view(b.0);
+		
+		r2 += r3 >> 32;
+		r3 = r3 & 0xFFFFFFFFu;
+		
+		r1 += r2 >> 32;
+		r2 = r2 & 0xFFFFFFFFu;
+		
+		r0 += r1 >> 32;
+		r1 = r1 & 0xFFFFFFFFu;
+		
+		r0 = r0 & 0xFFFFFFFFu;
+		
+		return (u32.view(r0), u32.view(r1), u32.view(r2), u32.view(r3));
+	}
+	private def u128Shift(val: (u32, u32, u32, u32), shift: int) -> (u32, u32, u32, u32) {
+		if (shift == 0) return val;
+		
+		if (shift > 0) { // Left shift
+			if (shift >= 128) {
+				return (0u, 0u, 0u, 0u);
+			}
+			
+			var word_shift = shift / 32;
+			var bit_shift = shift % 32;
+			
+			var result: (u32, u32, u32, u32);
+			
+			if (word_shift == 0) {
+				result = val;
+			} else if (word_shift == 1) {
+				result = (val.1, val.2, val.3, 0u);
+			} else if (word_shift == 2) {
+				result = (val.2, val.3, 0u, 0u);
+			} else if (word_shift == 3) {
+				result = (val.3, 0u, 0u, 0u);
+			} else {
+				return (0u, 0u, 0u, 0u);
+			}
+			
+			if (bit_shift > 0) {
+				var carry: u32 = 0;
+				var new_carry: u32;
+				
+				new_carry = result.3 >> byte.!(32 - bit_shift);
+				var r3 = (result.3 << byte.!(bit_shift)) | carry;
+				carry = new_carry;
+				
+				new_carry = result.2 >> byte.!(32 - bit_shift);
+				var r2 = (result.2 << byte.!(bit_shift)) | carry;
+				carry = new_carry;
+				
+				new_carry = result.1 >> byte.!(32 - bit_shift);
+				var r1 = (result.1 << byte.!(bit_shift)) | carry;
+				carry = new_carry;
+				
+				var r0 = (result.0 << byte.!(bit_shift)) | carry;
+				
+				result = (r0, r1, r2, r3);
+			}
+			
+			return result;
+		} else { // Right shift
+			var s = -shift;
+			if (s >= 128) {
+				return (0u, 0u, 0u, 0u);
+			}
+			
+			var word_shift = s / 32;
+			var bit_shift = s % 32;
+			
+			var result: (u32, u32, u32, u32);
+			
+			if (word_shift == 0) {
+				result = val;
+			} else if (word_shift == 1) {
+				result = (0u, val.0, val.1, val.2);
+			} else if (word_shift == 2) {
+				result = (0u, 0u, val.0, val.1);
+			} else if (word_shift == 3) {
+				result = (0u, 0u, 0u, val.0);
+			} else {
+				return (0u, 0u, 0u, 0u);
+			}
+			
+			if (bit_shift > 0) {
+				var r3 = (result.3 >> byte.!(bit_shift)) | (result.2 << byte.!(32 - bit_shift));
+				var r2 = (result.2 >> byte.!(bit_shift)) | (result.1 << byte.!(32 - bit_shift));
+				var r1 = (result.1 >> byte.!(bit_shift)) | (result.0 << byte.!(32 - bit_shift));
+				var r0 = result.0 >> byte.!(bit_shift);
+				
+				result = (r0, r1, r2, r3);
+			}
+			
+			return result;
+		}
+	}
+	private def u128Mod10(a: (u32, u32, u32, u32)) -> u32 {
+		var remainder: u64 = 0;
+		var temp: u64;
+		
+		temp = (remainder << 32) + u64.view(a.0);
+		remainder = temp % 10;
+		
+		temp = (remainder << 32) + u64.view(a.1);
+		remainder = temp % 10;
+		
+		temp = (remainder << 32) + u64.view(a.2);
+		remainder = temp % 10;
+		
+		temp = (remainder << 32) + u64.view(a.3);
+		remainder = temp % 10;
+		
+		return u32.view(remainder);
+	}
+	private def u128Div10(a: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+		var remainder: u64 = 0;
+		var temp: u64;
+		
+		temp = (remainder << 32) | u64.view(a.0);
+		var r0 = u32.view(temp / 10);
+		remainder = temp % 10;
+		
+		temp = (remainder << 32) | u64.view(a.1);
+		var r1 = u32.view(temp / 10);
+		remainder = temp % 10;
+		
+		temp = (remainder << 32) | u64.view(a.2);
+		var r2 = u32.view(temp / 10);
+		remainder = temp % 10;
+		
+		temp = (remainder << 32) | u64.view(a.3);
+		var r3 = u32.view(temp / 10);
+		
+		return (r0, r1, r2, r3);
+	}
+}

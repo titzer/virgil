@@ -39,9 +39,13 @@ component Eval {
 			CLASS_CAST, VARIANT_CAST => {
 				if (val == null) return ok;
 				if (tt.open()) return throw;
-				if (!Record.?(val) || !TypeSystem.isSubtype(Record.!(val).rtype, tt))
-					return throw;
-				return ok;
+				if (Record.?(val) && TypeSystem.isSubtype(Record.!(val).rtype, tt))
+					return ok;
+				if (Address<Record>.?(val)) {
+					var rval = Address<Record>.!(val).val;
+					if (TypeSystem.isSubtype(rval.rtype, tt)) return ok;
+				}
+				return throw;
 			}
 			INT_VIEW_I => {
 				return (true, doIntView(IntType.!(ft), IntType.!(tt), val));
@@ -146,20 +150,10 @@ component Eval {
 			}
 		}
 	}
-	def doIntPromote(t1: Type, t2: Type, val: Val) -> Val {
-		if (val == null) return val;
-		if (t1 == t2) return val;
-		var i1 = IntType.!(t1), i2 = IntType.!(t2);
-		if (TypeSystem.isIntToLong(i1, i2)) {
-			var v = Box<int>.!(val).val;
-			return Box<long>.new(if(i1.signed, v, u32.view(v)));
-		}
-		return val;
-	}
 	def doIntView(t1: IntType, t2: IntType, val: Val) -> Val {
 		if (val == null) return val;
 		if (t1 == t2) return val;
-		var i1 = IntType.!(t1), i2 = IntType.!(t2);
+		var i1 = IntType.!(t1), i2 = IntType.!(t2); // XXX: redundant
 		if (!TypeSystem.isIntToLong(i1, i2) && TypeSystem.isIntPromotable(i1, i2)) return val;
 		if (t2.width <= 32) {
 			if (Box<int>.?(val)) {
@@ -214,12 +208,6 @@ class Arguments {
 		vals = v[0 ... size];
 		return v;
 	}
-	def getTypeArg(i: int) -> Type;
-	def getTypeArgs() -> Array<Type>;
-	def getProgram() -> Program;
-	def tailCall(spec: IrSpec, recvr: Val, startArg: int, endArg: int) -> Result;
-	def throw(ex: string, msg: string) -> Exception;
-
 	// Convenience accessors that perform casts on arguments
 	def it(i: int) -> IntType { return IntType.!(getTypeArg(i)); }
 	def z(i: int) -> bool { return Bool.unbox(vals[i]); }
@@ -278,9 +266,17 @@ class Arguments {
 	def do_f_f(func: float -> float) -> Val {
 		return boxf((func(f(0))));
 	}
+	def getPrimTypeArg(i: int) -> PrimType { return PrimType.!(getTypeArg(i)); }
+	// Overridden in subclasses.
+	def getTypeArg(i: int) -> Type;
+	def getTypeArgs() -> Array<Type>;
+	def getProgram() -> Program;
+	def tailCall(spec: IrSpec, recvr: Val, startArg: int, endArg: int) -> Result;
+	def throw(ex: string, msg: string) -> Exception;
 }
 
-def NULL_PTR = Addr.new(null, null, 0).setAbsolute(0);
+def NULL_PTR = Addr.new(null, null, 0);
+def unused_ = NULL_PTR.absolute = 0;
 
 def evalIntBinop(args: Arguments, op32: (int, int) -> int, op64: (long, long) -> long) -> Result  {
 	var it = IntType.!(args.getTypeArg(0));
@@ -311,7 +307,10 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 		BoolOr => return Bool.box(args.z(0) || args.z(1));
 		BoolNot => return Bool.box(!args.z(0));
 //----------------------------------------------------------------------------
-		OverloadedEq, IntEq, VariantEq, RefEq => return Bool.box(Values.equal(args.vals[0], args.vals[1]));
+		OverloadedEq, IntEq, VariantEq, RefEq => {
+			var v0 = args.vals[0], v1 = args.vals[1];
+			return Bool.box(Values.equal(v0, v1));
+		}
 //----------------------------------------------------------------------------
 		DefaultValue => return args.getProgram().getDefaultValue(args.getTypeArg(0));
 //----------------------------------------------------------------------------
@@ -619,8 +618,8 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 			return Int.box(ArrayRangeVal.!(val).length);
 		}
 		RangeStartPlusIndex => {
-			var index = args.i(1);
-			match (args.vals[0]) {
+			var index = args.i(2);
+			match (args.vals[1]) {
 				null => return PointerRangeStart.new(NULL_PTR.add(index));
 				x: ArrayRangeStart => return ArrayRangeStart.new(index + x.start, x.arrayType);
 				x: PointerRangeStart => return PointerRangeStart.new(x.start.add(index));
@@ -739,6 +738,32 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 			var val = args.vals[0];
 			return if(Record.?(val), Int.box(V3.getVariantTag(Record.!(val).rtype)));
 		}
+		VariantAlloc => {
+			var receiver = args.getTypeArg(0);
+			var prog = args.getProgram();
+			var ic = prog.ir.makeIrClass(receiver), num_args = args.vals.length, num_fields = ic.fields.length;
+			var record = prog.newRecord(receiver, num_fields);
+			// XXX: factor out argument adaption logic somewhere shared
+			if (args.vals.length == num_fields) {
+				// arity match; just copy values
+				for (i < record.values.length) record.values[i] = args.vals[i];
+			} else if (num_fields == 0) {
+				// nothing to do (could have been passed explicit void)
+			} else if (num_fields == 1) {
+				// box arguments into tuple if necessary
+				if (num_args > 0) record.values[0] = BoxVal.new(null, Ranges.dup(args.vals));
+			} else {
+				// unpack tuple value into individual fields
+				if (num_args != 1) return args.throw(V3Exception.InternalError, Strings.format2("expected %d values, got %d", num_fields, num_args));
+				var val = args.vals[0];
+				match (val) {
+					null => ; // empty tuple, nothing to do
+					x: BoxVal => for (i < record.values.length) record.values[i] = x.values[i];
+					_ => return args.throw(V3Exception.InternalError, Strings.format1("expected tuple value, got %q", V3.renderResult(val, null, _)));
+				}
+			}
+			return record;
+		}
 		VariantGetField(field) => {
 			var object = args.r(0);
 			return if(object != null, object.values[field.index]);
@@ -776,7 +801,8 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 		}
 //----------------------------------------------------------------------------
 		TypeCast(cast) => {
-			var val = args.vals[0], r = Eval.doCast(cast, args.getTypeArg(0), args.getTypeArg(1), val);
+			var val = args.vals[0];
+			var r = Eval.doCast(cast, args.getTypeArg(0), args.getTypeArg(1), val);
 			if (r.0) return r.1;
 			return args.throw(V3Exception.TypeCheck, null);
 		}
@@ -786,7 +812,8 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 		}
 		TypeSubsume => {
 			// XXX: factor out nop subsumes from non-throwing conversions
-			var val = args.vals[0], r = Eval.doCast0(args.getTypeArg(0), args.getTypeArg(1), val);
+			var val = args.vals[0];
+			var r = Eval.doCast0(args.getTypeArg(0), args.getTypeArg(1), val);
 			if (r.0) return r.1;
 			return args.throw(V3Exception.InternalError, "subsume should never fail");
 		}
@@ -865,11 +892,11 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 		}
 		RefLayoutGetField(offset, order) => {
 			var ref = args.ref(0);
-			return doRefLayoutGetField(args, args.getTypeArg(1), ref, offset, order);
+			return doRefLayoutGetField(args, args.getPrimTypeArg(1), ref, offset, order);
 		}
 		RefLayoutSetField(offset, order) => {
 			var ref = args.ref(0);
-			return doRefLayoutSetField(args, args.getTypeArg(1), ref, offset, order, args.vals[1]);
+			return doRefLayoutSetField(args, args.getPrimTypeArg(1), ref, offset, order, args.vals[1]);
 		}
 		RefLayoutAtRepeatedField(offset, scale, max) => {
 			var ref = args.ref(0);
@@ -883,25 +910,25 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 			var ref = args.ref(0);
 			var index = args.i(1);
 			if (u32.view(index) >= u32.view(max)) return args.throw(V3Exception.BoundsCheck, null);
-			return doRefLayoutGetField(args, args.getTypeArg(1), ref, offset + scale * index, order);
+			return doRefLayoutGetField(args, args.getPrimTypeArg(1), ref, offset + scale * index, order);
 		}
 		RefLayoutSetRepeatedField(offset, scale, max, order) => {
 			var ref = args.ref(0);
 			var index = args.i(1);
 			if (u32.view(index) >= u32.view(max)) return args.throw(V3Exception.BoundsCheck, null);
-			return doRefLayoutSetField(args, args.getTypeArg(1), ref, offset + scale * index, order, args.vals[2]);
+			return doRefLayoutSetField(args, args.getPrimTypeArg(1), ref, offset + scale * index, order, args.vals[2]);
 		}
 		ByteArrayGetField(offset, order) => {
 			var array = args.r(0);
 			var i_offset = if(ArrayRangeStart.?(args.vals[1]), ArrayRangeStart.!(args.vals[1]).start, args.i(1));
 			// XXX: Refactor so no intermediate ByteArrayOffset object needed
-			return doRefLayoutGetField(args, args.getTypeArg(0), ByteArrayOffset.new(array, offset), i_offset, order);
+			return doRefLayoutGetField(args, args.getPrimTypeArg(0), ByteArrayOffset.new(array, offset), i_offset, order);
 		}
 		ByteArraySetField(offset, order) => {
 			var array = args.r(0);
 			var i_offset = if(ArrayRangeStart.?(args.vals[1]), ArrayRangeStart.!(args.vals[1]).start, args.i(1));
 			// XXX: Refactor so no intermediate ByteArrayOffset object needed
-			return doRefLayoutSetField(args, args.getTypeArg(0), ByteArrayOffset.new(array, offset), i_offset, order, args.vals[2]);
+			return doRefLayoutSetField(args, args.getPrimTypeArg(0), ByteArrayOffset.new(array, offset), i_offset, order, args.vals[2]);
 		}
 
 //----------------------------------------------------------------------------
@@ -928,16 +955,14 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 	}
 	return args.throw("EvalUnimplemented", op.opcode.name);
 }
-
-def doRefLayoutGetField(args: Arguments, fieldType: Type, ref: ByteArrayOffset, offset: int, order: ByteOrder) -> Result {
+def doRefLayoutGetField(args: Arguments, fieldType: PrimType, ref: ByteArrayOffset, offset: int, order: ByteOrder) -> Result {
 	if (ref == null || ref.array == null) return args.throw(V3Exception.NullCheck, null);
+	var v = ref.read(order, offset, fieldType.packedByteSize);
 	match (fieldType) {
 		x: BoolType => {
-			var v = ref.read(order, offset, 1);
 			return Bool.box((v & 1) != 0);
 		}
 		x: IntType => {
-			var v = ref.read(order, offset, x.size);
 			match (x.rank) {
 				SUBI32 =>	return Int.box(int.view(v) << x.ishift >> x.ishift);
 				SUBU32 =>	return Int.box(int.view(v) << x.ishift >>> x.ishift);
@@ -948,37 +973,19 @@ def doRefLayoutGetField(args: Arguments, fieldType: Type, ref: ByteArrayOffset, 
 			}
 		}
 		x: EnumType => {
-			var v = ref.read(order, offset, x.packedByteSize());
 			if (v >= x.enumDecl.cases.length) v = 0; // out-of-bounds tag => 0
 			return Int.box(int.view(v)); // TODO: long enum vals?
 		}
 		x: FloatType => {
-			var v = ref.read(order, offset, x.byteSize());
 			if (x.is64) return Float64Val.new(v);
 			else return Float32Val.new(u32.view(v));
 		}
 		_ => return args.throw("EvalException", Strings.format1("invalid RefLayoutField type %q", fieldType.render));
 	}
 }
-def doRefLayoutSetField(args: Arguments, fieldType: Type, ref: ByteArrayOffset, offset: int, order: ByteOrder, val: Val) -> Result {
+def doRefLayoutSetField(args: Arguments, fieldType: PrimType, ref: ByteArrayOffset, offset: int, order: ByteOrder, val: Val) -> Result {
 	if (ref == null || ref.array == null) return args.throw(V3Exception.NullCheck, null);
-	var size = 0, bits: u64 = 0, signed = false;
-	match (fieldType) {
-		x: BoolType => {
-			size = 1;
-		}
-		x: IntType => {
-			size = x.packedByteSize();
-			signed = x.signed;
-		}
-		x: EnumType => {
-			size = x.packedByteSize();
-		}
-		x: FloatType => {
-			size = x.byteSize();
-		}
-		_ => return args.throw("EvalException", Strings.format1("invalid RefLayoutField type %q", fieldType.render));
-	}
+	var bits: u64 = 0, signed = false;
 	match (val) {
 		v: Box<bool> =>		bits = if(v.val, 1, 0);
 		v: Box<int> =>		bits = u32.view(v.val);
@@ -986,7 +993,7 @@ def doRefLayoutSetField(args: Arguments, fieldType: Type, ref: ByteArrayOffset, 
 		v: Float32Val =>	bits = v.bits;
 		v: Float64Val =>	bits = v.bits;
 	}
-	ref.write(order, offset, size, bits);
+	ref.write(order, offset, fieldType.packedByteSize, bits);
 	return Values.BOTTOM;
 }
 

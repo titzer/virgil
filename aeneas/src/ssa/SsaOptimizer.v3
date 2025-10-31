@@ -3,6 +3,9 @@
 
 // Coordinates optimizations of SSA graphs, blocks, and individual instructions.
 // Provides a facade to the outside that hides details of reduction, analysis, etc.
+
+def printWrapExtra = Reachability.printWrapExtra;
+
 class SsaOptimizer(context: SsaContext) {
 	var marker = SsaInternalMarker.new();
 	def iopt = SsaInstrReducer.new(context);
@@ -97,7 +100,7 @@ class SsaOptimizer(context: SsaContext) {
 				var pred = block.preds[j];
 				if (marker.getMark(pred.src) < 0) {
 					if (context.shouldPrintOpt()) Terminal.put2("  remove edge #%d -> #%d\n", pred.src.uid, pred.dest.uid);
-					cfopt.removeEdge(pred);
+					Ssa.removeEdge(pred, true);
 					changed = true;
 				}
 				else j++;
@@ -248,28 +251,124 @@ class SsaInstrMatcher {
 // Flow-sensitive state for local optimizations.
 class SsaBlockState {
 	var end: bool;
-	var fields: List<(SsaInstr, IrField, SsaInstr)>;
 	var inbounds: List<(SsaInstr, SsaInstr)>;
 	var nonnull: List<SsaInstr>;
 	var inits: List<IrMethod>;
+	def pure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
+	def impure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
+	def ptr_loads = Vector<(SsaInstr, Type, SsaInstr)>.new();
+
 	def clear() -> this {
-		fields = null;
 		nonnull = null;
 		inits = null;
 		inbounds = null;
 		end = false;
+		pure_loads.resize(0);
+		impure_loads.resize(0);
+		ptr_loads.resize(0);
 	}
-	def addField(receiver: SsaInstr, field: IrField, value: SsaInstr) {
-		fields = List.new((receiver, field, value), fields);
+	def kill() -> this {
+		impure_loads.resize(0);
+		ptr_loads.resize(0);
+	}
+	def load(obj: SsaInstr, m: IrMember, apply: SsaApplyOp) -> SsaInstr {
+//TODO:dce	if (apply.useList == null && apply.facts.O_NO_NULL_CHECK) {
+//			apply.replace(null);
+//			return context.graph.zeroConst();  // XXX: recursively delete dead code
+//		}
+		var val = find(obj, m);
+		if (val != null) return val;
+		if (m.isConst() || IrMethod.?(m) && !m.facts.F_POINTED_AT) pure_loads.put(obj, m, apply);
+		else impure_loads.put(obj, m, apply);
+		return apply;
+	}
+	def loadPtr(ptr: SsaInstr, loadType: Type, apply: SsaApplyOp) -> SsaInstr {
+		var prev = find0(ptr_loads, ptr, loadType);
+		if (prev != null) return prev;
+		ptr_loads.put(ptr, loadType, apply);
+		return apply;
+	}
+	def store(obj: SsaInstr, field: IrField, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
+		var prev = find(obj, field);
+		if (prev == val) { // redundant store of previous value to field
+			apply.remove();
+			apply.kill();
+			return null;
+		}
+		killField(field);
+		impure_loads.put(obj, field, val);
+		return apply;
+	}
+	def storePtr(ptr: SsaInstr, storeType: Type, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
+		var prev = find0(ptr_loads, ptr, storeType);
+		if (prev == val) { // redundant store of previous value to field
+			apply.remove();
+			apply.kill();
+			return null;
+		}
+		ptr_loads.resize(0); // XXX: improve pointer alias analysis, distinguish initializing stores
+		if (!isNarrowingStore(storeType, val)) ptr_loads.put(ptr, storeType, val); // XXX: cache narrowing stores properly
+		return apply;
+	}
+	def isNarrowingStore(storeType: Type, val: SsaInstr) -> bool {
+		match (storeType) {
+			x: PrimType => match (val.getType()) {
+				y: PrimType => return x.width != y.width;
+			}
+		}
+		return false;
+	}
+	def init(obj: SsaInstr, f: IrField, val: SsaInstr) {
+		if (f.isConst() && !f.facts.F_POINTED_AT) pure_loads.put(obj, f, val);
+		else impure_loads.put(obj, f, val);
 	}
 	def copy() -> SsaBlockState {
 		var that = SsaBlockState.new();
 		that.end = this.end;
-		that.fields = this.fields;
 		that.inbounds = this.inbounds;
 		that.nonnull = this.nonnull;
 		that.inits = this.inits;
+		that.pure_loads.putv(this.pure_loads);
+		that.impure_loads.putv(this.impure_loads);
+		that.ptr_loads.putv(this.ptr_loads);
 		return that;
+	}
+	def find(obj: SsaInstr, m: IrMember) -> SsaInstr {
+		var r = find0(pure_loads, obj, m);
+		if (r == null) r = find0(impure_loads, obj, m);
+		return r;
+	}
+	def find0<T>(v: Vector<(SsaInstr, T, SsaInstr)>, obj: SsaInstr, m: T) -> SsaInstr {
+		for (i < v.length) {
+			var t = v[i];
+			if (t.0 == obj && t.1 == m) return t.2;
+		}
+		return null;
+	}
+	def killField(f: IrField) {
+		var v = impure_loads, i = 0;
+		for (j < v.length) {
+			var t = v[i];
+			if (t.1 != f) {
+				if (i != j) v[i] = t;
+				i++;
+			}
+		}
+		v.resize(i);
+	}
+	def killPointedAt() {
+		var v = impure_loads, i = 0;
+		for (j < v.length) {
+			var t = v[i];
+			if (!t.1.facts.F_POINTED_AT) {
+				if (i != j) v[i] = t;
+				i++;
+			}
+		}
+		v.resize(i);
+	}
+	def killArrayElems() {
+		ptr_loads.resize(0); // assume pointer loads could alias array elements.
 	}
 }
 
@@ -303,22 +402,6 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			i = next;
 		}
 	}
-	def reducePhi(i: SsaPhi) -> bool {
-		var i0 = i.input0(), facts = i0.facts, same = true;
-		for (n = 1; n < i.inputs.length; n++) {
-			var iN = i.inputs[n].dest;
-			facts &= iN.facts;
-			if (iN != i0) same = false;
-		}
-		if (same) {
-			// phi(x, x, x...) => x
-			i.replace(i0);
-			return false;
-		}
-		i.facts |= facts;
-		return true;
-	}
-
 	def reduceInstr(i: SsaInstr) -> SsaInstr {
 		prev = i.prev;
 		match (i) {
@@ -586,7 +669,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			BoundsCheck => {
 				var receiver = boundscheck(i);
 				if (state.end) return receiver;
-				if (i.checkFact(Facts.O_SAFE_BOUNDS)) return killInstr(i);
+				if (i.checkFact(Facts.O_SAFE_BOUNDS)) return Ssa.killInstr(i);
 			}
 			TypeSubsume => {
 				var xval = unop(i);
@@ -595,7 +678,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (ft == tt) return x; // fold TypeSubsume<T, T>(x)
 				if (tt == x.getType()) return x; // fold TypeSubsume<F, T>(x: T)
 				match (tt.typeCon.kind) {
-					CLASS => {
+					CLASS, VARIANT => {
 						if (ft == Null.TYPE) return graph.nullConst(tt);
 						if (TypeSystem.isSubtype(ft, tt)) return x; // remove redundant subsume of class
 					}
@@ -611,7 +694,13 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			}
 			TypeCast => {
 				var ft = i.op.sig.paramTypes[0], tt = i.op.sig.returnType();
+				if (ft == tt) return i.input0();
 				var cast = TypeSystem.newTypeCast(ft, tt);
+				if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+					printWrapExtra()
+						.put3("SsaOptimizer TypeCast from %q  to %q  cast %s", ft.render, tt.render, cast.name)
+						.put2("  xconst %z  # inputs %d", xconst, i.inputs.length).outln();
+				}
 				if (i.inputs.length == 0) {
 					// special cast of casting void -> X
 					if (cast == TypeCast.THROW) return addThrow(i.source, V3Exception.TypeCheck); // fold TypeCast
@@ -624,8 +713,12 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					else return addThrow(i.source, V3Exception.TypeCheck);
 				}
 
+				// TODO consider using TypeSystem.computeCast
 				match (cast) {
-					TRUE, SUBSUME => return x; // fold TypeCast
+					TRUE, SUBSUME => {
+						if (context.compiler.NormConfig.WrapFuncTypeSubsume && Function_TypeCon.?(tt.typeCon)) return i;
+						return x; // fold TypeCast
+					}
 					THROW => {
 						return addThrow(i.source, V3Exception.TypeCheck); // fold TypeCast
 					}
@@ -669,12 +762,21 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			ArrayAlloc => {
 				var len = i.input0();
 				if (len.facts.V_NON_NEGATIVE) i.facts |= Fact.O_NO_NEGATIVE_CHECK;
-				state.addField(i, ARRAY_LENGTH_FIELD, i.input0());
+				if (remove_pure_ops && i.useList == null) { // unused array allocation
+					if (!i.facts.O_NO_NEGATIVE_CHECK) {
+						var op = IntType.!(len.getType()).opLt();
+						var check = addBinop(op, len, graph.zeroConst());
+						return addConditionalThrow(i.source, V3Exception.LengthCheck, check);
+					}
+					return killUnused(i);
+				}
+				state.init(i, ARRAY_LENGTH_FIELD, i.input0());
 			}
 			ArrayInit => {
 				if (i.op.isPolymorphic()) return i;
 				n_op(i);
-				if (true || !fold) return i;
+				if (remove_pure_ops && i.useList == null) return killUnused(i); // unused empty array init
+				if (true || !fold) return i; // TODO: can fold array init if identity not observed
 				var arrayType = i.op.typeArgs[0];
 				var record = context.prog.newRecord(arrayType, i.inputs.length);
 				for (j < i.inputs.length) record.values[j] = SsaConst.!(i.inputs[j].dest).val;
@@ -686,11 +788,21 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (!i.facts.O_PURE) return i;
 				var yval = norm_binop(i);
 				// ArrayGetElem(#array, #index) => K
-				if (fold) return graph.valConst(i.getType(), Record.!(xval).values[V3.unboxI32(yval)]);
+				var values: Array<Val>;
+				match (xval) {
+					x: Record => values = x.values;
+					x: Address<Record> => values = x.val.values;
+					_ => ;
+				}
+				if (fold) return graph.valConst(i.getType(), values[V3.unboxI32(yval)]);
 			}
 			ArraySetElem => {
 				var receiver = boundscheck(i);
 				if (state.end) return receiver;
+				if (optimize_loads) state.killArrayElems();
+			}
+			ArraySetElemElem, RangeSetElem, NormRangeSetElem, NormRangeSetElemElem => {
+				if (optimize_loads) state.killArrayElems();
 			}
 			ArrayGetLength => {
 				var receiver = nullcheck(i);
@@ -705,45 +817,40 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					// ArrayGetLength(ArrayAlloc(x)) => x
 					return receiver.input0();
 				}
-				var len = lookupField(i, receiver, ARRAY_LENGTH_FIELD);
-				if (len != i) return len;
+				if (optimize_loads) return state.load(receiver, ARRAY_LENGTH_FIELD, i);
 			}
-			ClassAlloc => {
-				if (i.op.isPolymorphic()) return i;
-				if (!i.facts.O_PURE) return i;
-				n_op(i);
-				if (!fold) return i;
-				// ClassAlloc(#K, #K ..) => #K (variant)
-				var classType = i.op.typeArgs[0];
-				var record = context.prog.newRecord(classType, i.inputs.length);
-				for (j < i.inputs.length) record.values[j] = SsaConst.!(i.inputs[j].dest).val;
-				var ic = context.prog.ir.getIrClass(classType);
-				if (ic != null) ic.facts |= Fact.C_HEAP;
-				return graph.recordConst(record);
+			ClassAlloc(method) => {
+				if (method != null) {
+					if (!i.facts.O_PURE) state.kill(); // XXX: Fact.O_NO_SIDEFFECT
+				} else {
+					if (remove_pure_ops && i.useList == null) return killUnused(i); // unused empty alloc
+				}
 			}
 			ClassGetField(field) => {
-				var receiver = if(V3.isVariant(field.receiver), i.input0(), nullcheck(i));
+				var receiver = nullcheck(i);
 				if (state.end) return receiver;
 				if (field.isConst()) {
 					if (SsaConst.?(receiver)) {
 						// ClassGetField(#K) => #K
-						return graph.valConst(getFieldType(i.op, field),
-							asRecord(receiver).values[field.index]);
+						var record = asRecord(receiver);
+						var ftype = field.fieldType;
+						if (ftype.open()) ftype = IrSpec.new(record.rtype, TypeUtil.NO_TYPES, field).getFieldType();
+						return graph.valConst(ftype, record.values[field.index]);
 					}
 					i.setFactIf(Fact.O_NO_NULL_CHECK, Fact.O_PURE);
 					i.facts |= Fact.F_VALUE;
 					if (remove_pure_ops && i.facts.O_PURE && i.useList == null) return killUnused(i);
-					return lookupField(i, receiver, field);
 				}
+				if (optimize_loads) return state.load(receiver, field, i);
 			}
 			ClassInitField(field) => {
 				i.facts |= Fact.O_NO_NULL_CHECK;
-				if (field.isConst()) state.addField(i.input0(), field, i.input1());  // forward stores
+				if (optimize_loads) state.init(i.input0(), field, i.input1());  // forward stores
 			}
 			ClassSetField(field) => {
 				var receiver = nullcheck(i);
 				if (state.end) return receiver;
-				if (field.isConst()) state.addField(receiver, field, i.input1());  // forward stores
+				if (optimize_loads) state.store(receiver, field, i, i.input1());  // forward stores
 			}
 			ClassGetMethod(method) => {
 				var meth = V3Op.extractIrSpec(i.op, method);
@@ -771,6 +878,56 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					return replaceOp(i, V3Op.newClassGetMethod(dv));  // ClassGetVirtual[m](K) => ClassGetMethod[m](K)
 				}
 			}
+			VariantAlloc => {
+				if (i.op.isPolymorphic()) return i;
+				n_op(i);
+				if (!fold) return i;
+				// VariantAlloc(#K, #K ..) => #K (variant)
+				var variantType = i.op.typeArgs[0];
+				var ic = context.prog.ir.getIrClass(variantType);
+				if (ic == null) return i;  // TODO: can occur for closure classes
+				var record = context.prog.newRecord(variantType, ic.fields.length);
+				if (ic.fields.length != i.inputs.length) {
+					// Ugly, adapt for tuple arity mismatch
+					if (i.inputs.length == 1) {
+						var v = BoxVal.!(SsaConst.!(i.inputs[0].dest).val);
+						for (i < record.values.length) record.values[i] = v.values[i];
+					} else if (ic.fields.length == 1) {
+						var values = Array<Val>.new(i.inputs.length);
+						if (i.inputs.length > 0) {
+							for (j < i.inputs.length) values[j] = SsaConst.!(i.inputs[j].dest).val;
+							record.values[0] = BoxVal.new(null, values);
+						}
+					} else {
+						return i; // TODO: arity mismatch should never happen, but conservatively don't fold.
+					}
+				} else {
+					for (j < i.inputs.length) record.values[j] = SsaConst.!(i.inputs[j].dest).val;
+				}
+				if (ic != null) ic.facts |= Fact.C_HEAP;
+				return graph.recordConst(record);
+			}
+			VariantGetField(field) => {
+				var receiver = i.input0();
+				if (state.end) return receiver;
+				if (SsaConst.?(receiver)) {
+					// VariantGetField(#K) => #K
+					var record = asRecord(receiver);
+					var ftype = field.fieldType;
+					if (ftype.open()) ftype = IrSpec.new(record.rtype, TypeUtil.NO_TYPES, field).getFieldType();
+					return graph.valConst(ftype, if(record != null, record.values[field.index]));
+				}
+				if (!i.facts.F_POINTED_AT) i.facts |= Fact.F_VALUE;
+				if (receiver.optag() == Opcode.VariantAlloc.tag) {
+					// VariantGetField[n](x:VariantAlloc(...)) => x[n]
+					var r = SsaApplyOp.!(receiver);
+					var variantType = i.op.typeArgs[0];
+					var ic = context.prog.ir.getIrClass(variantType);
+					// Ugly: avoid arity mismatch problems for tuple/void fields
+					if (r.inputs.length == ic.fields.length) return r.inputs[field.index].dest;
+				}
+				if (optimize_loads) return state.load(receiver, field, i);
+			}
 			VariantGetMethod(method) => {
 				var meth = V3Op.extractIrSpec(i.op, method);
 				var receiver = i.input0();
@@ -779,10 +936,11 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (xconst) {
 					// VariantGetMethod[m](#K) => (m, #K)
 					var obj = Record.!(xval);
-					return graph.valConst(meth.getBoundType(), Closure.new(obj, meth));
+					var val = if(!meth.member.facts.M_UNREACHABLE, Closure.new(obj, meth));
+					return graph.valConst(meth.getBoundType(), val);
 				}
 			}
-			VariantGetVirtual(method) => {
+			VariantGetVirtual(method) => { // XXX: also optimize VariantGetSelector
 				var meth = V3Op.extractIrSpec(i.op, method);
 				var receiver = i.input0();
 				var dv = devirtualize(meth, receiver);
@@ -790,17 +948,21 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 					var xval = unop(i);
 					if (xconst && !i.op.isPolymorphic()) {  // VariantGetVirtual[m](K) => (m, K)
 						var obj = Record.!(xval);
-						return graph.valConst(dv.getBoundType(), Closure.new(obj, dv));
+						var val = if(!dv.member.facts.M_UNREACHABLE, Closure.new(obj, dv));
+						return graph.valConst(dv.getBoundType(), val);
 					}
 					return replaceOp(i, V3Op.newCreateClosure(dv, i.op.typeArgs[0]));  // VariantGetVirtual[m](K) => CreateClosure[m](K)
 				}
 			}
-			ClassGetSelector(method) => {
+			ClassGetSelector(method) => { // XXX: combine with ClassGetVirtual
 				var meth = V3Op.extractIrSpec(i.op, method);
-				var receiver = if(V3.isVariant(meth.receiver), i.input0(), nullcheck(i));
+				var receiver = nullcheck(i);
 				if (state.end) return receiver;
 				var dv = devirtualize(meth, receiver);
-				if (dv != null) return graph.valConst(dv.getFuncType(), FuncVal.new(dv));
+				if (dv != null) {
+					var val = if(!dv.member.facts.M_UNREACHABLE, FuncVal.new(dv));
+					return graph.valConst(dv.getFuncType(), val);
+				}
 			}
 			Init(method) => {
 				if (!optimize_inits) return i;
@@ -818,10 +980,10 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 						return if(lit.exactType != field.fieldType, convert(const, field.fieldType), const);
 					}
 				}
-				if (field.isConst()) return lookupField(i, null, field);
+				if (optimize_loads) return state.load(null, field, i);
 			}
 			ComponentSetField(field) => {
-				if (field.isConst()) state.addField(null, field, i.input1());  // forward stores
+				if (optimize_loads) state.store(null, field, i, i.input1());  // forward stores
 			}
 			TupleCreate(length) => {
 				if (i.op.isPolymorphic()) return i;
@@ -850,10 +1012,12 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			CallMethod(method) => {
 				i.facts |= method.facts & Fact.O_PURE;
 				if (i.inputs.length > 0 && i.input0().facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
+				state.kill();
 			}
 			CallClassMethod(method) => {
 				i.facts |= method.facts & Fact.O_PURE;
 				var target = nullcheck(i);
+				state.kill();
 				if (SsaThrow.?(target)) return target;
 				if (i.inputs.length > 0 && i.input0().facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
 			}
@@ -863,16 +1027,19 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (state.end) return receiver;
 				if (i.input0().facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
 				var dv = devirtualize(meth, receiver);
+				state.kill();
 				if (dv != null) return replaceOp(i, V3Op.newCallClassMethod(dv));  // CallClassVirtual[m](K) => CallClassMethod[m](k)
 			}
 			CallVariantVirtual(method) => {
 				var receiver = i.input0(), meth = V3Op.extractIrSpec(i.op, method);
 				if (i.input0().facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
 				var dv = devirtualize(meth, receiver);
+				state.kill();
 				if (dv != null) return replaceOp(i, V3Op.newCallMethod(dv));  // CallVariantVirtual[m](K) => CallMethod[m](k)
 			}
 			CallClosure => {
 				var target = nullcheck(i);
+				state.kill();
 				if (SsaThrow.?(target)) return target;
 				var xval = unop(i);
 				if (xconst) {
@@ -914,20 +1081,34 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 						else ni.facts |= x.facts & Fact.O_NO_NULL_CHECK;
 						return ni;
 					}
-					_ => ;
+					_ => {
+						if (!i.facts.O_PURE) state.kill();
+					}
 				}
 			}
 			CallFunction => {
 				var target = nullcheck(i);
 				if (SsaThrow.?(target)) return target;
+				state.kill();
 				var xval = unop(i);
-				if (xconst) {
+				if (xconst && FuncVal.?(xval)) {
 					var d = FuncVal.!(xval);
 					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
 					// CallFunction(#K) => CallMethod
-					var inputs = copyInputs(i, null, 1);
-					return add(i.source, V3Op.newCallMethod(d.memberRef), inputs).setFact(Fact.O_NO_NULL_CHECK);
+					adaptKnownFunctionInputs(i, d);  // add any needed subsumptions / casts
+					return add(i.source, V3Op.newCallMethod(d.memberRef), copyInputs(i, null, 1)).setFact(Fact.O_NO_NULL_CHECK);
 				}
+			}
+			CallAddress => {
+				var t = i.input0();
+				if (SsaConst.?(t)) {
+					var target = SsaConst.!(t).val;
+					if (target == null) return addThrow(i.source, V3Exception.NullCheck);
+				}
+				state.kill();
+			}
+			CallVariantSelector, SystemCall, CallKernel => {
+				state.kill();
 			}
 			CreateClosure(method) => {
 				if (i.op.isPolymorphic()) return i;
@@ -950,11 +1131,79 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				if (!fold) return i;
 				// ConditionalThrow(#K) => throw | nop
 				if (Bool.unbox(xval)) return addThrow(i.source, exception);
-				else return killInstr(i);
+				else return Ssa.killInstr(i);
 			}
-			_ => ;
+			RefLayoutSetField,
+			RefLayoutSetRepeatedField,
+			ByteArraySetField => {
+				if (optimize_loads) state.killArrayElems();
+			}
+			PtrAdd => {
+				binop(i);
+				if (yzero) return x;
+				if (!fold) return i;
+				if (!Addr.?(xval)) return i;
+				var a = Addr.!(xval);
+				match (yval) {
+					yi: Box<int> => { // TODO(addr64)
+						var na: Addr;
+						if (a != null) {
+							na = a.add(yi.val);
+						} else if (MachProgram.?(context.prog.tprog)) {
+							na = Addr.new(MachProgram.!(context.prog.tprog).dataRegion, null, yi.val);
+							na.absolute = yi.val;
+						}
+						if (na != null) return graph.valConst(i.getType(), na);
+					}
+				}
+			}
+			PtrCmpSwp => {
+				nullcheck(i);
+				state.kill();
+			}
+			PtrLoad => {
+				var ptr = nullcheck(i);
+				// XXX: use Fact.O_FOLDABLE to indicate a load of an immutable value
+				if (optimize_loads) {
+					return state.loadPtr(ptr, i.op.typeArgs[1], i);
+				}
+			}
+			PtrStore => {
+				var ptr = nullcheck(i);
+				state.killArrayElems();
+				state.killPointedAt();
+				// XXX: use a fact to indicate an initializing store that cannot kill previous loads
+				if (optimize_loads) {
+					state.storePtr(ptr, i.op.typeArgs[1], i, i.input1());
+				}
+			}
+			_ => if (!i.facts.O_PURE) state.kill();
 		}
 		return i;
+	}
+	def adaptKnownFunctionInputs(i: SsaApplyOp, d: FuncVal) {
+		var ftype = i.op.typeArgs[0];
+		var fsig = FuncType.!(ftype).sig();
+		var xtype = Function.prependParamType(AnyRef.TYPE, d.memberRef.getMethodType());
+		var xsig = FuncType.!(xtype).sig();
+		var rcvr = d.memberRef.asMethod().receiver;
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			var in0type = i.inputs[0].dest.getType();
+			printWrapExtra()
+				.put3("SsaOptimizer: adaptCallKnownFunctionInputs const type %q.%q  arg type %q", rcvr.render, xtype.render, in0type.render)
+				.put2("  call type %q.%q", AnyRef.TYPE.render, ftype.render).outln();
+		}
+		if (xtype == ftype) return;
+		for (j = 1; j < xsig.paramTypes.length; ++j) {
+			var input = i.inputs[j].dest;
+			var ft = fsig.paramTypes[j], tt = xsig.paramTypes[j], atype = input.getType();
+			if (SsaConst.?(input)) atype = SsaConst.!(input).vtype;
+			if (ft != tt && atype != tt) {
+				// add subsume/cast if argument type is different from the static type
+				var i_new = add(i.source, V3Op.newTypeSubsume(atype, tt), [input]);
+				i.inputs[j].update(i_new);
+			}
+		}
 	}
 	def normSingleArg(op: Operator, args: Array<SsaInstr>) -> Array<SsaInstr> {
 		if (op.sig.paramTypes.length == 1 && args.length > 1) return [args[0]];
@@ -996,12 +1245,6 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		for (j = extra; j < inputs.length; j++) inputs[j] = i.inputs[j + start - extra].dest;
 		return inputs;
 	}
-	def killInstr(i: SsaInstr) -> SsaInstr {
-		i.remove();
-		i.kill();
-		i.facts |= Fact.O_KILLED;
-		return i;
-	}
 
 	def i_const(v: int) -> SsaInstr {
 		return graph.intConst(Eval.doIntTrunc32(inttype, v));
@@ -1038,7 +1281,11 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		// Compute the constant length of the array if possible.
 		var length = -1;
 		if (xconst) {
-			length = Record.!(xval).values.length;
+			match (xval) {
+				x: Record => length = x.values.length;
+				x: Address<Record> => length = x.val.values.length;
+				_ => return receiver;
+			}
 		} else if (x.optag() == Opcode.ArrayAlloc.tag) {
 			var l = x.inputs[0].dest;
 			if (!SsaConst.?(l)) return receiver;
@@ -1157,28 +1404,33 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		state.nonnull = List.new(receiver, state.nonnull);
 		return receiver;
 	}
-	def lookupField(load: SsaInstr, receiver: SsaInstr, field: IrField) -> SsaInstr {
-		if (!optimize_loads) return load;
-		for (l = state.fields; l != null; l = l.tail) {
-			var h = l.head;
-			if (h.0 == receiver && h.1 == field) return h.2;
-		}
-		state.addField(receiver, field, load);
-		return load;
-	}
 	def devirtualize(m: IrSpec, x: SsaInstr) -> IrSpec {
-		if (!m.member.facts.M_OVERRIDDEN) {
-			return m; // CHA devirtualization
-		} else if (SsaConst.?(x) && asRecord(x) != null) {
-			return context.prog.ir.resolveMethodImpl(asRecord(x).rtype, m); // devirtualize K
-		} else if (x.optag() == Opcode.ClassAlloc.tag) {
-			return context.prog.ir.resolveMethodImpl(SsaApplyOp.!(x).op.typeArgs[0], m); // devirtualize ClassAlloc
+		// Try to devirtualize based on the class hierachy first.
+		if (!m.member.facts.M_OVERRIDDEN) return m;
+		var optag = x.optag();
+		// Look through TypeSubsumes at a potentially more precise receiver.
+		while (optag == Opcode.TypeSubsume.tag) {
+			x = SsaApplyOp.!(x).inputs[0].dest;
+			optag = x.optag();
+		}
+		// Try to constant-fold.
+		var r = asRecord(x);
+		if (r != null) 	return context.prog.ir.resolveMethodImpl(r.rtype, m); // devirtualize K
+		// Pattern-match allocations.
+		if (optag == Opcode.ClassAlloc.tag || optag == Opcode.VariantAlloc.tag) {
+			return context.prog.ir.resolveMethodImpl(SsaApplyOp.!(x).op.typeArgs[0], m); // devirtualize {Class,Variant}Alloc
+		}
+		// Try resolving on the (potentially more precise) static type of the receiver.
+		var xt = x.getType();
+		if (TypeSystem.isSubtype(xt, m.receiver)) {
+			var xm = context.prog.ir.resolveMethodImpl(xt, m);
+			if (!xm.member.facts.M_OVERRIDDEN) return xm;
 		}
 		return null;
 	}
 
 	def asRecord(i: SsaInstr) -> Record {
-		return Record.!(SsaConst.!(i).val);
+		return if(SsaConst.?(i), Record.!(SsaConst.!(i).val));
 	}
 	def getFieldType(op: Operator, field: IrField) -> Type {
 		return if(op.isPolymorphic(), V3Op.extractIrSpec(op, field).getFieldType(), field.fieldType);
@@ -1296,25 +1548,10 @@ class SsaCfOptimizer(context: SsaContext) {
 		var i0 = inputs[0].dest;
 		if (i0 == null || phi.useList == null) {
 			// one of the inputs is dead, or the phi is unused
-			killInstr(phi);
+			Ssa.killInstr(phi);
 			return true;
 		}
-		var facts = i0.facts, reduce = true;
-		for (i in inputs) {
-			var d = i.dest;
-			if (d != phi) {
-				facts = facts & d.facts;
-				if (d != i0) reduce = false;
-			}
-		}
-		if (reduce) {
-			phi.replace(i0); // the phi can be replaced by its (one) input
-			phi.remove();
-			return true;
-		} else {
-			phi.setFact(facts); // phi facts are the intersection of all input facts
-			return false;
-		}
+		return reducePhi(phi);
 	}
 	def optIf(block: SsaBlock, sw: SsaIf) {
 		var e = sw.inputs[0], v = e.dest;
@@ -1452,7 +1689,7 @@ class SsaCfOptimizer(context: SsaContext) {
 		for (i = vec.length - 1; i >= 0; i--) {
 			var c = vec[i], index = c.val - min;
 			var p = table[index];
-			if (p != null) removeEdge(p);
+			if (p != null) Ssa.removeEdge(p, true);
 			table[index] = c.tSucc;
 		}
 		if (min != 0) {
@@ -1523,7 +1760,7 @@ class SsaCfOptimizer(context: SsaContext) {
 		for (s in edges) {
 			var d = s.dest;
 			if (d != null) {
-				removeEdge(s);
+				Ssa.removeEdge(s, true);
 				succs.put(d);
 			}
 		}
@@ -1532,12 +1769,6 @@ class SsaCfOptimizer(context: SsaContext) {
 			var d = succs[i];
 			if (!d.hasPred()) killBlock(d);
 		}
-	}
-	def killInstr(i: SsaInstr) -> SsaInstr {
-		i.remove();
-		i.kill();
-		i.facts |= Fact.O_KILLED;
-		return i;
 	}
 	def optEdge(edge: SsaCfEdge) -> bool {
 		var src = edge.src, dest = edge.dest;
@@ -1549,7 +1780,7 @@ class SsaCfOptimizer(context: SsaContext) {
 			if (!dest.empty()) return false;		// is not empty
 			var destdest = dest.succ(0).dest;
 			if (destdest.hasPhis()) return false;		// has phis
-			simplifyPhis(dest);
+			Ssa.simplifyPhis(dest);
 			edge.connect(destdest);				// redirect edge
 			killBlock(dest);				// try to kill the destination
 			return true;
@@ -1561,7 +1792,7 @@ class SsaCfOptimizer(context: SsaContext) {
 		src.remove();
 
 		// Move destination instructions, including end, into source
-		simplifyPhis(dest);
+		Ssa.simplifyPhis(dest);
 		var first = dest.next, end = dest.end();
 		first.prev = null;
 		end.next = null;
@@ -1584,34 +1815,12 @@ class SsaCfOptimizer(context: SsaContext) {
 		// replace the old edge A -> B with a new edge X -> B
 		xbEdge.replace(abEdge);
 	}
-	def removeEdge(edge: SsaCfEdge) {
-		var dest = edge.dest;
-		if (dest == null) return;
-		var next = dest.next, index = edge.desti, preds = dest.preds;
-		for (i = index + 1; i < preds.length; i++) {
-			var p = preds[i];
-			preds[i - 1] = p;
-			p.desti = i - 1;
-		}
-		dest.preds = Arrays.range(dest.preds, 0, dest.preds.length - 1);
-		while (true) {
-			if (!SsaPhi.?(next)) break;
-			var phi = SsaPhi.!(next), inputs = phi.inputs;
-			// for each phi, remove the corresponding input
-			inputs[index].update(null); // kill the DF edge
-			phi.inputs = Arrays.deleteAt(phi.inputs, index);
-			next = phi.next;
-		}
-		if (dest.preds.length == 1) simplifyPhis(dest);
-	}
-	def simplifyPhis(block: SsaBlock) {
-		var next = block.next;
-		while (true) {
-			if (!SsaPhi.?(next)) break;
-			var phi = SsaPhi.!(next), nn = phi.next;
-			phi.replace(phi.input0());
-			killInstr(phi);
-			next = nn;
+	def removeUnmarkedPredecessors(block: SsaBlock) {
+		var i = 0;
+		while (i < block.preds.length) {
+			var e = block.preds[i], p = e.src.block();
+			if (p.mark < 0) Ssa.removeEdge(e, true);
+			else i++;
 		}
 	}
 	// fold away a type cast if dominated by a type query that evaluates to true
@@ -1692,7 +1901,7 @@ class SsaCfOptimizer(context: SsaContext) {
 		for (dead in oldsucc) {
 			if (dead == target) continue;
 			var dest = dead.dest;
-			removeEdge(dead);
+			Ssa.removeEdge(dead, true);
 			if (!dest.hasPred()) killBlock(dest);
 		}
 	}
@@ -1706,10 +1915,10 @@ class SsaCfOptimizer(context: SsaContext) {
 			if (SsaEnd.?(p)) {
 				var end = SsaEnd.!(p);
 				killSuccs(end.succs);
-				killInstr(end);
+				Ssa.killInstr(end);
 				break;
 			}
-			if (SsaInstr.?(p)) killInstr(SsaInstr.!(p));
+			if (SsaInstr.?(p)) Ssa.killInstr(SsaInstr.!(p));
 			p = n;
 		}
 		return if(vt != null, context.graph.valConst(vt, Values.BOTTOM), context.graph.nop());
@@ -1717,6 +1926,22 @@ class SsaCfOptimizer(context: SsaContext) {
 }
 class SwitchCmp(val: int, cmp: SsaInstr, end: SsaIf, tSucc: SsaCfEdge, fSucc: SsaCfEdge) { }
 
+def reducePhi(i_phi: SsaPhi) -> bool {
+	var i0 = i_phi.input0(), facts = i0.facts, same = true;
+	for (n = 1; n < i_phi.inputs.length; n++) {
+		var iN = i_phi.inputs[n].dest;
+		facts &= iN.facts;
+		if (iN != i0 && iN != i_phi) same = false;
+	}
+	if (same) {
+		// phi(x, phi, x...) => x
+		i_phi.replace(i0);
+		i_phi.remove();
+		return false;
+	}
+	i_phi.facts |= facts;
+	return true;
+}
 
 // Performs optimizations on loops.
 // 1. eliminate rendundant bounds checks for induction variables.
@@ -1901,125 +2126,5 @@ type BoundOp {
 			Gt => return BoundOp.Lt;
 			Gteq => return BoundOp.Lteq;
 		}
-	}
-}
-
-// Performs load/store optimizations on a completed SsaGraph.
-class SsaLoadOptimizer(context: SsaContext) {
-	var pure = SsaLoadedFields.new();
-	var impure = SsaLoadedFields.new();
-	var any = false;
-
-	def optimize() -> bool {
-		// visit all the blocks of the graph, removing redundant loads.
-		for (block in context.graph.bfBlocks(null)) optBlock(block);
-		return any;
-	}
-	def optBlock(block: SsaBlock) {
-		pure.length = 0;
-		impure.length = 0;
-		var i = block.next;
-		for (i = block.next; SsaInstr.?(i); ()) {
-			var next = i.next;
-			match (i) {
-				instr: SsaApplyOp => {
-					var repl = optInstr(instr);
-					if (repl != null) {
-						any = true;
-						instr.replace(repl);
-						instr.remove();
-					}
-				}
-			}
-			i = next;
-		}
-		while (SsaApplyOp.?(i)) {
-			var instr = SsaApplyOp.!(i);
-			var next = instr.next;
-			i = next;
-		}
-	}
-	def optInstr(apply: SsaApplyOp) -> SsaInstr {
-		match (apply.op.opcode) {
-			ClassAlloc(method) => {
-				if (method != null) impure.length = 0;
-			}
-			// XXX: ClassGetMethod, ClassGetVirtual for monomorphic methods.
-			ClassGetField(field) => return load(apply.input0(), field, apply);
-			VariantGetField(field) => return load(apply.input0(), field, apply);
-			ComponentGetField(field) => return load(null, field, apply);
-			ClassInitField(field) => {
-				var obj = apply.input0();
-				var map = if(field.isConst(), pure, impure);
-				map.add(obj, field, apply.input1());
-			}
-			ClassSetField(field) => return store(apply.input0(), field, apply, apply.input1());
-			ComponentSetField(field) => return store(null, field, apply, apply.input1());
-			Init,
-			CallMethod,
-			CallClassMethod,
-			CallClassVirtual,
-			CallClassSelector,
-			CallVariantVirtual,
-			CallVariantSelector,
-			CallClosure,
-			CallFunction,
-			SystemCall => impure.length = 0;
-			_ => ;
-		}
-		return null;
-	}
-	def load(obj: SsaInstr, m: IrMember, apply: SsaApplyOp) -> SsaInstr {
-		if (apply.useList == null && apply.facts.O_NO_NULL_CHECK) {
-			apply.replace(null);
-			return context.graph.zeroConst();  // XXX: recursively delete dead code
-		}
-		var val = find(obj, m);
-		if (val != null) return val;
-		if (m.isConst() || IrMethod.?(m)) pure.add(obj, m, apply);
-		else impure.add(obj, m, apply);
-		return null;
-	}
-	def store(obj: SsaInstr, field: IrField, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
-		var prev = find(obj, field);
-		if (prev == val) { // redundant store of previous value to field
-			apply.remove();
-			apply.kill();
-		} else {
-			impure.kill(field);
-			impure.add(obj, field, val);
-		}
-		return null;
-	}
-	def find(o: SsaInstr, f: IrMember) -> SsaInstr {
-		var v = pure.find(o, f);
-		return if(v == null, impure.find(o, f), v);
-	}
-}
-// Analysis data for tracking the loaded fields.
-class SsaLoadedFields {
-	var array = Array<(SsaInstr, IrMember, SsaInstr)>.new(4);
-	var length = 0;
-	def add(obj: SsaInstr, f: IrMember, val: SsaInstr) {
-		if (length == array.length) array = Arrays.grow(array, array.length * 2);
-		array[length++] = (obj, f, val);
-	}
-	def find(obj: SsaInstr, f: IrMember) -> SsaInstr {
-		for (i < length) {
-			var t = array[i];
-			if (t.0 == obj && t.1 == f) return t.2;
-		}
-		return null;
-	}
-	def kill(f: IrField) {
-		var i = 0;
-		for (j < length) {
-			var t = array[j];
-			if (t.1 != f) {
-				if (i != j) array[i] = t;
-				i++;
-			}
-		}
-		length = i;
 	}
 }

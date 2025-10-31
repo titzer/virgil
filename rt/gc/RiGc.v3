@@ -1,16 +1,18 @@
 // Copyright 2011 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Shared logic of the GC, including logic to compute object sizes and scan
-// objects, stacks, and globals
+// Shared logic of the GC, including logic to compute object sizes and scan objects, stacks, and
+// globals.
 component RiGc {
+	def OUT = System.out; // output stream used for debugging
+
 	def CTRL_DEFAULT = "\x1B[1;00m"; // XXX: move to Terminal
 	def CTRL_GREEN	 = "\x1B[0;32m";
 	def CTRL_YELLOW	 = "\x1B[1;33m";
 	def CTRL_RED	 = "\x1B[0;31m";
 	def CTRL_CYAN	 = "\x1B[0;36m";
 
-	// XXX: extract to RiGcConfig
+	// Constants that enable/disable debugging and stats reporting. (Use -redef-field).
 	def verbose   = false;
 	def debug     = false;
 	def paranoid  = false;
@@ -19,218 +21,218 @@ component RiGc {
 	def INT_SIZE  = 4;
 	def REF_SIZE  = Pointer.SIZE;
 	def OBJ_ALIGN = Pointer.SIZE;
-        def ARRAY_LENGTH_OFFSET = INT_SIZE;
-        def ARRAY_HEADER_SIZE = INT_SIZE + INT_SIZE;
-        def D = System.out;
+	def ARRAY_LENGTH_OFFSET = INT_SIZE;
+	def ARRAY_HEADER_SIZE = INT_SIZE + INT_SIZE;
 
-	// interface between the GC, stack scanning, and globals scanning.
+	// Interface between the GC, stack scanning, and globals scanning.
 	var scanRoot: Pointer -> void;			// provided by GC
+	var rescanRoot: Pointer -> void;		// provided by GC
 	var scanStack: (Pointer, Pointer) -> void;	// provided by stack scanner
 	var scanGlobals: void -> void;			// provided by global scanner
 
-	// computes the size of an non-null object, in bytes
-	def objectSize(ref: Pointer) -> int {
-		var tid = ref.load<int>();
+	// Compute the size in bytes of the object pointed to by {oop}.
+	def objectSize(oop: Pointer) -> int {
+		var tid = oop.load<int>();
 		// | 32	      tid	     0 |
 		// | typeid:30		  #0:2 | normal object
 		// | elemsize:30	  #1:2 | primitive array
-		// | #typeMap:30	  #2:2 | mixed array
+		// | #refmap:30	  	#2:2 | mixed array
 		// | #refsize:30	  #3:2 | reference array
 		match (tid & 3) {
-			0 => { // normal object; use refmap in TYPE_TABLE
+			0 => { // Normal object; use refmap in TYPE_TABLE.
 				var index = tid;
 				if (Pointer.SIZE == 8) index >>= 1; // TODO: 64-bit type maps
-				var typeMap = (CiRuntime.GC_TYPE_TABLE + index).load<int>();
-				if ((typeMap & 0x80000000) != 0) {
+				var refmap = (CiRuntime.GC_TYPE_TABLE + index).load<int>();
+				if ((refmap & 0x80000000) != 0) {
 					// extended entry
-					var vmap_p = CiRuntime.GC_EXTMAPS + (INT_SIZE * (typeMap & 0x7FFFFFFF));
-					return extmapSize(vmap_p);
+					var refmap_loc = CiRuntime.GC_EXTMAPS + (INT_SIZE * (refmap & 0x7FFFFFFF));
+					return extmapSize(refmap_loc);
 				} else {
 					// normal entry
-					return refmapSize(typeMap);
+					return refmapSize(refmap);
 				}
 			}
-			1 => { // primitive array
-				var length = (ref + ARRAY_LENGTH_OFFSET).load<int>(), elemscale = tid >>> 2;
+			1 => { // Primitive array.
+				var length = (oop + ARRAY_LENGTH_OFFSET).load<int>(), elemscale = tid >>> 2;
 				return alignObject(ARRAY_HEADER_SIZE + elemscale * length);
 			}
-			2 => { // mixed array
-				var length = (ref + ARRAY_LENGTH_OFFSET).load<int>();
-				var typeMap = tid >>> 2, elemscale: int;
-				if ((typeMap & 0x20000000) != 0) {
-					// extended entry
-					var vmap_p = CiRuntime.GC_EXTMAPS + (INT_SIZE * (typeMap & 0x1FFFFFFF));
-					elemscale = extmapSize(vmap_p);
+			2 => { // Mixed array.
+				var length = (oop + ARRAY_LENGTH_OFFSET).load<int>();
+				var refmap = tid >>> 2, elemscale: int;
+				if ((refmap & 0x20000000) != 0) {
+					// Extended entry.
+					var refmap_loc = CiRuntime.GC_EXTMAPS + (INT_SIZE * (refmap & 0x1FFFFFFF));
+					elemscale = extmapSize(refmap_loc);
 				} else {
-					// normal entry
-					elemscale = refmapSize(typeMap);
+					// Normal entry.
+					elemscale = refmapSize(refmap);
 				}
 				return alignObject(ARRAY_HEADER_SIZE + elemscale * length);
 			}
-			3 => { // reference array
-				var length = (ref + ARRAY_LENGTH_OFFSET).load<int>();
+			3 => { // Reference array.
+				var length = (oop + ARRAY_LENGTH_OFFSET).load<int>();
 				return ARRAY_HEADER_SIZE + (REF_SIZE * length); // XXX: may need heap align
 			}
 		}
-		return invalidHeader(ref);
+		return invalidHeader(oop);
 	}
-	// compute the size of the an item based on the highest bit of a map
-	def refmapSize(v: int) -> int {
-		var vmap = v;
-		if (vmap == 0) return 0;
+	// Compute the size in bytes from the highest 1 bit in {refmap}.
+	def refmapSize(refmap: int) -> int {
+		if (refmap == 0) return 0;
 		var size = 0;
-		while (vmap != 1) { // highest bit set indicates the length
-			vmap = vmap >>> 1;
+		while (refmap != 1) { // highest bit set indicates the length
+			refmap = refmap >>> 1;
 			size = size + REF_SIZE;
 		}
 		return size;
 	}
-	// compute the size of an item based on the bits of the extended map
-	def extmapSize(v: Pointer) -> int {
-		var vmap_p = v;
+	// Compute the size in bytes from the bits of an extended reference map pointed to by {refmap_loc}.
+	def extmapSize(refmap_loc: Pointer) -> int {
 		var size = 0;
 		while (true) { // iterate over words of extended map
-			var vmap = vmap_p.load<int>();
-			if ((vmap & 0x80000000) == 0) return size + refmapSize(vmap & 0x7FFFFFFF);
+			var refmap = refmap_loc.load<int>();
+			if ((refmap & 0x80000000) == 0) return size + refmapSize(refmap & 0x7FFFFFFF);
 			size = size + 31 * REF_SIZE;
-			vmap_p = vmap_p + INT_SIZE;
+			refmap_loc = refmap_loc + INT_SIZE;
 		}
 		return size; // should be unreachable
 	}
 	private def alignObject(size: int) -> int {
 		return (-1 ^ (OBJ_ALIGN - 1)) & (size + OBJ_ALIGN - 1);
 	}
-	def scanObject(ref: Pointer) -> int {
-		var tid = ref.load<int>();
+	// Scan the object pointed to by {oop}, calling {scanRoot} for every reference in the object.
+	def scanObject(oop: Pointer) -> int {
+		var tid = oop.load<int>();
 		// | 32			     0 |
 		// | typeid:30		  #0:2 | normal object
 		// | elemsize:30	  #1:2 | primitive array
-		// | #typeMap:30	  #2:2 | mixed array
+		// | #refmap:30		  #2:2 | mixed array
 		// | #refsize:30	  #3:2 | reference array
 		match (tid & 3) {
-			0 => { // normal object; use refmap in TYPE_TABLE
+			0 => { // Normal object; use refmap in TYPE_TABLE.
 				var index = tid;
 				if (Pointer.SIZE == 8) index >>= 1; // TODO: 64-bit type maps
-				var typeMap = (CiRuntime.GC_TYPE_TABLE + index).load<int>();
-				if ((typeMap & 0x80000000) != 0) {
-					// extended entry
-					var vmap_p = CiRuntime.GC_EXTMAPS + (INT_SIZE * (typeMap & 0x7FFFFFFF));
-					return scanExtMap(vmap_p, ref); // should be aligned to OBJ_SIZE
+				var refmap = (CiRuntime.GC_TYPE_TABLE + index).load<int>();
+				if ((refmap & 0x80000000) != 0) {
+					// Extended entry.
+					var refmap_loc = CiRuntime.GC_EXTMAPS + (INT_SIZE * (refmap & 0x7FFFFFFF));
+					return scanExtMap(refmap_loc, oop); // should be aligned to OBJ_ALIGN
 				} else {
-					// normal entry
-					return scanRefMap(typeMap, ref); // should be aligned to OBJ_SIZE
+					// Normal entry.
+					return scanRefMap(refmap, oop); // should be aligned to OBJ_ALIGN
 				}
 			}
-			1 => { // primitive array
-				var length = (ref + ARRAY_LENGTH_OFFSET).load<int>(), elemscale = tid >>> 2;
+			1 => { // Primitive array.
+				var length = (oop + ARRAY_LENGTH_OFFSET).load<int>(), elemscale = tid >>> 2;
 				return alignObject(ARRAY_HEADER_SIZE + elemscale * length);
 			}
-			2 => { // mixed array
-				var length = (ref + ARRAY_LENGTH_OFFSET).load<int>();
-				var typeMap = tid >> 2;
-				var p = ref + ARRAY_HEADER_SIZE;
-				if ((typeMap & 0x20000000) != 0) { // XXX: do we really need big mixed arrays?
-					// extended entry
-					var vmap_p = CiRuntime.GC_EXTMAPS + (INT_SIZE * (typeMap & 0x1FFFFFFF));
-					for (i < length) p += scanExtMap(vmap_p, p);
+			2 => { // Mixed array.
+				var length = (oop + ARRAY_LENGTH_OFFSET).load<int>();
+				var refmap = tid >> 2;
+				var p = oop + ARRAY_HEADER_SIZE;
+				if ((refmap & 0x20000000) != 0) { // XXX: do we really need big mixed arrays?
+					// Extended entry.
+					var refmap_loc = CiRuntime.GC_EXTMAPS + (INT_SIZE * (refmap & 0x1FFFFFFF));
+					for (i < length) p += scanExtMap(refmap_loc, p);
 				} else {
-					// normal entry
-					for (i < length) p += scanRefMap(typeMap, p);
+					// Normal entry.
+					for (i < length) p += scanRefMap(refmap, p);
 				}
-				return int.!(p - ref);
+				return int.!(p - oop);
 			}
-			3 => { // reference array
-				var length = (ref + ARRAY_LENGTH_OFFSET).load<int>();
-				var size = ARRAY_HEADER_SIZE + (REF_SIZE * length), end = ref + size;
-				for (p = ref + ARRAY_HEADER_SIZE; p < end; p = p + REF_SIZE) scanRoot(p);
+			3 => { // Reference array.
+				var length = (oop + ARRAY_LENGTH_OFFSET).load<int>();
+				var size = ARRAY_HEADER_SIZE + (REF_SIZE * length), end = oop + size;
+				for (p = oop + ARRAY_HEADER_SIZE; p < end; p = p + REF_SIZE) scanRoot(p);
 				return size; // XXX: heap alignment may be necessary
 			}
 		}
-		return invalidHeader(ref);
+		return invalidHeader(oop);
 	}
-	def invalidHeader(ref: Pointer) -> int {
+	private def invalidHeader(oop: Pointer) -> int {
 		System.error("GcError", "Invalid object header");
 		return 0;
 	}
-	// scan references in a frame and return the size in bytes
+	// Scan references in a frame pointed to by {sp} and return the size in bytes.
 	def scanStackFrame(sp: Pointer, stackMap: int) -> int {
 		if ((stackMap & 0x80000) != 0) {
 			// extended entry
-			var vmap_p = CiRuntime.GC_EXTMAPS + (RiGc.INT_SIZE * (stackMap & 0x7FFFF));
-			return scanExtMap(vmap_p, sp);
+			var refmap_loc = CiRuntime.GC_EXTMAPS + (RiGc.INT_SIZE * (stackMap & 0x7FFFF));
+			return scanExtMap(refmap_loc, sp);
 		} else {
 			// normal entry
 			return scanRefMap(stackMap, sp);
 		}
 	}
+	// Compute the size in bytes of a stackmap entry, which is slightly narrower than a refmap.
 	def stackmapSize(stackMap: int) -> int {
 		if ((stackMap & 0x80000) != 0) {
 			// extended entry
-			var vmap_p = CiRuntime.GC_EXTMAPS + (RiGc.INT_SIZE * (stackMap & 0x7FFFF));
-			return extmapSize(vmap_p);
+			var refmap_loc = CiRuntime.GC_EXTMAPS + (RiGc.INT_SIZE * (stackMap & 0x7FFFF));
+			return extmapSize(refmap_loc);
 		} else {
 			// normal entry
 			return refmapSize(stackMap);
 		}
 	}
-	// scan the references at the given start address, returning the size
-	def scanRefMap(v: int, start: Pointer) -> int {
-		var vmap = v;
-		if (debug) D.puts("scanRefMap @ ").putp(start).puts(", map = ").putp(Pointer.NULL + vmap).ln();
-		if (vmap == 0) return 0;
+	// Using the reference map {refmap}, scan the references at {start}, returning the size in bytes.
+	def scanRefMap(refmap: int, start: Pointer) -> int {
+		if (debug) OUT.puts("scanRefMap @ ").putp(start).puts(", map = ").putp(Pointer.NULL + refmap).ln();
+		if (refmap == 0) return 0;
 		var size = 0;
-		while (vmap != 1) { // highest bit set indicates the length
-			if ((vmap & 1) != 0) scanRoot(start + size);
-			vmap = vmap >>> 1;
+		while (refmap != 1) { // highest bit set indicates the length
+			if ((refmap & 1) != 0) scanRoot(start + size);
+			refmap = refmap >>> 1;
 			size = size + REF_SIZE;
 		}
 		return size;
 	}
-	// scan an extended map: an array of vmaps, delimited by a high 0 bit
-	def scanExtMap(v: Pointer, s: Pointer) -> int {
-		var vmap_p = v;
+	// Using the extended reference map pointed to by {refmap_loc}, scan the references at {start}, returning
+	// the size in bytes.
+	def scanExtMap(refmap_loc: Pointer, s: Pointer) -> int {
 		var start = s;
 		var size = 0;
 		while (true) { // iterate over words of extended map
-			var vmap = vmap_p.load<int>();
-			if (debug) D.puts("scanExtMap = ").putp(Pointer.NULL + vmap).ln();
-			var s = scanRefMap(vmap, start);
+			var refmap = refmap_loc.load<int>();
+			if (debug) OUT.puts("scanExtMap = ").putp(Pointer.NULL + refmap).ln();
+			var s = scanRefMap(refmap, start);
 			size = size + s;
 			if (s < 31 * REF_SIZE) break; // last entry is < 31 words
 			start = start + s;
-			vmap_p = vmap_p + INT_SIZE;
+			refmap_loc = refmap_loc + INT_SIZE;
 		}
-		if (debug) D.puts("extmapsize = ").puti(size).ln();
+		if (debug) OUT.puts("extmapsize = ").putd(size).ln();
 		return size;
 	}
-	// scan the references at the given start address, printing them to the console
-	def debugScanMap(v: int, start: Pointer) {
-		var vmap = v;
+	// Debug version of {scanMap} which also prints to the console.
+	def debugScanMap(refmap: int, start: Pointer) {
 		// TODO: handle extended entries in printing debugging information
-		var o = D.puts("stackMap ").putp(Pointer.NULL + vmap).ln();
-		if (vmap == 0) return;
-		for (p = start; vmap != 1; p = p + REF_SIZE) {
-			var marked = (vmap & 1) != 0;
-			var val = p.load<Pointer>();
+		var o = OUT.puts("stackMap ").putp(Pointer.NULL + refmap).ln();
+		if (refmap == 0) return;
+		for (p = start; refmap != 1; p = p + REF_SIZE) {
+			var marked = (refmap & 1) != 0;
+			var oop = p.load<Pointer>();
 			o.puts("@ ").putp(p).puts(" ").putc(if(marked, '*', ' ')).puts(" | ");
 
-			if (val == Pointer.NULL) o.putp(val).puts(" |\n");
-			else if (val >= CiRuntime.HEAP_START && val < CiRuntime.HEAP_END) debugScanRef(val, if(marked, CTRL_GREEN, CTRL_YELLOW), "heap");
-			else if (val >= CiRuntime.DATA_START && val < CiRuntime.DATA_END) debugScanRef(val, if(marked, CTRL_GREEN, CTRL_YELLOW), "data");
-			else if (marked) debugScanRef(val, CTRL_RED, "");
-			else o.putp(val).puts(" |\n");
+			if (oop == Pointer.NULL) o.putp(oop).puts(" |\n");
+			else if (oop >= CiRuntime.HEAP_START && oop < CiRuntime.HEAP_END) debugScanRef(oop, if(marked, CTRL_GREEN, CTRL_YELLOW), "heap");
+			else if (oop >= CiRuntime.DATA_START && oop < CiRuntime.DATA_END) debugScanRef(oop, if(marked, CTRL_GREEN, CTRL_YELLOW), "data");
+			else if (marked) debugScanRef(oop, CTRL_RED, "");
+			else o.putp(oop).puts(" |\n");
 
-			vmap = vmap >>> 1;
+			refmap = refmap >>> 1;
 		}
 	}
-	def debugScanRef(val: Pointer, color: string, region: string) {
-		D.puts(color).putp(val).puts(CTRL_DEFAULT).puts(" | ").puts(region).ln();
+	private def debugScanRef(oop: Pointer, color: string, region: string) {
+		OUT.puts(color).putp(oop).puts(CTRL_DEFAULT).puts(" | ").puts(region).ln();
 	}
+	// Fast routine to zero memory pointed to by {ptr}, ending at {end}.
 	def memClear(ptr: Pointer, end: Pointer) {
 		for (p = ptr; p < end; p = p + Pointer.SIZE) {
 			p.store(Pointer.NULL);
 		}
 	}
+	// Fast memory copy routine that copies {size} bytes (in word-sized chunks) from {s} to {b}.
 	def memCopy(d: Pointer, s: Pointer, size: int) {
 		var dest = d, src = s;
 		var end = src + size;
@@ -240,19 +242,22 @@ component RiGc {
 			dest = dest + Pointer.SIZE;
 		}
 	}
+	// Forces the garbage collector to run.
 	def forceGC() {
 		RiRuntime.gc(0, CiRuntime.callerIp(), CiRuntime.callerSp());
 	}
-	// On-collect callback support
-	private var ptrs = Array<Pointer>.new(1); // for unsafe cast of ref to pointer
+
+	//========================================================================================
+	// Support for weak references and finalizers.
+	//========================================================================================
+	private var ptrs = Array<Pointer>.new(1); // for unsafe cast of oop to pointer
 	private var finalizers: RiGcFinalizerLink;
 	private var scanners: RiGcScannerLink;
 	private var survivingScanners: RiGcScannerLink;
 
-	// Called by user applications to register a {callback} after the object {ref} is
-	// collected.
-	def registerFinalizer<R>(ref: R, callback: void -> void) {
-		Pointer.atContents(ptrs).store(ref); // unsafe type cast R -> Pointer
+	// Called by user applications to register a {callback} after the object {ref} is collected.
+	def registerFinalizer<R>(oop: R, callback: void -> void) {
+		Pointer.atContents(ptrs).store(oop); // unsafe type cast R -> Pointer
 		finalizers = RiGcFinalizerLink.new(ptrs[0], finalizers, callback);
 	}
 	// Called by the GC after finishing a GC cycle to run weak callbacks.
@@ -263,20 +268,20 @@ component RiGc {
 			var next = l.next;
 			var np = l.pointer = reloc(l.pointer);
 			if (np != Pointer.NULL) {
-				// object is live, keep in finalizer list
+				// Object is live, keep in finalizer list.
 				l.next = finalizers;
 				finalizers = l;
 			} else {
-				// object is dead, call the callback and remove from list
+				// Object is dead, call the callback and remove from list.
 				l.callback();
 			}
 			l = next;
 		}
 	}
-	// Called by user applications to register a {callback} to scan an object {ref} when
+	// Called by user applications to register a {callback} to scan an object {oop} when
 	// it is determined reachable by the GC.
-	def registerScanner<R>(ref: R, callback: R -> void) {
-		Pointer.atContents(ptrs).store(ref); // unsafe type cast R -> Pointer
+	def registerScanner<R>(oop: R, callback: R -> void) {
+		Pointer.atContents(ptrs).store(oop); // unsafe type cast R -> Pointer
 		scanners = RiGcScannerLinkOf.new(ptrs[0], scanners, callback);
 	}
 	// Called by the GC after finishing scanning to run any user application scanners for
@@ -287,14 +292,14 @@ component RiGc {
 		while (l != null) {
 			var next = l.next;
 			var old_ptr = l.pointer;
-			if (debug) D.puts("runScanner @ ").putp(old_ptr).ln();
+			if (debug) OUT.puts("runScanner @ ").putp(old_ptr).ln();
 			var new_ptr = reloc(l.pointer);
 			if (new_ptr != Pointer.NULL) {
 				// Object is live, scan and move to surviving for this cycle.
 				l.pointer = new_ptr;
 				l.next = survivingScanners;
 				survivingScanners = l;
-				if (debug) D.puts("  runScanner [live] @ ").putp(old_ptr).puts(" -> ").putp(new_ptr).ln();
+				if (debug) OUT.puts("  runScanner [live] @ ").putp(old_ptr).puts(" -> ").putp(new_ptr).ln();
 				l.scan();
 			} else {
 				// Object is not (yet) live, put back in scanners list.
@@ -308,26 +313,26 @@ component RiGc {
 	// nonsurviving objects) and retain the surviving scanners.
 	def finishScanners() {
 		if (debug) {
-			for (l = scanners; l != null; l = l.next) D.puts("dropScanner @ ").putp(l.pointer).ln();
+			for (l = scanners; l != null; l = l.next) OUT.puts("dropScanner @ ").putp(l.pointer).ln();
 		}
 		scanners = survivingScanners; // overwrite old scanners list with survivors only
 		survivingScanners = null;
 	}
 }
 // A node in the list of on-collect finalizer callbacks.
-class RiGcFinalizerLink(var pointer: Pointer, var next: RiGcFinalizerLink, callback: void -> void) { }
+private class RiGcFinalizerLink(var pointer: Pointer, var next: RiGcFinalizerLink, callback: void -> void) { }
 
 // Nodes in the list of on-collect scanner callbacks.
-class RiGcScannerLink(var pointer: Pointer, var next: RiGcScannerLink) {
+private class RiGcScannerLink(var pointer: Pointer, var next: RiGcScannerLink) {
 	def scan();
 }
-class RiGcScannerLinkOf<R> extends RiGcScannerLink {
+private class RiGcScannerLinkOf<R> extends RiGcScannerLink {
 	def callback: R -> void;
 
 	new(pointer: Pointer, next: RiGcScannerLink, callback) super(pointer, next) { }
 
 	def scan() {
-		var ref = Pointer.atField(this.pointer).load<R>(); // unsafe cast Pointer -> R
-		callback(ref);
+		var oop = Pointer.atField(this.pointer).load<R>(); // unsafe cast Pointer -> R
+		callback(oop);
 	}
 }

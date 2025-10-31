@@ -23,17 +23,14 @@ class X86DarwinTarget extends Target {
 	}
 	private def getScalar(compiler: Compiler, prog: Program, t: Type) -> Scalar.set {
 		match (t) {
-			x: BoolType => return Scalar.B32 | Scalar.B64;
-			x: IntType => return if(x.width <= 32, Scalar.B32 | Scalar.B64, Scalar.B64); // XXX: Scalar.R32, once packed refs
 			x: FloatType => return if(x.is64, Scalar.F64 | Scalar.B64, Scalar.F32 | Scalar.B32);
+			x: PrimType => return if(x.width <= 32, Scalar.B32 | Scalar.B64, Scalar.B64); // XXX: Scalar.R32, once packed refs
 			_ => return Scalar.R32;
 		}
 	}
 	private def getBitWidth(compiler: Compiler, prog: Program, t: Type) -> byte {
 		match (t) {
-			x: BoolType => return 1;
-			x: IntType => return x.width;
-			x: FloatType => return x.total_width;
+			x: PrimType => return x.width;
 			_ => return 32;
 		}
 	}
@@ -59,7 +56,7 @@ class X86DarwinTarget extends Target {
 		mach.build(compiler, MachLoweringConfig.new());
 
 		var header = MachO_Header.new(false);
-		var pageAlign = rt.codeRegion.space.pageAlign;
+		var pageAlign = mach.code.pageAlign;
 		header.cputype = MachO.CPU_TYPE_X86;
 		header.filetype = MachO.MH_EXECUTE;
 		var startAddr = 0x10000;
@@ -68,7 +65,7 @@ class X86DarwinTarget extends Target {
 		var pz = newSegmentLoad(header, "__NULL", 0);
 		pz.vmsize = pageAlign.size;
 		// stack (data) segment if a non-zero stack size is specified
-		var stackSize = pageAlign.alignUp(int.!(CLOptions.STACK_SIZE.get()));
+		var stackSize = int.!(pageAlign.alignUp_u64(CLOptions.STACK_SIZE.get()));
 		if (stackSize > 0) {
 			var ss = newSegmentLoad(header, "__STACK", MachO.VM_PROT_RW);
 			ss.filesize = 0;
@@ -88,9 +85,12 @@ class X86DarwinTarget extends Target {
 		header.addCmd(ts);
 		// ex segment for trapping explicit checks
 		var ex = if(rt.src != null, newSegmentLoad(header, "__EX", 0));
+		// rtexe segment for runtime code
+		var runtimeCodeSize = int.!(CLOptions.RUNTIME_CODE_SIZE.get());
+		var rtexe = if(runtimeCodeSize > 0, newSegmentLoad(header, "__RT_TEXT", MachO.VM_PROT_RWX));
+
 		// create the buffer
-		var w = MachDataWriter.new(rt.codeRegion.space.pageAlign,
-			startAddr, 300 + mach.numMethods * 50);
+		var w = MachDataWriter.new(mach.code.pageAlign, startAddr, 300 + mach.numMethods * 50);
 		// skip mach-o headers
 		w.skipN(header.totalsize);
 		// skip page zero
@@ -98,44 +98,54 @@ class X86DarwinTarget extends Target {
 		// generate code and runtime tables into buffer
 		// encodeCode(w, cs, ts);
 		var backend = X86DarwinBackend.new(compiler, prog, mach, w, test);
-		ts.eip = w.endAddr();
+		ts.eip = w.addr_end();
 		cs.vmaddr = w.endPageAddr();
 		rt.recordCodeStart(ts.eip);
 		backend.genAllCode();
 		var size = w.end();
 		if (size < pageAlign.size) w.skipN(pageAlign.size - size); // MacOS security requires >= 4096 bytes
-		rt.recordCodeEnd(w.endAddr());
-		mach.reserveSupplementalCode(w);
+		rt.recordCodeEnd(w.addr_end());
+		mach.reserveRuntimeCode(w);
 		mach.layoutMeta(w);
 		mach.layoutRuntime(w);
 		cs.filesize = w.end();
-		cs.vmsize = pageAlign.alignUp(cs.filesize);
+		cs.vmsize = pageAlign.alignUp_i32(cs.filesize);
 		cs.fileoff = 0;
 		// generate the unmapped "ex" region for trapping explicit checks
 		if (ex != null) {
 			w.skipPage();
 			var exStart = w.endPageAddr();
-			var exSize = pageAlign.alignUp(rt.src.layoutExRegion(exStart));
-			w.startAddr = w.startAddr + exSize;
+			var exSize = pageAlign.alignUp_i32(rt.src.layoutExRegion(exStart));
+			w.skipAddr(exSize);
 			ex.vmaddr = exStart;
 			ex.vmsize = exSize;
 			ex.filesize = 0;
 			ex.fileoff = 0;
+		}
+		// generate the runtime code region, if any
+		if (rtexe != null)  {
+			w.skipPage();
+			var exStart = w.endPageAddr();
+			var exSize = pageAlign.alignUp_i32(runtimeCodeSize);
+			w.skipAddr(exSize);
+			rtexe.vmaddr = exStart;
+			rtexe.vmsize = exSize;
+			rtexe.filesize = 0;
+			rtexe.fileoff = 0;
+			rt.recordRuntimeCode(exStart, exSize);
 		}
 		// generate data into buffer
 		w.skipPage();
 		// compute starting location of data
 		w.atEnd().align(mach.data.addressSize);
 		ds.vmaddr = w.endPageAddr();
-		ds.fileoff = ds.vmaddr - w.startAddr;
-		rt.recordDataStart(w.endAddr());
+		ds.fileoff = ds.vmaddr - int.!(w.startAddr); // TODO(addr64)
 		mach.layoutData(w);
-		rt.recordDataEnd(w.endAddr());
 		rt.addHeapPointers(w);
 		ds.filesize = w.end() - ds.fileoff;
-		ds.vmsize = pageAlign.alignUp(ds.filesize + int.view(rt.heapSize));
+		ds.vmsize = pageAlign.alignUp_i32(ds.filesize + int.view(rt.heapSize + rt.shadowStackSize));
 		// patch all addresses in the binary
-		w.patch(backend.patchCodeAddr);
+		w.patch(mach);
 		// encode header at position 0 now that all addresses and offsets are known
 		header.encode(w.at(0));
 		header.encodeCmds(w);
@@ -188,7 +198,7 @@ class X86DarwinBackend extends X86Backend {
 	def genSignalHandlerStub() {
 		// Specialized assembly to directly handle a signal from the kernel
 		var frame = getFrame(ri_signal.ssa);
-		mach.runtime.recordAddr(CiRuntimeModule.SIGNAL_STUB, asm.machBuffer.posAddr());
+		mach.runtime.bindAddr(CiRuntimeModule.SIGNAL_STUB, asm.machBuffer);
 		// "this" = null
 		asm.movd_rm_i(asm.loc_rm(frame, frame.conv.calleeParam(0)), 0); // "this" = null
 		var scratch = X86RegSet.SCRATCH;
@@ -204,7 +214,7 @@ class X86DarwinBackend extends X86Backend {
 	}
 	def genFatalStub(ex: string, addr: Addr) {
 		var asm = X86Assembler.new(w);
-		addr.absolute = w.endAddr();
+		w.bind(addr);
 		// 1. encode a call to write() on stderr
 		asm.push_i(ex.length + 1);			// size to write
 		asm.push_i(X86Addrs.ABS_CONST);			// pointer to msg
@@ -219,7 +229,7 @@ class X86DarwinBackend extends X86Backend {
 		asm.movd_rm_i(X86Regs.EAX, 1);			// exit()
 		asm.intK(0x80);
 		// 3. output message at end of code
-		var msgAddr = w.posAddr();
+		var msgAddr = w.addr();
 		w.putb('!');
 		w.puta(ex);
 		w.at(msgAddrPos).put_b32(msgAddr);
@@ -230,7 +240,7 @@ class X86DarwinBackend extends X86Backend {
 		asm.push_i(0);			// sa_flags
 		asm.push_i(0);			// sa_mask
 		asm.push_i(X86Addrs.ABS_CONST);	// sa_handler: handler address
-		recordPatch(handler);
+		asm.recordPatch(asm.pos() - 4, handler);
 		asm.push_i(2);			// TODO: why a nonzero value here?
 		asm.movd_rm_r(X86Regs.EBX, X86Regs.ESP);
 		asm.push_i(0);			// sigaction *oact

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 #Copyright 2024 Virgil Authors. All rights reserved.
 #See LICENSE for details of Apache 2.0 license.
@@ -23,7 +23,7 @@ if [ -z "$AS" ]; then
 fi
 
 printf "  Generating (v3i)..."
-run_v3c "" -run ./Arm64AssemblerTestGen.v3 $LIB_ASM $LIB_UTIL $ASM $VIRGIL_OBJDUMP $OBJECT
+run_v3c "" -run ./Arm64AssemblerTestGen.v3 $LIB_ASM $LIB_UTIL $ASM $VIRGIL_OBJDUMP $OBJECT "$@"
 if [ "$?" != 0 ]; then
     printf "\n"
     cat $S

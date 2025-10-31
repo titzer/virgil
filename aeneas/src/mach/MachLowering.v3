@@ -12,6 +12,7 @@ enum ArithWidth(subword: bool, width: byte) {
 	Exactly64(false, 64)
 }
 class MachLoweringConfig {
+	var MachLoweringFactory = MachLowering.new;	// supprots subclassing
 	var IntDivZeroTraps = true;	 // int division traps on zero
 	var IntDivOverflowMinint = true; // int division overflow is minint
 	var Int8Arith = false;		 // native support for int8 arithmetic
@@ -223,9 +224,6 @@ class SsaGraphNormalizer(context: SsaContext) {
 		i_old.setInputs(ai_new);
 		return i_old;
 	}
-	def normType(t: Type) -> TypeNorm;
-	def genSimpleVal(v: Val, tn: TypeNorm) -> Val;
-	def genValIntoArray(v: Val, tn: TypeNorm, dest: Array<Val>, index: int);
 	def normType1(t: Type) -> Type {
 		var tn = normType(t);
 		return if(tn != null, tn.newType, t);
@@ -234,7 +232,6 @@ class SsaGraphNormalizer(context: SsaContext) {
 		var tn = normType(t);
 		return tn != null && (tn.size != 1 || tn.newType != t);
 	}
-
 	def mapMultiReturn(i_old: SsaInstr, i_new: SsaInstr, tn: TypeNorm) {
 		if (tn == null || tn.size == 1) return map1(i_old, i_new);
 		if (tn.size == 0) return map0(i_old);
@@ -268,12 +265,17 @@ class SsaGraphNormalizer(context: SsaContext) {
 		}
 		return expr;
 	}
+	// ==== Required overrides ================================================
+	def normType(t: Type) -> TypeNorm;
+	def genSimpleVal(v: Val, tn: TypeNorm) -> Val;
+	def genValIntoArray(v: Val, tn: TypeNorm, dest: Array<Val>, index: int);
 }
 
 // Lowers Virgil code to machine level in-place by replacing object-level operations
 // with loads and stores. Introduces truncations and wrapping for integer operations
 // according to the {config}.
-class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringConfig) extends SsaGraphNormalizer(SsaContext.new(compiler, mach.prog)) {
+class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringConfig) extends SsaGraphNormalizer {
+	new() super(SsaContext.new(compiler, mach.prog)) { }
 	var maybeDead: List<SsaInstr>;
 	def doMethod(method: IrMethod) {
 		context.enterMethod(method);
@@ -307,9 +309,13 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			}
 		}
 
+		// Some checks may have got folded into throws, making some blocks unreachable.
+		// Without trimming them unreachable blocks, phis will look for inputs from unreachable blocks.
+		Ssa.removeUnreachableBlocks(context.graph);
 		for (l = phis; l != null; l = l.tail) genPhi(l.head);
 		phis = null;
 
+		// XXX: consider making this a proper dead code elimination pass.
 		for (l = maybeDead; l != null; l = l.tail) {
 			if (l.head.useList == null) {
 				l.head.kill();
@@ -374,8 +380,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 	}
 	def doBlock(block: SsaBlock) {
-		curBlock.clear();
-		context.block = curBlock.block = block;
+		context.block = block;
+		curBlock.set(block);
 		var i = block.next;
 		while (true) {
 			if (i == null) break;
@@ -415,7 +421,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			return if(mt != t, TypeNorm.new(t, mt, null));
 		}
 	}
-
 	def normTypeTuple(t: Type) -> TupleNorm {
 		// TODO: cache flattened tuples which occur in returns
 		// flatten tuples
@@ -436,6 +441,10 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return mach.intNorm.normType(t);
 	}
 	def genApplyOp(i_old: SsaApplyOp) {
+		// coded so that subclass can selectively override what this does and then call genApplyOp0
+		genApplyOp0(i_old);
+	}
+	def genApplyOp0(i_old: SsaApplyOp) {
 		var i_new: SsaInstr;
 		match(i_old.op.opcode) {
 			// Simple operators require no conversion other than normalization
@@ -494,14 +503,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			ArrayTupleInit(elems, length) => i_new = genArrayTupleInit(i_old, elems, length);
 			ArrayGetElem => 		return genArrayGetElem(i_old, 0);
 			ArraySetElem => 		return genArraySetElem(i_old, 0);
-			RangeStartPlusIndex => {
-				var arrayType = i_old.op.typeArgs[0];
-				var inputs = normRefs(i_old.inputs);
-				var rangeStart = inputs[0];
-				var index = inputs[1]; // XXX: discarding upper words for normalized integers
-				var offset = genArrayElemOffset(0, mach.getArrayElemScale(arrayType), index);
-				i_new = ptrAdd(rangeStart, offset);
-			}
+			RangeStartPlusIndex =>		i_new = genRangeStartPlusIndex(i_old);
 			NormRangeGetElem =>		return genNormRangeGetElem(i_old, 0);
 			NormRangeGetElemElem(index) =>	return genNormRangeGetElem(i_old, index);
 			NormRangeSetElem =>		return genNormRangeSetElem(i_old, 0);
@@ -517,7 +519,15 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			ClassSetField(field) => 	return genClassSetField(i_old, field, false);
 			ClassGetMethod(method) => 	i_new = genClassGetMethod(i_old, method);
 			ClassGetSelector(selector) => 	i_new = genClassGetSelector(i_old, selector);
-			VariantGetField(field) => 	return genClassGetField(true, i_old, field);
+			VariantGetField(field) => {
+				var rcvrType = i_old.input0().getType();
+				var treatAsVariant = (
+					!ClassType.?(rcvrType) ||
+					!ClassType.!(rcvrType).classDecl.isUnboxed()
+					);
+				return genClassGetField(treatAsVariant, i_old, field);
+			}
+			VariantAlloc =>			return genVariantAlloc(i_old);
 			VariantGetMethod(method) => 	i_new = genVariantGetMethod(i_old, method);
 			VariantGetSelector(selector) => i_new = genVariantGetSelector(i_old, selector);
 			ComponentGetField(field) => 	return genComponentGetField(i_old, field);
@@ -529,11 +539,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			CallClassMethod(selector) => 	return genCallClassMethod(i_old, selector);
 			CallClassSelector(selector) => 	return genCallClassSelector(i_old, selector);
 			CallVariantSelector(selector) => 	return genCallVariantSelector(i_old, selector);
-			CallFunction => {
-				var funcRep = mach.getFuncRep(i_old.op.typeArgs[0]);
-				call(i_old, funcRep, normRefs(i_old.inputs));
-				return;
-			}
+			CallFunction => return void(genCallFunction(i_old));
 			VariantGetTag => {
 				var i_obj = normRef1(i_old.inputs[0]);
 				i_new = genIfNull(i_old, i_old.op.sig.returnType(), i_obj, null, genVariantGetTag(i_old, _));
@@ -562,13 +568,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				i_new = ptrAdd(i_obj, context.graph.intConst(size));
 				// TODO: PtrAtEnd<Array<T>> should add array length
 			}
-			PtrAtRef => {
-				var i_array = normRef1(i_old.inputs[0]), arrayType = V3.arrayByteType;
-				var i_index = normRef1(i_old.inputs[1]);
-				var hsize = mach.getArrayElemOffset(arrayType, 0), scale = 1;
-				var i_offset = genArrayElemOffset(hsize, scale, i_index);
-				i_new = ptrAdd(i_array, i_offset);
-			}
+			PtrAtRef => return void(genPtrAtRef(i_old));
 			PtrAtComponentField(field) => {
 				var fieldRef = V3Op.extractIrSpec(i_old.op, field);
 				i_new = componentFieldPtr(fieldRef);
@@ -579,14 +579,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var offset = context.graph.intConst(mach.classFieldOffset(fieldRef));
 				i_new = ptrAdd(i_obj, offset);
 			}
-			PtrAtRefLayoutField(offset1) => {
-				var i_array = normRef1(i_old.inputs[0]), arrayType = V3.arrayByteType;
-				var i_index = normRef1(i_old.inputs[1]);
-				var hsize = mach.getArrayElemOffset(arrayType, 0), scale = 1;
-				var i_offset2 = genArrayElemOffset(hsize, scale, i_index);
-				var i_offset = curBlock.opIntAdd(i_offset2, context.graph.intConst(offset1));
-				i_new = ptrAdd(i_array, i_offset);
-			}
+			PtrAtRefLayoutField(offset) => return void(genPtrAtRefLayoutField(i_old, offset));
 			PtrCmpSwp => {
 				if (!config.NativeCmpSwp) {
 					var ifc = curBlock.splitForIfCascade(null);
@@ -1003,7 +996,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			i_cmp2.facts |= Facts.O_NO_NAN_CHECK; // NaN handled by first check
 			ifc.addCase(i_cmp2);
 			ifc.endCase(i_false);
-			ifc.addElse();
+			ifc.addElse(); // TODO: suspicious
 			var i_cmp = genIntTruncFEqual(i_old.source, ft, ett, i_x);
 			ifc.endCase(i_cmp);
 			var i_new = ifc.finish();
@@ -1036,7 +1029,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var i_gteq = apply(i_old.source, ft.opcache().opGteq, [i_x, i_maxf]);
 		ifc.addCase(i_gteq);
 		ifc.endCase(i_false);
-		ifc.addElse();
+		ifc.addElse(); // TODO: suspicious addElse
 		var i_cmp = genIntTruncFEqual(i_old.source, ft, ett, i_x);
 		ifc.endCase(i_cmp);
 		var i_new = ifc.finish();
@@ -1370,7 +1363,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		mapN(i_old, normRefs(i_old.inputs));  // always a no-op at the machine level
 	}
 	def genArrayAlloc(i_old: SsaApplyOp) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var olen = i_old.inputs[0], arrayType = i_old.op.typeArgs[0];
 		var hsize = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
 		if (SsaConst.?(olen.dest)) {
@@ -1390,10 +1382,10 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			// scale the length by the element scale
 			var elemsize = nlen;
 			if (scale > 1) elemsize = curBlock.opIntMul(nlen, context.graph.intConst(scale));
-			if (scale != mach.data.addrAlign.alignUp(scale)) {
+			if (scale != mach.data.addrAlign.alignUp_i32(scale)) {
 				// alignment is necessary
 				size = curBlock.opIntAdd(elemsize, context.graph.intConst(hsize + mach.data.addrAlign.add));
-				size = curBlock.opIntAnd(size, context.graph.intConst(mach.data.addrAlign.mask));
+				size = curBlock.opIntAnd(size, context.graph.intConst(int.view(mach.data.addrAlign.mask_u32)));
 			} else {
 				size = curBlock.opIntAdd(elemsize, size);
 			}
@@ -1406,7 +1398,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return narr;
 	}
 	def genArrayAllocWithSize(source: Source, arrayType: Type, hsize: int, len: int, scale: int) -> SsaInstr {
-		var totalSize = mach.data.addrAlign.alignUp(hsize + len * scale);
+		var totalSize = mach.data.addrAlign.alignUp_i32(hsize + len * scale);
 		// allocate the array with the known size
 		mach.allocates = true;
 		var narr = genAlloc(source, mach.machType(arrayType), context.graph.intConst(totalSize));
@@ -1427,7 +1419,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 	}
 	def genArrayInit(i_old: SsaApplyOp) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var arrayType = i_old.op.typeArgs[0];
 		var offset = mach.getArrayElemOffset(arrayType, 0), scale = mach.getArrayElemScale(arrayType);
 		var narr = genArrayAllocWithSize(i_old.source, arrayType, offset, i_old.inputs.length, scale);
@@ -1437,12 +1428,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		for (i = 0; i < inputs.length; (i = i + stride, offset = offset + scale)) {
 			// generate unchecked pointer stores to initialize the array
 			// XXX: cache type normalization across calls to this method
-			genNormTypedStores(i_old, Fact.O_NO_NULL_CHECK, true, machType, narr, offset, inputs, i);
+			genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, machType, narr, offset, inputs, i);
 		}
 		return narr;
 	}
 	def genArrayTupleInit(i_old: SsaApplyOp, elems: int, length: int) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var arrayType = i_old.op.typeArgs[0];
 		var arrayRep = mach.arrayRep(arrayType);
 		var narr = genArrayAllocWithSize(i_old.source, arrayType, arrayRep.headerSize, length, arrayRep.elemScale);
@@ -1452,13 +1442,12 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var inputs = normRefN(val);
 				var offset = arrayRep.headerSize + arrayRep.offsets[j] + i * arrayRep.elemScale;
 				// XXX: cache type normalization across calls to this method
-				genNormTypedStores(i_old, Fact.O_NO_NULL_CHECK, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
+				genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
 			}
 		}
 		return narr;
 	}
 	def genArrayGetElem(i_old: SsaApplyOp, elem: int) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var inputs = normRefs(i_old.inputs);
 		var narr = inputs[0], nindex = inputs[1], arrayType = i_old.op.typeArgs[0];
 		var nullity = context.compiler.nullity(i_old, narr);
@@ -1471,7 +1460,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		mapN(i_old, loads);
 	}
 	def genArraySetElem(i_old: SsaApplyOp, elem: int) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var inputs = normRefs(i_old.inputs);
 		var narr = inputs[0], nindex = inputs[1], arrayType = i_old.op.typeArgs[0];
 		var nullity = context.compiler.nullity(i_old, narr);
@@ -1480,12 +1468,19 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
 		// XXX: fold null check into pointer access if no bounds check
 		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
-		genNormTypedStores(i_old, nullity, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
+		genNormTypedStores(i_old.source, nullity, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
 		i_old.kill();
 		i_old.remove();
 	}
+	def genRangeStartPlusIndex(i_old: SsaApplyOp) -> SsaInstr {
+		var arrayType = i_old.op.typeArgs[0];
+		var inputs = normRefs(i_old.inputs);
+		var rangeStart = inputs[1];
+		var index = inputs[2]; // XXX: discarding upper words for normalized integers
+		var offset = genArrayElemOffset(0, mach.getArrayElemScale(arrayType), index);
+		return ptrAdd(rangeStart, offset);
+	}
 	def genNormRangeGetElem(i_old: SsaApplyOp, elem: int) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var inputs = normRefs(i_old.inputs);
 		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], rangeType = i_old.op.typeArgs[0];
 		var arrayRep = mach.arrayRep(rangeType);
@@ -1496,14 +1491,13 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		mapN(i_old, loads);
 	}
 	def genNormRangeSetElem(i_old: SsaApplyOp, elem: int) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var inputs = normRefs(i_old.inputs);
 		var narr = inputs[0], rangeStart = inputs[1], nindex = inputs[2], rangeType = i_old.op.typeArgs[0];
 		var arrayRep = mach.arrayRep(rangeType);
 		var offset = genArrayElemOffset(if(arrayRep.offsets != null, arrayRep.offsets[elem], 0), arrayRep.elemScale, nindex);
 		var pos = ptrAdd(ptrAdd(narr, rangeStart), offset);
 		var machType = mach.machType(arrayRep.getElemElemType(rangeType, elem));
-		genNormTypedStores(i_old, Fact.O_NO_NULL_CHECK, false, machType, pos, 0, inputs, 3);
+		genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, false, machType, pos, 0, inputs, 3);
 		i_old.kill();
 		i_old.remove();
 	}
@@ -1517,7 +1511,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		if (i_old.op.typeArgs[1] != V3Range.START_TYPE) offset += mach.arrayRep(V3.arrayByteType).getElemElemOffset(0);
 
 		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
-		var t = decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder), tn = t.0, accesses = t.1;
+		var t = MachLowerings.decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder, false), tn = t.0, accesses = t.1;
 
 		var ai_results = Array<SsaInstr>.new(accesses.length);
 		for (i < accesses.length) {
@@ -1548,18 +1542,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return mapN(i_old, ai_results);
 	}
-	def getAccessViewOp(fieldType: Type, wordType: Type) -> Operator {
-		if (fieldType == wordType) return null;
-		match (fieldType) {
-			x: IntType => match (wordType) {
-				y: IntType => return V3Op.newIntViewI(wordType, x);
-				y: FloatType => return if(y.is64, V3Op.opIntViewF64, V3Op.opIntViewF32);
-				_ => return null; // TODO
-			}
-			x: FloatType => return if(x.is64, V3Op.newFloat64ViewI(wordType), V3Op.newFloat32ViewI(wordType));
-			_ => return null; // TODO
-		}
-	}
 	def genByteArraySetField(i_old: SsaApplyOp, offset: int, order: ByteOrder) { // TODO: byte order
 		var inputs = normRefs(i_old.inputs);
 		var ni_arr = inputs[0], ni_start = inputs[1], vals = Arrays.range(inputs, 2, inputs.length);
@@ -1570,7 +1552,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		if (i_old.op.typeArgs[1] != V3Range.START_TYPE) offset += mach.arrayRep(V3.arrayByteType).getElemElemOffset(0);
 
 		var memoryOrder = if(mach.data.bigEndian, ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN);
-		var t = decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder), tn = t.0, accesses = t.1;
+		var t = MachLowerings.decomposeByteArrayAccess(mach, config, fieldType, offset, order, memoryOrder, false), tn = t.0, accesses = t.1;
 
 		var ai_results = Array<SsaInstr>.new(accesses.length);
 		if (tn != null && tn.newType != fieldType) {
@@ -1599,6 +1581,18 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		i_old.kill();
 		i_old.remove();
 	}
+	def getAccessViewOp(fieldType: Type, wordType: Type) -> Operator {
+		if (fieldType == wordType) return null;
+		match (fieldType) {
+			x: IntType => match (wordType) {
+				y: IntType => return V3Op.newIntViewI(wordType, x);
+				y: FloatType => return if(y.is64, V3Op.opIntViewF64, V3Op.opIntViewF32);
+				_ => return null; // TODO
+			}
+			x: FloatType => return if(x.is64, V3Op.newFloat64ViewI(wordType), V3Op.newFloat32ViewI(wordType));
+			_ => return null; // TODO
+		}
+	}
 	def genArrayElemOffset(headerSize: int, scale: int, index: SsaInstr) -> SsaInstr {
 		if (SsaConst.?(index)) {
 			// fold the offset calculation
@@ -1611,13 +1605,11 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 	}
 	def genArrayGetLength(i_old: SsaApplyOp) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var oarr = i_old.inputs[0], narr = normRef1(oarr);
 		var nullity = context.compiler.nullity(i_old, null);
 		return refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
 	}
 	def genClassAlloc(i_old: SsaApplyOp, method: IrMethod) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var classType = i_old.getType();
 		var size = mach.getObjectSize(classType, null);
 		// allocate the object
@@ -1635,8 +1627,27 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return map1(i_old, nobj);
 	}
+	def genVariantAlloc(i_old: SsaApplyOp) {
+		var classType = i_old.getType();
+		var size = mach.getObjectSize(classType, null);
+		// allocate the object
+		mach.allocates = true;
+		var i_new = genAlloc(i_old.source, mach.machType(classType), context.graph.intConst(size));
+		storeObjectTag(i_new, classType);
+		var ic = context.prog.ir.getIrClass(classType);
+		var ai_inputs = normRefs(i_old.inputs);
+		// Generate explicit field initializations.
+		var start = 0;
+		for (i < ic.fields.length) {
+			var f = ic.fields[i];
+			var machType = mach.machType(f.fieldType);
+			var tn = normIntType(machType);
+			genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, true, machType, i_new, f.machOffset, ai_inputs, start);
+			start += if(tn != null, tn.size, 1);
+		}
+		return map1(i_old, i_new);
+	}
 	def genClassGetField(isVariant: bool, i_old: SsaApplyOp, field: IrField) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
 		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
 		var machType = mach.machType(fieldRef.getFieldType());
@@ -1671,38 +1682,33 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 	}
 	def genClassSetField(i_old: SsaApplyOp, field: IrField, init: bool) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var inputs = normRefs(i_old.inputs);
 		var fieldRef = V3Op.extractIrSpec(i_old.op, field), nobj = inputs[0];
 		var offset = mach.classFieldOffset(fieldRef);
 		var machType = mach.machType(fieldRef.getFieldType());
 		var nullity = compiler.nullity(i_old, nobj);
-		genNormTypedStores(i_old, nullity, init, machType, nobj, offset, inputs, 1);
+		genNormTypedStores(i_old.source, nullity, init, machType, nobj, offset, inputs, 1);
 		i_old.kill();
 		i_old.remove();
 	}
 	def genClassGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var methodRef = V3Op.extractIrSpec(i_old.op, method);
 		var funcRep = mach.funcRep(methodRef);
 		genNullCheck(i_old);
 		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
 	}
 	def genClassGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
 		var funcRep = mach.funcRep(methodRef);
 		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
 		return genMtableLookup(i_old, oobj, nobj, funcRep, methodRef);
 	}
 	def genVariantGetMethod(i_old: SsaApplyOp, method: IrMethod) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var methodRef = V3Op.extractIrSpec(i_old.op, method);
 		var funcRep = mach.funcRep(methodRef);
 		return context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
 	}
 	def genVariantGetSelector(i_old: SsaApplyOp, selector: IrSelector) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
 		var funcRep = mach.funcRep(methodRef);
 		var oobj = i_old.inputs[0], nobj = normRef1(oobj);
@@ -1717,7 +1723,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
 	}
 	def genComponentGetField(i_old: SsaApplyOp, field: IrField) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
 		var fieldType = mach.machType(fieldRef.getFieldType());
 		var ptr = componentFieldPtr(fieldRef);
@@ -1725,13 +1730,12 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		mapN(i_old, loads);
 	}
 	def genComponentSetField(i_old: SsaApplyOp, field: IrField) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var fieldRef = V3Op.extractIrSpec(i_old.op, field);
 		var inputs = normRefs(i_old.inputs);
 		var machType = mach.machType(fieldRef.getFieldType());
 		var ptr = componentFieldPtr(fieldRef);
 		// generate remaining stores for normalized fields.
-		genNormTypedStores(i_old, Fact.O_NO_NULL_CHECK, false, machType, ptr, 0, inputs, 1);
+		genNormTypedStores(i_old.source, Fact.O_NO_NULL_CHECK, false, machType, ptr, 0, inputs, 1);
 		i_old.kill();
 		i_old.remove();
 	}
@@ -1761,7 +1765,10 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			if (!nullity.O_NO_NULL_CHECK) genNullCheck0(i_old.source, narr);
 			return (context.graph.nullConst(Void.TYPE), nullity | Fact.O_NO_NULL_CHECK);
 		}
-		if (config.ObjectSystem) return (normId(i_old), nullity);
+		return genBoundsCheck0(i_old, nullity, narr);
+	}
+	def genBoundsCheck0(i_old: SsaApplyOp, nullity: Fact.set, narr: SsaInstr) -> (SsaInstr, Fact.set) {
+		var oarr = i_old.inputs[0];
 		// load length
 		// XXX: CSE the array length if possible
 		var len = refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
@@ -1773,7 +1780,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return (index, nullity | Fact.O_NO_NULL_CHECK);
 	}
 	def genCallMethod(i_old: SsaApplyOp, method: IrMethod) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var methodRef = V3Op.extractIrSpec(i_old.op, method);
 		var funcRep = mach.funcRep(methodRef);
 		var func = context.graph.valConst(funcRep.machType, mach.getCodeAddress(methodRef));
@@ -1781,7 +1787,6 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		call(i_old, funcRep, args);
 	}
 	def genCallClassMethod(i_old: SsaApplyOp, method: IrMethod) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var methodRef = V3Op.extractIrSpec(i_old.op, method);
 		if (!i_old.facts.O_NO_NULL_CHECK) genNullCheck(i_old);
 		var funcRep = mach.funcRep(methodRef);
@@ -1790,21 +1795,23 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		call(i_old, funcRep, args);
 	}
 	def genCallClassSelector(i_old: SsaApplyOp, selector: IrSelector) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var func = genClassGetSelector(i_old, selector);
 		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
 		var args = Arrays.prepend(func, normRefs(i_old.inputs));
 		call(i_old, mach.funcRep(methodRef), args);
 	}
 	def genCallVariantSelector(i_old: SsaApplyOp, selector: IrSelector) {
-		if (config.ObjectSystem) return void(normId(i_old));
 		var func = genVariantGetSelector(i_old, selector);
 		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
 		var args = Arrays.prepend(func, normRefs(i_old.inputs));
 		call(i_old, mach.funcRep(methodRef), args);
 	}
+	def genCallFunction(i_old: SsaApplyOp) {
+		var funcRep = mach.getFuncRep(i_old.op.typeArgs[0]);
+		call(i_old, funcRep, normRefs(i_old.inputs));
+		return;
+	}
 	def genVariantGetTag(i_old: SsaApplyOp, nobj: SsaInstr) -> SsaInstr {
-		if (config.ObjectSystem) return normId(i_old);
 		var val = ptrLoad(mach.tagType, nobj, 0);
 		var root = V3.getRootType(i_old.op.typeArgs[0]);
 		var min = mach.classIdRange(root).0;
@@ -1817,6 +1824,23 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		var conv = V3Op.newIntViewI(mach.tagType, i_old.op.sig.returnType());
 		return apply(i_old.source, conv, [val]);
+	}
+	def genPtrAtRef(i_old: SsaApplyOp) {
+		var i_array = normRef1(i_old.inputs[0]), arrayType = V3.arrayByteType;
+		var i_index = normRef1(i_old.inputs[1]);
+		var hsize = mach.getArrayElemOffset(arrayType, 0), scale = 1;
+		var i_offset = genArrayElemOffset(hsize, scale, i_index);
+		var i_new = ptrAdd(i_array, i_offset);
+		map1(i_old, i_new);
+	}
+	def genPtrAtRefLayoutField(i_old: SsaApplyOp, offset1: int) {
+		var i_array = normRef1(i_old.inputs[0]), arrayType = V3.arrayByteType;
+		var i_index = normRef1(i_old.inputs[1]);
+		var hsize = mach.getArrayElemOffset(arrayType, 0), scale = 1;
+		var i_offset2 = genArrayElemOffset(hsize, scale, i_index);
+		var i_offset = curBlock.opIntAdd(i_offset2, context.graph.intConst(offset1));
+		var i_new = ptrAdd(i_array, i_offset);
+		map1(i_old, i_new);
 	}
 
 	def explicitNullCheck(source: Source, t: Type, nobj: SsaInstr) -> SsaInstr {
@@ -1850,7 +1874,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 
 	def call(i_old: SsaApplyOp, funcRep: Mach_FuncRep, args: Array<SsaInstr>) {
 		if (curBlock.end) return;
-		var i_new = apply(i_old.source, if(config.ObjectSystem, i_old.op, V3Op.newCallAddress(funcRep)), args);
+		var i_new = apply(i_old.source, V3Op.newCallAddress(funcRep), args);
 		i_new.facts = i_new.facts | i_old.facts;
 		var tn = normType(i_old.op.sig.returnType());
 		mapMultiReturn(i_old, i_new, tn);
@@ -1988,12 +2012,12 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return loads;
 	}
-	def genNormTypedStores(i_old: SsaApplyOp, nullity: Fact.set, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
+	def genNormTypedStores(source: Source, nullity: Fact.set, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
 		var tn = normIntType(machType), nullCheck = !nullity.O_NO_NULL_CHECK;
 		// check for simple case first.
 		if (tn == null) {
 			var val = vals[start];
-			if (nullCheck) ptrStoreT(i_old.source, machType, base, offset, val);
+			if (nullCheck) ptrStoreT(source, machType, base, offset, val);
 			else if (isNonTrivialStore(init, val)) ptrStore(machType, base, offset, val);
 			return;
 		}
@@ -2001,7 +2025,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var check = if(nullCheck, 0, -1);
 		for (i < tn.size) {
 			var et = tn.sub[i], val = vals[start + i];
-			if (i == check) ptrStoreT(i_old.source, et, base, offset, val);
+			if (i == check) ptrStoreT(source, et, base, offset, val);
 			else if (isNonTrivialStore(init, val)) ptrStore(et, base, offset, val);
 			offset = offset + mach.sizeOf(et);
 		}
@@ -2026,7 +2050,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	def genAllocMethod(size: IntType) -> IrMethod {
 		if (mach.allocMethod != null) return mach.allocMethod;
 		var receiverType = AnyRef.TYPE, returnType = AnyRef.TYPE, ptr = mach.data.ptrType;
-		var vst = VstMethod.new(false, Token.new(null, ".alloc", 0, 0), null, null, ReturnType.Explicit(TypeUtil.typeRefOf(returnType)), null);
+		var vst = VstMethod.new(false, Token.new(null, ".alloc", 0, 0), null,
+			VstFunc.new(null, ReturnType.Explicit(TypeUtil.typeRefOf(returnType)), null));
 		var p_receiver = SsaParam.new(0, receiverType);
 		var p_size = SsaParam.new(1, size);
 		var graph = SsaGraph.new([p_receiver, p_size], returnType);
@@ -2079,77 +2104,101 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 }
 
-def decomposeByteArrayAccess(mach: MachProgram, config: MachLoweringConfig, fieldType: Type, offset: int, fieldOrder: ByteOrder, memoryOrder: ByteOrder) -> (TypeNorm, Array<Access>) {
-	var machType = mach.machType(fieldType);
+component MachLowerings {
 
-	if (fieldOrder == memoryOrder) {
-		// Common case: byte order match.
-		if (!IntType.?(machType)) return (null, [Access.Simple(fieldType, offset)]); // non-integer type
+	def decomposeByteArrayAccess(mach: MachProgram, config: MachLoweringConfig, fieldType: Type, offset: int, fieldOrder: ByteOrder, memoryOrder: ByteOrder, bytesOnly: bool) -> (TypeNorm, Array<Access>) {
+		var machType = mach.machType(fieldType);
 
-		var tn = mach.intNorm.makeType(IntType.!(machType)), sub = tn.sub;
-		var accesses = Array<Access>.new(sub.length);
-		// Generate full-word loads for all but the last word; TODO: little/big endian normalization
-		var loads = Array<SsaInstr>.new(tn.size), last = sub.length - 1;
-		for (i < last) {
-			var et = sub[i];
-			accesses[i] = Access.Simple(et, offset); // XXX: should not need recursive decomposition
-			offset = offset + mach.packedSizeOf(et);
-		}
+		if (fieldOrder == memoryOrder && !bytesOnly) {
+			// Common case: byte order match.
+			if (!IntType.?(machType)) return (null, [Access.Simple(fieldType, offset)]); // non-integer type
 
-		var et = IntType.!(sub[last]);
-		if (et.width >= 8 && (et.width & et.width - 1) == 0) {
-			// common case; last load is a power of two and at least a full byte
-			accesses[last] = Access.Simple(et, offset);
+			var tn = mach.intNorm.makeType(IntType.!(machType)), sub = tn.sub;
+			var accesses = Array<Access>.new(sub.length);
+			// Generate full-word loads for all but the last word; TODO: little/big endian normalization
+			var loads = Array<SsaInstr>.new(tn.size), last = sub.length - 1;
+			for (i < last) {
+				var et = sub[i];
+				accesses[i] = Access.Simple(et, offset); // XXX: should not need recursive decomposition
+				offset = offset + mach.packedSizeOf(et);
+			}
+
+			var et = IntType.!(sub[last]);
+			if (et.width >= 8 && (et.width & et.width - 1) == 0) {
+				// common case; last load is a power of two and at least a full byte
+				accesses[last] = Access.Simple(et, offset);
+			} else {
+				// generate multiple power-of-2 accesses
+				var vec = Vector<AccessDatum>.new();
+				var wordType = config.getMinimumArithSize(et.width);
+				var etWidth = et.packedByteSize * 8, bitPos = 0;
+				for (curWidth = mach.intNorm.width; curWidth >= 8; curWidth >>= 1) {
+					if ((etWidth & curWidth) != 0) {
+						var curType = Int.getType(false, curWidth);
+						vec.put(AccessDatum(curType, offset + (bitPos >> 3), byte.!(bitPos)));
+						bitPos += curWidth;
+					}
+				}
+				accesses[last] = Access.Compound(et, wordType, vec.extract());
+			}
+			return (null, accesses);
 		} else {
-			// generate multiple power-of-2 accesses
-			var vec = Vector<AccessDatum>.new();
-			var wordType = config.getMinimumArithSize(et.width);
-			var etWidth = et.packedByteSize() * 8, bitPos = 0;
-			for (curWidth = mach.intNorm.width; curWidth >= 8; curWidth >>= 1) {
-				if ((etWidth & curWidth) != 0) {
-					var curType = Int.getType(false, curWidth);
-					vec.put(AccessDatum(curType, offset + (bitPos >> 3), byte.!(bitPos)));
-					bitPos += curWidth;
+			// Byte order mismatch. Generate individual byte loads and assemble scalars.
+			var size = mach.packedSizeOf(machType), width = size * 8;
+			var intType = Int.getType(false, width);
+			var tn = mach.intNorm.makeType(intType), sub = tn.sub;
+			var accesses = Array<Access>.new(sub.length);
+			if (sub == null && false) {
+				var compound = compoundAccess(mach, fieldType, fieldOrder, offset);
+				accesses[0] = compound;
+			} else if (fieldOrder == ByteOrder.BIG_ENDIAN) {
+				for (i = sub.length - 1; i >= 0; i--) {
+					var compound = compoundAccess(mach, sub[i], fieldOrder, offset);
+					accesses[i] = compound;
+					offset += compound.wordType.packedByteSize;
+				}
+			} else {
+				for (i < sub.length) {
+					var compound = compoundAccess(mach, sub[i], fieldOrder, offset);
+					accesses[i] = compound;
+					offset += compound.wordType.packedByteSize;
 				}
 			}
-			accesses[last] = Access.Compound(et, wordType, vec.extract());
+			return (tn, accesses);
 		}
-		return (null, accesses);
-	} else {
-		// Byte order mismatch. Generate individual byte loads and assemble scalars.
-		var size = mach.packedSizeOf(machType), width = size * 8;
-		var intType = Int.getType(false, width);
-		var tn = mach.intNorm.makeType(intType), sub = tn.sub;
-		var accesses = Array<Access>.new(sub.length);
-		if (fieldOrder == ByteOrder.BIG_ENDIAN) {
-			for (i = sub.length - 1; i >= 0; i--) {
-				var compound = compoundAccess(mach, sub[i], fieldOrder, offset);
-				accesses[i] = compound;
-				offset += compound.wordType.packedByteSize();
-			}
-		} else {
-			for (i < sub.length) {
-				var compound = compoundAccess(mach, sub[i], fieldOrder, offset);
-				accesses[i] = compound;
-				offset += compound.wordType.packedByteSize();
-			}
+	}
+
+	def compoundAccess(mach: MachProgram, et: Type, fieldOrder: ByteOrder, offset: int) -> Access.Compound {
+		var size = mach.packedSizeOf(et), width = size * 8;
+		var bytes = Array<AccessDatum>.new(size);
+		var wordType = Int.getType(false, width);
+		for (j < size) {
+			var shift = if(fieldOrder == ByteOrder.LITTLE_ENDIAN, j * 8, width - 8 - j * 8);
+			bytes[j] = AccessDatum(Byte.TYPE, j + offset, byte.!(shift));
 		}
-		return (tn, accesses);
+		return Access.Compound(et, wordType, bytes);
 	}
-}
-def compoundAccess(mach: MachProgram, et: Type, fieldOrder: ByteOrder, offset: int) -> Access.Compound {
-	var size = mach.packedSizeOf(et), width = size * 8;
-	var bytes = Array<AccessDatum>.new(size);
-	var wordType = Int.getType(false, width);
-	for (j < size) {
-		var shift = if(fieldOrder == ByteOrder.LITTLE_ENDIAN, j * 8, width - 8 - j * 8);
-		bytes[j] = AccessDatum(Byte.TYPE, j + offset, byte.!(shift));
-	}
-	return Access.Compound(et, wordType, bytes);
 }
 
 type Access {
-	case Simple(t: Type, offset: int);
-	case Compound(t: Type, wordType: IntType, datums: Array<AccessDatum>);
+	case Simple(t: Type, offset: int) {
+		def render(sb: StringBuilder) -> StringBuilder {
+			return sb.put2("Simple(type %q, offset %d)", t.render, offset);
+		}
+	}
+	case Compound(t: Type, wordType: IntType, datums: Array<AccessDatum>) {
+		def render(sb: StringBuilder) -> StringBuilder {
+			sb.put2("Compound(type %q, wordType %q, datums [", t.render, wordType.render);
+			for (i < datums.length) {
+				sb.put2("%s%q", if(i == 0, "", " "), datums[i].render);
+			}
+			return sb.puts("])");
+		}
+	}
+	def render(sb: StringBuilder) -> StringBuilder;
 }
-type AccessDatum(t: Type, offset: int, shift: byte);
+type AccessDatum(t: Type, offset: int, shift: byte) {
+	def render(sb: StringBuilder) -> StringBuilder {
+		return sb.put3("(type %q, offset: %d, shift %d)", t.render, offset, shift);
+	}
+}

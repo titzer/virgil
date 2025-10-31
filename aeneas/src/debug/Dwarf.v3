@@ -22,9 +22,11 @@ class Dwarf {
 	def loclists = DwarfLocListsSection.new();
 	def line = DwarfLineSection.new(dirFile);
 	def normTupleMap = TypeUtil.newTypeMap<TypeNorm>();
+
 	new(elf, sections, prog, mach) {
 		codePointerSize = if(elf.is64(), CODE_POINTER_SIZE64, CODE_POINTER_SIZE32);
 	}
+
 	def emit(w: DataWriter) {
 		// .debug_str
 		var sectionStart = w.pos;
@@ -32,6 +34,7 @@ class Dwarf {
 		// Iterate methods for name and prepare subprogram information
 		for (i < prog.ir.methods.length) {
 			var m = prog.ir.methods[i];
+//			Terminal.put1("Emitting DWARF for: %q\n", m.renderLong);
 			if (m.source == null) continue;
 			var addr = mach.methodMap[m];
 			if (addr == null || addr.absolute < 0) continue;
@@ -43,9 +46,9 @@ class Dwarf {
 			entry.rettype = m.ssa.returnType;
 			var hasRet = entry.rettype.typeCon.kind != Kind.VOID;
 			if (hasRet) info.putType(entry.rettype);
-			var hasFile = if(m.source.body != null, true);
+			var hasFile = if(m.source.func.body != null, true);
 			if (hasFile) {
-				var fileRange = m.source.body.range();
+				var fileRange = m.source.func.body.range();
 				entry.decl_file = dirFile.files[fileRange.fileName].index;
 				entry.decl_line = u32.!(fileRange.beginLine);
 			}
@@ -53,6 +56,7 @@ class Dwarf {
 			// Fill the end of loclist to method end
 			for (j < entry.loclistMap.length) {
 				var index = entry.loclistMap[j] - 1;
+				if (index < 0) continue;
 				if (loclists.locLists[index].end == 0) loclists.locLists[index].end = u32.!(entry.low_pc) + entry.high_pc;
 			}
 			// Populate method name
@@ -98,15 +102,15 @@ class Dwarf {
 	// Add a new variable with variable name, type and initial location. pos is the code address.
 	def addVar(newvar: (string, Type), index: int, locs: Array<(X86_64Reg, int)>, pos: int) {
 		if (context.method.subprogram == null) context.method.subprogram = DwarfSubprogram.new();
-		if (locs.length == 1) {
+		if (locs.length == 0) {
+			// do nothing.
+		} else if (locs.length == 1) {
 			var v = DwarfVariable.new(newvar.0, newvar.1, pos);
 			if (index != -1) { // Non-ssa var
 				var i = loclists.addLocList(v);
 				loclists.locLists[i-1].addLoc(u32.!(pos), locs[0]);
-				if (context.method.subprogram.loclistMap.length <= index || context.method.subprogram.loclistMap[index] == 0) {
-					// Set loclist index for non-tuple var or the first element of tuple.
-					context.method.subprogram.loclistMap.set(index, i);
-				}
+				// Set loclist index for non-tuple var or the first element of tuple.
+				context.method.subprogram.loclistMap.set(index, i);
 				v.setLocList(i);
 			} else {
 				v.setSingleLoc(locs[0]);
@@ -127,28 +131,28 @@ class Dwarf {
 	}
 	// Update non-ssa var location.
 	def updateVarLoc(index: int, locs: Array<(X86_64Reg, int)>, pos: int) {
-		index = context.method.subprogram.loclistMap[index] - 1;
-		if (locs.length == 1) {
-			loclists.locLists[index].addLoc(u32.!(pos), locs[0]);
-		} else {
-			for (i < locs.length) {
-				loclists.locLists[index + i].addLoc(u32.!(pos), locs[i]);
-			}
+		if (context.method.subprogram == null) return; // TODO: no variable map
+		index = context.method.subprogram.loclistMap.get(index) - 1;
+		if (index < 0) return; // TODO: variable not found, probably a missing new var
+		var lists = loclists.locLists;
+		for (i < locs.length) {
+			var list = lists.get(index + i);
+			if (list != null) list.addLoc(u32.!(pos), locs[i]);
 		}
 	}
 	// Delete {n} number of variables. Add Dwarf lexical block to mark the scope of variable.
 	def deleteVar(n: int, pos: int) {
+		if (context.method.subprogram == null) return; // TODO: no variable map
 		var code = abbrev.getAbbrev(DwarfAbbrevTag.LexicalBlock);
 		var children = context.method.subprogram.children, childLen = children.length;
 		var i = 0, j = childLen;
-		while (i < n) {
-			j --;
-			if (DwarfVariable.?(children[j])) {
-				i ++;
-			}
+		while (i < n && j > 0) {
+			j--;
+			if (DwarfVariable.?(children[j])) i++;
 		}
 		var extract = Arrays.range(children.array, j, childLen);
 		children.resize(j);
+		if (extract.length == 0) return; // TODO: deleteVar of variable not found
 		var firstchild = DwarfVariable.!(extract[0]); // the first one is always DwarfVariable
 		var block = DwarfLexicalBlock.new(code, firstchild.pos, pos - firstchild.pos);
 		children.put(block);
@@ -171,6 +175,7 @@ class Dwarf {
 		}
 	}
 	def normTuple(t: Type) -> TypeNorm {
+//		Terminal.put2("normTuple %q in %q\n", t.render, context.method.render);
 		var tn = normTupleMap[t];
 		if (tn != null) return tn;
 		// not in the hashmap, build appropriately
@@ -221,7 +226,7 @@ class DwarfDirFile {
 	def dirOrder = Vector<DwarfDir>.new();
 
 	new(prog: Program) {
-		rootFile = toDwarfFile(prog.getMain().asMethod().source.body.range().fileName);
+		rootFile = toDwarfFile(prog.getMain().asMethod().source.func.body.range().fileName);
 		for (i < prog.files.length) {
 			var tmp = toDwarfFile(prog.files[i]);
 			files[prog.files[i]] = tmp;
@@ -299,39 +304,24 @@ class DwarfInfoSection(abbrev: DwarfAbbrevSection) {
 	def emitType(t: Type, v: int) {
 		typeRef[t] = w.pos - info_start;
 		var byteSize: int, encoding: int;
-		match (t.typeCon.kind) {
-			VOID,
-			COMPONENT => return;
-			BOOL => {
-				emitBaseType(t, 1, DW.DW_ATE_boolean);
-			}
-			FLOAT => {
-				var x = FloatType.!(t);
-				byteSize = x.byteSize();
+		match (t) {
+			x: VoidType => ; // do nothing
+			x: ComponentType => ; // do nothing
+			x: BoolType => emitBaseType(t, 1, DW.DW_ATE_boolean);
+			x: FloatType => {
+				byteSize = x.byteSize;
 				encoding = DW.DW_ATE_float;
 				emitBaseType(t, byteSize, encoding);
 			}
-			INT => {
-				var x = IntType.!(t);
-				byteSize = x.byteSize();
+			x: IntType => {
+				byteSize = x.byteSize;
 				encoding = if (V3.isSigned(x), DW.DW_ATE_signed, DW.DW_ATE_unsigned);
 				emitBaseType(t, byteSize, encoding);
 			}
-			VARIANT,
-			CLASS => emitClassType(ClassType.!(t));
-			ENUM => emitEnumType(EnumType.!(t));
-			ARRAY => emitArrayType(ArrayType.!(t));
-			ENUM_SET,
-			ANYFUNC,
-			POINTER,
-			FUNCREF,
-			CLOSURE,
-			RANGE,
-			RANGE_START,
-			REF,
-			TYPE_VAR,
-			TYPE_PARAM,
-			TUPLE => emitUnspecifiedType(t);
+			x: ClassType => emitClassType(x);
+			x: EnumType => emitEnumType(x);
+			x: ArrayType => emitArrayType(x);
+			_ => emitUnspecifiedType(t);
 		}
 	}
 	def emitBaseType(t: Type, byteSize: int, encoding: int) {
@@ -369,7 +359,7 @@ class DwarfInfoSection(abbrev: DwarfAbbrevSection) {
 		t.render(buf);
 		buf.send(w.putr);
 		w.putb(0);
-		w.putb(t.byteSize());
+		w.putb(t.byteSize);
 		for (c in t.enumDecl.cases) {
 			w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.Enumurator));
 			buf.reset();
@@ -994,7 +984,7 @@ class DwarfLineSection(dirFile: DwarfDirFile) {
 		}
 		var tmp = lineDelta - DWARFLineBase;
 		// If the line increment is out of range of a special opcode, we must encode
-  	// it with DW_LNS_advance_line.
+	  	// it with DW_LNS_advance_line.
 		if (tmp < 0 || tmp >= DWARFLineRange || tmp + DWARFLineOpcodeBase > 255) {
 			w.putb(DW.DW_LNS_advance_line);
 			w.put_sleb32(lineDelta);
@@ -1009,7 +999,7 @@ class DwarfLineSection(dirFile: DwarfDirFile) {
 			return;
 		}
 		// Bias the opcode by the special opcode base.
-  	tmp += DWARFLineOpcodeBase;
+	  	tmp += DWARFLineOpcodeBase;
 		// Avoid overflow
 		if (addrDelta < 256u + maxSpecialAddrDelta) {
 			// Try using a special opcode.
@@ -1041,7 +1031,7 @@ class DwarfLineSection(dirFile: DwarfDirFile) {
 		var size = 1u;
 		while (x >= 0x80) {
 			x = x >> 7;
-			size ++;
+			size++;
 		}
 		return size;
 	}

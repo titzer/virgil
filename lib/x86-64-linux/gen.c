@@ -18,6 +18,13 @@
 
 #include <sys/signal.h>
 
+#define _GNU_SOURCE          /* See feature_test_macros(7) */
+#include <fcntl.h>           /* Definition of AT_* constants */
+#include <sys/stat.h>
+#include <linux/stat.h>
+
+#include <linux/sched.h>
+
 struct FooStruct {
   unsigned int my_field;
   unsigned short other_field;
@@ -110,6 +117,42 @@ int main() {
   //  FIELD(si_mtime, u32);
   END_LAYOUT(siginfo_t);
   
-  
+
+    BEGIN(struct statx, statxf);
+    FIELD(stx_mask, u32);
+    FIELD(stx_blksize, u32);
+    FIELD(stx_attributes, u64);
+    FIELD(stx_nlink, u32);
+    FIELD(stx_uid, u32);
+    FIELD(stx_gid, u32);
+    FIELD(stx_mode, u16);
+    FIELD(stx_ino, u64);
+    FIELD(stx_size, u64);
+    FIELD(stx_blocks, u64);
+    FIELD(stx_attributes_mask, u64);
+    FIELD(stx_atime, u64);
+    FIELD(stx_btime, u64);
+    FIELD(stx_ctime, u64);
+    FIELD(stx_mtime, u64);
+    FIELD(stx_rdev_major, u32);
+    FIELD(stx_rdev_minor, u32);
+    FIELD(stx_dev_major, u32);
+    FIELD(stx_dev_minor, u32);
+    //    FIELD(stx_mnt_id, u64);
+    //    FIELD(stx_dio_mem_align, u32);
+    //FIELD(stx_dio_offset_align, u32);
+  END_LAYOUT(statxf);
+
+  BEGIN(struct clone_args, clone_args);
+  FIELD(flags, u64); // Pointer
+  FIELD(pidfd, u32);
+  FIELD(child_tid, u64); // Pointer<iovec>
+  FIELD(parent_tid, u64); // size_t
+  FIELD(exit_signal, u64); // Pointer
+  FIELD(stack, u64);
+  FIELD(stack_size, u64);
+  FIELD(tls, u64);
+  END_LAYOUT(clone_args);
+
   return 0;
 }
