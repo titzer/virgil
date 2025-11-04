@@ -69,7 +69,7 @@ function do_compiled() {
             short="${runner##*/}"
             if [ -x $runner ]; then
                 if [ "$short" = "run-wasm-gc-wasi1@node" ]; then
-	            $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-gc-wasi1/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
+	            $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-wasi1-common/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
                 else
 	            $OUT/$target/main $TESTS | tee $R | $PROGRESS
                 fi
