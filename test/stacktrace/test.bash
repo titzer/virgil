@@ -12,6 +12,8 @@ for target in $(get_io_targets); do
         continue # TODO: stacktrace tests for wasm-wave
     elif [ "$target" = "wasm-linux" ]; then
         continue # TODO: stacktrace tests for wasm-linux
+    elif [ "$target" = "wasm-gc-wasi1" ]; then
+        continue # TODO: stacktrace tests for wasm-linux
     elif [ "$target" = "jar" ]; then
         continue # TODO: stacktrace tests for jar
     fi

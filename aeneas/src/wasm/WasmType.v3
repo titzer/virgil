@@ -1,4 +1,4 @@
-// Copyright 2022 Ben L. Titzer. All rights reserved.
+// Copyright 2016-2025 Virgil authors.  All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
 type WasmValueType {
@@ -9,6 +9,9 @@ type WasmValueType {
 	case F64;
 	case FuncRef;
 	case ExternRef;
+	case AnyRef;	// EBM less sure this comes up any more
+	case EqRef;     // for comparing class objects in closures
+	case NoneRef;	// EBM less sure that this comes up
 	case RefNull(ht: WasmHeapType);
 
 	def render(buf: StringBuilder) -> StringBuilder {
@@ -20,7 +23,15 @@ type WasmValueType {
 			F64 		=> buf.puts("f64");
 			FuncRef 	=> buf.puts("funcref");
 			ExternRef 	=> buf.puts("externref");
-			RefNull(ht) 	=> buf.put1("ref null #%d", ht.index);
+			AnyRef		=> buf.puts("anyref");
+			EqRef		=> buf.puts("eqref");
+			NoneRef		=> buf.puts("noneref");
+			RefNull(ht) 	=> {
+				buf.puts("ref null ");
+				if (ht == null) buf.puts("??");
+				else if (ht.index == 0) buf.putc('?');
+				else buf.put1("#%d", ht.index);
+			}
 		}
 		return buf;
 	}
@@ -33,47 +44,265 @@ type WasmValueType {
 			F64 		=> return WasmTypeConCode.F64.val;
 			FuncRef 	=> return WasmTypeConCode.FUNCREF.val;
 			ExternRef 	=> return WasmTypeConCode.EXTERNREF.val;
+			AnyRef		=> return WasmTypeConCode.ANYREF.val;
+			EqRef		=> return WasmTypeConCode.EQREF.val;
+			NoneRef		=> return WasmTypeConCode.NONEREF.val;
 			RefNull(ht)	=> return int.view(ht.index);
+		}
+	}
+	def heapType() -> WasmHeapType {
+		match (this) {
+			RefNull(ht) => return ht;
+			_ => return null;
 		}
 	}
 	def put(w: DataWriter) {
 		match (this) {
-			Void 		=> w.putb(WasmTypeConCode.EmptyBlock.code);
+			Void 		=> w.putb(WasmTypeConCode.I32.code);
 			I32 		=> w.putb(WasmTypeConCode.I32.code);
 			I64 		=> w.putb(WasmTypeConCode.I64.code);
 			F32 		=> w.putb(WasmTypeConCode.F32.code);
 			F64 		=> w.putb(WasmTypeConCode.F64.code);
 			FuncRef 	=> w.putb(WasmTypeConCode.FUNCREF.code);
 			ExternRef 	=> w.putb(WasmTypeConCode.EXTERNREF.code);
-			RefNull(ht)	=> w.putb(WasmTypeConCode.REF_NULL.code).put_uleb32(ht.index);
+			AnyRef		=> w.putb(WasmTypeConCode.ANYREF.code);
+			EqRef		=> w.putb(WasmTypeConCode.REF_NULL.code).put_sleb32(int.!(WasmTypeConCode.EQREF.val));
+			NoneRef		=> w.putb(WasmTypeConCode.NONEREF.code);
+			RefNull(ht)	=> w.putb(WasmTypeConCode.REF_NULL.code).put_sleb32(int.!(ht.index - 1));
+		}
+	}
+	def hash() -> int {
+		match (this) {
+			RefNull(ht) => return this.tag + int.view(ht.index);
+			_ => return this.tag;
+		}
+	}
+	def equals(other: WasmValueType) -> bool {
+		return equals0(other, Vector<(WasmHeapType,WasmHeapType)>.new());
+	}
+	def equals0(other: WasmValueType, seen: Vector<(WasmHeapType,WasmHeapType)>) -> bool {
+		match (this) {
+			RefNull(ht) => {
+				match (other) {
+					RefNull(oht) => return ht.equals0(oht, seen);
+					_ => return false;
+				}
+			}
+			_ => return this.tag == other.tag;
+		}
+	}
+	// use only after heap types have their index properly set
+	def equals2(other: WasmValueType) -> bool {
+		match (this) {
+			RefNull(ht) => {
+				match (other) {
+					RefNull(oht) => return ht.index == oht.index;
+					_ => return false;
+				}
+			}
+			_ => return this.tag == other.tag;
 		}
 	}
 }
 enum WasmPacking {
-	PACKED_8S,
-	PACKED_8U,
-	PACKED_16S,
-	PACKED_16U
+	NONE,
+	PACKED_8,
+	PACKED_16
+}
+type WasmStorageType(pack: WasmPacking, valType: WasmValueType, mutable: bool) {
+	def heapType() -> WasmHeapType {
+		return valType.heapType();
+	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		match (pack) {
+			PACKED_8 => buf.puts("i8");
+			PACKED_16 => buf.puts("i16");
+			NONE => valType.render(buf);
+		}
+		if (mutable) buf.puts(" mut");
+		return buf;
+	}
+	def hash() -> int {
+		return pack.tag * 37 + valType.hash() + if(mutable, 11, 0);
+	}
+	def equals(other: WasmStorageType) -> bool {
+		return (pack == other.pack) && mutable == other.mutable && valType.equals(other.valType);
+	}
+	def equals0(other: WasmStorageType, seen: Vector<(WasmHeapType,WasmHeapType)>) -> bool {
+		return (pack == other.pack) && mutable == other.mutable && valType.equals0(other.valType, seen);
+	}
+	def put(w: DataWriter) {
+		match (pack) {
+			NONE => valType.put(w);
+			PACKED_8 => w.putb(WasmTypeConCode.I8.code);
+			PACKED_16 => w.putb(WasmTypeConCode.I16.code);
+		}
+		w.putb(if (mutable, WasmMutabilityCode.Mutable.code, WasmMutabilityCode.Constant.code));
+	}
 }
 
-class WasmHeapType(index: u32) {
+class WasmHeapType {
+	var index: u32;		// var so index can be assigned later, if necessary
+	var typeInfo: WasmGcTypeInfo;	// only for WasmGc back end
+	var source: string;	// where the type came from, for printing out
+	def hash() -> int;
+	def equals(other: WasmHeapType) -> bool {
+		if (this == other) return true;
+		return equals0(other, Vector<(WasmHeapType,WasmHeapType)>.new());
+	}
+	def equals0(other: WasmHeapType, seen: Vector<(WasmHeapType,WasmHeapType)>) -> bool;
+	def put(w: DataWriter);
+	def initTypeInfo() -> this {
+		getTypeInfo();
+	}
+	def getTypeInfo() -> WasmGcTypeInfo {
+		if (typeInfo == null) {
+			typeInfo = WasmGcTypeInfo.new(this);
+		}
+		return typeInfo;
+	}
+	def addEdgeTo(wht: WasmHeapType) {
+		getTypeInfo().addEdgeToHeapType(wht);
+	}
+	def render(sb: StringBuilder) -> StringBuilder;
 }
-class WasmFunc extends WasmHeapType {
-	def params: Array<WasmValueType>;
-	def results: Array<WasmValueType>;
+component WasmHeapTypes {
+	def vecHasPair(seen: Vector<(WasmHeapType,WasmHeapType)>,
+		       t1: WasmHeapType, t2: WasmHeapType) -> bool {
+		for (i < seen.length) {
+			if ((seen[i].0 == t1) && (seen[i].1 == t2))
+				return true;
+		}
+		return false;
+	}
+}
+class WasmFuncType(params: Array<WasmValueType>, results: Array<WasmValueType>) extends WasmHeapType {
 
-	new(index: u32, params, results) super(index) { }
+	def hash() -> int {
+		var h = Arrays.hash(WasmDefTypeCode.Function.code, params, WasmValueType.hash);
+		return Arrays.hash(h, results, WasmValueType.hash);
+	}
+	def equals0(other: WasmHeapType, seen: Vector<(WasmHeapType,WasmHeapType)>) -> bool {
+		if (this == other) return true;
+		if (!WasmFuncType.?(other)) return false;
+		if (WasmHeapTypes.vecHasPair(seen, this, other)) return true;
+		var wfo = WasmFuncType.!(other);
+		if (params.length != wfo.params.length) return false;
+		if (results.length != wfo.results.length) return false;
+		// assume this pair is equal before recursing
+		seen.put((this, other));
+		for (i < params.length) {
+			if (!params[i].equals0(wfo.params[i], seen)) return false;
+		}
+		for (i < results.length) {
+			if (!results[i].equals0(wfo.results[i], seen)) return false;
+		}
+		return true;
+	}
+	def render(sb: StringBuilder) -> StringBuilder {
+		sb.puts("function(");
+		for (k < params.length) {
+			sb.put2("%s%q", if(k > 0, ", ", ""), params[k].render);
+		}
+		sb.puts(")");
+		if (results.length >= 1 && !WasmValueType.Void.?(results[0])) {
+			sb.put2("%s%s", if(results.length > 0, " -> ", ""),
+					if(results.length > 1, "(", ""));
+			for (k < results.length) {
+				sb.put2("%s%q", if(k > 0, ", ", ""), results[k].render);
+			}
+			sb.puts(if(results.length > 1, ")", ""));
+		}
+		if (source != null) sb.put1(" from <%s>", source);
+		return sb;
+	}
 }
-class WasmStruct extends WasmHeapType {
-	def parent: WasmStruct;
-	def fields: Array<(WasmPacking, WasmValueType)>;
+class WasmStructType extends WasmHeapType {
+	// var so can be filled later
+	var parent: WasmStructType;
+	var fields: Array<WasmStorageType>;
 	
-	new(index: u32, parent, fields) super(index) { }
+	def hash() -> int {
+		var h: int = if(parent == null, WasmDefTypeCode.Struct.code, parent.hash());
+		for (f in fields) {
+			h = h * 33 + f.hash();
+		}
+		return h;
+	}
+	def equals0(other: WasmHeapType, seen: Vector<(WasmHeapType,WasmHeapType)>) -> bool {
+		if (this == other) return true;
+		if (!WasmStructType.?(other)) return false;
+		if (WasmHeapTypes.vecHasPair(seen, this, other)) return true;
+		var wso = WasmStructType.!(other);
+		if (fields.length != wso.fields.length) return false;
+		// assume this pair is equal before recursing
+		seen.put((this, other));
+		if (parent == null) {
+			if (wso.parent != null) return false;
+		} else {
+			if (wso.parent == null) return false;
+			if (!parent.equals0(wso.parent, seen)) return false;
+		}
+		for (i < fields.length) {
+			if (fields[i].equals0(wso.fields[i], seen)) continue;
+			return false;
+		}
+		return true;
+	}
+	def put(w: DataWriter) {
+		if (parent != null) {
+			w.putb(WasmDefTypeCode.SUB.code);	// we don't bother with SUB_FINAL
+			w.put_uleb32(1);			// only one super type
+			w.put_uleb32(u32.view(parent.index - 1));	// the Wasm index of that type
+		}
+		w.put_sleb32(WasmDefTypeCode.Struct.code);
+		w.put_uleb32(u32.view(fields.length));
+		for (i < fields.length) fields[i].put(w);
+	}
+	def render(sb: StringBuilder) -> StringBuilder {
+		sb.puts("struct");
+		if (parent != null) sb.put1("[super=#%d]", parent.index);
+		sb.puts("(");
+		if (fields == null) {
+			sb.puts("...");
+		} else {
+			for (k < fields.length) {
+				sb.put2("%q%s", fields[k].render, if(k + 1 < fields.length, ", ", ""));
+			}
+		}
+		sb.puts(")");
+		if (source != null) sb.put1(" from <%s>", source);
+		return sb;
+	}
 }
-class WasmArray extends WasmHeapType {
-	def elem: (WasmPacking, WasmValueType);
+class WasmArrayType extends WasmHeapType {
+	// var so can update later, if need be
+	var elem: WasmStorageType;
 
-	new(index: u32, elem) super(index) { }
+	def hash() -> int {
+		var h: int = WasmDefTypeCode.Array.code;
+		h = h * 33 + elem.hash();
+		return h;
+	}
+	def equals0(other: WasmHeapType, seen: Vector<(WasmHeapType,WasmHeapType)>) -> bool {
+		if (this == other) return true;
+		if (!WasmArrayType.?(other)) return false;
+		// assume this pair is equal before recursing
+		seen.put((this, other));
+		var wao = WasmArrayType.!(other);
+		return elem.equals(wao.elem);
+	}
+	def put(w: DataWriter) {
+		w.put_sleb32(WasmDefTypeCode.Array.code);
+		// Wasm must always be mutable since there is no way to build an immutable
+		// array of run-time determined size
+		elem.put(w);
+	}
+	def render (sb: StringBuilder) -> StringBuilder {
+		sb.put1("(array %q)", elem.render);
+		if (source != null) sb.put1(" from <%s>", source);
+		return sb;
+	}
 }
 
 enum WasmTypeConCode(code: byte, val: i7) {
@@ -82,26 +311,30 @@ enum WasmTypeConCode(code: byte, val: i7) {
 	F32		(0x7D, -3),
 	F64		(0x7C, -4),
 	V128		(0x7B, -5), // ext:simd
-	I8		(0x7A, -6), // ext:gc
-	I16		(0x79, -7), // ext:gc
+	I8		(0x78, -8), // ext:gc
+	I16		(0x77, -9), // ext:gc
+	NULLFUNCREF	(0x73, -13),
 	FUNCREF		(0x70, -16),
 	EXTERNREF	(0x6F, -17),
 	ANYREF		(0x6E, -18), // ext:gc
 	EQREF		(0x6D, -19), // ext:gc
 	EmptyBlock	(0x40, -64), // XXX: move?
-	REF_NULL	(0x6C, -20), // ext:gc
-	REF		(0x6B, -21), // ext:gc
-	I31REF		(0x6A, -22), // ext:gc
+	REF_NULL	(0x63, -29), // ext:gc
+	REF		(0x64, -28), // ext:gc
+	I31REF		(0x6C, -20), // ext:gc
 	DATAREF		(0x67, -25),
 	ARRAYREF	(0x66, -26),
 	NONEREF		(0x65, -27)
 }
 
+enum WasmMutabilityCode(code: byte) {
+	Constant(0),
+	Mutable(1),
+}
+
 // Canonicalizes and encodes signatures into WASM function sigs
 class WasmTypeTable(wasmType: Type -> WasmValueType) {
 	def typeMap = HashMap<Signature, int>.new(Signature.hash, Signature.equals);
-	def structMap = TypeUtil.newTypeMap<WasmStruct>();
-	def arrayMap = TypeUtil.newTypeMap<WasmArray>();
 	def buf = DataWriter.new().grow(100);
 	var rawMap: HashMap<(int, int), int>;
 	var count = 0;
@@ -133,6 +366,7 @@ class WasmTypeTable(wasmType: Type -> WasmValueType) {
 		typeMap[sig] = index;
 		return u32.!(index - 1);
 	}
+	def assignTypeIndices() { }	// used by WasmGc subclass
 	def hash(begin: int, len: int) -> int {
 		var hashval = 0, end = begin + len;
 		var array = buf.data;
