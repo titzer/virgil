@@ -475,6 +475,20 @@ function is_gc_target() {
     return 1
 }
 
+function get_vm_addr_width() {
+    if [ "$target" = "x86-darwin" ]; then
+	echo 32
+    elif [ "$target" = "x86-64-darwin" ]; then
+	echo 48
+    elif [ "$target" = "x86-linux" ]; then
+	echo 32
+    elif [ "$target" = "x86-64-linux" ]; then
+	echo 48
+    elif [ "$target" = "wasm" ]; then
+        echo 32
+    fi
+}
+
 function do_nothing() {
     return 0;
 }
