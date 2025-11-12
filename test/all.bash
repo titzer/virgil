@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -94,7 +94,7 @@ esac
 if [ $# != 0 ]; then
     TEST_DIRS="$@"
 else
-    TEST_DIRS="unit asm/x86 asm/x86-64 redef core cast variants enums fsi32 fsi64 float range layout funexpr readonly large pointer darwin linux rt stacktrace gc system lib wizeng apps bench"
+    TEST_DIRS="unit asm/x86 asm/x86-64 redef core cast variants enums wasmgc fsi32 fsi64 float range layout funexpr readonly large pointer vmaddr darwin linux rt stacktrace gc system lib wizeng apps bench"
 fi
 
 function run_test_dirs() {
@@ -110,7 +110,8 @@ function run_test_dirs() {
 # Init test framework
 #######################################################################
 # Clean up results of any previous tests
-rm -rf /tmp/$USER/virgil-test
+rm -rf /tmp/$USER/virgil-test${CI_DIR:+/$CI_DIR}
+# CI_DIR allows multiple CI tests to run concurrently
 
 . $DIR/common.bash all
 
@@ -154,7 +155,7 @@ done
 # Compile Aeneas with stable compiler and run tests on bootstrap compiler
 #######################################################################
 if [ "$TEST_BOOTSTRAP" != 0 ]; then
-    compile_aeneas $V3C_STABLE $VIRGIL_TEST_OUT/aeneas/bootstrap $TEST_HOST
+    V3C_OPTS="" compile_aeneas $V3C_STABLE $VIRGIL_TEST_OUT/aeneas/bootstrap $TEST_HOST
     fail_fast
     BOOTSTRAP_V3C=$VIRGIL_TEST_OUT/aeneas/bootstrap/$TEST_HOST/Aeneas
     export AENEAS_TEST=$BOOTSTRAP_V3C

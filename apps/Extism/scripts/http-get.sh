@@ -1,4 +1,5 @@
-#!/bin/bash -ex
+#!/usr/bin/env bash
+set -ex
 extism call \
     http-get/HttpGet.wasm \
     http_get \

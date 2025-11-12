@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 . ../common.bash lib
 
@@ -52,14 +52,32 @@ function do_compiled() {
     R=$OUT/$target/run.out
 
     print_compiling $target
+    # HACK until wasm-gc is in stable
+    if [ "$target" = wasm-gc-wasi1 ] && [ -z "${AENEAS_TEST##*/stable/*}" ]; then
+	printf "${YELLOW}skipped${NORM}\n"
+        return
+    fi
     run_v3c $target -output=$T $TESTS $LIB_FILES &> $C
     check_no_red $? $C
 
     print_status Running $target
-    if [ -x $CONFIG/run-$target ]; then
-	$OUT/$target/main $TESTS | tee $R | $PROGRESS
+    runners=$(get_io_runners $target)
+    if [ "$runners" = "" ]; then
+        printf "${YELLOW}skipped${NORM}\n"
     else
-	printf "${YELLOW}skipped${NORM}\n"
+        for runner in $runners; do
+            short="${runner##*/}"
+            if [ -x $runner ]; then
+                if [ "$short" = "run-wasm-gc-wasi1@node" ]; then
+	            $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-wasi1-common/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
+                else
+	            $OUT/$target/main $TESTS | tee $R | $PROGRESS
+                fi
+            else
+	        printf "${YELLOW}skipped${NORM}\n"
+            fi
+            break
+        done
     fi
 }
 

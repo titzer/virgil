@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 . ../common.bash stacktrace
 if [ $# -gt 0 ]; then
@@ -11,6 +11,8 @@ for target in $(get_io_targets); do
     if [ "$target" = "wasm-wave" ]; then
         continue # TODO: stacktrace tests for wasm-wave
     elif [ "$target" = "wasm-linux" ]; then
+        continue # TODO: stacktrace tests for wasm-linux
+    elif [ "$target" = "wasm-gc-wasi1" ]; then
         continue # TODO: stacktrace tests for wasm-linux
     elif [ "$target" = "jar" ]; then
         continue # TODO: stacktrace tests for jar

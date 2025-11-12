@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [ $# = 0 ]; then
 	echo "Usage: compile.bash <target> [benchmarks]"
@@ -57,22 +57,25 @@ function do_compile() {
 	opts="$opts $(cat $p/v3c-opts-$target)"
     fi
 
-		if [ ! -z $binary ]; then
-			# compile with provided binary
-			RT=$VIRGIL_LOC/rt
-			RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
-			CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
-			$BTIME -i 1 $binary $CONFIG"$RT_FILES" -output=$TMP -program-name=$PROG "${opts[@]}" $files
-			return $?
+    if [ ! -z $binary ]; then
+	# compile with provided binary
+	RT=$VIRGIL_LOC/rt
+	RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
+        if [ "$target" ~= "*-wasi*" ]; then
+            RT_FILES=$(echo $RT_FILES $RT/wasm-wasi1-common/*.v3)
+        fi
+	CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
+	$BTIME -i 1 $binary $CONFIG"$RT_FILES" -output=$TMP -program-name=$PROG "${opts[@]}" $files
+	return $?
     elif [ "$target" = "v3i" ]; then
 	# v3i is a special target that runs the V3C interpreter
-	echo "#!/bin/bash" > $EXE
+	echo "#!/usr/bin/env bash" > $EXE
 	echo "exec v3i $files \"$@\"" >> $EXE
 	chmod 755 $EXE
 	return 0
     elif [ "$target" = "v3i-ra" ]; then
 	# v3i is a special target that runs the V3C interpreter (with -ra)
-	echo "#!/bin/bash" > $EXE
+	echo "#!/usr/bin/env bash" > $EXE
 	echo "exec v3i -ra $files \"$@\"" >> $EXE
 	chmod 755 $EXE
 	return 0

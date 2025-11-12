@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
@@ -8,4 +8,4 @@ TEST_DIR="${VIRGIL_LOC}/test"
 
 "${TEST_DIR}"/configure
 
-V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="v3i x86-64-darwin" "${TEST_DIR}"/all.bash
+V3C_OPTS="$@ -heap-size=600m" PROGRESS_ARGS=c TEST_TARGETS="v3i x86-64-darwin" "${TEST_DIR}"/all.bash
