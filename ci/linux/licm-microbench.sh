@@ -11,12 +11,12 @@ if [ "$(type -t nasm)" = "" ]; then
 fi
 TMP_DIR="/tmp/licm-microbench"
 
-if [ -f "${TMP_DIR}/default/licm_microbench" ]; then 
-    rm "${TMP_DIR}/default/licm_microbench"
+if [ -f "${TMP_DIR}/default/licm-microbench" ]; then 
+    rm "${TMP_DIR}/default/licm-microbench"
 fi
 
-if [ -f "${TMP_DIR}/licm/licm_microbench" ]; then 
-    rm "${TMP_DIR}/licm/licm_microbench"
+if [ -f "${TMP_DIR}/licm/licm-microbench" ]; then 
+    rm "${TMP_DIR}/licm/licm-microbench"
 fi
 
 if [ -f "${TMP_DIR}/results.json" ]; then 
@@ -29,10 +29,10 @@ mkdir -p "${TMP_DIR}/licm"
 
 echo "$@ -output=${TMP_DIR}/default"
 
-v3c-x86-64-linux $@ -O2 -output=${TMP_DIR}/default/ ${TEST_DIR}/licm_microbench.v3
-v3c-x86-64-linux $@ -O2 -licm -output=${TMP_DIR}/licm/ ${TEST_DIR}/licm_microbench.v3
+v3c-x86-64-linux $@ -O2 -output=${TMP_DIR}/default/ ${TEST_DIR}/licm-microbench.v3
+v3c-x86-64-linux $@ -O2 -licm -output=${TMP_DIR}/licm/ ${TEST_DIR}/licm-microbench.v3
 
-hyperfine --export-json ${TMP_DIR}/results.json "${TMP_DIR}/default/licm_microbench" "${TMP_DIR}/licm/licm_microbench" --runs=3
+hyperfine --export-json ${TMP_DIR}/results.json "${TMP_DIR}/default/licm-microbench" "${TMP_DIR}/licm/licm-microbench" --runs=3
 
 DEFAULT_MEAN=$(jq -r '.results[0].mean' ${TMP_DIR}/results.json)
 LICM_MEAN=$(jq -r '.results[1].mean' ${TMP_DIR}/results.json)
