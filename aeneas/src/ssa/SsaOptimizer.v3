@@ -39,6 +39,11 @@ class SsaOptimizer(context: SsaContext) {
 			}
 		}
 		checkAndPruneGraph();
+
+		if (context.compiler.LoopInvariantCodeMotion) { 
+			def l = SsaLoopOptimizer.new(context.graph, null, null, null, context);
+			l.licm(); 
+		}
 	}
 	def optLoop(header: SsaBlock, loopBody: SsaBlock, loopEnd: SsaBlock) {
 	}
@@ -1973,10 +1978,17 @@ class SsaLoopOptimizer {
 	def header: SsaBlock;	// start of loop (ends with loop condition)
 	def loopBody: SsaBlock; // first block of loop body
 	def loopEnd: SsaBlock;  // first block outside of loop
+	def context: SsaContext;
 	def headerMark = ++graph.markGen;
 	def gvn = Gvn.new(graph);
+	var marker: SsaExternalMarker;
+	var blockOrdering: SsaBlockOrder;
 
-	new(graph, header, loopBody, loopEnd) {}
+	new(graph, header, loopBody, loopEnd, context) {
+		marker = SsaExternalMarker.new();
+		blockOrdering = SsaBlockOrder.new(graph, false, marker);
+		blockOrdering.computeDominators();
+	}
 
 	def optimize() {
 		// XXX: optimize phis in header first
@@ -1987,6 +1999,149 @@ class SsaLoopOptimizer {
 			var iv = l.head;
 			if (cond != null) tryBoundingIv(iv, cond, condTrue);
 		}
+
+	}
+	def licm() {
+		if (context.shouldPrintLicm()) Terminal.putln("===== LICM =====");
+
+		if (blockOrdering == null || blockOrdering.order == null || blockOrdering.order.length <= 1) return; 
+		marker = SsaExternalMarker.!(blockOrdering.marker);
+		// Go through each block; accumulate loop depth info; and hoist invariants
+		var loopsInScope: Vector<SsaLoopInfo> = Vector<SsaLoopInfo>.new();
+		var outermostLoopBlockMark: u31;
+		for (i = 0; i < blockOrdering.order.length; i++) {
+			def curBlock: SsaBlock = blockOrdering.order[i];
+			context.block = curBlock;
+
+			def curBlockMark = (marker.getMark(curBlock));
+			for (curLink = curBlock.next; curLink != SsaLink.!(curBlock); curLink = curLink.next) {
+				marker.setMark(curLink, u31.!(curBlockMark));
+			}
+			// Case 1.) The block is the first block in the loop (header)
+			if (curBlock.info.loop != null) {
+				def loopInfo: SsaLoopInfo = curBlock.info.loop;
+				loopsInScope.put(loopInfo);
+				continue;
+			}
+			// Case 2.) The block is the exit node of the loop => need to update loopsInScope
+			while (loopsInScope.length > 0 && loopsInScope[loopsInScope.length - 1].end == i) {
+				def recentLoop: SsaLoopInfo = loopsInScope[loopsInScope.length-1];
+				loopsInScope.resize(loopsInScope.length - 1);
+			}
+			// Case 3.) The block is not in a loop 
+			if (loopsInScope.length == 0) continue;
+			// Case 4.) The block is in the body of the loop 
+			// Scan the block for invariants to hoist 
+			if (blockDominatesExitsAndBackedge(curBlock, loopsInScope[loopsInScope.length - 1])) {
+				var nextLink: SsaLink;
+				for (link = curBlock.next; link != curBlock; link = nextLink) {
+					// Grab the next link in the current block. `link` could be hoisted elsewhere. 
+					nextLink = link.next;
+					if (link.facts.O_PURE && SsaApplyOp.?(link)) {
+						//Hoist the instruction to outermostHoistLocation
+						hoistInstrToOuterScope(blockOrdering.order, loopsInScope, SsaInstr.!(link), curBlock);
+					}
+				}
+			}
+			
+		}
+		
+	}
+
+	def blockDominatesExitsAndBackedge(curBlock: SsaBlock, loopInfo: SsaLoopInfo) -> bool {
+		def header: SsaBlock = blockOrdering.order[loopInfo.start];
+		// def exits: Array<SsaCfEdge> = Lists.toArray(loopInfo.exits);
+		// Check that block dominates all exits except for the default exit. Only the header dominates default exit 
+		for (exits = loopInfo.exits; exits != null; exits = exits.tail) {
+			var exit = exits.head;
+			// Ignore the default exit from the loop header 
+			if (exit.src == header.end()) { 
+				continue; 
+			}
+			def dominatesExit: bool = blockOrdering.isDominator(curBlock.info, exit.dest.info);
+			if (!dominatesExit) return false;
+		}
+		// Check that block dominates the block before the backedge 
+		for (predEdge in header.preds) {
+			def predBlock = SsaBlock.!(predEdge.src.next);
+			// Ignore if the predecessor is outside of the loop 
+			if (!loopInfo.contains(predBlock)) { continue; }
+			// Check the current block dominates the predecessor 
+			def dominatesPred: bool = blockOrdering.isDominator(curBlock.info, predBlock.info);
+			if (!dominatesPred) return false;
+		}
+		return true;
+	}
+	// Precondition: loopsInScope is a vector of the loops that curBlock is nested in
+	def hoistInstrToOuterScope(order: Vector<SsaBlock>, loopsInScope: Vector<SsaLoopInfo>, curInstr: SsaInstr, curBlock: SsaBlock) {
+		if (loopsInScope == null || loopsInScope.length == 0) return;
+		// Get the mark of the start of the outermost loop. 
+		// All inputs must be previously explored because they're dominators (perhaps not always strict dominators)
+		def outerLoopBlockMark: u31 = u31.!(marker.getMark(order[loopsInScope[0].start])); 
+		// Calculate the innermost depth
+		// The outermost loop to hoist the instruction **outside of**. If we cannot hoist, then set the outermostHoistableLoop to null 
+		var outermostHoistableLoop: SsaLoopInfo = loopsInScope[0];  
+		for (input in curInstr.inputs) {
+			// Case 1.) The input is outside of the loop 
+			// Change this to instead check if the input block is actually before the start node of the first block (a dominator or predecessor)
+			if (marker.getMark(input.dest) < outerLoopBlockMark) {continue;}
+			// Case 2.) The input is within the loop 
+			// Identify which loop the input is in; Note that instructions have the same mark as their block
+			// Case on the input type to decide whether you need to find the location of the instruction
+			match (input.dest) {
+				instr: SsaParam => continue; 
+				instr: SsaApplyOp => {
+					outermostHoistableLoop = updateOuterMostHoistableLoopGivenInput(instr, order, loopsInScope, outermostHoistableLoop);
+				}
+				instr: SsaCheckpoint => continue;
+				instr: SsaProbe => continue;
+				instr: SsaNewVar => continue;
+				instr: SsaUpdateVar => continue;
+				instr: SsaDeleteVar => continue;
+				instr: SsaConst =>  continue; 
+				instr: SsaPhi => {
+					outermostHoistableLoop = updateOuterMostHoistableLoopGivenInput(instr, order, loopsInScope, outermostHoistableLoop);
+				}
+			}
+
+			// Instruction has input from innermost loop => cannot hoist
+			if (outermostHoistableLoop == null) { return; }
+		}
+		// Hoistable case 
+		// Remove the instruction from the current block 
+		curInstr.remove();
+		// Find the predecessor that's not in the loop (not a backedge)	
+		def loopBlock: SsaBlock = order[outermostHoistableLoop.start];
+		for (predCfEdge in loopBlock.preds) {
+			def predEnd: SsaEnd = predCfEdge.src;
+			if (marker.getMark(predEnd) < marker.getMark(loopBlock)) {
+				def predBlock:SsaBlock = SsaBlock.!(predEnd.next);
+				predBlock.append(curInstr);
+				if (context.shouldPrintLicm()) {
+					Terminal.put3("\tHoisting SsaInstr UID: %d | From SsaBlock UID: %d --> To SsaBlock UID: %d\n", curInstr.uid, curBlock.uid, predBlock.uid);
+					Terminal.put2("\t\tOrigin loop depth: %d | Hoist outside loop depth: %d\n", loopsInScope[loopsInScope.length-1].depth, outermostHoistableLoop.depth);
+				}
+				return;
+			}
+		}
+	}
+	// Constrain where the instruction-to-hoist can go based on where the inputInstr is. 
+	// Note that the last element in loopsInScope is the same loop that the original instruction is in. 
+	def updateOuterMostHoistableLoopGivenInput(inputInstr: SsaInstr, order: Vector<SsaBlock>, loopsInScope: Vector<SsaLoopInfo>, currentOutermostLoop: SsaLoopInfo) -> SsaLoopInfo {
+		if (currentOutermostLoop == null) { return null; }
+		var outermostHoistableLoop = currentOutermostLoop;
+		def blockOfUse: SsaBlock  = order[marker.getMark(inputInstr)]; 
+		for (i = 0; i < loopsInScope.length; i++) {
+			// Input instr is in the same loop as the original 
+			def loopInfo: SsaLoopInfo = loopsInScope[i];
+			if ( i < loopsInScope.length - 1 && loopInfo.contains(blockOfUse) && loopInfo.depth >= outermostHoistableLoop.depth) {
+				outermostHoistableLoop = loopsInScope[i+1];
+			} else if (i == loopsInScope.length - 1 && loopInfo.contains(blockOfUse)) {
+				outermostHoistableLoop  = null;
+			}
+		}
+
+		return outermostHoistableLoop;
 	}
 	def tryBoundingIv(iv: SsaLinearIv, cond: SsaInstr, condTrue: bool) {
 		var op: BoundOp;

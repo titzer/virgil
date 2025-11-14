@@ -81,7 +81,7 @@ function do_compile() {
 	return 0
     else
 	# compile to the given target architecture
-	v3c-$target -output=$TMP -program-name=$PROG "${opts[@]}" $files
+	v3c-$target -output=$TMP -program-name=$PROG ${opts[@]} $files
 	return $?
     fi
 }
