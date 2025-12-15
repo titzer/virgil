@@ -22,22 +22,23 @@ class TextReader {
 	def var error_column: int = int.max;	// earliest column with error
 	def var error_msg: string;		// error message
 
-	var skipWs  = TextReader.skipWhitespace;// whitespace callback
-	var onError = TextReader.setFirstError;	// error callback
+	var skipWs  = TextReader.skipWhitespace;	// configurable whitespace callback
+	var onError = TextReader.setFirstError;		// configurable error callback
 
 	new(fileName, data) {
 		line = 1;
 		column = 1;
 		if (data.length > 0) char = data[0];
-		skipWs(this);
 	}
-	// Extract a token of the specified length from the current position and advance.
+	// Extract a token of length {len} from the current position and advance.
 	def readToken(len: int) -> Token {
-		var t = tokenFor(pos, pos + len, line, column);
+		var beginLine = line, beginColumn = column;
+		var image = Array<byte>.new(len);
+		for (i < len) image[i] = data[pos + i]; // inlined array copy
 		advance(len);
-		return t;
+		return Token.new(fileName, image, beginLine, beginColumn);
 	}
-	// Extract a token between {start} and {end}.
+	// Extract a token between positions {start} and {end} and advance.
 	def readTokenAt(start: int, end: int) -> Token {
 		return tokenFor(start, end, posToLine(start), posToColumn(start));
 	}
@@ -48,31 +49,32 @@ class TextReader {
 		}
 		return Token.new(fileName, b, l, c);
 	}
-	// Advance by {len} bytes and skip to next non-whitespace byte.
+	// Consume {len} bytes and advance past whitespace.
 	def advance(len: int) -> int {
-		at(pos + len, line, column + len);
+		eat(len, 0);
 		skipWs(this);
 		return pos;
 	}
-	// Advance by 1 byte and skip to next non-whitespace byte (specialized for speed).
+	// Consume 1 byte and advance past whitespace.
 	def advance1() -> this {
-		var newPos = 1 + pos;
-		if (newPos < limit) {
-			pos = newPos;
-			if (char == '\t') tabColumn();
-			else if (char == '\n') {
-				lineEnds.put(pos);
-				column = 1;
-				line++;
-			}
-			char = data[newPos];
-			skipWs(this);
-		} else {
-			pos = limit;
-			char = '\x00';
-		}
+		eat(1, 0);
+		skipWs(this);
 	}
-	// optionally consume a sequence of bytes and advance()
+	// Consume {len} bytes, but do not advance past whitespace.
+	def skip(len: int) -> int {
+		eat(len, 0);
+		return pos;
+	}
+	// Consume 1 byte, but do not advance past whitespace.
+	def skip1() -> this {
+		eat(1, 0);
+	}
+	// If the current byte matches {ch}, consume it, advance, and return the position.
+	def opt1(ch: byte) -> int {
+		if (char == ch) { var p = pos; advance1(); return p; }
+		return -1;
+	}
+	// If the current bytes match {s}, consume them and advance.
 	def optN(s: string) -> int {
 		if (pos + s.length <= limit) {
 			var p = pos, d = data, max = s.length;
@@ -83,18 +85,13 @@ class TextReader {
 		}
 		return -1;
 	}
-	// optionally consume a single byte and advance()
-	def opt1(ch: byte) -> int {
-		if (char == ch) { var p = pos; advance1(); return p; }
-		return -1;
-	}
-	// consume the byte {ch} at the current position; error if no match
+	// Consume the byte {ch} at the current position and advance; error if no match.
 	def req1(ch: byte) -> int {
 		if (char == ch) { var p = pos; advance1(); return p; }
 		fail(Strings.format1("\"%c\" expected", ch));
 		return -1;
 	}
-	// consume the bytes {s} at the current position; error if no match
+	// Consume the bytes {s} at the current position and advance; error if no match.
 	def reqN(s: string) -> int {
 		if (pos + s.length > limit) return expected(s);
 		for (i < s.length) {
@@ -102,10 +99,6 @@ class TextReader {
 		}
 		advance(s.length);
 		return pos;
-	}
-	private def expected(s: string) -> int {
-		fail(Strings.format1("\"%s\" expected", s));
-		return -1;
 	}
 	// Set the current position, line, and column.
 	def at(npos: int, nline: int, ncol: int) -> this {
@@ -137,7 +130,7 @@ class TextReader {
 		if (l > 0) q = 1 + lineEnds[l - 1];
 		while (q < at) {
 			var ch = d[q];
-			if (ch == '\t') c = 1 + ((c + 8) / 8) * 8; // tab byte
+			if (ch == '\t') c = nextTabStop(c);
 			else if (ch == '\n') {
 				System.error("TextReader", Strings.format2("missed a newline %d:%d", l + 1, c));
 				c = 1;
@@ -146,16 +139,6 @@ class TextReader {
 			q++;
 		}
 		return c;
-	}
-	// Record an error with the specified message.
-	def fail(msg: string) -> this {
-		failRel(0, msg);
-	}
-	// Record an error at the given offset with the specified message.
-	def failRel(offset: int, msg: string) -> this {
-		var eline = posToLine(pos + offset);
-		var ecol = posToColumn(pos + offset);
-		onError(this, eline, ecol, msg);
 	}
 	// Peek {offset} bytes ahead without advancing.
 	def peekRel(offset: int) -> byte {
@@ -197,43 +180,46 @@ class TextReader {
 	}
 	// Default skip callback: skip spaces, tabs, and newlines.
 	def skipWhitespace() {
-		var pos = this.pos, line = this.line, column = this.column;
-		var data = this.data, max = limit;
-		while (pos < max) {
-			var ch = data[pos];
-			match (ch) {
-				' ' => column++;
-				'\t' => tabColumn();
+		eat(limit - pos, STOP_ON_CHAR);
+	}
+	// Skip spaces and tabs, but not newlines.
+	def skipSpacesAndTabs() {
+		eat(limit - pos, STOP_ON_CHAR | STOP_ON_NEWLINE);
+	}
+	// Skip nothing--no characters.
+	def skipNothing() {
+	}
+	// Eat a maximum of {len} characters, maintaining line and column numbers.
+	// Flags in {stops} controls which if any characters will stop eating early.
+	private def eat(len: int, stops: int) {
+		if (pos >= limit) return void(char = 0);
+		var max = pos + len;
+		var end = limit;
+		if (max < end) end = max;
+		while (pos < end) {
+			match (data[pos]) {
+				' ' => {
+					if ((stops & STOP_ON_SPACE) != 0) break;
+					column++;
+				}
+				'\t' => {
+					if ((stops & STOP_ON_TAB) != 0) break;
+					column = nextTabStop(column);
+				}
 				'\n' => {
+					if ((stops & STOP_ON_NEWLINE) != 0) break;
 					lineEnds.put(pos);
 					column = 1;
 					line++;
 				}
-				_ => break; // not whitespace
+				_ => {
+					if ((stops & STOP_ON_CHAR) != 0) break;
+					column++;
+				}
 			}
 			pos++;
 		}
-		// reached the end or a non-whitespace byte
-		at(pos, line, column);
-	}
-	// Skip spaces and tabs, but not newlines.
-	def skipSpacesAndTabs() {
-		var pos = this.pos, line = this.line, column = this.column;
-		var data = this.data, max = limit;
-		while (pos < max) {
-			var ch = data[pos];
-			match (ch) {
-				' ' => column++;
-				'\t' => tabColumn();
-				_ => break; // not whitespace
-			}
-			pos++;
-		}
-		// reached the end or a non-whitespace byte
-		at(pos, line, column);
-	}
-	// Skip nothing--no characters.
-	def skipNothing() {
+		char = if (pos < limit, data[pos]);
 	}
 	// Default error callback: record first error.
 	def setFirstError(eline: int, ecol: int, msg: string) {
@@ -244,14 +230,28 @@ class TextReader {
 			error_msg = msg;
 		}
 	}
-	private def tabColumn() {
-		column = nextTabStop(column);
+	private def expected(s: string) -> int {
+		fail(Strings.format1("\"%s\" expected", s));
+		return -1;
 	}
+	// Record an error with the specified message.
+	def fail(msg: string) -> this {
+		failRel(0, msg);
+	}
+	// Record an error at the given offset with the specified message.
+	def failRel(offset: int, msg: string) -> this {
+		var eline = posToLine(pos + offset);
+		var ecol = posToColumn(pos + offset);
+		onError(this, eline, ecol, msg);
+	}
+	// Compute the next tab stop for the given column.
 	def nextTabStop(column: int) -> int {
-		return 1 + (((column + 8) >>> 3) << 3);
+		return 1 + (((column + 7) >>> 3) << 3);
 	}
+	// Output the current line of text and a second line, with a caret at the corresponding position.
 	def renderCurrentLineWithCaret(buf: StringBuilder, pos: int) -> StringBuilder {
 		var start = pos - 1;
+		if (start < 0) start = 0;
 		while (start > 0) {
 			if (data[start] == '\n') {
 				start++;
@@ -280,3 +280,7 @@ class TextReader {
 		return buf;
 	}
 }
+def STOP_ON_SPACE = 1;
+def STOP_ON_NEWLINE = 2;
+def STOP_ON_CHAR = 4;
+def STOP_ON_TAB = 8;
