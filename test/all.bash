@@ -126,6 +126,8 @@ if [ "$QUIET_SETUP" != 1 ]; then
     echo "TEST_EXPLICIT=$TEST_EXPLICIT"
     echo "V3C_STABLE=$V3C_STABLE"
     echo "V3C_OPTS=\"$V3C_OPTS\""
+    echo "STABLE_V3C_OPTS=\"$STABLE_V3C_OPTS\""
+    echo "BOOTSTRAP_V3C_OPTS=\"$BOOTSTRAP_V3C_OPTS\""
     echo "PROGRESS_ARGS=\"$PROGRESS_ARGS\""
     echo "AENEAS_TEST=\"$AENEAS_TEST\""
 fi
@@ -155,7 +157,7 @@ done
 # Compile Aeneas with stable compiler and run tests on bootstrap compiler
 #######################################################################
 if [ "$TEST_BOOTSTRAP" != 0 ]; then
-    V3C_OPTS="" compile_aeneas $V3C_STABLE $VIRGIL_TEST_OUT/aeneas/bootstrap $TEST_HOST
+    V3C_OPTS="$STABLE_V3C_OPTS" compile_aeneas $V3C_STABLE $VIRGIL_TEST_OUT/aeneas/bootstrap $TEST_HOST
     fail_fast
     BOOTSTRAP_V3C=$VIRGIL_TEST_OUT/aeneas/bootstrap/$TEST_HOST/Aeneas
     export AENEAS_TEST=$BOOTSTRAP_V3C
@@ -169,7 +171,7 @@ if [ "$TEST_CURRENT" != 0 ]; then
     if [ "$TEST_BOOTSTRAP" != 0 ]; then
 	# Already tested the bootstrap compiler.
 	# Check if recompiling current with bootstrap yields the same binary
-	compile_aeneas $BOOTSTRAP_V3C $VIRGIL_TEST_OUT/aeneas/current $TEST_HOST
+	V3C_OPTS="$V3C_OPTS $BOOTSTRAP_V3C_OPTS" compile_aeneas $BOOTSTRAP_V3C $VIRGIL_TEST_OUT/aeneas/current $TEST_HOST
 	CURRENT_V3C=$VIRGIL_TEST_OUT/aeneas/current/$TEST_HOST/Aeneas
 	diff -rq $VIRGIL_TEST_OUT/aeneas/bootstrap/ $VIRGIL_TEST_OUT/aeneas/current/ > $OUT/bootstrap.diff
 	if [ $? = 0 ]; then
@@ -185,10 +187,10 @@ if [ "$TEST_CURRENT" != 0 ]; then
     else
 	# Didn't compile or test the bootstrap compiler yet.
 	# Compile the bootstrap compiler with stable, and then recompile with bootstrap.
-	compile_aeneas $V3C_STABLE $VIRGIL_TEST_OUT/aeneas/bootstrap $TEST_HOST
+	V3C_OPTS="$STABLE_V3C_OPTS" compile_aeneas $V3C_STABLE $VIRGIL_TEST_OUT/aeneas/bootstrap $TEST_HOST
 	fail_fast
 	BOOTSTRAP_V3C=$VIRGIL_TEST_OUT/aeneas/bootstrap/$TEST_HOST/Aeneas
-	compile_aeneas $BOOTSTRAP_V3C $VIRGIL_TEST_OUT/aeneas/current $TEST_HOST
+	V3C_OPTS="$V3C_OPTS $BOOTSTRAP_V3C_OPTS" compile_aeneas $BOOTSTRAP_V3C $VIRGIL_TEST_OUT/aeneas/current $TEST_HOST
 	fail_fast
 	CURRENT_V3C=$VIRGIL_TEST_OUT/aeneas/current/$TEST_HOST/Aeneas
     fi
