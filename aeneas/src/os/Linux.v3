@@ -75,7 +75,17 @@ class LinuxTarget extends Target {
 		elf.e_machine = elf_machine;
 
 		// allocate section headers for string, symbol table
-		var sections = if(CLOptions.SYMBOLS.val || compiler.DebugSymbol, ElfSections.new(elf, compiler.DebugSymbol));
+		def exports = Vector<IrRoot>.new();
+		for (i < prog.ir.roots.length) {
+			var root = prog.ir.roots[i];
+			if (root.name != null) exports.put(root);
+		}
+		def haveExports = exports.length > 0;
+		def haveImports = prog.numImports > 0;
+		def emitRel = haveExports | haveImports;
+		if (emitRel) elf.e_type = ElfType.ET_REL;
+		def emitSymbols = emitRel || CLOptions.SYMBOLS.val || compiler.DebugSymbol;
+		var sections = if(emitSymbols, ElfSections.new(elf, haveExports, haveImports, compiler.DebugSymbol));
 		var dwarf = if(compiler.DebugSymbol, Dwarf.new(elf, sections, prog, mach));
 
 		var pageAlign = mach.code.pageAlign;
@@ -128,8 +138,9 @@ class LinuxTarget extends Target {
 		var backend = newBackend(compiler, prog, mach, w, dwarf);
 		code.p_vaddr = w.endPageAddr();
 		backend.genAllCode();
+		var main = prog.getMain();
 		rt.recordCodeStart(mach.entryStub.absolute);
-		elf.e_entry = mach.entryStub.absolute;
+		if (main != null) elf.e_entry = mach.entryStub.absolute;
 		rt.recordCodeEnd(w.addr_end());
 
 		mach.reserveRuntimeCode(w); // TODO: add .reserved_code symbol
@@ -148,6 +159,54 @@ class LinuxTarget extends Target {
 		} else {
 			rt.recordRuntimeCode(0, 0);
 		}
+
+		// Build list of addresses of imported functions, for replacing references
+		// to their Unimplemented stubs.  This is done here so that all later
+		// encoding of addresses in MachProgram will record references to the stubs.
+
+		// hash set of imported names (as imported)
+		var importNames = HashMap<string, void>.new(Strings.hash, Strings.equal);
+		// Map from addresses of imported functions to their symbol table indexes
+		var importAddrs = HashMap<long, int>.new(int.view, long.==);
+		// Map from addresses of imported functions to locations that refer to them;
+		// locations are (virtual address, offset in DataWriter)
+		var importLocs = HashMap<long, List<(long, int)>>.new(int.view, long.==);
+		// Flag to track whether a symbol section is needed
+		var anySymbols = false;
+		if (haveImports) {
+			for (i < prog.ir.classes.length) {
+				var cls = prog.ir.classes[i];
+				var ctype = cls.ctype;
+				// only methods of component can possibly be imported
+				if (!V3.isComponent(ctype)) continue;
+				var importToken = ComponentType.!(ctype).componentDecl.importName;
+				// the component's methods are imported if its importToken is set
+				if (importToken == null) continue;
+				for (j < cls.methods.length) {
+					var meth = cls.methods[j];
+					// only specifically defined/named methods can be imported
+					if (meth == null || meth.source == null) continue;
+					var source = meth.source;
+					var methName = source.name();
+					var addr = mach.methodMap[meth];
+					if (addr == null || addr.absolute < 0) {
+						prog.ERROR.addError(source.token.range(), null, "ImportError: imported method is undefined", methName);
+						continue;
+					}
+					// imported name: compImport.methImport, or just methImport if compImport is empty
+					var methImportToken = source.importName;
+					if (methImportToken != null) methName = methImportToken.image;
+					var sep = if(importToken.image.length > 0, ".", "");
+					var fullName = StringBuilder.new().puts(importToken.image).puts(sep).puts(methName).extract();
+					anySymbols = true;
+					importAddrs[addr.absolute] = sections.queueUndefSymbol(fullName, long.!(space.addressSize));
+					importLocs[addr.absolute] = null;
+					importNames[fullName] = ();
+				}
+			}
+			prog.ERROR.report();
+		}
+		if (anySymbols) mach.importLocs = importLocs;
 
 		mach.layoutMeta(w);
 		mach.layoutRuntime(w);
@@ -190,9 +249,114 @@ class LinuxTarget extends Target {
 			sections.text.sh_size = code.p_filesz;
 
 			sections.startStringSection(w);
+			sections.addQueuedUndefs(w);  // do this right away so indices are right
+
+			if (emitRel) {
+				var tempAddr = Addr.new(null, null, 0);
+				tempAddr.absolute = code.p_vaddr;
+				sections.addAbsSymbol(w, ".text.virgil.base", tempAddr);
+				tempAddr.absolute = data.p_vaddr;
+				sections.addAbsSymbol(w, ".data.virgil.base", tempAddr);
+			}
+
+			def exportAddrs = HashMap<string, Addr>.new(Strings.hash, Strings.equal);
+			if (main != null && (haveExports || haveImports || CLOptions.SYMBOLS.val)) {
+				sections.addFuncSymbol(w, ".entry", mach.entryStub);
+			}
+	
+			if (haveExports) {
+				for (i < exports.length) {
+					var exp = exports[i];
+					var name = exp.name;
+					var meth = exp.spec.asMethod();
+					var range = if(meth.source != null, meth.source.token.range());
+					var addr = mach.methodMap[meth];
+					if (addr == null || addr.absolute < 0) {
+						prog.ERROR.addError(range, null, "ExportDeclError: exported method is undefined", name);
+						continue;
+					}
+					exportAddrs[name] = addr;
+					anySymbols = true;
+					sections.addFuncSymbol(w, name, addr);
+				}
+				prog.ERROR.report();
+			}
+
+			if ((haveExports || haveImports) && main != null && !exportAddrs.has("main")) {
+				// need to export main, if it exists, for linking purposes
+				var mainMeth = main.asMethod();
+				var mainAddr = mach.methodMap[mainMeth];
+				if (mainAddr != null && mainAddr.absolute >= 0) {
+					exportAddrs["main"] = mainAddr;
+					anySymbols = true;
+					sections.addFuncSymbol(w, "main", mainAddr);
+				}
+			}
+
+			if (haveImports) {
+				for (node = w.patches; node != null; node = node.tail) {
+					var patch = node.head;
+					var kind: PatchKind = patch.0;  // the kind of relocation at this place
+					var addr: Addr = patch.1;       // the virtual address this location should refer to
+					var posAddr: long = patch.2;    // the virtual address of pos in the executable
+					var isDataAddr = (u64.view(posAddr) >= u64.view(data.p_vaddr));
+					var pos: int = patch.3;         // location in the ELF file to update
+					if (addr == null || !importAddrs.has(addr.absolute)) continue;
+					var index = u32.!(importAddrs[addr.absolute]);
+					var offset = u64.!(posAddr - if(isDataAddr, data.p_vaddr, code.p_vaddr));
+					var rtype: u8;
+					var addend: i64;
+					// Note: regular patching has already happened ...
+					match (kind) {
+						RELA_32 => {
+							// want S - (P - delta) where delta was value in first byte
+							// first, get delta by contents - S, + P
+							// use a RELA R_X86_64_PC32 / R_386_PC32 with A = delta
+							var rf = Ref<Layout_i32>.of(w.data[pos ..+ 4]);
+							var curr = rf.val;
+							var delta: i32 = (curr - i32.view(addr.absolute)) + i32.!(posAddr);
+							rtype = if(elf.is64(), Elf64_R_Type.R_X86_64_PC32.code, Elf32_R_Type.R_386_PC32.code);
+							addend = i64.!(delta);
+						}
+						ABS_32 => { // want S (32 bits)
+							// use R_X86_64_32 / R_386_32 with A = 0
+							var rf = Ref<Layout_i32>.of(w.data[pos ..+ 4]);
+							var curr = rf.val;
+							rtype = if(elf.is64(), Elf64_R_Type.R_X86_64_32.code, Elf32_R_Type.R_386_32.code);
+							addend = 0;
+						}
+						ABS_64 => { // want S (64 bits)
+							// use R_X86_64_64 with A = 0
+							var rf = Ref<Layout_i64>.of(w.data[pos ..+ 8]);
+							var curr = rf.val;
+							rtype = Elf64_R_Type.R_X86_64_64.code;
+							addend = 0;
+						}
+						_ => {
+							// complain
+						}
+					}
+					var entries = if(isDataAddr, sections.data_reloc_entries, sections.text_reloc_entries);
+					entries.put(RelocInfo(offset, index, rtype, addend, pos));
+				}
+
+				for (node = Maps.keyList(importLocs); node != null; node = node.tail) {
+					var addr = node.head;  // addr is virtual address of Unimplemented stub
+					for (lnode = importLocs[addr]; lnode != null;lnode = lnode.tail) {
+						var info = lnode.head, vaddr = info.0, pos = info.1;
+						var isDataAddr = (u64.view(vaddr) >= u64.view(data.p_vaddr));
+						var index = u32.!(importAddrs[addr]);
+						var offset = u64.!(vaddr - if(isDataAddr, data.p_vaddr, code.p_vaddr));
+						var rtype: u8 = if(elf.is64(), Elf64_R_Type.R_X86_64_64.code, Elf32_R_Type.R_386_32.code);
+						var addend: i64 = 0;
+						var entries = if(isDataAddr, sections.data_reloc_entries, sections.text_reloc_entries);
+						entries.put(RelocInfo(offset, index, rtype, addend, pos));
+					}
+				}
+			}
 
 			if (CLOptions.SYMBOLS.val) {
-				sections.addFuncSymbol(w, ".entry", mach.entryStub);
+				anySymbols = true;
 				if (mach.allocStub != null) sections.addFuncSymbol(w, ".alloc", mach.allocStub);
 				if (mach.signalStub != null) sections.addFuncSymbol(w, ".signal", mach.signalStub);
 
@@ -202,15 +366,22 @@ class LinuxTarget extends Target {
 					if (m.source == null) continue;
 					var addr = mach.methodMap[m];
 					if (addr == null || addr.absolute < 0) continue;
-					sections.addMethodSymbol(w, m, addr, buf);
+//					var name = m.source.renderLong(buf).extract();
+					var name = m.renderLong(buf).extract();
+					if (exportAddrs.has(name) || importNames.has(name)) {
+						// a different function is exported or imported under this name, so
+						// change the name of this function in the symbol table
+						name = Arrays.concat(name, ".hide");
+					}
+					sections.addFuncSymbol(w, name, addr);
 				}
-				sections.finishStringSection(w);
-				// encode the symbol table entries
-				sections.encodeSymbolTable(w);
-			} else {
-				sections.finishStringSection(w);
 			}
+			sections.finishStringSection(w);
+			// encode the symbol table entries
+			if (anySymbols) sections.encodeSymbolTable(w);
 		}
+
+		if (haveImports) sections.encodeRelocs(w);
 
 		if (dwarf != null) {
 			dwarf.emit(w);
@@ -219,14 +390,14 @@ class LinuxTarget extends Target {
 		// encode ELF header section
 		elf.encode(w.at(0));
 
-		var file = compiler.getOutputFileName(prog.name(), null);
+		var file = compiler.getOutputFileName(prog.name(), if(emitRel, "o", null));
 		var fd = System.fileOpen(file, false);
 		if (fd < 0) return prog.ERROR.OutputError(file);
 		// write the entire file from the buffer array
 		System.write(fd, w.alias());
 		System.fileClose(fd);
 		// change permissions to make binary executable
-		compiler.makeExecutable(file);
+		if (!emitRel) compiler.makeExecutable(file);
 	}
 }
 
@@ -240,21 +411,31 @@ enum DebugSection(printName: string) {
 }
 def DebugSectionCount = 6;
 
-class ElfSections(elf: ElfHeader, debugSymbol: bool) {
+type RelocInfo(offset: u64, index: u32, rtype: u8, addend: i64, pos: int);
+
+class ElfSections(elf: ElfHeader, haveExports: bool, haveImports: bool, debugSymbol: bool) {
 	def str = ElfSectionHeader.new();
 	def sym = ElfSectionHeader.new();
 	def text = ElfSectionHeader.new();
 	def data = ElfSectionHeader.new();
 	def debugs = Array<ElfSectionHeader>.new(DebugSectionCount);
 	def symbols = Vector<ElfSymbol>.new();
-
+	def relocatable = haveExports | haveImports;
+	def text_relocs = ElfSectionHeader.new();
+	def data_relocs = ElfSectionHeader.new();
+	// an entry is (offset, symbol index, reloc type, addend, position in writer)
+	// these are encoded for 32- and 64-bit as a last step
+	def text_reloc_entries = Vector<RelocInfo>.new();
+	def data_reloc_entries = Vector<RelocInfo>.new();
 	var str_start: int;
+	def queuedUndefs = Vector<(string, long)>.new();
 
 	new() {
 		elf.sheaders.put(ElfSectionHeader.new());
 		str.index = elf.sheaders.length;
 		elf.sheaders.put(str);
-		if (CLOptions.SYMBOLS.val) {
+		def haveSym = haveExports || haveImports || CLOptions.SYMBOLS.val;
+		if (haveSym) {
 			sym.index = elf.sheaders.length;
 			elf.sheaders.put(sym);
 		}
@@ -262,6 +443,13 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		elf.sheaders.put(text);
 		data.index = elf.sheaders.length;
 		elf.sheaders.put(data);
+
+		if (haveImports) {
+			text_relocs.index = elf.sheaders.length;
+			elf.sheaders.put(text_relocs);
+			data_relocs.index = elf.sheaders.length;
+			elf.sheaders.put(data_relocs);
+		}
 
 		if (debugSymbol) {
 			for (e in DebugSection) {
@@ -274,12 +462,28 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		}
 
 		str.sh_type = ElfShType.SHT_STRTAB;
-		if (CLOptions.SYMBOLS.val) {
+		if (haveSym) {
 			symbols.put(ElfSymbol.new());
 			sym.sh_type = ElfShType.SHT_SYMTAB;
 			sym.sh_link = str.index;
 			sym.sh_entsize = if(elf.is64(), Elf64le_Symbol.size, Elf32le_Symbol.size);
 			sym.sh_info = 1;
+		}
+
+		if (haveImports) {
+			// set up relocs
+			// they can be located in the text section and in the data section
+			text_relocs.sh_type = if(elf.is64(), ElfShType.SHT_RELA, ElfShType.SHT_REL);
+			text_relocs.sh_link = sym.index;
+			text_relocs.sh_entsize = if(elf.is64(), Elf64le_Rela.size, Elf32le_Rel.size);
+			text_relocs.sh_info = u32.!(text.index);
+			text_relocs.sh_flags = ElfConst.SHF_INFO_LINK;
+
+			data_relocs.sh_type = if(elf.is64(), ElfShType.SHT_RELA, ElfShType.SHT_REL);
+			data_relocs.sh_link = sym.index;
+			data_relocs.sh_entsize = if(elf.is64(), Elf64le_Rela.size, Elf32le_Rel.size);
+			data_relocs.sh_info = u32.!(data.index);
+			data_relocs.sh_flags = ElfConst.SHF_INFO_LINK;
 		}
 
 		elf.e_shstrndx = byte.!(str.index);
@@ -305,10 +509,17 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		}
 
 		text.sh_name = w.pos - str_start;
-		w.puta(".text\x00");
+		w.puta(".text").puta(if(relocatable, ".virgil", null)).putb(0);
 
 		data.sh_name = w.pos - str_start;
-		w.puta(".data\x00");
+		w.puta(".data").puta(if(relocatable, ".virgil", null)).putb(0);
+
+		if (haveImports) {
+			text_relocs.sh_name = w.pos - str_start;
+			w.puta(if(elf.is64(), ".rela.text", ".rel.text")).putb(0);
+			data_relocs.sh_name = w.pos - str_start;
+			w.puta(if(elf.is64(), ".rela.data", ".rel.data")).putb(0);
+		}
 
 		if (debugSymbol) {
 			for (e in DebugSection) {
@@ -330,28 +541,140 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		}
 		sym.sh_size = w.pos - sym.sh_offset;
 	}
+	def encodeReloc32(w: DataWriter, reloc: RelocInfo) {
+		match (reloc.rtype) {
+			Elf32_R_Type.R_386_32.code => {
+				var entry = Ref<Elf32le_Rel>.of(w.acquire(Elf32le_Rel.size));
+				entry.r_offset = u32.!(reloc.offset);
+				entry.r_info = ElfLayouts.Elf32_R_Info(reloc.index, reloc.rtype);
+				var save = w.pos;
+				w.at(reloc.pos);
+				w.put_b32(0);
+				w.at(save);
+			}
+			Elf32_R_Type.R_386_PC32.code => {
+				var entry = Ref<Elf32le_Rel>.of(w.acquire(Elf32le_Rel.size));
+				entry.r_offset = u32.!(reloc.offset);
+				entry.r_info = ElfLayouts.Elf32_R_Info(reloc.index, reloc.rtype);
+				var save = w.pos;
+				w.at(reloc.pos);
+				w.put_b32(int.!(reloc.addend));
+				w.at(save);
+			}
+			_ => {
+				// complain
+			}
+		}
+	}
+	def encodeReloc64(w: DataWriter, reloc: RelocInfo) {
+		match (reloc.rtype) {
+			Elf64_R_Type.R_X86_64_64.code => {
+				var entry = Ref<Elf64le_Rela>.of(w.acquire(Elf64le_Rela.size));
+				entry.r_offset = reloc.offset;
+				entry.r_info = ElfLayouts.Elf64_R_Info(reloc.index, reloc.rtype);
+				entry.r_addend = reloc.addend;
+				// clearing the original position may not be necessary, but 0 is usual there
+				var save = w.pos;
+				w.at(reloc.pos);
+				w.put_b64(0);
+				w.at(save);
+			}
+			Elf64_R_Type.R_X86_64_PC32.code => {
+				var entry = Ref<Elf64le_Rela>.of(w.acquire(Elf64le_Rela.size));
+				entry.r_offset = reloc.offset;
+				entry.r_info = ElfLayouts.Elf64_R_Info(reloc.index, reloc.rtype);
+				entry.r_addend = reloc.addend;
+				// clearing the original position may not be necessary, but 0 is usual there
+				var save = w.pos;
+				w.at(reloc.pos);
+				w.put_b32(0);
+				w.at(save);
+			}
+			Elf64_R_Type.R_X86_64_32.code => {
+				var entry = Ref<Elf64le_Rela>.of(w.acquire(Elf64le_Rela.size));
+				entry.r_offset = reloc.offset;
+				entry.r_info = ElfLayouts.Elf64_R_Info(reloc.index, reloc.rtype);
+				entry.r_addend = reloc.addend;
+				// clearing the original position may not be necessary, but 0 is usual there
+				var save = w.pos;
+				w.at(reloc.pos);
+				w.put_b32(0);
+				w.at(save);
+			}
+			_ => {
+				// complain
+			}
+		}
+	}
+	def encodeRelocs(w: DataWriter) {
+		text_relocs.sh_offset = w.pos;
+		for (i < text_reloc_entries.length) {
+			var reloc = text_reloc_entries[i];
+			if (elf.is64()) {
+				encodeReloc64(w, reloc);
+			} else {	
+				encodeReloc32(w, reloc);
+			}
+		}
+		text_relocs.sh_size = w.pos - text_relocs.sh_offset;
+
+		data_relocs.sh_offset = w.pos;
+		for (i < data_reloc_entries.length) {
+			var reloc = data_reloc_entries[i];
+			if (elf.is64()) {
+				encodeReloc64(w, reloc);
+			} else {
+				encodeReloc32(w, reloc);
+			}
+		}
+		data_relocs.sh_size = w.pos - data_relocs.sh_offset;
+	}
+	def SHN_ABS: u16 = 0xFFF1;
+	def addAbsSymbol(w: MachDataWriter, str: string, addr: Addr) {
+		var entry = ElfSymbol.new();
+		symbols.put(entry);
+		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
+		entry.st_name = w.pos - str_start;
+		entry.st_value = addr.absolute;
+		entry.st_size = addr.size;
+		entry.st_index = SHN_ABS;
+		w.puta(str);
+		w.putb(0);
+	}
+	def queueUndefSymbol(str: string, size: long) -> int {
+		var index = symbols.length + queuedUndefs.length;
+		queuedUndefs.put((str, size));
+		return index;
+	}
+	def addQueuedUndefs(w: MachDataWriter) {
+		for (i < queuedUndefs.length) {
+			var info = queuedUndefs[i], name = info.0, size = info.1;
+			addUndefSymbol(w, name, size);
+		}
+	}
+	def SHN_UNDEF: u16 = 0;
+	def addUndefSymbol(w: MachDataWriter, str: string, size: long) -> int {
+		var entry = ElfSymbol.new();
+		var index = symbols.length;
+		symbols.put(entry);
+		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
+		entry.st_name = w.pos - str_start;
+		entry.st_value = 0;
+		entry.st_size = size;
+		entry.st_index = SHN_UNDEF;
+		w.puta(str);
+		w.putb(0);
+		return index;
+	}
 	def addFuncSymbol(w: MachDataWriter, str: string, addr: Addr) {
 		var entry = ElfSymbol.new();
 		symbols.put(entry);
 		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
 		entry.st_name = w.pos - str_start;
-		entry.st_value = addr.absolute;
+		entry.st_value = addr.absolute - text.sh_addr;
 		entry.st_size = addr.size;
 		entry.st_index = u16.!(text.index);
 		w.puta(str);
-		w.putb(0);
-	}
-	def addMethodSymbol(w: DataWriter, m: IrMethod, addr: Addr, buf: StringBuilder) {
-		var entry = ElfSymbol.new();
-		symbols.put(entry);
-		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
-		entry.st_name = w.pos - str_start;
-		entry.st_value = addr.absolute;
-		entry.st_size = addr.size;
-		entry.st_index = u16.!(text.index);
-		buf.reset();
-		m.source.renderLong(buf);
-		buf.send(w.putr);
 		w.putb(0);
 	}
 }
