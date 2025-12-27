@@ -1,6 +1,18 @@
 // Copyright 2025 Virgil authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// NOTE: For classes and tuples, first elements at higher bits, last elements at lower bits. 
+
+// Packs data into an IntType. 
+// Given a `ft` (fromType), `flatten` retreives each scalar 
+// from `input`, based on its type, `ft`. Scalars are stored in  
+// `scalars` and then packed into the final result through `finish`.
+// 
+// Note on the order scalars are packed: 
+// For types like tuples and ADTs with multiple scalars, 
+// the first elements are packed into the higher order bits 
+// The last elements are stored at the least significant bits 
+// Intuitively, convention allows us to read the class as a binary number 0b.....
 class SsaPacker(builder: SsaBuilder, result: IntType) {
 	def scalars = Vector<(PrimType, int, SsaInstr)>.new();
 	var pos: int;
@@ -27,6 +39,7 @@ class SsaPacker(builder: SsaBuilder, result: IntType) {
 			x: ClassType => {
 				// pack the fields of this class type
 				var ic = builder.context.prog.ir.makeIrClass(x); // XXX: makeIrClass seems wrong after normalization
+				// Now pack the fields of the class 
 				var fs = ic.fields;
 				for (i = fs.length -1; i >= 0; i--) {
 					var f = fs[i];
@@ -72,5 +85,136 @@ class SsaPacker(builder: SsaBuilder, result: IntType) {
 			else v = builder.pure(result.opOr(), [v, i]);
 		}
 		return v;		
+	}	
+}
+// Unpacks data from an IntType into a desired type
+// Given a `tt` (toType) to unpack the `ft` (fromType) into, 
+// `unpack` will unpack the scalars from the `i` (input). 
+// 
+// Note on the order scalars are unpacked: 
+// Recall that for types with multiple scalars, the first 
+// scalars (ex. 0th element in tuples, the first field in ADTs etc.)
+// are packed at the higher order bits, and the last scalar elements
+// are packed at the lower order bits. Unpack starts unpacking the 
+// last scalar elements at the lower order bits of `i`. 
+class SsaUnpacker(builder: SsaBuilder, ft: IntType) {
+	// Track the position in the input IntType we are unpacking
+	var pos: int = 0;
+	// A buffer to hold the scalars so that we can construct tuples and variants. 
+	def unpackedBuffer = ListStack<SsaInstr>.new();
+	var input: SsaInstr;
+	def unpack(tt: Type, i: SsaInstr) -> SsaInstr {
+		input = i;
+		unpack0(tt);
+		def unpackedInstr = if (!unpackedBuffer.empty(), unpackedBuffer.pop(), builder.graph.nullConst(tt));
+		if (!unpackedBuffer.empty() ) { builder.context.fail(Strings.format1("Error unpacking %q. Extraneous instructions found", tt.render)); }
+		return unpackedInstr;
+	}
+	def unpack0(tt: Type) {
+		var shiftedInput = input;
+		if (pos != 0) { 
+			shiftedInput = builder.add(ft.opShr(), [input, builder.graph.intConst(pos)], Fact.O_NO_SHIFT_CHECK);
+		}
+		
+		match (tt) {
+			x: IntType => {
+				if (x == ft) { 
+					unpackedBuffer.push(shiftedInput); 
+				} else {
+					def viewInstr = builder.opIntViewI0(ft, x, shiftedInput);
+					unpackedBuffer.push(viewInstr);
+					pos += x.width;
+				}
+			}
+			x: BoolType => {
+				def bitType: IntType = Int.getType(false, 1);
+				def unpackedBit: SsaInstr = builder.opIntViewI0(ft, bitType, shiftedInput);
+				def boolInstr = builder.pure(bitType.opEq(), [unpackedBit, builder.graph.intConst(1)]);
+				unpackedBuffer.push(boolInstr);
+				pos += x.width;
+			}
+			x: FloatType => {
+				if (x.is64 && x.width == 64) {
+					def op = V3Op.newFloat64ViewI(ft);
+					unpackedBuffer.push(builder.add(op, [shiftedInput], Facts.NONE));
+				} else {
+					// IntView as a 32 bit integer first if width is larger than 32
+					shiftedInput = if(ft.width > 32, builder.opIntViewI0(ft, Int.TYPE, shiftedInput), shiftedInput);
+					def op = V3Op.newFloat32ViewI(Int.TYPE);
+					unpackedBuffer.push(builder.add(op, [shiftedInput], Facts.NONE));
+				}
+
+				pos += x.width;
+			}
+			x: EnumType => {
+				def tagType: IntType = x.enumDecl.tagType;
+				def unpackedTag: SsaInstr = builder.opIntViewI0(ft, tagType, shiftedInput);
+				def numCases = x.enumDecl.cases.length;
+				def cond: SsaInstr = builder.addApply(builder.source, tagType.opLt(), [unpackedTag, builder.graph.intConst(numCases)]);
+				// Valid tag case
+				def trueBlock = SsaBlock.new();
+				def subsumeOrigTag = SsaApplyOp.new(builder.source, V3Op.newTypeSubsume(tagType, x), [unpackedTag]);
+				trueBlock.append(subsumeOrigTag);
+				// Invalid tag -> map to 0th enum value 
+				def falseBlock = SsaBlock.new();
+				def subsumeZero = SsaApplyOp.new(builder.source, V3Op.newTypeSubsume(tagType, x), [builder.graph.intConst(0)]);
+				falseBlock.append(subsumeZero);
+				builder.addIf(cond, trueBlock, falseBlock);
+				// Set builder to process on joinBlock
+				def joinBlock = SsaBlock.new();
+				trueBlock.append(SsaGoto.new(joinBlock));
+				falseBlock.append(SsaGoto.new(joinBlock));
+				builder.set(joinBlock);
+				def enumInstr = builder.addPhi(x, [subsumeOrigTag, subsumeZero]);
+
+				unpackedBuffer.push(enumInstr);
+				pos += tagType.width;
+			}
+			x: EnumSetType => {
+				def repType: IntType = x.repType;
+				def unpackedRep = builder.opIntViewI0(ft, repType, shiftedInput); 
+				def enumSetInstr = SsaApplyOp.new(builder.source, V3Op.newTypeSubsume(repType, x), [unpackedRep]);
+				builder.append(enumSetInstr);
+
+				unpackedBuffer.push(enumSetInstr);
+				pos += repType.width;
+			}
+			x: TupleType => {
+				def elemTypes: Array<Type> = Lists.toArray(x.nested);
+				def unpackedElems = Array<SsaInstr>.new(elemTypes.length);
+				for (i = elemTypes.length - 1; i >= 0; i--) {
+					unpack0(elemTypes[i]);
+					unpackedElems[i] = if(!VoidType.?(elemTypes[i]), unpackedBuffer.pop(), builder.graph.nullConst(elemTypes[i]));
+				}
+				def tupleCreate = builder.opTupleCreate(x, unpackedElems);
+				unpackedBuffer.push(tupleCreate);
+			}	
+			x: ClassType => {
+				var ic = builder.context.prog.ir.makeIrClass(x); // XXX: makeIrClass seems wrong after normalization
+				var fs = ic.fields; 
+				for (i=fs.length-1; i >= 0; i--) {	
+					def field = fs[i];
+					unpack0(field.fieldType);
+				}
+				def fieldInstr = Array<SsaInstr>.new(fs.length);
+				for (i < fs.length) {
+					if (unpackedBuffer.empty()) { 
+						builder.context.fail(Strings.format2("Error unpacking %q. Missing %q", x.render, fs[i].render));
+					}
+					fieldInstr[i] = unpackedBuffer.pop();
+				}
+
+				def irFieldTypes = Arrays.map(fs, IrField.fieldType);
+				def variantAlloc = builder.pure(V3Op.newVariantAlloc(x, irFieldTypes), fieldInstr);
+				unpackedBuffer.push(variantAlloc);
+			}
+			_ => {
+			}
+		}
 	}
 }
+
+
+
+
+
