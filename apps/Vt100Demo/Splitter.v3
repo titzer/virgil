@@ -1,0 +1,457 @@
+// Copyright 2025 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Colors for VT100/ANSI terminals
+type Color {
+	case Black;
+	case Red;
+	case Green;
+	case Yellow;
+	case Blue;
+	case Magenta;
+	case Cyan;
+	case White;
+	case BrightBlack;	// aka Dark Gray
+	case BrightRed;
+	case BrightGreen;
+	case BrightYellow;
+	case BrightBlue;
+	case BrightMagenta;
+	case BrightCyan;
+	case BrightWhite;
+	case Indexed(index: byte);		// 256-color palette
+	case Rgb(r: byte, g: byte, b: byte);	// 24-bit true color
+	case Default;				// Default terminal color
+}
+
+// Text attributes for SGR (Select Graphic Rendition)
+type TextAttr {
+	case Reset;				// Reset all attributes
+	case Bold;
+	case Dim;				// Faint/dim intensity
+	case Italic;
+	case Underline;
+	case SlowBlink;
+	case RapidBlink;
+	case Reverse;				// Swap fg/bg colors
+	case Conceal;				// Hidden text
+	case CrossedOut;			// Strikethrough
+	case NormalIntensity;			// Not bold or dim
+	case NotItalic;
+	case NotUnderlined;
+	case NotBlinking;
+	case NotReversed;
+	case NotConcealed;
+	case NotCrossedOut;
+	case Fraktur;				// Gothic font
+	case DoubleUnderline;
+	case FgColor(color: Color);
+	case BgColor(color: Color);
+	case UnderlineColor(color: Color);	// Underline color
+}
+
+// Cursor movement directions
+type CursorDir {
+	case Up(count: int);
+	case Down(count: int);
+	case Forward(count: int);	// Right
+	case Backward(count: int);	// Left
+	case NextLine(count: int);	// Beginning of next line, n lines down
+	case PrevLine(count: int);	// Beginning of previous line, n lines up
+	case Column(col: int);		// Move to column
+}
+
+// Erase modes for display/line
+type EraseMode {
+	case ToEnd;		// From cursor to end
+	case ToStart;		// From start to cursor
+	case All;		// Entire display/line
+	case Scrollback;	// All including scrollback (display only)
+}
+
+// ADT for VT100/ANSI escape sequences
+type EscSeq {
+	// Text attributes (SGR - Select Graphic Rendition)
+	case TextAttrs(attrs: Array<TextAttr>);
+	// Cursor positioning
+	case CursorPos(row: int, col: int);
+	case SaveCursor;
+	case RestoreCursor;
+	// Cursor movement
+	case CursorMove(dir: CursorDir);
+	// Erase operations
+	case EraseDisplay(mode: EraseMode);
+	case EraseLine(mode: EraseMode);
+	// Scrolling
+	case ScrollUp;
+	case ScrollDown;
+	// Cursor visibility
+	case ShowCursor;
+	case HideCursor;
+	// Character set selection
+	case SelectCharset(designator: byte, charset: byte);
+	case ShiftIn;	// Select G0 charset (SI, 0x0F)
+	case ShiftOut;	// Select G1 charset (SO, 0x0E)
+	// OSC (Operating System Command) sequences
+	case SetTitle(title: Array<byte>);
+	case OscCommand(command: int, data: Array<byte>);
+	// Generic CSI for unhandled sequences
+	case CsiGeneric(params: Array<int>, intermediates: Array<byte>, final_byte: byte);
+	// Unknown or malformed escape sequence
+	case Unknown(bytes: Array<byte>);
+}
+
+// Splits raw terminal output with escape sequences into separate text character
+// and escape sequence streams.
+class Vt100Splitter {
+	private var input: Range<byte>;	// array containing data
+	private var pos: int;	// current position
+	private var startAddr: u32;	// position of pos = 0
+
+	private def output = Vector<byte>.new();	// text output
+	private def escs = Vector<(u32, EscSeq)>.new();	// escape sequences and positions
+
+	private def ESC: byte = 0x1B;	// ESC character
+	private def BEL: byte = 0x07;	// Bell character
+	private def SI: byte = 0x0F;	// Shift In
+	private def SO: byte = 0x0E;	// Shift Out
+
+	// Append more data.
+	def put(data: Range<byte>) -> this {
+		input = data;
+		pos = 0;
+		startAddr = u32.!(output.length);
+		parse();
+	}
+	// Extract the raw text output and the escapes.
+	def extract() -> (Array<byte>, Array<(u32, EscSeq)>) {
+		return (output.extract(), escs.extract());
+	}
+	private def parse() {
+		while (pos < input.length) {
+			var b = input[pos];
+			if (b == ESC) {
+				parseEscape();
+			} else if (b == SI) {
+				recordEsc(EscSeq.ShiftIn);
+				pos++;
+			} else if (b == SO) {
+				recordEsc(EscSeq.ShiftOut);
+				pos++;
+			} else {
+				output.put(b);
+				pos++;
+			}
+		}
+	}
+	private def parseEscape() {
+		var start = pos;
+		pos++;	// Skip ESC
+
+		if (pos >= input.length) {
+			// Incomplete escape at end of input
+			recordUnknown(start, pos);
+			return;
+		}
+
+		var next = input[pos];
+		match (next) {
+			'[' => parseCsi(start);
+			']' => parseOsc(start);
+			'(' => parseCharset(start, '(');
+			')' => parseCharset(start, ')');
+			'M' => { recordEsc(EscSeq.ScrollUp); pos++; }
+			'D' => { recordEsc(EscSeq.ScrollDown); pos++; }
+			's' => { recordEsc(EscSeq.SaveCursor); pos++; }
+			'u' => { recordEsc(EscSeq.RestoreCursor); pos++; }
+			_ => { recordUnknown(start, pos + 1); pos++; }
+		}
+	}
+	private def parseCsi(start: int) {
+		pos++;	// Skip '['
+		var params = Vector<int>.new();
+		var intermediates = Vector<byte>.new();
+		var current_num = 0;
+		var has_num = false;
+
+		// Parse parameter bytes (digits, semicolons)
+		while (pos < input.length) {
+			var b = input[pos];
+			if (b >= '0' && b <= '9') {
+				current_num = current_num * 10 + int.!(b - '0');
+				has_num = true;
+				pos++;
+			} else if (b == ';') {
+				params.put(if(has_num, current_num, 0));
+				current_num = 0;
+				has_num = false;
+				pos++;
+			} else if (b >= 0x20 && b <= 0x2F) {
+				// Intermediate byte
+				if (has_num) {
+					params.put(current_num);
+					current_num = 0;
+					has_num = false;
+				}
+				intermediates.put(b);
+				pos++;
+			} else if (b >= 0x40 && b <= 0x7E) {
+				// Final byte
+				if (has_num) params.put(current_num);
+				pos++;
+				processCsi(params.extract(), intermediates.extract(), b);
+				return;
+			} else {
+				// Invalid CSI sequence
+				recordUnknown(start, pos);
+				return;
+			}
+		}
+
+		// Incomplete CSI sequence
+		recordUnknown(start, pos);
+	}
+	private def processCsi(params: Array<int>, intermediates: Array<byte>, final: byte) {
+		match (final) {
+			'm' => processSgr(params);
+			'H', 'f' => {
+				var row = if(params.length > 0, params[0], 1);
+				var col = if(params.length > 1, params[1], 1);
+				recordEsc(EscSeq.CursorPos(row, col));
+			}
+			'A' => {
+				var count = if(params.length > 0, params[0], 1);
+				recordEsc(EscSeq.CursorMove(CursorDir.Up(count)));
+			}
+			'B' => {
+				var count = if(params.length > 0, params[0], 1);
+				recordEsc(EscSeq.CursorMove(CursorDir.Down(count)));
+			}
+			'C' => {
+				var count = if(params.length > 0, params[0], 1);
+				recordEsc(EscSeq.CursorMove(CursorDir.Forward(count)));
+			}
+			'D' => {
+				var count = if(params.length > 0, params[0], 1);
+				recordEsc(EscSeq.CursorMove(CursorDir.Backward(count)));
+			}
+			'E' => {
+				var count = if(params.length > 0, params[0], 1);
+				recordEsc(EscSeq.CursorMove(CursorDir.NextLine(count)));
+			}
+			'F' => {
+				var count = if(params.length > 0, params[0], 1);
+				recordEsc(EscSeq.CursorMove(CursorDir.PrevLine(count)));
+			}
+			'G' => {
+				var col = if(params.length > 0, params[0], 1);
+				recordEsc(EscSeq.CursorMove(CursorDir.Column(col)));
+			}
+			'J' => {
+				var mode = if(params.length > 0, params[0], 0);
+				var em: EraseMode;
+				match(mode) {
+					0 => em = EraseMode.ToEnd;
+					1 => em = EraseMode.ToStart;
+					2 => em = EraseMode.All;
+					3 => em = EraseMode.Scrollback;
+					_ => em = EraseMode.ToEnd;
+				};
+				recordEsc(EscSeq.EraseDisplay(em));
+			}
+			'K' => {
+				var mode = if(params.length > 0, params[0], 0);
+				var em: EraseMode;
+				match(mode) {
+					0 => em = EraseMode.ToEnd;
+					1 => em = EraseMode.ToStart;
+					2 => em = EraseMode.All;
+					_ => em = EraseMode.ToEnd;
+				};
+				recordEsc(EscSeq.EraseLine(em));
+			}
+			'h' => {
+				// Set mode - check for cursor visibility
+				if (params.length > 0 && params[0] == 25) {
+					recordEsc(EscSeq.ShowCursor);
+				} else if (intermediates.length > 0 && intermediates[0] == '?') {
+					if (params.length > 0 && params[0] == 25) {
+						recordEsc(EscSeq.ShowCursor);
+					} else {
+						recordEsc(EscSeq.CsiGeneric(params, intermediates, final));
+					}
+				} else {
+					recordEsc(EscSeq.CsiGeneric(params, intermediates, final));
+				}
+			}
+			'l' => {
+				// Reset mode - check for cursor visibility
+				if (intermediates.length > 0 && intermediates[0] == '?') {
+					if (params.length > 0 && params[0] == 25) {
+						recordEsc(EscSeq.HideCursor);
+					} else {
+						recordEsc(EscSeq.CsiGeneric(params, intermediates, final));
+					}
+				} else {
+					recordEsc(EscSeq.CsiGeneric(params, intermediates, final));
+				}
+			}
+			's' => recordEsc(EscSeq.SaveCursor);
+			'u' => recordEsc(EscSeq.RestoreCursor);
+			_ => recordEsc(EscSeq.CsiGeneric(params, intermediates, final));
+		}
+	}
+	private def processSgr(params: Array<int>) {
+		if (params.length == 0) {
+			recordEsc(EscSeq.TextAttrs([TextAttr.Reset]));
+			return;
+		}
+
+		var attrs = Vector<TextAttr>.new();
+		var i = 0;
+		while (i < params.length) {
+			var p = params[i];
+			match (p) {
+				0 => attrs.put(TextAttr.Reset);
+				1 => attrs.put(TextAttr.Bold);
+				2 => attrs.put(TextAttr.Dim);
+				3 => attrs.put(TextAttr.Italic);
+				4 => attrs.put(TextAttr.Underline);
+				5 => attrs.put(TextAttr.SlowBlink);
+				6 => attrs.put(TextAttr.RapidBlink);
+				7 => attrs.put(TextAttr.Reverse);
+				8 => attrs.put(TextAttr.Conceal);
+				9 => attrs.put(TextAttr.CrossedOut);
+				20 => attrs.put(TextAttr.Fraktur);
+				21 => attrs.put(TextAttr.DoubleUnderline);
+				22 => attrs.put(TextAttr.NormalIntensity);
+				23 => attrs.put(TextAttr.NotItalic);
+				24 => attrs.put(TextAttr.NotUnderlined);
+				25 => attrs.put(TextAttr.NotBlinking);
+				27 => attrs.put(TextAttr.NotReversed);
+				28 => attrs.put(TextAttr.NotConcealed);
+				29 => attrs.put(TextAttr.NotCrossedOut);
+				30 => attrs.put(TextAttr.FgColor(Color.Black));
+				31 => attrs.put(TextAttr.FgColor(Color.Red));
+				32 => attrs.put(TextAttr.FgColor(Color.Green));
+				33 => attrs.put(TextAttr.FgColor(Color.Yellow));
+				34 => attrs.put(TextAttr.FgColor(Color.Blue));
+				35 => attrs.put(TextAttr.FgColor(Color.Magenta));
+				36 => attrs.put(TextAttr.FgColor(Color.Cyan));
+				37 => attrs.put(TextAttr.FgColor(Color.White));
+				38 => i = parseColor(params, i, true, attrs);
+				39 => attrs.put(TextAttr.FgColor(Color.Default));
+				40 => attrs.put(TextAttr.BgColor(Color.Black));
+				41 => attrs.put(TextAttr.BgColor(Color.Red));
+				42 => attrs.put(TextAttr.BgColor(Color.Green));
+				43 => attrs.put(TextAttr.BgColor(Color.Yellow));
+				44 => attrs.put(TextAttr.BgColor(Color.Blue));
+				45 => attrs.put(TextAttr.BgColor(Color.Magenta));
+				46 => attrs.put(TextAttr.BgColor(Color.Cyan));
+				47 => attrs.put(TextAttr.BgColor(Color.White));
+				48 => i = parseColor(params, i, false, attrs);
+				49 => attrs.put(TextAttr.BgColor(Color.Default));
+				90 => attrs.put(TextAttr.FgColor(Color.BrightBlack));
+				91 => attrs.put(TextAttr.FgColor(Color.BrightRed));
+				92 => attrs.put(TextAttr.FgColor(Color.BrightGreen));
+				93 => attrs.put(TextAttr.FgColor(Color.BrightYellow));
+				94 => attrs.put(TextAttr.FgColor(Color.BrightBlue));
+				95 => attrs.put(TextAttr.FgColor(Color.BrightMagenta));
+				96 => attrs.put(TextAttr.FgColor(Color.BrightCyan));
+				97 => attrs.put(TextAttr.FgColor(Color.BrightWhite));
+				100 => attrs.put(TextAttr.BgColor(Color.BrightBlack));
+				101 => attrs.put(TextAttr.BgColor(Color.BrightRed));
+				102 => attrs.put(TextAttr.BgColor(Color.BrightGreen));
+				103 => attrs.put(TextAttr.BgColor(Color.BrightYellow));
+				104 => attrs.put(TextAttr.BgColor(Color.BrightBlue));
+				105 => attrs.put(TextAttr.BgColor(Color.BrightMagenta));
+				106 => attrs.put(TextAttr.BgColor(Color.BrightCyan));
+				107 => attrs.put(TextAttr.BgColor(Color.BrightWhite));
+			}
+			i++;
+		}
+
+		recordEsc(EscSeq.TextAttrs(attrs.extract()));
+	}
+	// Parse 256-color or RGB color: 38;5;n or 38;2;r;g;b
+	private def parseColor(params: Array<int>, i: int, fg: bool, attrs: Vector<TextAttr>) -> int {
+		if (i + 2 < params.length && params[i + 1] == 5) {
+			// 256-color: 38;5;n
+			var color = Color.Indexed(byte.!(params[i + 2]));
+			if (fg) attrs.put(TextAttr.FgColor(color));
+			else attrs.put(TextAttr.BgColor(color));
+			return i + 2;
+		} else if (i + 4 < params.length && params[i + 1] == 2) {
+			// RGB: 38;2;r;g;b
+			var r = byte.!(params[i + 2]);
+			var g = byte.!(params[i + 3]);
+			var b = byte.!(params[i + 4]);
+			var color = Color.Rgb(r, g, b);
+			if (fg) attrs.put(TextAttr.FgColor(color));
+			else attrs.put(TextAttr.BgColor(color));
+			return i + 4;
+		}
+		return i;
+	}
+	private def parseOsc(start: int) {
+		pos++;	// Skip ']'
+		var buf = Vector<byte>.new();
+		// Read until BEL or ST (ESC \)
+		while (pos < input.length) {
+			var b = input[pos];
+			if (b == BEL) {
+				pos++;
+				processOsc(buf.extract());
+				return;
+			} else if (b == ESC && pos + 1 < input.length && input[pos + 1] == '\\') {
+				pos += 2;
+				processOsc(buf.extract());
+				return;
+			} else {
+				buf.put(b);
+				pos++;
+			}
+		}
+		// Incomplete OSC sequence
+		recordUnknown(start, pos);
+	}
+	private def processOsc(data: Array<byte>) {
+		// Parse OSC command number (e.g., "0;title" or "2;title")
+		var cmd = 0;
+		var idx = 0;
+		while (idx < data.length && data[idx] >= '0' && data[idx] <= '9') {
+			cmd = cmd * 10 + int.!(data[idx] - '0');
+			idx++;
+		}
+
+		if (idx < data.length && data[idx] == ';') {
+			idx++;	// Skip semicolon
+			var payload = Arrays.range(data, idx, data.length);
+
+			if (cmd == 0 || cmd == 2) {
+				// Set window title
+				recordEsc(EscSeq.SetTitle(payload));
+			} else {
+				recordEsc(EscSeq.OscCommand(cmd, payload));
+			}
+		} else {
+			recordEsc(EscSeq.OscCommand(cmd, data));
+		}
+	}
+	private def parseCharset(start: int, designator: byte) {
+		if (pos++ >= input.length) { // Skip '(' or ')'
+			return recordUnknown(start, pos);
+		}
+
+		var charset = input[pos++];
+		recordEsc(EscSeq.SelectCharset(designator, charset));
+	}
+	private def recordEsc(esc: EscSeq) {
+		var addr = startAddr + u32.!(output.length);
+		escs.put(addr, esc);
+	}
+	private def recordUnknown(start: int, end: int) {
+		var seq = Ranges.dup(input[start ... end]);
+		recordEsc(EscSeq.Unknown(seq));
+	}
+}
