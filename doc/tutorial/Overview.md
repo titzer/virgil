@@ -50,6 +50,7 @@ That way, you can jump right into a topic.
 * [Casts](Casts.md) allow us to convert one type of data to another, and query the type of data or objects.
 * [Layouts](Layouts.md) allow expressing exact data representations for interfacing with external software and hardware.
 * [Pointers](Pointers.md) are used in platform-specific parts of the runtime.
+* [Linking](Linking.md) to external code
 * Type parameters don't have [variance](Variance.md) in Virgil; only subtyping on functions.
 * Putting it all together, [synthesis](Synthesis.md).
 
