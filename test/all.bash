@@ -94,7 +94,7 @@ esac
 if [ $# != 0 ]; then
     TEST_DIRS="$@"
 else
-    TEST_DIRS="unit asm/x86 asm/x86-64 redef core cast variants enums wasmgc fsi32 fsi64 float range layout funexpr readonly large pointer vmaddr darwin linux rt stacktrace gc system lib wizeng apps bench"
+    TEST_DIRS="unit asm/x86 asm/x86-64 redef core cast variants enums wasmgc fsi32 fsi64 float range layout funexpr readonly large pointer vmaddr darwin linux rt stacktrace gc system link lib wizeng apps bench"
 fi
 
 function run_test_dirs() {

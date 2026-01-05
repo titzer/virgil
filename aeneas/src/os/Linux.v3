@@ -75,7 +75,13 @@ class LinuxTarget extends Target {
 		elf.e_machine = elf_machine;
 
 		// allocate section headers for string, symbol table
-		var sections = if(CLOptions.SYMBOLS.val || compiler.DebugSymbol, ElfSections.new(elf, compiler.DebugSymbol));
+		def exports = mach.exports;  // may include implicit export of main
+		def haveExports = mach.explicitExports;  // only explicit imports
+		def haveImports = prog.numImports > 0;   // imports are always explicit
+		def emitRel = haveExports | haveImports;  // explicit externals implies relocatable output
+		if (emitRel) elf.e_type = ElfType.ET_REL;
+		def emitSymbols = emitRel || CLOptions.SYMBOLS.val || compiler.DebugSymbol;
+		var sections = if(emitSymbols, ElfSections.new(elf, haveExports, haveImports, compiler.DebugSymbol));
 		var dwarf = if(compiler.DebugSymbol, Dwarf.new(elf, sections, prog, mach));
 
 		var pageAlign = mach.code.pageAlign;
@@ -128,8 +134,9 @@ class LinuxTarget extends Target {
 		var backend = newBackend(compiler, prog, mach, w, dwarf);
 		code.p_vaddr = w.endPageAddr();
 		backend.genAllCode();
+		var main = prog.getMain();
 		rt.recordCodeStart(mach.entryStub.absolute);
-		elf.e_entry = mach.entryStub.absolute;
+		if (main != null) elf.e_entry = mach.entryStub.absolute;
 		rt.recordCodeEnd(w.addr_end());
 
 		mach.reserveRuntimeCode(w); // TODO: add .reserved_code symbol
@@ -147,6 +154,31 @@ class LinuxTarget extends Target {
 			w.skipAddr(runtimeCodeSize);
 		} else {
 			rt.recordRuntimeCode(0, 0);
+		}
+
+		// Build list of addresses of imported functions, for replacing references
+		// to their Unimplemented stubs.  This is done here so that all later
+		// encoding of addresses in MachProgram will record references to the stubs.
+
+		var imports = mach.imports;
+		var importLocs = mach.importLocs;
+		var importSymNum: Vector<int>;
+		// hash set of imported names (as imported)
+		var importNames: HashMap<string, void> = Strings.newMap();
+		// Map from addresses of imported functions to their symbol table indexes
+		var importAddrs = HashMap<long, int>.new(int.view, long.==);
+		// Map from addresses of imported functions to locations that refer to them;
+		// locations are (virtual address, offset in DataWriter)
+//		var importLocs: Vector<List<(long, int)>>;
+		// Flag to track whether a symbol section is needed
+		var anySymbols = false;
+		if (haveImports) {
+			importSymNum = Vector<int>.new().putn(-1, imports.length);
+			for (i < imports.length) {
+				var imp = imports[i], name = imp.0, meth = imp.1;
+				anySymbols = true;
+				importSymNum[i] = sections.queueUndefSymbol(name, long.!(space.addressSize));
+			}
 		}
 
 		mach.layoutMeta(w);
@@ -178,7 +210,7 @@ class LinuxTarget extends Target {
 		data.p_memsz = pageAlign.alignUp_i64(data.p_filesz + int.view(rt.heapSize + rt.shadowStackSize));
 
 		// patch all addresses in the binary
-		w.patch(mach);
+		w.patchWithCallback(mach, patchImport(elf, sections, code, data, w, mach, _, _, _, _));
 
 		if (sections != null) {
 			sections.data.sh_addr = data.p_vaddr;
@@ -190,9 +222,49 @@ class LinuxTarget extends Target {
 			sections.text.sh_size = code.p_filesz;
 
 			sections.startStringSection(w);
+			sections.addQueuedUndefs(w);  // do this right away so indices are right
+
+			if (emitRel) {
+				var tempAddr = Addr.new(null, null, 0);
+				tempAddr.absolute = code.p_vaddr;
+				sections.addAbsSymbol(w, ".text.virgil.base", tempAddr);
+				tempAddr.absolute = data.p_vaddr;
+				sections.addAbsSymbol(w, ".data.virgil.base", tempAddr);
+			}
+
+			def exportAddrs = mach.getExportAddrs();
+			if (main != null && (exports != null || haveImports || CLOptions.SYMBOLS.val)) {
+				sections.addFuncSymbol(w, ".entry", mach.entryStub);
+			}
+	
+			if (exports != null) {
+				for (i < exports.length) {
+					var exp = exports[i];
+					var name = if(exp.name == null, exp.spec.asMethod().source.name(), exp.name);
+					var addr = exportAddrs[name];
+					if (addr == null) continue;
+					anySymbols = true;
+					sections.addFuncSymbol(w, name, addr);
+				}
+			}
+
+			if (haveImports) {
+				for (i < importLocs.length) {
+					for (node = importLocs[i]; node != null; node = node.tail) {
+						def info = node.head, vaddr = info.0, pos = info.1;
+						var isDataAddr = (u64.view(vaddr) >= u64.view(data.p_vaddr));
+						var index = u32.!(importSymNum[i]);
+						var offset = u64.!(vaddr - if(isDataAddr, data.p_vaddr, code.p_vaddr));
+						var rtype: u8 = if(elf.is64(), Elf64_R_Type.R_X86_64_64.code, Elf32_R_Type.R_386_32.code);
+						var addend: i64 = 0;
+						var entries = if(isDataAddr, sections.data_reloc_entries, sections.text_reloc_entries);
+						entries.put(ElfReloc.new(offset, index, rtype, addend, pos));
+					}
+				}
+			}
 
 			if (CLOptions.SYMBOLS.val) {
-				sections.addFuncSymbol(w, ".entry", mach.entryStub);
+				anySymbols = true;
 				if (mach.allocStub != null) sections.addFuncSymbol(w, ".alloc", mach.allocStub);
 				if (mach.signalStub != null) sections.addFuncSymbol(w, ".signal", mach.signalStub);
 
@@ -202,15 +274,21 @@ class LinuxTarget extends Target {
 					if (m.source == null) continue;
 					var addr = mach.methodMap[m];
 					if (addr == null || addr.absolute < 0) continue;
-					sections.addMethodSymbol(w, m, addr, buf);
+					var name = m.renderLong(buf).extract();
+					if (exportAddrs.has(name) || importNames.has(name)) {
+						// a different function is exported or imported under this name, so
+						// change the name of this function in the symbol table
+						name = Arrays.concat(name, ".hide");
+					}
+					sections.addFuncSymbol(w, name, addr);
 				}
-				sections.finishStringSection(w);
-				// encode the symbol table entries
-				sections.encodeSymbolTable(w);
-			} else {
-				sections.finishStringSection(w);
 			}
+			sections.finishStringSection(w);
+			// encode the symbol table entries
+			if (anySymbols) sections.encodeSymbolTable(w);
 		}
+
+		if (haveImports) sections.encodeRelocs(w);
 
 		if (dwarf != null) {
 			dwarf.emit(w);
@@ -219,15 +297,57 @@ class LinuxTarget extends Target {
 		// encode ELF header section
 		elf.encode(w.at(0));
 
-		var file = compiler.getOutputFileName(prog.name(), null);
+		var file = compiler.getOutputFileName(prog.name(), if(emitRel, "o", null));
 		var fd = System.fileOpen(file, false);
 		if (fd < 0) return prog.ERROR.OutputError(file);
 		// write the entire file from the buffer array
 		System.write(fd, w.alias());
 		System.fileClose(fd);
 		// change permissions to make binary executable
-		compiler.makeExecutable(file);
+		if (!emitRel) compiler.makeExecutable(file);
 	}
+}
+def patchImport(elf: ElfHeader, sections: ElfSections, code: ElfProgramHeader, data: ElfProgramHeader,
+		w: MachDataWriter, mach: MachProgram, kind: PatchKind, addr: Addr, posAddr: long, pos: int) {
+	var isDataAddr = (u64.view(posAddr) >= u64.view(data.p_vaddr));
+	var imports = mach.imports;
+	var absAddr = addr.absolute;
+	var index = u32.!((-absAddr) - 1);  // map -2 to 1, -3 to 2, etc.
+	var offset = u64.!(posAddr - if(isDataAddr, data.p_vaddr, code.p_vaddr));
+	var rtype: u8;
+	var addend: i64;
+	// Note: regular patching has already happened ...
+	match (kind) {
+		RELA_32 => {
+			// want S - (P - delta) where delta was value in first byte
+			// first, get delta by contents - S, + P
+			// use a RELA R_X86_64_PC32 / R_386_PC32 with A = delta
+			var rf = Ref<Layout_i32>.of(w.data[pos ..+ 4]);
+			var curr = rf.val;
+			var delta: i32 = (curr - i32.view(addr.absolute)) + i32.!(posAddr);
+			rtype = if(elf.is64(), Elf64_R_Type.R_X86_64_PC32.code, Elf32_R_Type.R_386_PC32.code);
+			addend = i64.!(delta);
+		}
+		ABS_32 => { // want S (32 bits)
+			// use R_X86_64_32 / R_386_32 with A = 0
+			var rf = Ref<Layout_i32>.of(w.data[pos ..+ 4]);
+			var curr = rf.val;
+			rtype = if(elf.is64(), Elf64_R_Type.R_X86_64_32.code, Elf32_R_Type.R_386_32.code);
+			addend = 0;
+		}
+		ABS_64 => { // want S (64 bits)
+			// use R_X86_64_64 with A = 0
+			var rf = Ref<Layout_i64>.of(w.data[pos ..+ 8]);
+			var curr = rf.val;
+			rtype = Elf64_R_Type.R_X86_64_64.code;
+			addend = 0;
+		}
+		_ => {
+			// complain
+		}
+	}
+	var entries = if(isDataAddr, sections.data_reloc_entries, sections.text_reloc_entries);
+	entries.put(ElfReloc.new(offset, index, rtype, addend, pos));
 }
 
 enum DebugSection(printName: string) {
@@ -240,21 +360,29 @@ enum DebugSection(printName: string) {
 }
 def DebugSectionCount = 6;
 
-class ElfSections(elf: ElfHeader, debugSymbol: bool) {
+class ElfSections(elf: ElfHeader, haveExports: bool, haveImports: bool, debugSymbol: bool) {
 	def str = ElfSectionHeader.new();
 	def sym = ElfSectionHeader.new();
 	def text = ElfSectionHeader.new();
 	def data = ElfSectionHeader.new();
 	def debugs = Array<ElfSectionHeader>.new(DebugSectionCount);
 	def symbols = Vector<ElfSymbol>.new();
-
+	def relocatable = haveExports | haveImports;
+	var text_relocs: ElfSectionHeader;
+	var data_relocs: ElfSectionHeader;
+	// an entry is (offset, symbol index, reloc type, addend, position in writer)
+	// these are encoded for 32- and 64-bit as a last step
+	def text_reloc_entries = Vector<ElfReloc>.new();
+	def data_reloc_entries = Vector<ElfReloc>.new();
 	var str_start: int;
+	def queuedUndefs = Vector<(string, long)>.new();
 
 	new() {
 		elf.sheaders.put(ElfSectionHeader.new());
 		str.index = elf.sheaders.length;
 		elf.sheaders.put(str);
-		if (CLOptions.SYMBOLS.val) {
+		def haveSym = haveExports || haveImports || CLOptions.SYMBOLS.val;
+		if (haveSym) {
 			sym.index = elf.sheaders.length;
 			elf.sheaders.put(sym);
 		}
@@ -262,6 +390,15 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		elf.sheaders.put(text);
 		data.index = elf.sheaders.length;
 		elf.sheaders.put(data);
+
+		if (haveImports) {
+			text_relocs = ElfSectionHeader.new();
+			text_relocs.index = elf.sheaders.length;
+			elf.sheaders.put(text_relocs);
+			data_relocs = ElfSectionHeader.new();
+			data_relocs.index = elf.sheaders.length;
+			elf.sheaders.put(data_relocs);
+		}
 
 		if (debugSymbol) {
 			for (e in DebugSection) {
@@ -274,12 +411,28 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		}
 
 		str.sh_type = ElfShType.SHT_STRTAB;
-		if (CLOptions.SYMBOLS.val) {
+		if (haveSym) {
 			symbols.put(ElfSymbol.new());
 			sym.sh_type = ElfShType.SHT_SYMTAB;
 			sym.sh_link = str.index;
 			sym.sh_entsize = if(elf.is64(), Elf64le_Symbol.size, Elf32le_Symbol.size);
 			sym.sh_info = 1;
+		}
+
+		if (haveImports) {
+			// set up relocs
+			// they can be located in the text section and in the data section
+			text_relocs.sh_type = if(elf.is64(), ElfShType.SHT_RELA, ElfShType.SHT_REL);
+			text_relocs.sh_link = sym.index;
+			text_relocs.sh_entsize = if(elf.is64(), Elf64le_Rela.size, Elf32le_Rel.size);
+			text_relocs.sh_info = u32.!(text.index);
+			text_relocs.sh_flags = ElfConst.SHF_INFO_LINK;
+
+			data_relocs.sh_type = if(elf.is64(), ElfShType.SHT_RELA, ElfShType.SHT_REL);
+			data_relocs.sh_link = sym.index;
+			data_relocs.sh_entsize = if(elf.is64(), Elf64le_Rela.size, Elf32le_Rel.size);
+			data_relocs.sh_info = u32.!(data.index);
+			data_relocs.sh_flags = ElfConst.SHF_INFO_LINK;
 		}
 
 		elf.e_shstrndx = byte.!(str.index);
@@ -305,10 +458,17 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		}
 
 		text.sh_name = w.pos - str_start;
-		w.puta(".text\x00");
+		w.puta(".text").puta(if(relocatable, ".virgil", null)).putb(0);
 
 		data.sh_name = w.pos - str_start;
-		w.puta(".data\x00");
+		w.puta(".data").puta(if(relocatable, ".virgil", null)).putb(0);
+
+		if (haveImports) {
+			text_relocs.sh_name = w.pos - str_start;
+			w.puta(if(elf.is64(), ".rela.text", ".rel.text")).putb(0);
+			data_relocs.sh_name = w.pos - str_start;
+			w.puta(if(elf.is64(), ".rela.data", ".rel.data")).putb(0);
+		}
 
 		if (debugSymbol) {
 			for (e in DebugSection) {
@@ -330,28 +490,69 @@ class ElfSections(elf: ElfHeader, debugSymbol: bool) {
 		}
 		sym.sh_size = w.pos - sym.sh_offset;
 	}
+	def encodeRelocs(w: DataWriter) {
+		text_relocs.sh_offset = w.pos;
+		if (elf.is64()) {
+			for (i < text_reloc_entries.length) text_reloc_entries[i].encode64(w);
+		} else {
+			for (i < text_reloc_entries.length) text_reloc_entries[i].encode32(w);
+		}
+		text_relocs.sh_size = w.pos - text_relocs.sh_offset;
+
+		data_relocs.sh_offset = w.pos;
+		if (elf.is64()) {
+			for (i < data_reloc_entries.length) data_reloc_entries[i].encode64(w);
+		} else {
+			for (i < data_reloc_entries.length) data_reloc_entries[i].encode32(w);
+		}
+		data_relocs.sh_size = w.pos - data_relocs.sh_offset;
+	}
+	def SHN_ABS: u16 = 0xFFF1;
+	def addAbsSymbol(w: MachDataWriter, str: string, addr: Addr) {
+		var entry = ElfSymbol.new();
+		symbols.put(entry);
+		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
+		entry.st_name = w.pos - str_start;
+		entry.st_value = addr.absolute;
+		entry.st_size = addr.size;
+		entry.st_index = SHN_ABS;
+		w.puta(str);
+		w.putb(0);
+	}
+	def queueUndefSymbol(str: string, size: long) -> int {
+		var index = symbols.length + queuedUndefs.length;
+		queuedUndefs.put((str, size));
+		return index;
+	}
+	def addQueuedUndefs(w: MachDataWriter) {
+		for (i < queuedUndefs.length) {
+			var info = queuedUndefs[i], name = info.0, size = info.1;
+			addUndefSymbol(w, name, size);
+		}
+	}
+	def SHN_UNDEF: u16 = 0;
+	def addUndefSymbol(w: MachDataWriter, str: string, size: long) -> int {
+		var entry = ElfSymbol.new();
+		var index = symbols.length;
+		symbols.put(entry);
+		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
+		entry.st_name = w.pos - str_start;
+		entry.st_value = 0;
+		entry.st_size = size;
+		entry.st_index = SHN_UNDEF;
+		w.puta(str);
+		w.putb(0);
+		return index;
+	}
 	def addFuncSymbol(w: MachDataWriter, str: string, addr: Addr) {
 		var entry = ElfSymbol.new();
 		symbols.put(entry);
 		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
 		entry.st_name = w.pos - str_start;
-		entry.st_value = addr.absolute;
+		entry.st_value = addr.absolute - text.sh_addr;
 		entry.st_size = addr.size;
 		entry.st_index = u16.!(text.index);
 		w.puta(str);
-		w.putb(0);
-	}
-	def addMethodSymbol(w: DataWriter, m: IrMethod, addr: Addr, buf: StringBuilder) {
-		var entry = ElfSymbol.new();
-		symbols.put(entry);
-		entry.st_info = ElfConst.STB_GLOBAL | ElfConst.STT_FUNC;
-		entry.st_name = w.pos - str_start;
-		entry.st_value = addr.absolute;
-		entry.st_size = addr.size;
-		entry.st_index = u16.!(text.index);
-		buf.reset();
-		m.source.renderLong(buf);
-		buf.send(w.putr);
 		w.putb(0);
 	}
 }
