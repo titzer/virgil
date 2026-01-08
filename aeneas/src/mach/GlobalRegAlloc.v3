@@ -2,7 +2,6 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def COALESCE = false;
-def SPLIT_SPILLS = false; // TODO: fix splitting of spills
 
 // Implements global register allocation via graph coloring, including spilling, splitting,
 // and coalescing.
@@ -28,7 +27,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	var blockWeight: Array<int>;
 	var curWeight: int;
 	var originVarsCnt: int;
-	var blockReloads: Array<Vector<VReg>>; // XXX: use lazily-allocate array/vector of List<VReg>
 	// --- allocate after coloring ----------
 	def regState = RegState.new(regSet, codegen);
 	def regUsage = Array<int>.new(regSet.physRegs);
@@ -75,10 +73,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def reset() {
 		verbose = codegen.context.shouldPrintMach();
 		statistic.reset(vars.length);
-		blockReloads = Array<Vector<VReg>>.new(codegen.order.length);
-		for (i < codegen.order.length) {
-			blockReloads[i] = Vector<VReg>.new();
-		}
 		regState.clear();
 		for (i < regUsage.length) regUsage[i] = 0;
 	}
@@ -567,7 +561,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	// =====================
 	def insertSpills() {
 		originVarsCnt = codegen.nextId();
-		for (i < codegen.order.length) blockReloads[i].resize(0);
 		codegen.iterateInstructionsForward(insertSpill0);
 		insertSpillCleanup();
 	}
@@ -584,14 +577,14 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 							operands[j] = Operand.Use(vreg, regSet.spillStart); // Set the constraint to stack
 							continue;
 						}
-						processSpill(vreg, constraint, block);
-						operands[j] = Operand.Use(node.newVreg, constraint);
+						var newVreg = processSpill(vreg, constraint, block);
+						operands[j] = Operand.Use(newVreg, constraint);
 					}
 				}
 				Overwrite(vreg, use, constraint) => {
 					if (!regSet.isStack(constraint) && coloring[use.varNum] == 0) {
-						processSpill(use, constraint, block);
-						operands[j] = Operand.Overwrite(vreg, graph.nodes[use.varNum].newVreg, constraint);
+						var newVreg = processSpill(use, constraint, block);
+						operands[j] = Operand.Overwrite(vreg, newVreg, constraint);
 					}
 					if (vreg != null && coloring[vreg.varNum] == 0) {
 						graph.nodes[vreg.varNum].defBlock = block;
@@ -600,10 +593,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				Def(vreg, constraint) => {
 					if (vreg != null && coloring[vreg.varNum] == 0) {
 						var node = graph.nodes[vreg.varNum];
-						if (node.commonDominator != null) {
-							insertReload(vreg, node);
-							node.commonDominator = null;
-						}
 						node.defBlock = block;
 						if (opcode == ArchInstrs.ARCH_RELOAD) {
 							// vreg is spilled again, remove this reload
@@ -620,74 +609,12 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 	}
 	// Decide whether to insert reload right before this use or on block level.
-	def processSpill(vreg: VReg, constraint: int, block: SsaBlock) {
-		var node = graph.nodes[vreg.varNum];
-		if (!SPLIT_SPILLS || node.defBlock == block) {
-			var newVreg = codegen.dupVReg(vreg);
-			newVreg.notSpillable = true;
-			newVreg.reloadFrom = vreg;
-			if (constraint < regSet.physRegs) newVreg.hint = byte.view(constraint);
-			node.newVreg = newVreg;
-		} else {
-			if (node.commonDominator == null) {
-				node.newVreg = codegen.dupVReg(vreg);
-				node.newVreg.spill = vreg.spill;
-				node.commonDominator = block;
-			} else {
-				var newCommonDominator = findCommonDominator(vreg, block);
-				if (newCommonDominator == null) {
-					// Insert reload for the past uses at the start of the common dominator.
-					insertReload(vreg, node);
-					node.newVreg = codegen.dupVReg(vreg);
-					node.newVreg.spill = vreg.spill;
-					node.commonDominator = block;
-				} else {
-					node.commonDominator = newCommonDominator;
-				}
-			}
-			liveness[block.info.srpo_num, node.newVreg.varNum] = true;
-		}
-	}
-	def findCommonDominator(vreg: VReg, block: SsaBlock) -> SsaBlock {
-		var node = graph.nodes[vreg.varNum], commonDominator = node.commonDominator;
-		var order = codegen.order;
-		var blockA = codegen.blocks.commonDominator(commonDominator, block);
-		if (blockA == null) return null;
-		var loops = codegen.blocks.loops;
-		if (loops != null) for (i < loops.length) {
-			if (loops[i].contains(blockA) &&
-				(!loops[i].contains(commonDominator) || !loops[i].contains(block))) {
-				return null; // Avoid a common dominator which is in a loop but the {block} is not
-			}
-		}
-		if (blockA == commonDominator) return blockA;
-		if (blockA == node.defBlock) return null; // Avoid inserting reload at definition
-		for (e in blockA.succs()) {
-			// Check if every successor requires this reload
-			var succ = e.dest;
-			if (!liveness[succ.info.srpo_num, vreg.varNum]) return null;
-		}
-		return blockA;
-	}
-	// Insert reload at the start of the commonDominator block
-	def insertReload(vreg: VReg, node: Node) {
-		node.commonDominator = findDominatorOutOfLoop(node);
-		// TODO(fix): this can sometimes insert the reload before the definition.
-		codegen.insertReload(vreg, (node.newVreg, 0), codegen.instrs[node.commonDominator.info.srpo_num].next);
-		blockReloads[node.commonDominator.info.srpo_num].put(node.newVreg);
-	}
-	def findDominatorOutOfLoop(node: Node) -> SsaBlock {
-		var vreg = node.newVreg;
-		var blockinfo = node.commonDominator.info;
-		var defBlockinfo = node.defBlock.info;
-		for (p = blockinfo; p != null; p = p.dom_parent) {
-			if (p.dom_parent != null && !codegen.blocks.isDominator(defBlockinfo, p.dom_parent)) break;
-			if (p.loop != null && p.dom_parent != null && p.dom_parent != defBlockinfo && p.loop.containsInfo(blockinfo)) {
-				blockinfo = p.dom_parent;
-				liveness[p.srpo_num, vreg.varNum] = true;
-			}
-		}
-		return blockinfo.block;
+	def processSpill(vreg: VReg, constraint: int, block: SsaBlock) -> VReg {
+		var newVreg = codegen.dupVReg(vreg);
+		newVreg.notSpillable = true;
+		newVreg.reloadFrom = vreg;
+		if (constraint < regSet.physRegs) newVreg.hint = byte.view(constraint);
+		return newVreg;
 	}
 	def insertSpillCleanup() {
 		for (i = originVarsCnt; i < vars.length; i++) {
@@ -696,8 +623,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		for (i < originVarsCnt) {
 			if (coloring[i] == 0) {
 				liveness[maskRow, i] = false; // spill vregs are not live across blocks
-				var node = graph.nodes[i];
-				if (node.commonDominator != null) insertReload(vars[i], node);
  			}
 		}
 		// Gather liveness for new variables.
@@ -708,9 +633,6 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				for (j = originVarsCnt; j < vars.length; j++) {
 					if (liveness[succ.info.srpo_num, j]) liveness[info.srpo_num, j] = true;
 				}
-			}
-			for (j < blockReloads[i].length) {
-				liveness[i, blockReloads[i][j].varNum] = false;
 			}
 			if (info.loop != null) {
 				var end = info.loop.end;
@@ -1087,9 +1009,6 @@ class Node(var alias: int, var defBlock: SsaBlock) {
 	var spill: bool = false;
 	var use: bool = false;
 	var color: bool = false; // whether a node requires a color even without use
-	//  -- state for inserting spill ---------------------------
-	var newVreg: VReg;
-	var commonDominator: SsaBlock;
 
 	def addInterfere(n: int) -> bool {
 		var stop = interfere.length;
