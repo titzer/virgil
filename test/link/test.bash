@@ -42,18 +42,10 @@ function compile_target_tests() {
 	rm -f $C
 	LIB_LOC=$VIRGIL_LOC/lib/util
 	for t in $TESTS; do
-		if [ -z "${t##*_lib.v3}" ]; then
-			# requires library files (and run time)
-			RT_OPT="-rt.files=$(echo $RT_FILES $LIB_LOC/*.v3)"
-			GC_OPT="-rt.gc -rt.gctables -rt.test-gc -rt.sttables -heap-size=10k"
-		else
-			RT_OPT=""
-			GC_OPT=""
-#			RT_OPT="-rt.files=$(echo $RT_FILES $LIB_LOC/*.v3)"
-#			GC_OPT="-rt.gc -rt.gctables -rt.test-gc -rt.sttables -heap-size=10k"
-		fi
-		echo "Command: V3C=$AENEAS_TEST $F $V3C_OPTSX -multiple ${RT_OPT:+"$RT_OPT"} $GC_OPT $t"
-		V3C=$AENEAS_TEST $F $V3C_OPTSX -multiple ${RT_OPT:+"$RT_OPT"} $GC_OPT $t
+	    RT_OPT=""
+	    GC_OPT=""
+	    echo "Command: V3C=$AENEAS_TEST $F $V3C_OPTSX -multiple ${RT_OPT:+"$RT_OPT"} $GC_OPT $t"
+	    V3C=$AENEAS_TEST $F $V3C_OPTSX -multiple ${RT_OPT:+"$RT_OPT"} $GC_OPT $t
 	done | tee $C | $PROGRESS
 }
 
