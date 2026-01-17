@@ -217,6 +217,13 @@ E |- c: ?  E |- i: iv    E'=(E; z: iv eval z = loop(c, i, r))  E' |- c: true  E'
 ------------------------------------------------------------------------
 E eval z = loop(c, i, r) body end => E'; z: rv
 
+==== A {bottom} causes instructions to produce {bottom} outputs =======================================
+
+We model control variables and are careful to use {true} and not {true} for decisions.
+We have the {bottom} value which can be used for control which is not {true}, but also for variables of other types.
+In order to short-circuit evaluation of instructions that depend on false conditions, effects that won't happen, or lots of other reasons, we simply define that *any instruction* produces {bottom} for *all* of its variable outputs when any one input is {bottom}.
+So in (recursively) evaluating an instruction's inputs, if any one of them evaluates to {bottom}, then the whole instruction produces {bottom}, and it is not necessary to evaluate the rest of the inputs.
+(Incidentally, this sometimes means that infinite loops can be known to be infinite; it's fine to replace uses of the variables outside the loop with {bottom}.
 
 ==== Using control and effects ========================================================================
 
@@ -305,6 +312,120 @@ An anti-dependence edge {R <- W} prevents a write from being scheduled *before* 
 It doesn't prevent the read {R} from being deleted if nothing else references it.
 The edge also does *not* require that the read *dominate* the write; it could be scheduled on a completely separate path that doesn't even lead to the write.
 Instead, the edge only requires that the write not be scheduled *before* the read.
+
+==== Optimizing the sea of variables ==================================================================
+
+What's so great about the sea of variables?
+After all, it seems like evaluating it recursively (especially with loops) is not particularly efficient.
+It's not immediately obvious how expressive it is, how it could be constructed from a CFG easily, and it's not a representation from which code can immediately be generated.
+
+First, yes, direct evaluation of a sea of variables program (with loops) is indeed very inefficient, but it's not a major drawback.
+To run a non-trivial program, it makes more sense to schedule it, which produces a runnable CFG.
+Even a naive scheduling algorithm will produce a program that's efficient (by interpreter standards), and doesn't require explicit world-passing, but can use actual mutable state.
+
+What makes the sea of variable shine is the optimization potential.
+It represents the next step in abstraction from CFG -> SSA-CFG -> SoN -> SoV.
+In the same way that we see benefits from SSA directly connecting dataflow between computations, making dependence explicit, the sea of nodes made control and effect dependence explicit.
+In both representations, phis, effect phis, and merges (which are really control phis) make merges of alternatives explicit, allowing data flow equations and local reasoning to be sound.
+But the drawback of merges and phis is that they don't encode *why* the different alternatives would be chosen.
+Phis and merges encode information about execution paths, not about conditions.
+Instead, the sea of variable makes conditions {if} uniform and ties all choices back to the decision that led to picking one alternative over another.
+Because of this decoupling of paths and reconnection with conditions, then possibilities for finding equivalences are increased.
+
+==== Double diamonds ====================================================================================
+
+A good illustration of the difference between CFG, SSA-CFG, SoN, and SoV is two chained conditionals.
+
+Consider:
+
+def foo(c: bool) -> (int, int) {
+    var z: int;
+    var w: int;
+    if (c) z = 0;
+    else z = 1;
+    if (c) w = 0;
+    else w = 1;
+    return (z, w);
+}
+
+Notice that this program has two if's that both use {c} as a condition.
+In a traditional CFG, this will result in the classic "double diamond" where control splits, merges, splits again, and then merges again.
+
+   B0
+  /  \
+B1    B2
+  \  /
+   M1
+  /  \
+B2    B3
+  \  /
+   M2
+
+In SSA-CFG, at both merges M1 and M2, each will have a phi which represents the alternatives for the original source variables {z} and {w}, respectively.
+If we assume that {M1: z = phi(1, 0)} and {M2: w = phi(1, 0)}, we notice that they are almost the same computation...except they are in different merge blocks M1 and M2.
+We can't just conclude that phis with equivalent inputs are equivalent, they are in different blocks.
+
+In this example, the sea of nodes representation would also produce similar-looking phis, but at least their control inputs would be explicit merges, looking something like {z = phi(M1, 1, 0)} and {w = phi(M2, 1, 0)}.
+This is actually good because GVN on the sea of nodes can more or less be a blind comparison of all inputs; the explicit control input means GVN won't get it wrong.
+(If it did happen that the control inputs to the phis were the same, then GVN would *correctly* conclude they are equivalent, and merge them, which is nice)!
+
+
+Now, as it happens, as humans we can see that the original program is equivalent to this:
+
+def foo(c: bool) -> (int, int) {
+    var z = if(c, 1, 0);
+    var w = if(c, 1, 0);
+    return (z, w);
+}
+
+Not only is this more compact (using Virgil if expressions), but it makes it more obvious that actually {z} and {w} are the same computation.
+Why is that?
+Because the condition is in the computation.
+This is basically what the sea of variables representation would produce; it makes all *conditions* explicit.
+
+{
+   k0: SrcInt <- const(Src#0)
+   k1: SrcInt <- const(Src#1)
+   c: control <- param(Param@0)
+   z: SrcInt  <- if(c, k1, k0)
+   w: SrcInt  <- if(c, k1, k0)
+   ()         <- goal(z, w)
+}
+
+Great, now we can see that {z} and {w} are equivalent instructions on equivalent inputs.
+In the sea of variables, these are *always* equivalent computations and can be merged:
+
+{
+   k0: SrcInt <- const(Src#0)
+   k1: SrcInt <- const(Src#1)
+   c: control <- param(Param@0)
+   z: SrcInt  <- if(c, k1, k0)
+   ()         <- goal(z, z)
+}
+
+Like phis from SSA and the sea of nodes, we can do all kinds of smart dataflow reasoning about {if}, such as {if(c, v, v) = v}, we can do the obvious constant folding: { c <- const(true); z <- if(c, x, y) => c <- const(true); z <- x }, etc.
+The benefit is that *all phis* from all different choices of the same condition, no matter where they occured in order in the source program, will eventually become choies on equivalent conditions.
+
+==== What about double diamonds where effects are involved? =============================================
+
+TODO: the construction algorithm will thread effects through, and inputs to ifs will end up depending on outputs of other ifs.
+It all works out: the schedule will chain or nested repeated conditionals into a valid order, rebuilding a new CFG that may be equivalent to the original CFG, or may mereley resemble it.
+In general, the program produced by the scheduler might do branches in a completely new, but equivalent way.
+
+==== Strength reduction and folding =====================================================================
+
+Obviously, all strength-reduction and constant-folding optimizations apply.
+If during an optimization all the input variables to an instruction are known to be constants, the instruction can be folded.
+This works for effectful operations as well, with careful design to modeling effects.
+Control constructs such as {if} easily fold away; but {loop} can also fold away if the condition is not {true}.
+For a {loop} whose condition becomes {true}, we make all {loops} define a control variable that is effectively the negation of the condition, and code following the loop must depend on it.
+Since this "termination" control value then becomes known to be {bottom}, code after the loop can be removed, except we don't remove {goal}.
+
+
+==== Dead code elimination ==============================================================================
+
+Easy; if no {goal} depends on an instruction (transitively), the instruction is dead.
+This codes for variables defined by a loop too.
 
 
 // TODO[1]
