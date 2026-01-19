@@ -10,4 +10,4 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
-int cmeth(int x) { return x; }
+int xmeth(int x) { return x + 1000000000; }

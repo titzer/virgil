@@ -10,4 +10,4 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
-int xmeth(void *p, int x) { return x; }
+int xmeth(int x) { return x; }
