@@ -52,11 +52,13 @@ class VariantProblem {
 	def render(buf: StringBuilder) -> StringBuilder {
 		for (i < normFields.length) {
 			if (i > 0) buf.csp();
+			// c stands for case
 			buf.put1("c%d: [", i);
 			for (j < normFields[i].length) {
 				if (j > 0) buf.csp();
 				var cf = CaseField(i, j);
 				var field = normFields[i][j];
+				// f stands for field
 				buf.put2("f%d=%q: ", j, field.render);
 
 				if (!assignments.has(cf)) {
@@ -132,7 +134,9 @@ class VariantSolution {
 		if (state != null) for (i < state.length) buf.put1("%q|", state[i].render);
 		return buf;
 	}
-	def size() -> byte { return byte.!(types.length); }
+	def size() -> byte { 
+		Terminal.put1("[VariantSolution.size] solution size = %d\n", types.length);
+		return byte.!(types.length); }
 
 	def score() -> int {
 		if (cachedScore >= 0) return cachedScore;
@@ -158,6 +162,7 @@ class VariantSolver(nc: NormalizerConfig) {
 	var curUsed = Vector<byte>.new();
 	var bwCache = TypeUtil.newTypeMap<byte>();
 	var usePacking: bool;
+	var packingSoln: PackingSolution;
 
 	private def getBitWidth(t: Type) -> byte {
 		if (bwCache.has(t)) return bwCache[t];
@@ -201,6 +206,8 @@ class VariantSolver(nc: NormalizerConfig) {
 				} else {
 					var assn = assignments[CaseField(i, j)];
 					var sc = nc.GetScalar(normFields[i][j]);
+					Terminal.put2("[VariantSolver.solve] GetScalar call | caseIdx: %d | fieldIdx: %d\n", i, j);
+					printScalarSet(sc);
 					curRep[assn.0] &= sc;
 				}
 			}
@@ -291,6 +298,42 @@ class VariantSolver(nc: NormalizerConfig) {
 		return false;
 	}
 	private def solvePacking() -> bool {
+		Terminal.put("[VariantSolver.solvePacking]\n");
+		if (usePacking && curRep.length == 1) {
+			// Compute maxScalarWidth
+			var maxScalarWidth: byte = 0;
+			def curWidth = getWidthFromScalarSet(curRep[0]);
+			printScalarSet(curRep[0]);
+			maxScalarWidth = if(maxScalarWidth < curWidth, curWidth, maxScalarWidth);
+			// Initialize Packing fields
+			def numCases = normFields.length;
+			def casesPacking = Array<Array<PackingField>>.new(numCases);
+			for (caseIdx < numCases) {
+				def caseNormFields = normFields[caseIdx];
+				def packingFields = Array<PackingField>.new(caseNormFields.length);
+				for (fieldIdx < caseNormFields.length) packingFields[fieldIdx] = getPackingFieldFromType(caseNormFields[fieldIdx]);
+				casesPacking[caseIdx] = packingFields;
+			}
+			// Run the PackingSolver
+			def packingProblem = PackingProblem(casesPacking, []);
+			def packingSolver = PackingSolver.new(maxScalarWidth, if(maxScalarWidth == 32, ScalarPatterns.TAGGED_PTR_32, ScalarPatterns.TAGGED_PTR_64));
+			packingSoln = packingSolver.solveScalar(packingProblem);
+			if (packingSoln == null) return false;
+			// Update `assignments`
+			for (caseIdx < numCases) {
+				for (fieldIdx < normFields[caseIdx].length) {
+					def interval = packingSoln.assignments[CaseField(caseIdx, fieldIdx)];
+					assignments[CaseField(caseIdx, fieldIdx)] = (0, interval);
+				}
+			}
+			// Update `state`
+			state = assignIntervalsToPatterns(packingSoln);
+			// Update `explicitTag`
+			explicitTag = (0, packingSoln.explicitTag);
+			def types = getTypes(false);
+			curSoln = VariantSolution.new(normFields, assignments, state, explicitTag, types);
+			return true;
+		}	
 		var cases = Array<VariantPattern>.new(normFields.length);
 		// build up patterns from the individual cases
 		for (i < normFields.length) {
@@ -299,8 +342,55 @@ class VariantSolver(nc: NormalizerConfig) {
 			cases[i] = VariantPattern.new(patterns);
 		}
 		state = cases;
-
 		return solveField(0);
+	}
+	private def printScalarSet(scalarSet: Scalar.set) {
+		Terminal.put("[VariantSolver.printScalarSet] Scalars in set ");
+		for (i in scalarSet) {
+			match (i) {
+				B32 => Terminal.put("| B32 ");
+				B64 => Terminal.put("| B64 ");
+				F32 => Terminal.put("| F32 ");
+				F64 => Terminal.put("| F64 ");
+				R32 => Terminal.put("| R32 ");
+				R64 => Terminal.put("| R64 ");
+				Ref => Terminal.put("| Ref ");
+			}
+		}
+		Terminal.ln();
+	}
+	// Uses the interval assignments from PackingSolver to assign intervals in ScalarPatterns
+	private def assignIntervalsToPatterns(packingSoln: PackingSolution) -> Array<VariantPattern> {
+		// XXX: Move this function to PackingSolver? 
+		def numCases = normFields.length;
+		def singletonPatterns = Array<Array<ScalarPattern>>.new(numCases);
+		for (caseIdx < numCases) {
+			def caseScalarPattern = packingSoln.patterns[caseIdx].copy();
+			// Assign intervals based on PackingSolution
+			for (fieldIdx < normFields[caseIdx].length) {
+				def interval = packingSoln.assignments[CaseField(caseIdx, fieldIdx)];
+				caseScalarPattern.assignInterval(interval);
+			}
+			singletonPatterns[caseIdx] = [caseScalarPattern];
+		}
+		return Arrays.map(singletonPatterns, VariantPattern.new);
+	}
+	private def getPackingFieldFromType(t: Type) -> PackingField {
+		return if(isRef(t), PackingField.Ref, PackingField.Nonref(PrimType.!(t).width));
+	}
+	private def isRef(t: Type) -> bool {
+		// Use NormalizerConfig to determine whether the field is a ref or not
+		def emptySet: Scalar.set;
+		def scalarsForFieldType = nc.GetScalar(t);
+		return (scalarsForFieldType & Scalar.Ref) != emptySet;
+	}
+	private def getWidthFromScalarSet(scalarSet: Scalar.set) -> byte {
+		def scalarSetOfAll32 = Scalar.B32 | Scalar.F32 | Scalar.R32;
+		def scalarSetOfAll64 = Scalar.B64 | Scalar.F64 | Scalar.R64 | Scalar.Ref;
+		def emptySet: Scalar.set;
+
+		if ((scalarSet & scalarSetOfAll64) != emptySet) return 64;
+		return if((scalarSet & scalarSetOfAll32) != emptySet, 32, 0);
 	}
 	private def solveField(idx: int) -> bool {
 		if (idx >= fields.length) {
