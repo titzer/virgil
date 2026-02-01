@@ -662,6 +662,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def normTypeSubsume(i_old: SsaApplyOp, op: Operator) {
 		var atn = normTypeArg(op, 0), rtn = normTypeArg(op, 1);
+		Terminal.put2("[SsaRaNormalizer.normTypeSubsume] atn == null? %s | rtn: %s\n", if(atn==null, "true", "false"), if(rtn==null, "true", "false"));
+		if (atn != null) Terminal.put1("[SsaRaNormalizer.normTypeSubsume] atn: %q \n", atn.render);
+		if (rtn != null) Terminal.put1("[SsaRaNormalizer.normTypeSubsume] rtn: %q \n", rtn.render);
 		if (rtn.sub == null) {
 			// common case 1-1 mapping
 			var i_new = curBlock.opTypeSubsume0(atn.newType, rtn.newType, genRef1(i_old.inputs[0]), norm.ra);
@@ -1187,6 +1190,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 	}
 	def normArrayGetElem(i_old: SsaApplyOp, op: Operator) {
+		Terminal.put1("[SsaRaNormalizer.normArrayGetElem] i_old uid: %d\n", i_old.uid);
 		var arrayNorm = ArrayNorm.!(normTypeArg(op, 0)), rtn = normReturnType(op);
 		var ai_new = genRefs(i_old.inputs), width = rtn.size;
 		var indexType = norm.config.ArrayIndexType;
@@ -1484,6 +1488,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def normGetField(isVariant: bool, i_old: SsaApplyOp, field: IrField, op: Operator) {
 		// XXX: propagate O_NO_NULL_CHECK and O_PURE
+		Terminal.put1("[SsaNormalizer.normGetField] fieldType: %q\n", field.fieldType.render);
 		var ai_new = genRefs(i_old.inputs);
 		if (i_old.useList == null) {
 			// OPT: remove unused read of field
@@ -1507,6 +1512,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 		normType(raField.receiver); // XXX: normType() side-effect of flattening
 		if (raField != null && rc.isUnboxed()) {
 			// field of unboxed data type
+			Terminal.put1("[SsaRaNormalizer.normGetField] Normalizing unboxed variant get field | i_old uid: %d\n", i_old.uid);
+			for (arg in ai_new) {
+				Terminal.put2("[SsaRaNormalizer.normGetField]\targ uid: %d | arg.type: %q\n", arg.uid, arg.getType().render);
+			}
+			Terminal.put1("[SsaRaNormalizer.normGetField]\torig input: %d\n", i_old.inputs[0].dest.uid);
 			var vals = genVariantGetField(rc, raField, rc.variantNorm, ai_new);
 			return mapNnf(i_old, vals);
 		}
@@ -1615,6 +1625,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var t = op.typeArgs[0];
 		var rc = norm.ra.getClass(t);
 		var vn = rc.variantNorm;
+		Terminal.put1("[SsaNormalizer.normVariantAlloc] Num scalars for variant: %d\n", vn.size);
 		if (vn == null) {
 			// Variant is boxed. Simply a VariantAlloc with normalized fields.
 			norm.makeOrigFieldTypes(rc);
@@ -1646,7 +1657,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 				if (IntRepType.?(vn.at(tagIdx))) result[tagIdx] = genSetInterval(result[tagIdx], newGraph.intConst(vn.tagValue), vn.tag.intervals[0], vn.tag.tn.newType, IntRepType.!(vn.at(tagIdx)));
 				else result[tagIdx] = newGraph.intConst(vn.tagValue);
 			}
-
+			// Pack the fields into the correct scalars
 			for (i < vn.fields.length) {
 				var f = vn.fields[i];
 				if (f.rf == null) continue;
@@ -1660,10 +1671,29 @@ class SsaRaNormalizer extends SsaRebuilder {
 			return mapN(i_old, result);
 		}
 	}
-	def genExtractInterval(scalar: SsaInstr, interval: Interval, ft: IntRepType, tt: Type) -> SsaInstr {
+	// Extracts an interval from a scalar
+	def genExtractInterval(scalar: SsaInstr, interval: Interval, ft: IntType, tt: Type) -> SsaInstr {
+		// Perform sign extension
+		if (IntType.?(tt) && IntType.!(tt).signed) {
+			scalar = curBlock.addApplyF(ft.opShl(), [scalar, newGraph.intConst(ft.width - interval.end)], Facts.O_SAFE_SHIFT);
+			scalar = curBlock.addApplyF(ft.opShr(), [scalar, newGraph.intConst(ft.width - interval.size())], Facts.O_SAFE_SHIFT);
+			return curBlock.opIntView(ft, IntType.!(tt), scalar);
+		} else if (IntType.?(tt) && interval.start > 0) {
+			scalar = curBlock.addApplyF(ft.opShr(), [scalar, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
+			return curBlock.opIntView(ft, IntType.!(tt), scalar);
+		} else if (IntType.?(tt)) {
+			return curBlock.opIntView(ft, IntType.!(tt), scalar);
+		} 
 		if (interval.start > 0) scalar = curBlock.addApplyF(ft.opShr(), [scalar, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
-		scalar = genVariantScalarView(ft, tt, scalar);
-		return scalar;
+		match (tt) {
+			x: BoolType => return curBlock.addApply(curBlock.source, ft.opEq(), [scalar, newGraph.intConst(1)]);
+			x: FloatType => {
+				if (x.is64) return curBlock.addApply(curBlock.source, V3Op.newFloat32ViewI(ft), [scalar]);
+				else return curBlock.addApply(curBlock.source, V3Op.newFloat64ViewI(ft), [scalar]);
+			}
+			_ => context.fail1("Unable to extract type: %q", tt.render);
+		}
+		return null;
 	}
 	def genSetInterval(scalar: SsaInstr, value: SsaInstr, interval: Interval, ft: Type, tt: IntRepType) -> SsaInstr {
 		// TODO: signed integer types require another mask before shifting
@@ -1674,12 +1704,27 @@ class SsaRaNormalizer extends SsaRebuilder {
 	def genVariantGetField(rc: RaClass, raField: RaField, vn: VariantNorm, ninputs: Array<SsaInstr>) -> Array<SsaInstr> {
 		var nf = raField.liveFields(norm.ra);
 		var vals = Array<SsaInstr>.new(nf.length);
-		var field = rc.variantNorm.fields[raField.orig.index];
+		var field: VariantField = rc.variantNorm.fields[raField.orig.index];
+		Terminal.put1("[SsaRaNormalizer.genVariantGetField] field info: %q\n", field.render);
 
 		for (i < vals.length) {
 			var idx = field.indexes[i];
-			if (IntRepType.?(vn.at(idx)) && field.intervals != null) vals[i] = genExtractInterval(ninputs[idx], field.intervals[i], IntRepType.!(vn.at(idx)), field.tn.at(i));
-			else vals[i] = genVariantScalarView(rc.variantNorm.at(idx), field.tn.at(i), ninputs[idx]);
+			// if (IntRepType.?(vn.at(idx)) && field.intervals != null) {
+			// 	vals[i] = genExtractInterval(ninputs[idx], field.intervals[i], IntRepType.!(vn.at(idx)), field.tn.at(i));
+			// } else 
+			if (field.isPacked()) {
+				// ninputs comes from genRefs called on the variant
+				// TODO(dnguyen): This is assuming that there's only one scalar storing the field 
+				Terminal.put3("[SsaNormalizer.genVariantGetField] Unpacking field | oldType: %q | normIndices: (%d, %d)\n",field.tn.oldType.render, raField.normIndices.0, raField.normIndices.1);
+				for (i < field.indexes.length) {
+					def scalarIdx = field.indexes[i];
+					def interval = field.intervals[i];
+					def scalar = ninputs[scalarIdx];
+					vals[i] = genExtractInterval(scalar, interval, IntType.!(scalar.getType()), field.tn.at(i));
+				}
+			} else {
+				vals[i] = genVariantScalarView(rc.variantNorm.at(idx), field.tn.at(i), ninputs[idx]);
+			}
 		}
 		return vals;
 	}
