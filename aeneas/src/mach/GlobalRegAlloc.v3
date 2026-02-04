@@ -15,6 +15,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	var graph: InterferenceGraph;
 	var coloring: Array<byte>;
 	var verbose = false;
+	var stackMoves = false;
 	// --- graph coloring ------------------
 	def availableColor = regSet.regSets[regSet.regClasses[RegClass.REF.tag]].length - 2;
 	def simplifyWorklist = Vector<int>.new();
@@ -40,13 +41,16 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		verbose = CLOptions.PRINT_REGALLOC.val && codegen.context.shouldPrintMach();
 		statistic.reset(vars.length);
 		regState.clear();
+		stackMoves = false;
 		for (i < regUsage.length) regUsage[i] = 0;
 
 		if (verbose) Terminal.putln("Begin global register allocation:");
 
 		// 1. Preprocess constants and uses whose constraint is stack.
 		if (verbose) Terminal.put1("Round %d: insert stack moves and constants\n", spillRound);
+		stackMoves = false;
 		insertStackMovesAndConstants();
+		if (stackMoves) codegen.print("after inserting stack moves");
 
 		// 2. Pre-spill variables live across calls and other kills.
 		if (verbose) Terminal.put1("Round %d: run shadow stack spiller\n", spillRound);
@@ -103,7 +107,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				Def(vreg, constraint) => {
 					if (vreg != null && regSet.isCallerStack(constraint)) {
 						operands[j] = Operand.DefSlot(vreg.regClass, vreg.spill); // already written by caller
-						codegen.insertMoveLocLoc(Operand.Use(null, vreg.spill), Operand.Def(vreg, 0), vreg.regClass, cur.next);
+						codegen.insertRestore(vreg, 0, cur.next);
 					}
 				}
 				Use(vreg, constraint) => {
@@ -129,12 +133,13 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 	}
 	def markConstLive(vreg: VReg, constraint: int) {
-		liveness[constRow, vreg.varNum] = true;
+		liveness.set(constRow, vreg.varNum);
 		if (vreg.hint == 0 && regSet.isReg(constraint)) vreg.hint = byte.!(constraint);
 	}
 	def insertStackWrite(constraint: int, vreg: VReg, cur: ArchInstr) {
 		if (vreg.isConst()) codegen.insertMoveConstLoc(SsaConst.!(vreg.ssa), Operand.Def(vreg, constraint), vreg.regClass, cur);
 		else codegen.insertMoveLocLoc(Operand.Use(vreg, 0), Operand.Def(null, constraint), vreg.regClass, cur);
+		stackMoves = true;
 	}
 	def insertDefsForLiveConsts(next: ArchInstr) {
 		liveness.apply(constRow, insertDefForLiveConst, next);
@@ -143,6 +148,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def insertDefForLiveConst(index: int, next: ArchInstr) {
 		var vreg = vars[index], val = SsaConst.!(vreg.ssa);
 		codegen.insertMoveConstLoc(val, Operand.Def(vreg, 0), vreg.regClass, next);
+		stackMoves = true;
 	}
 	// =====================
 	// Build interference graph via liveness analysis, iterating instructions backward.
@@ -191,8 +197,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 
 		// 2. Remove all defined variables from liveness.
 		for (o in operands) match (o) {
-			Def(vreg, constraint) => if(vreg != null) liveness[liveoutRow, vreg.varNum] = false;
-			Overwrite(vreg, use, constraint) => if(vreg != null) liveness[liveoutRow, vreg.varNum] = false;
+			Def(vreg, constraint) => if(vreg != null) liveness.clear(liveoutRow, vreg.varNum);
+			Overwrite(vreg, use, constraint) => if(vreg != null) liveness.clear(liveoutRow, vreg.varNum);
 			_ => ;
 		}
 
@@ -202,7 +208,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				Def(vreg, constraint) => {
 					if (vreg == null || vreg.spillRound != spillRound) continue;
 					if (cur.opcode() == ArchInstrs.ARCH_RESTORE) continue;
-					if (constraint == 0 && vreg.spill > 0) {
+					if ((constraint == 0 || constraint == vreg.spill) && vreg.spill > 0) {
 						operands[i] = Operand.DefSlot(vreg.regClass, vreg.spill); // write directly to the spill slot
 					} else {
 						operands[i] = Operand.Def(insertSaveIfNotConst(vreg, constraint, cur.next), constraint);
@@ -217,7 +223,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 				}
 				Use(vreg, constraint) => {
 					if (vreg == null || vreg.spillRound != spillRound) continue;
-					if (constraint == 0 && vreg.spill > 0) {
+					if ((constraint == 0 || constraint == vreg.spill) && vreg.spill > 0) {
 						operands[i] = Operand.Use(null, vreg.spill); // use can read directly from the spill slot
 					} else {
 						operands[i] = Operand.Use(insertSpillUse(vreg, constraint, cur), constraint);
@@ -229,8 +235,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 
 		// 4. Add all uses to liveness.
 		for (o in operands) match (o) {
-			Overwrite(vreg, use, constraint) => if (use != null) liveness[liveoutRow, use.varNum] = true;
-			Use(vreg, constraint) => if (vreg != null) liveness[liveoutRow, vreg.varNum] = true;
+			Overwrite(vreg, use, constraint) => if (use != null) liveness.set(liveoutRow, use.varNum);
+			Use(vreg, constraint) => if (vreg != null) liveness.set(liveoutRow, vreg.varNum);
 			_ => ;
 		}
 
@@ -287,8 +293,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 
 		// 2. Remove all defined variables from liveness.
 		for (o in operands) match (o) {
-			Def(vreg, constraint) => if(vreg != null) liveness[currentRow, vreg.varNum] = false;
-			Overwrite(vreg, use, constraint) => if (vreg != null) liveness[currentRow, vreg.varNum] = false;
+			Def(vreg, constraint) => if(vreg != null) liveness.clear(currentRow, vreg.varNum);
+			Overwrite(vreg, use, constraint) => if (vreg != null) liveness.clear(currentRow, vreg.varNum);
 			_ => ;
 		}
 
@@ -335,12 +341,12 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 	}
 	def setLiveAndAddInterference(currentRow: int, vreg: VReg) {
-		if (liveness[currentRow, vreg.varNum]) return;
-		liveness[currentRow, vreg.varNum] = true;
-		var node = graph.nodes[vreg.varNum];
-		node.use = true;
-		node.spillCost += curWeight;
-		liveness.apply(currentRow, graph.addInterference, vreg.varNum);
+		if (!liveness.set(currentRow, vreg.varNum)) {
+			var node = graph.nodes[vreg.varNum];
+			node.use = true;
+			node.spillCost += curWeight;
+			liveness.apply(currentRow, graph.addInterference, vreg.varNum);
+		}
 	}
 	def tryCoalescing(dst: VReg, dconstraint: int, src: VReg, sconstraint: int) {
 		// XXX: also consider !live[src] && !live[dst]
@@ -736,11 +742,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			Def(vreg, constraint) => {
 				// Ignore Def introduced by previous spill or preprocess
 				if (vreg == null || (regSet.isCallerStack(constraint) && !graph.nodes[vreg.varNum].use)) continue;
-				var loc = allocDefReg(vreg, constraint, false);
+				var loc = allocDefReg(vreg, constraint);
 				operands[i] = Operand.Def(vreg, loc);
 			}
 			Overwrite(vreg, use, constraint) => {
-				var loc = allocDefReg(vreg, constraint, true), newReg = byte.!(loc);
+				var loc = allocDefReg(vreg, constraint), newReg = byte.!(loc);
 				var gReg = coloring[use.varNum];
 				if (newReg != gReg) {
 					if (regSet.isReg(gReg)) movesPrev.addRegMove(use, gReg, newReg);
@@ -787,17 +793,13 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		regState.reassignReg(vreg, reg);
 		vreg.reg = reg;
 	}
-	def allocDefReg(vreg: VReg, constraint: int, genSave: bool) -> int {
+	def allocDefReg(vreg: VReg, constraint: int) -> int {
 		var gReg = coloring[vreg.varNum], loc: int = gReg;
 		var prevVreg = regState.getVreg(gReg);
 		regState.freeReg(loc, true);
 		if (!isOk(loc, constraint)) {
 			loc = findBestLocUnderConstraint(vreg.regClass, loc, constraint);
 			if (regSet.isReg(gReg) && prevVreg == vreg) movesNext.addRegMove(vreg, loc, gReg);
-		}
-		if (genSave && vreg.spill > 0) {
-			statistic.store++;
-			movesNext.saves.put(vreg, loc, vreg.spill);
 		}
 		return loc;
 	}
@@ -818,7 +820,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (constraint == 0) return true;
 		return regSet.isInRegSet(loc, constraint);
 	}
-	def findBestLocUnderConstraint(regClass: RegClass, prefer: int, constraint: int) -> int {
+	def findBestLocUnderConstraint(regClass: RegClass, prefer: int, constraint: int) -> int { // XXX: could move to RegState
 		if (constraint >= regSet.regSets.length) return constraint;
 		if (constraint == 0) constraint = regSet.regClasses[regClass.tag];
 		if (prefer != 0 && regSet.isInRegSet(prefer, constraint) &&
