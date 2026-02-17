@@ -29,7 +29,7 @@ In the main function, we use the enumeration function and pass a function expres
 The function expression is introduced with the `fun` keyword, followed by the declaration of any parameters the function accepts.
 In this case, the function accepts a prime number parameter, which we name `p`.
 The body of the function follows the `=>`, which is simply an expression that calls `System.puts`.
-(This last part is a [simple function body](SimpleBodies.v3), which has its own tutorial).
+(This last part is a [simple function body](SimpleBodies.md), which has its own tutorial).
 
 ## Parameter Type Inference ##
 
