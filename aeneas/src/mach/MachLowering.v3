@@ -619,36 +619,54 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var i_ptr = normRef1(i_old.inputs[0]), i_rs = normRef1(i_old.inputs[1]);
 				i_new = ptrAdd(i_ptr, i_rs);
 			}
-			PtrSetTag => {
+			PtrSetAuxTag => {
 				// Call on the packing solver to determine the best location to pack the tag 
 				var i_ptr = normRef1(i_old.inputs[0]); 
 				var i_tag = normRef1(i_old.inputs[1]);
 				def ptrType = PointerType.!(i_ptr.getType());
-				def tagType = IntType.!(i_tag.getType());
-				def problem = PackingProblem([[PackingField.Nonref(tagType.width)]], []);
+				def intPtrType = Int.getType(false, ptrType.width);
+				def tagTypeInfo = getTagTypesForPointer(ptrType);
+				def lowerTagType = tagTypeInfo.0;
+				def upperTagType = tagTypeInfo.1;
+				// Retrieve bits for lower tag and upper tag
+				def lowerTag = curBlock.opIntView(intPtrType, lowerTagType, i_tag);
+				// TODO(dnguyen): Use space for the upper tag too; Prioritizing lower tag for now
+				// def upperTagShiftAmt = intPtrType.box(1 + lowerTagType.width);
+				// def upperTagShiftConst = context.graph.valConst(intPtrType, upperTagShiftAmt);
+				// def upperTag = curBlock.add(intPtrType.opShr(), [intPtrType, upperTagShiftConst], Fact.O_NO_SHIFT_CHECK);
+
+				def problem = PackingProblem([[PackingField.Nonref(lowerTagType.width)]], [], 0);
 				def refPatterns = if(ptrType.width <= 32, ScalarPatterns.TAGGED_PTR_32, ScalarPatterns.TAGGED_PTR_64);
 				def solver = PackingSolver.new(ptrType.width, refPatterns);
 				def soln = solver.solveScalar(problem);
 				// Use the assignments to pack the tag
 				def tagInterval = soln.assignments[CaseField(0, 0)];
-				def ptrWidthIntType = Int.getType(false, ptrType.width);
-				i_tag = if(tagType.width != ptrType.width, curBlock.opIntViewI0(tagType, ptrWidthIntType, i_tag)); 
-				def shiftAmount = context.graph.intConst(tagInterval.start);
-				i_tag = curBlock.add(ptrWidthIntType.opShl(), [i_tag, shiftAmount], Fact.O_NO_SHIFT_CHECK);
+				i_tag = if(lowerTagType.width != ptrType.width, curBlock.opIntView(lowerTagType, intPtrType, i_tag)); 
+				def shiftAmount = context.graph.valConst(intPtrType, intPtrType.box(tagInterval.start));
+				i_tag = curBlock.add(intPtrType.opShl(), [i_tag, shiftAmount], Fact.O_NO_SHIFT_CHECK);
 				i_new = ptrAdd(i_ptr, i_tag);
 			}
-			PtrGetTag => {
-				// For now, assume that the tag will be in the lower 3 bits
-				var i_ptr = normRef1(i_old.inputs[0]);
+			PtrGetAuxTag => {
+				// Terminal.put2("[MachLowering.PtrGetAuxTag] heap size: %d | Ints.log(heap_size): %d\n", CLOptions.HEAP_SIZE.get(), V3.getNumBitsForCount(CLOptions.HEAP_SIZE.get()));
+				var i_ptr = normRef1(i_old.inputs[0]); 
 				def ptrType = PointerType.!(i_ptr.getType());
-				def ptrSubOp = Pointer_TypeCon.!(ptrType.typeCon).opcache().opSub;
-				def nullPtr = context.graph.nullConst(ptrType);
-				// TODO: add int.view<Pointer> to treat pointer as an int
-				def i_intPtr = curBlock.add(ptrSubOp, [i_ptr, nullPtr], Fact.O_NO_SHIFT_CHECK);
-				def ptrIntType = IntType.!(i_intPtr.getType());
-				// TODO: Keep track of pointer instructions and their tag locations
-				// For now assuming that the tag is stored in the lower 3 bits
-				i_new = curBlock.pure(ptrIntType.opAnd(), [i_intPtr, context.graph.intConst(3)]);
+				def intPtrType = Int.getType(false, ptrType.width);
+				// Compute mask for tag bit sections 
+				def tagTypeInfo: (IntType, IntType) = getTagTypesForPointer(ptrType);
+				def lowerTagType = tagTypeInfo.0;
+				def upperTagType = tagTypeInfo.1;
+				// Convert the pointer to an int-ptr 
+				// TODO(dnguyen): use IntViewP
+				def ptrOpSub = Pointer_TypeCon.!(ptrType.typeCon).opcache().opSub;
+				var i_intPtr = curBlock.add(ptrOpSub, [i_ptr, context.graph.nullConst(ptrType)], Facts.NONE);
+				// Retrieve the tags
+				i_intPtr = curBlock.add(intPtrType.opShr(), [i_intPtr, context.graph.valConst(intPtrType, intPtrType.box(1))], Fact.O_NO_SHIFT_CHECK);	
+				def lowerTag = curBlock.opIntView(intPtrType, lowerTagType, i_intPtr);	
+				def upperTagShiftAmt = intPtrType.box(ptrType.width - upperTagType.width);
+				def upperTagShiftConst = context.graph.valConst(intPtrType, upperTagShiftAmt);
+				var upperTag = curBlock.add(intPtrType.opShr(), [i_intPtr, upperTagShiftConst], Fact.O_NO_SHIFT_CHECK);
+				// Return the tag as a intPtrType
+				i_new = curBlock.pure(intPtrType.opOr(), [upperTag, lowerTag]);
 			}
 			TupleCreate,		// --
 			ClassGetVirtual,	// --
@@ -666,6 +684,17 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		if (i_new != i_old) map1(i_old, i_new);
 		else id(i_old);
+	}
+	// Returns a tuple containing the IntType for the (lowerTagType, upperTagType)
+	def getTagTypesForPointer(ptrType: PointerType) -> (IntType, IntType) {
+		// subtract 1 for the RefTag bit
+		def unusedBitsFromAlign = V3.getNumBitsForCount(mach.stackAlign);
+		def numLowerTagBits = if(unusedBitsFromAlign == 0, 0, unusedBitsFromAlign - 1);
+		def lowerTagType = Int.getType(false, numLowerTagBits);
+		def numValidHeapBits = V3.getNumBitsForCount(long.view(CLOptions.HEAP_SIZE.get()));
+		def numBitsBeforeUpperTag = 1 + numLowerTagBits + numValidHeapBits;
+		def upperTagType = Int.getType(false, ptrType.width - numBitsBeforeUpperTag);
+		return (lowerTagType, upperTagType);
 	}
 	def unexpected(i_old: SsaApplyOp) {
 		context.fail1("unexpected operator %q", i_old.op.render);
