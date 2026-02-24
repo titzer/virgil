@@ -21,13 +21,14 @@ def SYS_RT_sigreturn = 0x20000B8;
 def Regs: X86_64Regs;
 def MRegs: X86_64RegSet;
 
+// Rosetta 2 on Apple Silicon (ARM64) uses 16KB pages. All Mach-O segment
+// vmaddrs and file offsets must be 16KB-aligned for Rosetta 2 translation.
 def SPACE = AddressSpace.new("mem", false, 64, 8,
-	Alignment.new(4096), Alignment.new(8));
+	Alignment.new(16384), Alignment.new(8));
 
 // Darwin target for x86-64 architecture. Generates an Mach-O binary directly.
 class X86_64DarwinTarget extends Target {
 	def test: bool;
-	def DEFAULT_VADDR_START: int = 0x08000000;
 
 	new(name: string, test) super(name) { }
 
@@ -51,8 +52,7 @@ class X86_64DarwinTarget extends Target {
 		def space = SPACE;
 		def intNorm = IntNormalizers.I64LE;
 		var mach = MachProgram.new(prog, space, space, intNorm);
-		var startAddr = long.!(CLOptions.VM_START_ADDR.get());
-		if (startAddr == 0) startAddr = DEFAULT_VADDR_START;
+		var startAddr: long = 0x100000000; // 4GB __PAGEZERO for Rosetta 2
 		if (startAddr < 3_000_000_000L) mach.codeRegion.refSize = 4;
 		prog.tprog = mach;
 		var rt = MachRuntime.new(mach);
@@ -76,12 +76,13 @@ class X86_64DarwinTarget extends Target {
 		header.cputype = MachO.CPU_TYPE_X86_64;
 		header.cpusubtype = MachO.CPU_SUBTYPE_X86_64;
 		header.filetype = MachO.MH_EXECUTE;
+		header.flags = 0; // no MH_PIE: Virgil emits absolute addresses, ASLR would break them
 
-		var startAddr = long.!(CLOptions.VM_START_ADDR.get());
-		if (startAddr == 0) startAddr = DEFAULT_VADDR_START;
-		// protect page zero for trapping null accesses
+		// 4GB __PAGEZERO for Rosetta 2 compatibility
+		var startAddr: long = 0x100000000;
+		// protect page zero for trapping null accesses (full 4GB for Rosetta 2 compatibility)
 		var pz = newSegmentLoad(header, "__NULL", 0);
-		pz.vmsize = pageAlign.size;
+		pz.vmsize = startAddr;
 		// stack (data) segment if a non-zero stack size is specified
 		var stackSize = int.!(pageAlign.alignUp_u64(CLOptions.STACK_SIZE.get()));
 		if (stackSize > 0) {
@@ -116,9 +117,12 @@ class X86_64DarwinTarget extends Target {
 		// generate code and runtime tables into buffer
 		// encodeCode(w, cs, ts);
 		var backend = X86_64DarwinBackend.new(compiler, prog, mach, w, test);
-		ts.rip = w.addr_end();
 		cs.vmaddr = w.endPageAddr();
-		rt.recordCodeStart(ts.rip);
+		var entryAddr = w.addr_end();
+		// Rosetta 2 on Apple Silicon adds text_vmaddr to rip from LC_UNIXTHREAD,
+		// so store the text-relative offset rather than the absolute address.
+		ts.rip = entryAddr - cs.vmaddr;
+		rt.recordCodeStart(entryAddr);
 		backend.genAllCode();
 		var size = w.end();
 		if (size < pageAlign.size) w.skipN(pageAlign.size - size); // MacOS requires >= 4096 byte binaries
@@ -154,10 +158,17 @@ class X86_64DarwinTarget extends Target {
 		}
 		// generate data into buffer
 		w.skipPage();
+		// Pad the file to the next page boundary. The previous skipAddr() calls
+		// for __EX and __RT_TEXT advance the virtual address without writing file
+		// bytes, so ds.vmaddr - w.startAddr no longer gives the correct file offset.
+		// We must pad the actual file so DATA starts at a page-aligned file offset.
+		w.atEnd();
+		var padTo = pageAlign.alignUp_i32(w.end());
+		if (padTo > w.end()) w.skipN(padTo - w.end());
 		// compute starting location of data
-		w.atEnd().align(mach.data.addressSize);
+		w.align(mach.data.addressSize);
 		ds.vmaddr = w.endPageAddr();
-		ds.fileoff = int.!(u64.!(ds.vmaddr) - w.startAddr); // TODO(addr64)
+		ds.fileoff = w.end();
 		mach.layoutData(w);
 		rt.addHeapPointers(w);
 		ds.filesize = w.end() - ds.fileoff;
@@ -307,6 +318,8 @@ class X86_64DarwinBackend extends X86_64Backend {
 }
 
 // a mach-O thread state command for x86-64
+// NOTE: rip is stored as a text-relative offset (not absolute) because
+// Rosetta 2 on Apple Silicon computes entry = text_vmaddr + rip.
 class MachO_X86_64ThreadState extends MachO_LoadCmd {
 	var rip: long;
 	def encode(is64: bool, w: DataWriter) {
