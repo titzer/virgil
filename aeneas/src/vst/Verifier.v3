@@ -187,10 +187,128 @@ class Verifier(compiler: Compiler, prog: Program) {
 				decl.numMethods = superDecl.numMethods;
 			}
 		} else if (decl.kind == Kind.VARIANT) {
-			// top-level variant class
-			if (compiler.unboxVariantEarly(decl)) decl.repHints = List.new(VstRepHint.Unboxed, decl.repHints);
+			if (decl.qualifiers != null) {
+				// subtype variant: RepHints are not allowed
+				if (decl.repHints != null) cv.errAtDecl(decl).set("VariantDeclError",
+					"representation hints are not allowed on subtype variants");
+				verifyVariantQualifiers(decl, cv);
+			} else {
+				// top-level variant: RepHints are OK
+				if (compiler.unboxVariantEarly(decl)) decl.repHints = List.new(VstRepHint.Unboxed, decl.repHints);
+			}
 		}
 		cv.verify();
+	}
+	// Verify the qualifier chain of a dot-named variant (e.g. "type A.B.C").
+	// Checks: first qualifier names a top-level variant; each intermediate variant
+	// has a case _; the name doesn't clash with named cases of the parent; and the
+	// name is unique among direct subtypes of the parent.
+	def verifyVariantQualifiers(decl: VstClass, cv: VstCompoundVerifier) {
+		var q = decl.qualifiers;
+		// Resolve first qualifier: must be a top-level (root) variant.
+		var firstTok = q.head;
+		var tc = prog.typeEnv.lookup(firstTok.image);
+		if (tc == null || tc.kind != Kind.VARIANT) {
+			cv.errAtToken(firstTok).set("VariantDeclError",
+				Strings.format1("qualifier \"%s\" does not name a variant type", firstTok.image));
+			return;
+		}
+		var parentClass = ClassType.!(tc.create0()).classDecl;
+		if (!(parentClass.isVariant() && !parentClass.isVariantCase())) {
+			cv.errAtToken(firstTok).set("VariantDeclError",
+				Strings.format1("\"%s\" must be a top-level variant type", firstTok.image));
+			return;
+		}
+		q = q.tail;
+		// Walk any remaining qualifiers (for names like A.B.C).
+		while (q != null) {
+			if (!variantHasDefaultCase(parentClass)) {
+				cv.errAtToken(q.head).set("VariantDeclError",
+					Strings.format1("variant \"%s\" has no 'case _'", parentClass.name()));
+				return;
+			}
+			var tok = q.head;
+			var tc2 = prog.typeEnv.lookup(tok.image);
+			if (tc2 == null || tc2.kind != Kind.VARIANT) {
+				cv.errAtToken(tok).set("VariantDeclError",
+					Strings.format1("qualifier \"%s\" does not name a variant type", tok.image));
+				return;
+			}
+			var nextClass = ClassType.!(tc2.create0()).classDecl;
+			if (!isDirectSubtypeOf(nextClass, parentClass)) {
+				cv.errAtToken(tok).set("VariantDeclError",
+					Strings.format2("\"%s\" is not a direct subtype of \"%s\"", tok.image, parentClass.name()));
+				return;
+			}
+			parentClass = nextClass;
+			q = q.tail;
+		}
+		// parentClass is the immediate parent of decl.
+		if (!variantHasDefaultCase(parentClass)) {
+			cv.errAtDecl(decl).set("VariantDeclError",
+				Strings.format1("variant \"%s\" has no 'case _'", parentClass.name()));
+			return;
+		}
+		// Name must not clash with a named case of the parent.
+		var declName = decl.name();
+		for (c in parentClass.cases) {
+			if (!Strings.equal(c.name(), "_") && Strings.equal(c.name(), declName)) {
+				cv.errAtDecl(decl).set("VariantDeclError",
+					Strings.format2("subtype name \"%s\" conflicts with case of \"%s\"",
+						declName, parentClass.name()));
+				return;
+			}
+		}
+		// Name must be unique among direct subtypes of the parent.
+		if (parentClass.subtypes == null) parentClass.subtypes = Strings.newMap();
+		if (parentClass.subtypes[declName] != null) {
+			cv.errAtDecl(decl).set("VariantDeclError",
+				Strings.format2("subtype \"%s\" of \"%s\" declared more than once",
+					declName, parentClass.name()));
+		} else {
+			parentClass.subtypes[declName] = decl;
+		}
+		// Set up method inheritance: verify the parent first, then link the supertype chain.
+		verifyClass(parentClass);
+		var parentClassType = ClassType.!(parentClass.typeCon.create0());
+		// Wire parentClassType into the ClassType chain so lookupSuperMember() and IR
+		// building can walk transitively. Variant subtypes don't use classDecl.superclass.
+		parentClassType.superType = parentClass.verifier.superType;
+		// If the parent has a case _, route inheritance through it so its methods are
+		// visible to this subtype (and may override parent methods).
+		var defaultCaseDecl = findDefaultCase(parentClass);
+		if (defaultCaseDecl != null) verifyClass(defaultCaseDecl);
+		var effectiveSuperDecl = if(defaultCaseDecl != null, defaultCaseDecl, parentClass);
+		var effectiveSuperType = ClassType.!(effectiveSuperDecl.typeCon.create0());
+		ClassType.!(decl.typeCon.create0()).superType = effectiveSuperType;
+		cv.superType = effectiveSuperType;
+		decl.numMethods = effectiveSuperDecl.numMethods;
+	}
+	// Returns true if child.qualifiers == parent.qualifiers ++ [parent.name()].
+	def isDirectSubtypeOf(child: VstClass, parent: VstClass) -> bool {
+		var cq = child.qualifiers;
+		if (cq == null) return false;
+		// The prefix of child's qualifiers must match all of parent's qualifiers.
+		for (l = parent.qualifiers; l != null; l = l.tail) {
+			if (cq == null || !Strings.equal(cq.head.image, l.head.image)) return false;
+			cq = cq.tail;
+		}
+		// The next element must be parent.name() and then end.
+		return cq != null && Strings.equal(cq.head.image, parent.name()) && cq.tail == null;
+	}
+	// Returns true if the variant class has a "case _" default case.
+	def variantHasDefaultCase(decl: VstClass) -> bool {
+		for (c in decl.cases) {
+			if (Strings.equal(c.name(), "_")) return true;
+		}
+		return false;
+	}
+	// Returns the synthetic VstClass for the "case _" of a variant, or null if none.
+	def findDefaultCase(decl: VstClass) -> VstClass {
+		for (c in decl.cases) {
+			if (Strings.equal(c.name(), "_")) return c.decl;
+		}
+		return null;
 	}
 	def verifyEnum(decl: VstEnum) {
 		var cv = decl.verifier;
@@ -665,7 +783,7 @@ class VstCompoundVerifier {
 				"index operation cannot be declared in component");
 			errAtDecl(decl).IndexDeclError(msg);
 		}
-		if (compound.isVariantCase() && EmptyStmt.?(decl.func.body)) {
+		if (compound.isVariantCase() && !Strings.equal(compound.name(), "_") && EmptyStmt.?(decl.func.body)) {
 			errAtStmt(decl.func.body).UnimplementedError("variant method must have a body");
 		}
 		if (decl.typeParams != null) typeEnv = decl.typeEnv = buildTypeEnv(typeEnv, decl.typeParams);
