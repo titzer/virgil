@@ -36,6 +36,27 @@ VariantCase ::= 'case' id VariantCaseParams? RepHints? (';' | Members)   // name
               | 'def' DefDef
 
 DefaultCaseMembers ::= '{' (['private'] 'def' DefDef)* '}'               // only methods allowed (no 'var' or 'new')
+```
+
+### Variant subtype constraints (checked by verifier)
+
+A `VariantDecl` whose `DottedId` is a plain `id` is a **root** (top-level) variant.
+
+A `VariantDecl` whose `DottedId` has the form `D.T` (one or more dots) declares a **subtype variant**:
+
+- The first identifier in `D` must name a root variant.
+- Every intermediate identifier in `D` must name a variant that is a direct subtype of the previous one (transitively established by prior declarations).
+- The immediate parent (the variant named by all of `D`) must have a `case _`.
+- `T` must not clash with any named `case id` of the immediate parent.
+- `D.T` may be declared at most once (among all files of the program).
+- RepHints (`#boxed`, `#unboxed`, etc.) are **not** allowed on subtype variants; they are only allowed on root variants.
+
+### Variant method inheritance
+
+- A `def m` declared directly in a variant `T` is inherited by all subtype variants of `T` (transitively). It may be overridden in a subtype following the same rules as class method overrides.
+- A `def m` declared in the `case _` body of variant `T` is inherited by direct subtypes of `T`. It may override a `def m` already declared on `T` or a supertype of `T`, and may itself be overridden in subtypes. A `case _` method may have no body (abstract).
+
+```
 
 EnumDecl    ::= id EnumParams? '{' EnumCase* '}'
 EnumCase    ::= id ['(' Expr,* ')'] ','?
@@ -140,6 +161,19 @@ MatchPattern ::= id ':' TypeRef                             // binding pattern
 
 MatchParam  ::= '_' | id
 ```
+
+### Variant match pattern semantics
+
+When matching on an expression of variant type `T`, the second rule of `MatchPattern` may name:
+
+- A **named case** of `T` (e.g. `X` where `T` has `case X`) — matched by tag
+- A **subtype variant** of `T` (e.g. `S` where `T.S` is a subtype) — matched by runtime type check (`S.?(value)`)
+
+Only the **unqualified** name is legal in the second rule. For example, if `T.S` is a subtype of `T`, write `S`, not `T.S`.
+
+A match on a variant type `T` that has `case _` must always include a `_` arm regardless of which named cases or subtypes are listed.
+
+Subtype names may also appear as the `TypeRef` in the **first rule** (binding pattern `x: S`), in which case `x` is bound and cast to the subtype type.
 
 ---
 
