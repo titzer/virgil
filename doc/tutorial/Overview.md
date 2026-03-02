@@ -31,7 +31,7 @@ That way, you can jump right into a topic.
 * Logic is done with familiar control constructs.
   * [Branches](Branches.md) for simple conditional logic.
   * [Loops](Loops.md) for induction and iteration over arrays and ranges.
-* [Algebraic data types](ADTs.md) allow building structured data.
+* [Algebraic data types](ADTs.md) allow building structured data, including open and extensible variants.
 * [Enums](Enums.md) allow expressing fixed sets of values and even tables.
 * [Enum sets](EnumSets.md) allow expressing a set of values from a given enum type.
 * Virgil has switches and [pattern matching](Matches.md).

@@ -87,6 +87,27 @@ def playFetch(x: Dog) {
 
 The above example implements a method that plays with pets and illustrates how using type casts and type queries is sometimes the simplest approach. It would seem intrusive to add methods on each `Pet` corresponding to how we might play with it,  since only the `PetDemo` component really knows how to play with each kind of `Pet`. Instead of going overboard with a fancy _visitor pattern_, the cases are few enough that the straightforward approach with type casts and queries is probably simplest.
 
+## Variant subtypes ##
+
+The `?` and `!` operators also work with open variant subtypes.
+When an open variant type `A` has a subtype `A.B`, the query `A.B.?(v)` tests whether `v` is an instance of `A.B`, and `A.B.!(v)` casts `v` to `A.B`.
+
+```
+type Priority { case Low; case _; }
+type Priority.High { case Warning; case Critical; def level() -> int { return 2; } }
+
+def handle(p: Priority) -> int {
+    if (Priority.High.?(p)) {
+        var h: Priority.High = Priority.High.!(p); // safe: ? confirmed the subtype
+        return h.level();
+    }
+    return 0;
+}
+```
+
+Unlike class casts, variant subtype casts work via an integer tag range check rather than object identity.
+A `T.!(v)` cast on a variant that fails at runtime terminates the program with a `!TypeCheckException`, just as with class casts.
+
 ## Functions ##
 
 Function types support casts that follow the rules of [variance](Variance.md).
