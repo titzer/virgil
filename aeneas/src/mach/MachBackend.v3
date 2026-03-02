@@ -34,6 +34,7 @@ class VReg {
 	def ssa: SsaInstr;		// corresponding ssa instruction (if any)
 	def varNum: int;		// virtual register number
 	def varSize: int;		// number of virtual registers this var represents
+	// -- OldCodeGen state ----------------------------------
 	var start: int = -1;		// start position of code that defines this var
 	var end: int = -1;		// end position of code that defines this var
 	var live: bool;			// true if live
@@ -46,8 +47,7 @@ class VReg {
 	var next: VReg;			// next link for list management
 	var spill: int;			// assigned spill slot (< 0 indicates a constant)
 	var endPos: int;		// last live position
-	var notSpillable: bool;		// true if this var cannot be spill anymore
-	var reloadFrom: VReg;		// var that this var is spilled from
+	var spillRound: int;		// avoids repeated spilling in GRA
 	// -- state for stackifier -----------------------------
 	var usage = Usage.NONE;
 	var parmoveState: int;
@@ -160,6 +160,10 @@ class MachRegSet {
 		loc &= ~(IS_64);
 		return loc >= callerStart && loc < calleeStart;
 	}
+	def isCalleeStack(loc: int) -> bool {
+		loc &= ~(IS_64);
+		return loc >= calleeStart;
+	}
 	def isMultiple(loc: int) -> bool {
 		if (loc == 0) return true;
 		if (loc <= physRegs) return false;
@@ -212,6 +216,7 @@ type Operand {
 	case Immediate(val: Val);
 	case Use(vreg: VReg, constraint: int);
 	case Def(vreg: VReg, constraint: int);
+	case DefSlot(regClass: RegClass, constraint: int);
 	case Kill(constraint: int);
 	case RefMap(livepoint: int, outgoing: MachCallConv);
 	case Overwrite(dst: VReg, src: VReg, constraint: int);
@@ -331,13 +336,14 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 			blocks.print();
 		}
 		selectInstructionsForGraph();
-		print();
+		print(null);
 	}
-	def print() {
+	def print(phase: string) {
 		if (!context.shouldPrintMach()) return;
 		// print header
 		var out = getOutput();
-		out.puts("Arch instructions for: ");
+		if (phase != null) out.put1("Arch instructions (%s) for: ", phase);
+		else out.puts("Arch instructions for: ");
 		var render: StringBuilder -> StringBuilder;
 		if (context.spec != null) context.spec.render(out);
 		else if (context.method != null) context.method.renderLong(out);
@@ -696,6 +702,9 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 	def insertShadowStackRestore(shadow_sp: VReg, v: VReg, slot: int, next: ArchInstr) {
 		runInsertion(genShadowStackRestore, (shadow_sp, v, slot), next);
 	}
+	def insertSave(vreg: VReg, next: ArchInstr) {
+		runInsertion(genSave, vreg, next);
+	}
 	def insertRestore(vreg: VReg, reg: byte, next: ArchInstr) {
 		runInsertion(genRestore, (vreg, reg), next);
 	}
@@ -711,6 +720,9 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 	}
 	def genShadowStackRestore(shadow_sp: VReg, v: VReg, slot: int) {
 		emit3(ArchInstrs.ARCH_RESTORE, dfnv0(v), useInt(slot), usev0(shadow_sp));
+	}
+	def genSave(v: VReg) {
+		emit1(ArchInstrs.ARCH_SAVE, usev0(v));
 	}
 	def genRestore(vreg: VReg, reg: byte) {
 		if (vreg.isConst()) {
@@ -729,12 +741,6 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 	}
 	def insertMoveConstLoc(src: SsaConst, dst: Operand.Def, regClass: RegClass, next: ArchInstr) {
 		runInsertion(genMoveConstLoc, (src, dst, regClass), next);
-	}
-	def insertReload(src: VReg, dst: Operand.Def, next: ArchInstr) {
-		runInsertion(genReload, (src, dst), next);
-	}
-	def genReload(src: VReg, dst: Operand.Def) {
-		emit2(ArchInstrs.ARCH_RELOAD, op(dst), op(Operand.Use(src, 0)));
 	}
 	def genMoveConstLoc(val: SsaConst, dst: Operand.Def, regClass: RegClass) {
 		if (regSet.isStack(dst.constraint)) genMoveConstStack(val, dst, regClass);
@@ -943,6 +949,9 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 		i.mark = vreg.varNum;
 		return vreg;
 	}
+	def getConst(spill: int) -> VReg {
+		return vars[-2 - spill];
+	}
 	def useExSource(ex: string, source: Source) {
 		operands.put(Operand.ExSource(ex, source));
 	}
@@ -1044,6 +1053,7 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 		var prevL = computingLiveness;
 		computingLiveness = false;
 		for (i = first; i != null; i = i.next) {
+			if (i.opcode() == ArchInstrs.ARCH_BLOCK) context.block = Operand.Label.!(i.operands[0]).block;
 			if (out != null) {
 				indent = out.putInstr(indent, i);
 				out.outt();
@@ -1137,11 +1147,6 @@ class ArchInstrBuffer(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) ex
 				putIndent(indent);
 				puts("end");
 			}
-			ArchInstrs.ARCH_RELOAD => {
-				putIndent(indent + 1);
-				puts("reload ");
-				putOperands(a);
-			}
 			ArchInstrs.ARCH_GETSHADOWSTACKPTR => {
 				putNamedInstr(indent + 1, "get_shadowstack_ptr", a);
 			}
@@ -1152,10 +1157,23 @@ class ArchInstrBuffer(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) ex
 				putNamedInstr(indent + 1, "set_shadowstack_ptr", a);
 			}
 			ArchInstrs.ARCH_SAVE => {
-				putNamedInstr(indent + 1, "save", a);
+				var u = Operand.Use.!(a[0]);
+				putIndent(indent + 1);
+				puts("save ");
+				if (u.vreg == null) red().puts("<null>");
+				else yellow().puts(regSet.identify(u.vreg.spill)).end();
+				puts(", ");
+				putVReg("use", u.vreg);
+				putConstraint(u.constraint);
 			}
 			ArchInstrs.ARCH_RESTORE => {
-				putNamedInstr(indent + 1, "restore", a);
+				var d = Operand.Def.!(a[0]);
+				putIndent(indent + 1);
+				puts("restore ");
+				putVReg("def", d.vreg);
+				putConstraint(d.constraint);
+				puts(", ");
+				yellow().puts(regSet.identify(d.vreg.spill)).end();
 			}
 			ArchInstrs.ARCH_SOURCELINE => {
 				putIndent(indent + 1);
@@ -1194,12 +1212,12 @@ class ArchInstrBuffer(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) ex
 		putOperands(i.operands);
 		return indent;
 	}
-	def putIndent(indent: int) {
+	def putIndent(indent: int) -> this {
 		if (indent-- > 0) tab(); // the first two indent levels are tabs
 		if (indent-- > 0) tab();
 		while (indent-- > 0) sp().sp(); // two spaces for each afterwards
 	}
-	def putSsaBlock(block: SsaBlock) {
+	def putSsaBlock(block: SsaBlock) -> this {
 		blockColor().putc('#').putd(block.uid).end();
 	}
 	def putSsa(i: SsaInstr) -> this {
@@ -1246,6 +1264,11 @@ class ArchInstrBuffer(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) ex
 			Def(vreg, constraint) => {
 				putVReg("def", vreg);
 				putConstraint(constraint);
+			}
+			DefSlot(regClass, constraint) => {
+				puts("def");
+				putConstraint(constraint);
+				yellow().put1(":%s", regClass.name).end();
 			}
 			Kill(constraint) => {
 				blue().puts("kill").end();
