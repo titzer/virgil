@@ -6,8 +6,7 @@ def verbose = false;
 def paranoid = true;
 class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def regState = RegState.new(regSet, codegen);
-	def parmoveDests = Vector<(VReg, List<Operand.Def>)>.new();
-	def moveResolver = MoveResolver.new(codegen.mach.prog.ERROR);
+	def parmoves = ParMoveDests.new();
 	def moves = MoveSet.new(regSet);
 	var buf = ArchInstrBuffer.new(codegen, codegen.mach.prog, regSet);
 	var prev: ArchInstr;
@@ -27,9 +26,9 @@ class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			var opcode = cur.opcode();
 			if (opcode == ArchInstrs.ARCH_PARMOVE) { // perform parallel move
 				cur.remove();
-				parmoveDests.resize(0);
-				codegen.gatherParallelMoveDests(cur, parmoveDests);
-				for (j < parmoveDests.length) recursivelyEmitMoves(j, next);
+				parmoves.entries.resize(0);
+				codegen.gatherParallelMoveDests(cur, parmoves.entries);
+				for (j < parmoves.entries.length) parmoves.emitMoves(codegen, j, next);
 				cur = prev;
 				continue;
 			}
@@ -40,8 +39,8 @@ class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 						var a = regState.allocated[i];
 						var vreg = a.0;
 						regState.regState[vreg.reg] = -1;
-						allocSpill(vreg);
-						codegen.insertRestoreLocal(vreg, vreg.reg, next);
+						codegen.allocSpill(vreg);
+						codegen.insertRestore(vreg, vreg.reg, next);
 						vreg.reg = 0;
 					}
 					regState.cursor = 0;
@@ -103,7 +102,7 @@ class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			if (opcode == ArchInstrs.ARCH_ENTRY) {
 				for (j < regState.cursor) {
 					var vreg = regState.allocated[j].0;
-					if (vreg.isConst()) codegen.insertMoveValLoc(vreg, (vreg, vreg.reg), vreg.regClass, next);
+					if (vreg.isConst()) codegen.insertMoveConstLoc(SsaConst.!(vreg.ssa), Operand.Def(vreg, vreg.reg), vreg.regClass, next);
 				}
 			}
 			cur = prev;
@@ -113,14 +112,14 @@ class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		var prevReg = vreg.reg, loc: int = prevReg;
 		if (regSet.isStack(constraint)) {
 			if (vreg.isConst()) {
-				codegen.insertMoveValLoc(vreg, (vreg, constraint), vreg.regClass, prev.next);
+				codegen.insertMoveConstLoc(SsaConst.!(vreg.ssa), Operand.Def(vreg, constraint), vreg.regClass, prev.next);
 			} else {
 				if (prevReg != 0) {
 					regState.updateUsePos(prevReg);
-					codegen.insertMoveLocLoc((vreg, prevReg), (vreg, constraint), vreg.regClass, prev.next);
+					codegen.insertMoveLocLoc(Operand.Use(vreg, prevReg), Operand.Def(vreg, constraint), vreg.regClass, prev.next);
 				} else {
-					allocSpill(vreg); // insert a save instruction before and alloc reg independently for it
-					codegen.insertMoveLocLoc((vreg, vreg.spill), (vreg, constraint), vreg.regClass, prev.next);
+					codegen.allocSpill(vreg); // insert a save instruction before and alloc reg independently for it
+					codegen.insertMoveLocLoc(Operand.Use(vreg, vreg.spill), Operand.Def(vreg, constraint), vreg.regClass, prev.next);
 				}
 			}
 			return constraint;
@@ -130,7 +129,7 @@ class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			if (regState.isUsedInThisInstr(prevReg)) {
 				regState.freeReg(prevReg, true);
 				loc = reassignReg(vreg, findBestLoc(vreg.regClass, vreg.hint, constraint));
-				codegen.insertMoveLocLoc((vreg, loc), (vreg, prevReg), vreg.regClass, prev.next);
+				codegen.insertMoveLocLoc(Operand.Use(vreg, loc), Operand.Def(vreg, prevReg), vreg.regClass, prev.next);
 			} else {
 				spillReg(prevReg, next);
 				regState.freeReg(prevReg, true);
@@ -153,11 +152,8 @@ class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		var i = regState.regState[reg];
 		if (i < 0) return;
 		var vreg = regState.allocated[i].0;
-		allocSpill(vreg);
-		codegen.insertRestoreLocal(vreg, reg, next);
-	}
-	def allocSpill(vreg: VReg) {
-		if (vreg.spill == 0) vreg.spill = codegen.frame.allocSpill(vreg.regClass);
+		codegen.allocSpill(vreg);
+		codegen.insertRestore(vreg, reg, next);
 	}
 	def isOk(vreg: VReg, constraint: int) -> bool {
 		if (vreg.reg == 0) return false;
@@ -178,100 +174,10 @@ class LocalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (reg > regSet.physRegs) return reg;
 		var old = regState.reassignReg(vreg, reg);
 		if (old != null) {
-			allocSpill(old);
+			codegen.allocSpill(old);
 			moves.reloads.put(old, reg);
 			old.reg = 0;
 		}
 		return vreg.reg = byte.!(reg);
-	}
-	def recursivelyEmitMoves(j: int, next: ArchInstr) {
-		var t = parmoveDests[j], vreg = t.0, dest = t.1;
-		if (vreg.parmoveState <= 0) return; // already done on or stack
-		vreg.parmoveState = ON_STACK;
-		for (l = dest; l != null; l = l.tail) {
-			var o = l.head, dreg = o.vreg, index = dreg.parmoveState;
-			allocSpill(dreg);
-			if (index == ON_STACK) {
-				// destination is already on stack; cycle; load to temp
-				dreg.parmoveState = IN_CYCLE;
-				codegen.insertRestoreLocal(dreg, getParallelMoveReg(dreg.regClass, 1), next);
-			}
-			if (index > 0) recursivelyEmitMoves(index - 1, next);
-		}
-		allocSpill(vreg);
-		var loc: int;
-		if (vreg.parmoveState == IN_CYCLE) {
-			loc = getParallelMoveReg(vreg.regClass, 1);
-		} else {
-			loc = getParallelMoveReg(vreg.regClass, 0);
-			codegen.insertRestoreLocal(vreg, loc, next);
-		}
-		for (l = dest; l != null; l = l.tail) {
-			codegen.insertSaveLocal(loc, l.head.vreg, next);
-		}
-		vreg.parmoveState = 0;
-	}
-	def getParallelMoveReg(rcl: RegClass, which: int) -> int {
-		var set = regSet.regClasses[rcl.tag];
-		var loc = regSet.regSets[set][which];
-		return loc;
-	}
-}
-def LIVE: i8 = 0;
-def ON_STACK: i8 = -1;
-def IN_CYCLE: i8 = -2;
-def DEAD: i8 = -3;
-
-class MoveSet(regSet: MachRegSet) {
-	def regindex = Array<int>.new(regSet.physRegs);		// where each register occurs, if all, in regmoves
-	def regmoves = Vector<(i8, VReg, int, byte)>.new();	// (state, VReg, src, reg)
-	def saves = Vector<(VReg, int, int)>.new();		// (VReg, src, dst)
-	def reloads = Vector<(VReg, int)>.new();		// (VReg, dst)
-
-	def addRegMove(vreg: VReg, src: int, dst: byte) {
-		if (src == dst)	return;
-		var index = regmoves.length;
-		regmoves.put(LIVE, vreg, src, dst);
-		if (regSet.isReg(src)) regindex[src] = index;
-	}
-	def emit(codegen: SsaMachGen, next: ArchInstr) {
-		for (j < saves.length) {
-			var s = saves[j], vreg = s.0, src = s.1, dst = s.2;
-			if (src != dst) codegen.insertMoveLocLoc((vreg, src), (vreg, dst), vreg.regClass, next);
-		}
-		for (j < regmoves.length) emit0(codegen, j, next);
-		for (j < reloads.length) {
-			var t = reloads[j], vreg = t.0;
-			if (vreg.isConst()) codegen.insertMoveValLoc(vreg, (vreg, t.1), vreg.regClass, next);
-			else codegen.insertMoveLocLoc((vreg, vreg.spill), (vreg, t.1), vreg.regClass, next);
-		}
-	}
-	def emit0(codegen: SsaMachGen, j: int, next: ArchInstr) {
-		var t = regmoves[j], state = t.0, vreg = t.1, src = t.2, dst = t.3;
-		if (state < LIVE) return; // already done on or stack
-		regmoves[j] = (ON_STACK, vreg, src, dst);
-		var d = regindex[dst];
-		if (d >= 0) { // is the source of some regmove
-			var u = regmoves[d];
-			if (u.0 == ON_STACK) {
-				var regClass = u.1.regClass;
-				var scratch = regSet.scratch[regClass.tag];
-				regmoves[d] = (IN_CYCLE, u.1, u.2, scratch);
-				codegen.insertMoveLocLoc((vreg, dst), (vreg, scratch), regClass, next);
-			} else if (u.0 == LIVE) {
-				emit0(codegen, d, next);
-			}
-		}
-		// reload entry after recursion
-		t = regmoves[j];
-		if (t.0 == IN_CYCLE) src = t.3; // use scratch of entry
-		codegen.insertMoveLocLoc((vreg, src), (vreg, dst), vreg.regClass, next);
-		regmoves[j] = (DEAD, null, 0, 0);
-	}
-	def clear() {
-		for (i < regindex.length) regindex[i] = -1;
-		regmoves.resize(0);
-		saves.resize(0);
-		reloads.resize(0);
 	}
 }

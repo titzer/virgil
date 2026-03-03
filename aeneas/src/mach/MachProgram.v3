@@ -21,6 +21,10 @@ class MachProgram extends TargetProgram {
 	def fieldMap      = IrUtil.newIrItemMap<Address<IrField>>();
 	def recordMap     = V3.newRecordMap<Address<Record>>();
 	def recordQueue   = Vector<Record>.new();
+	var importAdapterGen: MachImportAdapterGen;
+	var exports: Vector<IrRoot>;
+	var explicitExports = false;
+	var exportAddrs: PartialMap<string, Addr>;
 	def stubMap       = Strings.newMap<(Addr, (Addr, MachDataWriter) -> void)>();
 	var longMap: HashMap<long, Addr>;
 	def entryStub = Addr.new(codeRegion, null, 0);
@@ -30,16 +34,19 @@ class MachProgram extends TargetProgram {
 	var allocates = false;
 	var stackAlign: int;
 	var numMethods: int;
-	var negativeHeaders = false; // object headers are at negative offsets
 
 	new(prog: Program, code, data, intNorm) super(prog) {
 		stackAlign = data.addrAlign.size;
 	}
 	def build(compiler: Compiler, config: MachLoweringConfig) {
 		prog.ir.classes.apply(processIrClass);
-		var methods = prog.ir.methods;
 		var lowering = config.MachLoweringFactory(this, compiler, config);
 		var opt = if(compiler.MachOptimize, SsaOptimizer.new(lowering.context));
+
+		var imports = prog.ir.imports;
+		if (imports.length > 0) buildImports(compiler, imports);
+
+		var methods = prog.ir.methods;
 		for (i < methods.length) {
 			lowering.doMethod(methods[i]);
 			if (compiler.MachOptimize &&
@@ -51,6 +58,62 @@ class MachProgram extends TargetProgram {
 			SsaGraphVerifier.new(lowering.context).verify();
 		}
 		numMethods = methods.length;
+		// extract exports; explicitly export main if it is not already exported under "main"
+		var main = prog.getMain();
+		var mainMeth = if(main != null, main.asMethod());
+		var mainName = if(mainMeth != null, mainMeth.source.name(), "");
+		var sawMain = false;
+		for (i < prog.ir.roots.length) {
+			var root = prog.ir.roots[i];
+			if (root.name != null) {
+				if (root.spec.asMethod() == mainMeth && Strings.equal(root.name, mainName)) sawMain = true;
+				if (exports == null) exports = Vector<IrRoot>.new();
+				exports.put(root);
+				explicitExports = true;
+			}
+		}
+		if (main != null && !sawMain) {
+			if (exports == null) exports = Vector<IrRoot>.new();
+			exports.put(prog.ir.roots[prog.mainRootIndex]);
+		}
+	}
+	def buildImports(compiler: Compiler, imports: Vector<IrImport>) {
+		for (i < imports.length) {
+			var imp = imports[i], meth = imp.meth;
+			var compName = Parser.canonExternalName(ComponentType.!(meth.receiver).componentDecl.importName);
+			var methName = Parser.canonExternalName(meth.source.importName);
+			var sep = if(compName.length == 0, "", ".");
+			imp.name = Strings.builderOf(compName).puts(sep).puts(methName).extract();
+			var addr: Addr;
+			if (importAdapterGen != null) {
+				addr = ExtAddr.new(imp.name);
+				importAdapterGen.doMethod(meth, addr);
+				importAdapterGen.context.printSsa("Mach import adapter");
+			} else {
+				addr = addrOfMethod(meth);
+			}
+			addr.absolute = long.!(-2 - i); // used to record patches into the IrImport
+		}
+	}
+	def getExportAddrs() -> PartialMap<string, Addr> {
+		// this cannot be computed in build because it has to come after addrs are set
+		if (exportAddrs != null) return exportAddrs;
+		if (exports == null) return null;
+		exportAddrs = Strings.newMap();
+		for (i < exports.length) {
+			var root = exports[i];
+			var meth = root.spec.asMethod();
+			var name = if(root.name == null, meth.source.name(), root.name);
+			var addr = methodMap[meth];
+			if (addr == null || addr.absolute < 0) {
+				var range = if(meth.source != null, meth.source.token.range());
+				prog.ERROR.addError(range, null, "ExportDeclError: exported method is undefined", name);
+				continue;
+			}
+			if (exportAddrs == null) exportAddrs = Strings.newMap();
+			exportAddrs[name] = addr;
+		}
+		return exportAddrs;
 	}
 	def processIrClass(ic: IrClass) {
 		if (ic.machSize >= 0) return;
@@ -66,28 +129,26 @@ class MachProgram extends TargetProgram {
 			mlayout.addType(tagType);
 		}
 		var b = ic.fields;
-		var show = (CLOptions.PRINT_MACH.get() != VstMatcher.None);
-		var buf: TerminalBuffer;
+		var show = (CLOptions.PRINT_MACH_FIELDS.get());
+		var buf = Terminal.buf;
 		if (show) {
-			buf = TerminalBuffer.new().puts("Fields for ");
-			buf = TerminalBuffer.!(ic.ctype.render(buf)).puts(":").outln();
+			if (V3.isVariant(t)) buf.puts("type ");
+			else if (V3.isClass(t)) buf.puts("class ");
+			buf.putq(t.render).outln();
 		}
 
 		for (i = start; i < b.length; i++) {
 			var f = b[i];
 			f.machOffset = mlayout.addType(f.fieldType);
 			if (show) {
-				if (f.source == null) {
-					buf.puts("??");
-				} else {
-					buf.put2("%q{%d}", f.source.render(_), f.index);
-				}
-				buf.put1(" at %d", f.machOffset).outln();
+				buf.put1("  field[%d]", f.index);
+				if (f.source != null) buf.puts(" \"").putq(f.source.render).putc('\"');
+				buf.put1(" offset=%d", f.machOffset).outln();
 			}
 		}
 		ic.machSize = mlayout.size;
 		// create GC maps for object if necessary
-		if (runtime != null && runtime.gc != null && Facts.isLive(ic)) runtime.gc.recordTypeRefMap(ic);
+		if (runtime != null && runtime.gc != null && IrUtil.isLive(ic)) runtime.gc.recordTypeRefMap(ic);
 	}
 	def processComponent(ic: IrClass) {
 		// queue component record for processing
@@ -125,7 +186,7 @@ class MachProgram extends TargetProgram {
 		var mlayout = MachLayout.new(this);
 		var isMixed = false;
 		var ets = arrayRep.elemTypes = Tuple.toTypeArray(elemType);
-		
+
 		arrayRep.offsets = Arrays.map(ets, mlayout.addType);
 		arrayRep.elemScale = mlayout.size;
 
@@ -221,7 +282,7 @@ class MachProgram extends TargetProgram {
 		}
 		return val;
 	}
-	def machTypeList(list: List<Type>) -> List<Type> {
+	def machTypeList(list: List<Type>) -> List<Type> { // XXX: use type flattening util
 		if (list == null) return null;
 		var sub = machTypeList(list.tail);
 		var head = list.head, kind = head.typeCon.kind;
@@ -235,9 +296,6 @@ class MachProgram extends TargetProgram {
 			head = machType(head);
 		}
 		return if(head == list.head && sub == list.tail, list, List.new(head, sub));
-	}
-	def getCodeAddress(methodRef: IrSpec) -> Val {
-		return addrOfMethod(methodRef.asMethod());
 	}
 	def getArrayLengthOffset(arrayType: Type) -> int {
 		return arrayRep(arrayType).lengthOffset;
@@ -263,7 +321,7 @@ class MachProgram extends TargetProgram {
 		}
 		return data.addrAlign.alignUp_i32(size);
 	}
-	def alignTo(i: int, a: int) -> int {
+	def alignTo(i: int, a: int) -> int { // XXX: replace uses with Alignment
 		// XXX: use masks for powers of two
 		if (a > 1) return (i + a - 1) / a * a;
 		return i;
@@ -275,27 +333,7 @@ class MachProgram extends TargetProgram {
 	}
 	def classIdRange(t: Type) -> (int, int) {
 		var r = prog.ir.getIrClass(t);
-		if (r == null) return (0, 0);
-		return (r.minClassId * code.addressSize, r.maxClassId * code.addressSize);
-	}
-	def componentFieldPtr(f: IrSpec) -> Val {
-		return fieldMap[f.asField()];
-	}
-	def classFieldOffset(f: IrSpec) -> int {
-		return f.asField().machOffset;
-	}
-	def methodTable(spec: IrSpec) -> Addr {
-		var mtable = IrSelector.!(spec.member).mtable;
-		if (mtable == null) return V3.fail1("mtable is null for %q", spec.render);
-		var mtaddr = mtableMap[mtable];
-		if (mtaddr == null) { // allocate space in method region for mtable
-			var size = mtable.table.length * code.addressSize;
-			mtaddr = metaRegion.allocate(mtable, size);
-			// return a pointer to a table indexed starting from 0
-			mtaddr = mtaddr.add(0 - mtable.rootId * code.addressSize);
-			mtableMap[mtable] = mtaddr;
-		}
-		return mtaddr;
+		return if(r != null, (r.minClassId * code.addressSize, r.maxClassId * code.addressSize));
 	}
 	def unexpectedType<T>(t: Type, v: T) -> T {
 		return prog.ERROR.unexpectedType(t, v);
@@ -465,6 +503,10 @@ class MachProgram extends TargetProgram {
 	}
 	def encodeAddr(w: DataWriter, space: AddressSpace, addr: Addr) {
 		var abs = absolute(addr);
+		if (abs < -1) {
+			var index = int.!(2 - abs), imp = prog.ir.imports[index];
+			imp.patches = List.new((w.addr(), w.pos), imp.patches);
+		}
 		if (CLOptions.PRINT_BIN.get()) {
 			TerminalBuffer.new()
 				.puts("encode ")
@@ -570,7 +612,7 @@ class MachProgram extends TargetProgram {
 		if (a.is<IrField>()) {
 			// a global field in the data section
 			var f = a.get<IrField>();
-			if (!f.facts.F_VALUE) {
+			if (!f.flags.F_VALUE) {
 				if (isRefType(f.fieldType)) runtime.gc.recordRootRef(off);
 			}
 		} else if (a.is<Record>()) {
@@ -615,6 +657,7 @@ class MachProgram extends TargetProgram {
 		return addr;
 	}
 	def getLongConstAddr(val: long) -> Addr {
+		// XXX: remove when last x86-64 lowering is gone
 		if (longMap == null) longMap = HashMap.new(Long.hash, long.==);
 		var addr = longMap[val];
 		if (addr == null) {
@@ -632,7 +675,11 @@ class Mach_FuncRep extends MachRep {
 	def returnTypes: Array<Type>;
 	var callConv: MachCallConv;
 	new(oldType: Type, newType: Type, paramTypes, returnTypes) super(oldType, newType) { }
+	def dup() -> Mach_FuncRep {
+		return Mach_FuncRep.new(origType, machType, paramTypes, returnTypes);
+	}
 }
+
 // Machine representation of an array.
 class Mach_V3Array extends MachRep {
 	var lengthOffset: int;
@@ -640,7 +687,7 @@ class Mach_V3Array extends MachRep {
 	var elemScale: int;
 	var typeTag: Box<int>;
 	// for compound arrays
-	var elemTypes: Array<Type>; 
+	var elemTypes: Array<Type>;
 	var offsets: Array<int>;
 	var refmap: int;
 
@@ -660,7 +707,7 @@ class Mach_V3Array extends MachRep {
 	}
 }
 // A layout is used for adding fields sequentially to a memory area, aligning fields
-// as necessary and recording which offsets contain references.
+// as necessary.
 class MachLayout(mach: MachProgram) {
 	var size: int;
 

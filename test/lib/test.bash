@@ -15,6 +15,11 @@ if [[ "$1" =~ "-fatal-calls=" ]]; then
     let PROGRESS_PIPE=0
 fi
 
+if [ "$1" = "-fatal" ]; then
+    FATAL="-fatal"
+    shift
+fi
+
 if [ $# -gt 0 ]; then
   TESTS=$*
 else
@@ -33,14 +38,14 @@ function do_v3i() {
 
     if [ "$PROGRESS_PIPE" = 1 ]; then
 	print_status Running v3i
-	run_v3c "" -run $TESTS $LIB_FILES | tee $P | $PROGRESS
+	run_v3c "" -run $TESTS $LIB_FILES $FATAL | tee $P | $PROGRESS
 	print_status Running "v3i -ra"
-	run_v3c "" -ra -run $TESTS $LIB_FILES | tee $P | $PROGRESS
+	run_v3c "" -ra -run $TESTS $LIB_FILES $FATAL | tee $P | $PROGRESS
     else
 	print_status Running v3i
-	run_v3c "" -run $TESTS $LIB_FILES | tee $P
+	run_v3c "" -run $TESTS $LIB_FILES $FATAL | tee $P
 	print_status Running "v3i -ra"
-	run_v3c "" -ra -run $TESTS $LIB_FILES | tee $P
+	run_v3c "" -ra -run $TESTS $LIB_FILES $FATAL | tee $P
     fi
 }
 
@@ -71,7 +76,7 @@ function do_compiled() {
                 if [ "$short" = "run-wasm-gc-wasi1@node" ]; then
 	            $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-wasi1-common/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
                 else
-	            $OUT/$target/main $TESTS | tee $R | $PROGRESS
+	            $OUT/$target/main $FATAL $TESTS | tee $R | $PROGRESS
                 fi
             else
 	        printf "${YELLOW}skipped${NORM}\n"
