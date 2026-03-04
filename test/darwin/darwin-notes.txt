@@ -1,0 +1,283 @@
+# Notes on x86-64-darwin Rosetta 2 Compatibility
+
+## The Core Problem (SOLVED -- see Session 3 Findings at bottom)
+
+Virgil generates static Mach-O binaries for x86-64-darwin using LC_UNIXTHREAD to
+set the initial thread state (including RIP = entry point). The problem was that
+the fix_rosetta branch used a text-relative rip (ts.rip = entryAddr - cs.vmaddr),
+which worked on Rosetta 2 but failed on native x86-64.
+
+NOTE: The assumption below about Rosetta 2 using text-relative rip turned out to
+be INCORRECT on macOS 26.3+. See Session 3 Findings for the correct behavior.
+
+  - Native x86-64 kernel: rip = ABSOLUTE entry address
+  - Rosetta 2 (macOS 26.3+): ALSO uses ABSOLUTE entry address (same as native)
+
+For a single binary to work on BOTH: use ts.rip = entryAddr (absolute address)
+with __PAGEZERO covering [0, 0x100000000) and __TEXT starting at 0x100000000.
+
+## Mathematical Analysis
+
+The two interpretations converge when:
+  native entry = rip = text_vmaddr + rip (Rosetta)
+  => text_vmaddr = 0
+
+BUT: Rosetta 2 kills binaries where __TEXT.vmaddr = 0 with SIGKILL.
+This appears to be a Rosetta 2 security/validation requirement.
+
+## What Was Tried
+
+### 1. LC_MAIN (macOS 10.8+ entry point command)
+- Added MachO_MainCmd class with entryoff (offset from first non-PAGEZERO segment vmaddr)
+- LC_MAIN works identically on native and Rosetta (XNU computes entry = min_vm_addr + entryoff)
+- RESULT: SIGKILL / "main executable failed strict validation" from codesign
+- REASON: LC_MAIN requires dyld (dynamic linker). Static binaries cannot use it.
+
+### 2. Absolute rip (for native x86-64)
+- Set ts.rip = entryAddr (e.g., 0x1000041b0)
+- RESULT: SIGSEGV on Rosetta 2
+- REASON: Rosetta computes entry = 0x100004000 + 0x1000041b0 = 0x200008000 (unmapped)
+
+### 3. Text-relative rip (for Rosetta 2) -- the fix_rosetta branch commit
+- Set ts.rip = entryAddr - cs.vmaddr
+- RESULT: Works on Rosetta 2, SIGSEGV on native x86-64
+- REASON: Native kernel uses rip as absolute, jumps to a tiny offset (e.g. 0x1b0)
+  which is in the __PAGEZERO null zone (unmapped)
+
+### 4. Small null zone experiment
+- Changed startAddr = 0x8000 (instead of 4GB)
+- RESULT: Still works on Rosetta 2
+- CONCLUSION: Rosetta 2 does NOT require a 4GB null zone, just SOME null zone.
+
+### 5. text_vmaddr = 0 (no null zone) experiment
+- startAddr = 0, no __NULL segment, no skipPage()
+- RESULT: SIGKILL on Rosetta 2
+- CONCLUSION: Rosetta 2 requires SOME non-zero vmaddr for __TEXT (or at least
+  some null/pagezero zone at address 0).
+
+## Current Approach (in the file now -- failing on Rosetta 2)
+
+The current X86_64Darwin.v3 uses startAddr = 0, no null zone:
+  - __TEXT.vmaddr = 0 (alignDown(header_size) = 0 since header_size < 16KB)
+  - rip = entryAddr = header_size (e.g., 0x168)
+  - For native: entry = 0x168 (absolute) -- lands in binary ✓ (if __TEXT.vmaddr=0)
+  - For Rosetta: entry = 0 + 0x168 = 0x168 ✓ (same!)
+  - PROBLEM: Rosetta 2 kills the binary because __TEXT.vmaddr = 0
+
+## Key Technical Details
+
+### DataWriter.skipAddr()
+  def skipAddr(length: long) -> this {
+      startAddr += u64.!(length);  // shifts virtual base address ONLY
+  }
+  // does NOT advance file position!
+  // skipPage() = skipAddr(pageAlign.size) only shifts vmaddr base
+
+### endPageAddr()
+  def endPageAddr() -> long {
+      return long.!(addr_end() & ~u64.!(pageAlign.size - 1));
+  }
+  // rounds DOWN (alignDown), not up
+
+### The code_offset calculation
+After w.skipN(header.totalsize) + w.skipPage():
+  - startAddr = original_startAddr + page_size
+  - file pos = header_size
+  - addr_end() = (original_startAddr + page_size) + header_size
+  - cs.vmaddr = alignDown(addr_end()) = original_startAddr + page_size (if header_size < page)
+  - entryAddr = addr_end()
+  - code_offset = entryAddr - cs.vmaddr = header_size (always a small number, ~360-432 bytes)
+
+With startAddr = 0x100000000:
+  - cs.vmaddr = 0x100004000 (4GB + 1 page)
+  - entryAddr = 0x100004168 (approx)
+  - code_offset = 0x168 = 360 bytes
+
+With startAddr = 0:
+  - cs.vmaddr = 0x4000 (1 page, after skipPage)
+  - entryAddr = 0x4168
+  - code_offset = 0x168 = 360 bytes
+
+## The Trampoline Approach (not yet implemented)
+
+The idea: make rip = V where:
+  - Native: jumps to absolute address V (a trampoline)
+  - The trampoline contains `mov rax, real_entry; jmp rax`
+  - Rosetta: jumps to text_vmaddr + V = real_entry directly
+
+For this to work: text_vmaddr + V = real_entry
+  => text_vmaddr = real_entry - V
+
+If the trampoline is at absolute address V = T, and real_entry = T + text_vmaddr:
+  We need a single page of "jump code" at vmaddr T before the real code.
+
+Concrete example (needs validation):
+  - Null zone: [0, 0x4000) vmaddr, no file bytes
+  - __TEXT segment: vmaddr = 0x4000
+    - At text offset 0x0000 (vmaddr 0x4000): trampoline (JMP to 0x8000)
+    - At text offset 0x4000 (vmaddr 0x8000): real code
+  - ts.rip = 0x4000
+
+  - Native: entry = 0x4000 -> trampoline -> JMP 0x8000 -> real code ✓
+  - Rosetta: entry = 0x4000 + 0x4000 = 0x8000 -> real code ✓
+
+The trampoline is:
+  mov rax, 0x8000  (48 B8 00 80 00 00 00 00 00 00)  -- 10 bytes
+  jmp rax          (FF E0)                            -- 2 bytes
+
+The real_entry address (0x8000) must be patched in after layout.
+
+PROBLEM: This requires 16KB (one page) of padding between the trampoline and the
+real code within the TEXT segment. Also, the trampoline address must be absolute
+and patched correctly.
+
+## Key Constraints Summary
+
+1. Rosetta 2 requires __TEXT.vmaddr > 0 (some null/pagezero zone at address 0)
+2. Native x86-64: LC_UNIXTHREAD.rip = absolute entry address
+3. Rosetta 2: LC_UNIXTHREAD.rip = text-relative offset (entry = text_vmaddr + rip)
+4. LC_MAIN is unusable for static binaries (requires dyld)
+5. The binary generates absolute addresses (no PIE/ASLR support in Virgil)
+6. Rosetta 2 requires page alignment of 16KB (vs 4KB for native x86-64)
+7. Small null zones work on Rosetta 2 (0x8000 tested successfully)
+8. code_offset within TEXT = header.totalsize (always ~360-432 bytes)
+
+## Files Modified
+
+- aeneas/src/exe/MachO.v3:
+  - Added LC_MAIN = 0x80000028 constant
+  - Added MachO_MainCmd class (24-byte command)
+
+- aeneas/src/x86-64/X86_64Darwin.v3:
+  - Currently has startAddr=0, no null zone, no skipPage (failing on Rosetta 2)
+  - Previously had the fix_rosetta approach (text-relative rip, works Rosetta, fails native)
+  - The MachO_X86_64ThreadState class was restored
+
+## Session 2 Findings (macOS 26.3 / Build 25D125)
+
+Test machine: Apple Silicon (arm64), macOS 26.3 (25D125), Rosetta 2 installed.
+
+### Strict Validation Problem
+
+On this machine, BOTH the fix_rosetta approach (text-relative rip) AND the trampoline
+approach (implemented in stash) fail with:
+
+  codesign -s - /tmp/HelloDarwin  =>  "main executable failed strict validation"
+
+And running unsigned gives: SIGKILL (exit 137).
+
+Using --no-strict gives: "internal error in Code Signing subsystem"
+
+This means macOS 26.3 requires x86-64 binaries to pass "strict validation" (via
+codesign) BEFORE they can run. The binary format must be acceptable to the code
+signing subsystem, or the binary is killed before execution.
+
+### Reference Binary (x86-64 system binary)
+
+/usr/bin/zip is a fat binary with an x86-64 slice. Its structure:
+  flags = 0x00200085 (MH_PIE | MH_TWOLEVEL | MH_DYLDLINK | MH_NOUNDEFS)
+  __PAGEZERO: vmaddr=0, vmsize=0x100000000 (4 GB)
+  __TEXT:     vmaddr=0x100000000 (right after __PAGEZERO, no gap)
+  Uses LC_MAIN + LC_LOAD_DYLIB (dynamically linked)
+  Has LC_CODE_SIGNATURE
+
+### Our binary vs reference
+
+Our binary: LC_UNIXTHREAD (static, no dyld), flags=0, no sections.
+Reference:  LC_MAIN (with dyld), flags=0x200085, sections, code signature.
+
+Key differences that could cause strict validation failure:
+  a) LC_UNIXTHREAD may be rejected by the strict validator on macOS 26+
+  b) Missing LC_CODE_SIGNATURE slot in the binary (even before signing)
+  c) No sections within segments
+  d) flags = 0 (missing MH_PIE or other flags)
+
+### Trampoline Approach (implemented in git stash)
+
+The trampoline was implemented in X86_64Darwin.v3 with startAddr = 0x4000:
+  - __TEXT.vmaddr = 0x4000 > 0 (satisfies Rosetta requirement)
+  - Trampoline at vmaddr 0x4168: movabs rax, 0x8168; jmp rax
+  - ts.rip = 0x4168 (native: jumps to trampoline; Rosetta: adds 0x4000 = 0x8168)
+  - Real code at vmaddr 0x8168
+  - Binary verified correct via xxd (0x48 0xB8 0x68 0x81 ... 0xFF 0xE0)
+  - BUT: fails "main executable failed strict validation" (same as fix_rosetta approach)
+
+### fix_rosetta commit bugs fixed
+
+In the fix_rosetta branch commit, two bugs were found:
+  1. Null zone segment named "__NULL" instead of "__PAGEZERO" (wrong name)
+  2. w.skipPage() after the header created a 16KB gap between __PAGEZERO end
+     and __TEXT start (0x100000000..0x100004000 gap -- not present in reference binaries)
+Both were fixed in the current file (renamed + skipPage removed), but strict
+validation still fails, so these alone were not the root cause.
+
+### Next Steps
+
+The strict validation failure is the blocking problem. Investigate:
+  1. Does macOS 26.3 require a code signature BEFORE execution? If so:
+     - Need to add an LC_CODE_SIGNATURE region to the binary output
+     - Implement ad-hoc SHA-256 signing in the Virgil compiler output
+  2. Is LC_UNIXTHREAD explicitly disallowed by strict validation on macOS 26+?
+     - Need to research XNU source or Apple documentation for validation rules
+  3. Does codesign --force -s - work on a simple hand-crafted static binary?
+     - Build a minimal known-correct static x86-64 binary and test
+  4. Check if makeExecutable() should also sign the binary (codesign -s -)
+
+## Session 3 Findings -- PROBLEM SOLVED
+
+The strict validation issue turned out to NOT be the blocking problem. The key
+insight came from examining a known-working static x86-64 binary produced by
+`ld -static` (the `hello_static` reference binary).
+
+### Discovery: Rosetta 2 on macOS 26.3 uses ABSOLUTE rip
+
+The `hello_static` reference binary (produced by the system linker):
+  - Uses LC_UNIXTHREAD (not LC_MAIN)
+  - Has __PAGEZERO: vmaddr=0, vmsize=0x100000000 (4 GB)
+  - Has __TEXT: vmaddr=0x100000000 (right after __PAGEZERO, NO gap)
+  - ts.rip = 0x100000279 (an ABSOLUTE address, not text-relative)
+  - This binary runs correctly on BOTH native x86-64 and Rosetta 2
+
+This disproves the earlier assumption in these notes:
+  WRONG: "Rosetta 2: rip = TEXT-RELATIVE offset (entry = text_vmaddr + rip)"
+  RIGHT: On macOS 26.3+, BOTH native x86-64 and Rosetta 2 treat
+         LC_UNIXTHREAD.rip as an ABSOLUTE virtual address.
+
+### The Fix
+
+The bug in X86_64Darwin.v3 was that after switching from LC_MAIN back to
+LC_UNIXTHREAD, the assignment still referenced `lm.entryoff` (from the LC_MAIN
+attempt) and `lm` was undefined. The `ts` (MachO_X86_64ThreadState) variable was
+declared but `ts.rip` was never set.
+
+Fix applied in aeneas/src/x86-64/X86_64Darwin.v3:
+  - BEFORE: lm.entryoff = entryAddr - cs.vmaddr  (lm undefined; wrong in any case)
+  - AFTER:  ts.rip = entryAddr                   (absolute address)
+
+The correct binary layout that works on BOTH platforms:
+  - __PAGEZERO: vmaddr=0, vmsize=0x100000000 (4 GB)
+  - __TEXT:     vmaddr=0x100000000 (= startAddr, right after __PAGEZERO, no gap)
+  - ts.rip = entryAddr (absolute, e.g. 0x100000130)
+  - No code signature required (ad-hoc signing happens via makeExecutable/chmod)
+
+### Test Results
+
+  $ bin/dev/v3c-dev -target=x86-64-darwin -output=/tmp apps/HelloDarwin/HelloDarwin.v3
+
+  # Native x86-64:
+  $ /tmp/HelloDarwin
+  Hello, Darwin!
+  # exit code: 15 (= bytes written by write syscall -- correct behavior)
+
+  # Rosetta 2:
+  $ arch -x86_64 /tmp/HelloDarwin
+  Hello, Darwin!
+  # exit code: 15 (= bytes written -- correct)
+
+### Why the Earlier Text-Relative Approach Failed
+
+The fix_rosetta branch used ts.rip = entryAddr - cs.vmaddr (text-relative) based
+on reports that Rosetta 2 added the text base to rip. This may have been true on
+an older macOS version. On macOS 26.3 (25D125), Rosetta 2 uses absolute rip, so:
+  - Text-relative rip: works Rosetta 2, SIGSEGV on native (absolute rip = tiny offset)
+  - Absolute rip:      works BOTH (the correct approach)
