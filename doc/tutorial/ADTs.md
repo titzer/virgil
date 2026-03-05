@@ -43,6 +43,13 @@ var node = Tree.Node(leaf1, leaf2);
 var x = node.height();  // == 2
 ```
 
+A variant method can also be used as a function value via `Type.method`, producing a function that takes the variant value as its first argument.
+
+```
+var f = Tree.height;                    // f: Tree -> int
+var x = f(Tree.Node(leaf1, leaf2));     // == 2
+```
+
 ## ADTs are immutable and use structural-equivalence ##
 
 In Virgil, ADT values are not (necessarily) represented as objects.

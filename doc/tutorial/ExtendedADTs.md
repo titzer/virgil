@@ -82,6 +82,26 @@ def describe(p: Priority) -> int {
 }
 ```
 
+## Type method references ##
+
+A method on a variant type `T` can be referenced as a function value using `T.m`, producing a function of type `T -> ReturnType` that takes a `T` value as its first argument.
+Dispatch is virtual: the function dispatches to the correct override based on the runtime case.
+
+```
+var f = Priority.level;             // f: Priority -> int
+f(Priority.Low)                     // 0
+f(Priority.High.Warning)            // 2: dispatches to High.level
+```
+
+This also works with subtype names:
+
+```
+var g = Priority.High.level;        // g: Priority.High -> int
+g(Priority.High.Critical)           // 2
+```
+
+Type method references can be stored, passed to other functions, or used in arrays just like any other function value.
+
 ## Narrowing to a subtype ##
 
 From a value of the parent type, you can test and downcast to a subtype using the query (`?`) and cast (`!`) operators:
