@@ -96,3 +96,43 @@ def fifth() {
 ```
 
 Why is chaining in this way useful? It turns out that it works really well with [type parameters](Typeparams.md). Returning the implicit `void` result of another call can often save a line of code, for example, by shortening a branch to a single line, like in the example of the `third` method above.
+
+## Adding methods to existing types ##
+
+Virgil allows adding methods to a class, component, or variant type from *outside* its declaration using a dotted name at the top level.
+
+```
+component Stats {
+    var count: int;
+}
+def Stats.increment() { Stats.count++; }
+def Stats.get() -> int { return Stats.count; }
+```
+
+This is useful for organizing related functionality across files, or for adding methods to a type without modifying its declaration block.
+The same syntax works for classes:
+
+```
+class Point(x: int, y: int) { }
+def Point.sum() -> int { return x + y; }
+```
+
+And for variant subtypes:
+
+```
+type Shape { case _; }
+type Shape.Circle { case Small; case Large; }
+def Shape.Circle.isSmall() -> bool { return this == Shape.Circle.Small; }
+```
+
+A dotted `def` must not duplicate a method already declared inside the type's own body — the compiler rejects redefinitions.
+
+Read-only field aliases can also be added to components and classes (but not variants) with the form `def T.name: Type = expr;`:
+
+```
+component Config { }
+def Config.maxRetries: int = 3;
+
+class Limits(lo: int, hi: int) { }
+def Limits.range: int = hi - lo;
+```
