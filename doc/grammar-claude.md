@@ -88,8 +88,8 @@ Member  ::= ['private'] [string]
 
 NewDef  ::= MethodParams (':' 'super' TupleExpr | 'super' TupleExpr)? BlockStmt
 
-DefDef  ::= DottedId TypeParams? MethodParams ReturnTypeAndBody           // method (dotted name allowed)
-          | id TypeParams? ':' TypeRef '=' Expr ';'                       // field alias (no dotted name)
+DefDef  ::= id TypeParams? MethodParams ReturnTypeAndBody                 // method
+          | id TypeParams? ':' TypeRef '=' Expr ';'                       // field alias
 
 VarDef  ::= id [':' TypeRef] ['=' Expr] ';'
 
