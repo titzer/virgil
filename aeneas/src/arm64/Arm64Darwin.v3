@@ -1,0 +1,196 @@
+// Copyright 2024 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def Regs: Arm64Regs;
+def MRegs: Arm64RegSet;
+
+def SPACE = AddressSpace.new("mem", false, 64, 8,
+	Alignment.new(16384), Alignment.new(8));  // arm64 macOS uses 16KB pages
+
+def target_ = Arm64DarwinTarget.new("arm64-darwin", false);
+def test_target_ = Arm64DarwinTarget.new("arm64-darwin-test", true);
+def X_ = if(Debug.UNSTABLE, (Aeneas.registerTarget(target_), Aeneas.registerTarget(test_target_)));
+
+// Darwin target for arm64 architecture. Generates a Mach-O binary directly.
+class Arm64DarwinTarget extends DarwinTarget {
+	def test: bool;
+	def MINIMUM_VADDR_START = 0x1_0000_0000L; // 4GB __PAGEZERO
+
+	new(name: string, test) super(name, SPACE, IntNormalizers.I64LE, Arm64Common.LOWERING,
+		Arm64DarwinBackend.new(_, _, _, _, _, test), null, MachO.CPU_TYPE_ARM64, MachO.CPU_SUBTYPE_ARM64_ALL) { }
+
+	def emit(compiler: Compiler, prog: Program) {
+		var rt = getRuntime(prog), mach = rt.mach;
+		mach.build(compiler, this.machLoweringConfig);
+
+		var header = MachO_Header.new(is64);
+		var pageAlign = mach.code.pageAlign;
+		header.cputype = this.cputype;
+		header.cpusubtype = this.cpusubtype;
+		header.filetype = MachO.MH_EXECUTE;
+		header.flags = 0; // no MH_PIE: disable ASLR
+
+		var startAddr = long.!(CLOptions.VM_START_ADDR.get());
+		if (startAddr < MINIMUM_VADDR_START) startAddr = MINIMUM_VADDR_START;
+		// __PAGEZERO covers [0, startAddr)
+		var pz = newSegmentLoad(header, "__PAGEZERO", 0);
+		pz.vmsize = startAddr;
+		// code (text) segment starts immediately after __PAGEZERO
+		var cs = newSegmentLoad(header, "__TEXT", MachO.VM_PROT_RX);
+		// data segment immediately follows code segment
+		var ds = newSegmentLoad(header, "__DATA", MachO.VM_PROT_RW);
+		// LC_UNIXTHREAD: set initial arm64 thread state (pc = absolute entry address).
+		var ts = MachO_Arm64ThreadState.new();
+		header.addCmd(ts);
+		// ex segment for trapping explicit checks
+		var ex = if(rt.src != null, newSegmentLoad(header, "__EX", 0));
+		// rtexe segment for runtime code
+		var runtimeCodeSize = int.!(CLOptions.RUNTIME_CODE_SIZE.get());
+		var rtexe = if(runtimeCodeSize > 0, newSegmentLoad(header, "__RT_TEXT", MachO.VM_PROT_RWX));
+		// stack segment: declared here so it's included in header.totalsize, but placed
+		// after __DATA (vmaddr set after data layout). __TEXT must start at startAddr
+		// (0x100000000); inserting __STACK before __TEXT breaks that.
+		var stackSize = int.!(pageAlign.alignUp_u64(CLOptions.STACK_SIZE.get()));
+		var ss = if(stackSize > 0, newSegmentLoad(header, "__STACK", MachO.VM_PROT_RW));
+
+		// create the buffer
+		var w = MachDataWriter.new(mach.code.pageAlign, startAddr, 300 + mach.numMethods * 50);
+		// write mach-o header placeholder (will be patched at end)
+		w.skipN(header.totalsize);
+		// generate code and runtime tables into buffer
+		var backend = Arm64DarwinBackend.new(compiler, prog, mach, w, null, test);
+		cs.vmaddr = w.endPageAddr();  // = startAddr = 0x100000000
+		var entryAddr = w.addr_end();
+		ts.pc = entryAddr;
+		rt.recordCodeStart(entryAddr);
+		backend.genAllCode();
+		var size = w.end();
+		if (size < pageAlign.size) w.skipN(pageAlign.size - size);
+		rt.recordCodeEnd(w.addr_end());
+		mach.reserveRuntimeCode(w);
+		mach.layoutMeta(w);
+		mach.layoutRuntime(w);
+		cs.filesize = w.end();
+		cs.vmsize = pageAlign.alignUp_i32(cs.filesize);
+		cs.fileoff = 0;
+		// generate the unmapped "ex" region for trapping explicit checks
+		if (ex != null) {
+			w.skipPage();
+			var exStart = w.endPageAddr();
+			var exSize = pageAlign.alignUp_i32(rt.src.layoutExRegion(exStart));
+			w.skipAddr(exSize);
+			ex.vmaddr = exStart;
+			ex.vmsize = exSize;
+			ex.filesize = 0;
+			ex.fileoff = 0;
+		}
+		// generate the runtime code region, if any
+		if (rtexe != null) {
+			w.skipPage();
+			var exStart = w.endPageAddr();
+			var exSize = pageAlign.alignUp_i32(runtimeCodeSize);
+			w.skipAddr(exSize);
+			rtexe.vmaddr = exStart;
+			rtexe.vmsize = exSize;
+			rtexe.filesize = 0;
+			rtexe.fileoff = 0;
+			rt.recordRuntimeCode(exStart, exSize);
+		}
+		// generate data into buffer
+		w.skipPage();
+		// Pad the file to the next page boundary so DATA starts at a page-aligned file offset.
+		w.atEnd();
+		var padTo = pageAlign.alignUp_i32(w.end());
+		if (padTo > w.end()) w.skipN(padTo - w.end());
+		w.align(mach.data.addressSize);
+		ds.vmaddr = w.endPageAddr();
+		ds.fileoff = w.end();
+		mach.layoutData(w);
+		rt.addHeapPointers(w);
+		ds.filesize = w.end() - ds.fileoff;
+		ds.vmsize = pageAlign.alignUp_i64(long.!(ds.filesize) + rt.heapSize + rt.shadowStackSize);
+		// Place the stack segment after the data region. The naturally unmapped gap of
+		// one page between __DATA end and __STACK start serves as a guard page.
+		if (ss != null) {
+			var stackStart = ds.vmaddr + ds.vmsize + long.!(pageAlign.size);
+			ss.vmaddr = stackStart;
+			ss.vmsize = stackSize;
+			ss.filesize = 0;
+			ss.fileoff = 0;
+			rt.recordStackStart(stackStart);
+			rt.recordStackEnd(stackStart + stackSize);
+		}
+		// patch all addresses in the binary
+		w.patch(mach);
+		// encode header at position 0 now that all addresses and offsets are known
+		header.encode(w.at(0));
+		header.encodeCmds(w);
+		// open the output file
+		var file = compiler.getOutputFileName(prog.name(), null);
+		var fd = System.fileOpen(file, false);
+		if (fd < 0) return prog.ERROR.OutputError(file);
+		// write the entire file from the buffer array
+		System.write(fd, w.alias());
+		System.fileClose(fd);
+		// change permissions to make binary executable
+		compiler.makeExecutable(file);
+	}
+}
+
+// Darwin-specific backend code generation for arm64.
+class Arm64DarwinBackend extends Arm64Backend {
+	def SYSNUM = Regs.R16;
+	def PARAM0 = Regs.R0;
+	def PARAM1 = Regs.R1;
+	def PARAM2 = Regs.R2;
+	def PARAM3 = Regs.R3;
+	def PARAM4 = Regs.R4;
+	def PARAM5 = Regs.R5;
+
+	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, dwarf: Dwarf,
+		test: bool) super(compiler, prog, mach, w, dwarf, test) { }
+
+	// Override Arm64Backend
+	def genSigHandlerInstall(signo: int, handler: Addr) { unimplemented(); }
+	def asm_exit_r(r: Arm64Gpr) {
+		asm.movq_r_r(PARAM0, r);
+		asm.movd_r_u16(SYSNUM, 1);	// SYS_exit = 1
+		asm.svc_u16(0x80);
+	}
+	def asm_exit_code(code: int) {
+		asm.movd_r_u16(SYSNUM, 1);	// SYS_exit = 1
+		asm.movd_r_u16(PARAM0, u16.view(code));
+		asm.svc_u16(0x80);
+	}
+	def genTestOutput(main: IrMethod, frame: MachFrame) {
+		// output the return register as a 4-byte integer to stdout
+		var gpr = loc_gpr(frame, frame.conv.callerRet(0));
+		asm.strd_r_r_i9(gpr, Regs.SP, 0);
+		asm.movd_r_u16(SYSNUM, 4);	// SYS_write = 4
+		asm.movd_r_u16(PARAM0, 1);			// stdout
+		asm.addq_r_r_u12_u1(PARAM1, Regs.SP, 0, 0);	// data is on stack
+		asm.movd_r_u16(PARAM2, 4);			// 4 bytes
+		asm.svc_u16(0x80);
+	}
+}
+
+// Mach-O LC_UNIXTHREAD load command for arm64 (ARM_THREAD_STATE64).
+// arm_thread_state64_t layout:
+//   x[29] (29 × u64) + fp + lr + sp = 32 × u64 = 256 bytes
+//   pc (u64) = 8 bytes
+//   cpsr (u32) + pad (u32) = 8 bytes
+//   total state = 272 bytes, count = 272/4 = 68 words
+//   cmdsize = 16 (header) + 272 = 288 bytes
+class MachO_Arm64ThreadState extends MachO_LoadCmd {
+	var pc: long;
+	def encode(is64: bool, w: DataWriter) {
+		w.put_b32(0x5);		// LC_UNIXTHREAD
+		w.put_b32(288);		// cmdsize
+		w.put_b32(6);		// ARM_THREAD_STATE64
+		w.put_b32(68);		// count: 272 / 4
+		w.zeroN(32 * 8);	// x0-x28, fp, lr, sp (256 bytes)
+		w.put_b64(pc);		// program counter
+		w.zeroN(8);		// cpsr (4) + pad (4)
+	}
+	def size(is64: bool) -> int { return 288; }
+}
