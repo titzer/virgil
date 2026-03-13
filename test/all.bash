@@ -11,7 +11,7 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 CI_FLAG="-ci"
 CI_RUNNING=0
 if [[ $@ =~ $CI_FLAG ]]; then 
-    CI_RUNNING=1
+    CI_RUNNING=0
 fi
 
 EXIT_SUCCESS=0
