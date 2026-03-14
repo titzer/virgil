@@ -14,6 +14,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 	var methodOverrideChecks: List<(VstCompoundVerifier, VstMethod)>;
 	var numImports = 0;
 
+
 	def forAll<T>(vec: Vector<T>, do: T -> void) {
 		for (i < vec.length) {
 			if (!ERROR.notTooMany) break;
@@ -26,6 +27,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 		forAll(vst.classes, resolveSuperClass);
 		forAll(vst.components, verifyComponent);
 		forAll(vst.classes, verifyClass);
+		forAll(vst.classes, assignVariantTagsIfRoot);
 		forAll(vst.enums, verifyEnum);
 		forAll(vst.layouts, verifyLayout);
 		forAll(vst.exports, verifyExport);
@@ -187,10 +189,238 @@ class Verifier(compiler: Compiler, prog: Program) {
 				decl.numMethods = superDecl.numMethods;
 			}
 		} else if (decl.kind == Kind.VARIANT) {
-			// top-level variant class
-			if (compiler.unboxVariantEarly(decl)) decl.repHints = List.new(VstRepHint.Unboxed, decl.repHints);
+			if (decl.qualifiers != null) {
+				// subtype variant: RepHints are not allowed
+				if (decl.repHints != null) cv.errAtDecl(decl).set("VariantDeclError",
+					"representation hints are not allowed on subtype variants");
+				verifyVariantQualifiers(decl, cv);
+			} else {
+				// top-level variant: RepHints are OK
+				if (compiler.unboxVariantEarly(decl)) decl.repHints = List.new(VstRepHint.Unboxed, decl.repHints);
+			}
+			checkVariantDefaultCase(decl, cv);
 		}
 		cv.verify();
+	}
+	// Verify the qualifier chain of a dot-named variant (e.g. "type A.B.C").
+	// Checks: first qualifier names a top-level variant; each intermediate variant
+	// has a case _; the name doesn't clash with named cases of the parent; and the
+	// name is unique among direct subtypes of the parent.
+	def verifyVariantQualifiers(decl: VstClass, cv: VstCompoundVerifier) {
+		var q = decl.qualifiers;
+		// Resolve first qualifier: must be a top-level (root) variant.
+		var firstTok = q.head;
+		var tc = prog.typeEnv.lookup(firstTok.image);
+		if (tc == null || tc.kind != Kind.VARIANT) {
+			cv.errAtToken(firstTok).set("VariantDeclError",
+				Strings.format1("qualifier \"%s\" does not name a variant type", firstTok.image));
+			return;
+		}
+		var parentClass = ClassType.!(tc.create0()).classDecl;
+		if (!(parentClass.isVariant() && !parentClass.isVariantCase())) {
+			cv.errAtToken(firstTok).set("VariantDeclError",
+				Strings.format1("\"%s\" must be a top-level variant type", firstTok.image));
+			return;
+		}
+		q = q.tail;
+		// Walk any remaining qualifiers (for names like A.B.C).
+		while (q != null) {
+			if (!variantHasDefaultCase(parentClass)) {
+				cv.errAtToken(q.head).set("VariantDeclError",
+					Strings.format1("variant \"%s\" has no 'case _'", parentClass.name()));
+				return;
+			}
+			var tok = q.head;
+			var tc2 = prog.typeEnv.lookup(tok.image);
+			if (tc2 == null || tc2.kind != Kind.VARIANT) {
+				cv.errAtToken(tok).set("VariantDeclError",
+					Strings.format1("qualifier \"%s\" does not name a variant type", tok.image));
+				return;
+			}
+			var nextClass = ClassType.!(tc2.create0()).classDecl;
+			if (!isDirectSubtypeOf(nextClass, parentClass)) {
+				cv.errAtToken(tok).set("VariantDeclError",
+					Strings.format2("\"%s\" is not a direct subtype of \"%s\"", tok.image, parentClass.name()));
+				return;
+			}
+			parentClass = nextClass;
+			q = q.tail;
+		}
+		// parentClass is the immediate parent of decl.
+		if (!variantHasDefaultCase(parentClass)) {
+			cv.errAtDecl(decl).set("VariantDeclError",
+				Strings.format1("variant \"%s\" has no 'case _'", parentClass.name()));
+			return;
+		}
+		// Name must not clash with a named case of the parent.
+		var declName = decl.name();
+		for (c in parentClass.cases) {
+			if (!Strings.equal(c.name(), "_") && Strings.equal(c.name(), declName)) {
+				cv.errAtDecl(decl).set("VariantDeclError",
+					Strings.format2("subtype name \"%s\" conflicts with case of \"%s\"",
+						declName, parentClass.name()));
+				return;
+			}
+		}
+		// Name must be unique among direct subtypes of the parent.
+		if (parentClass.subtypes == null) parentClass.subtypes = Strings.newMap();
+		if (parentClass.subtypes[declName] != null) {
+			cv.errAtDecl(decl).set("VariantDeclError",
+				Strings.format2("subtype \"%s\" of \"%s\" declared more than once",
+					declName, parentClass.name()));
+		} else {
+			parentClass.subtypes[declName] = decl;
+			parentClass.subtypeOrder = List.new(decl, parentClass.subtypeOrder);
+		}
+		// Set up method inheritance: verify the parent first, then link the supertype chain.
+		verifyClass(parentClass);
+		var parentClassType = ClassType.!(parentClass.typeCon.create0());
+		// Wire parentClassType into the ClassType chain so lookupSuperMember() and IR
+		// building can walk transitively. Variant subtypes don't use classDecl.superclass.
+		parentClassType.superType = parentClass.verifier.superType;
+		// If the parent has a case _, route inheritance through it so its methods are
+		// visible to this subtype (and may override parent methods).
+		var defaultCaseDecl = findDefaultCase(parentClass);
+		if (defaultCaseDecl != null) verifyClass(defaultCaseDecl);
+		var effectiveSuperDecl = if(defaultCaseDecl != null, defaultCaseDecl, parentClass);
+		var effectiveSuperType = ClassType.!(effectiveSuperDecl.typeCon.create0());
+		ClassType.!(decl.typeCon.create0()).superType = effectiveSuperType;
+		cv.superType = effectiveSuperType;
+		decl.numMethods = effectiveSuperDecl.numMethods;
+	}
+	// Returns true if child.qualifiers == parent.qualifiers ++ [parent.name()].
+	def isDirectSubtypeOf(child: VstClass, parent: VstClass) -> bool {
+		var cq = child.qualifiers;
+		if (cq == null) return false;
+		// The prefix of child's qualifiers must match all of parent's qualifiers.
+		for (l = parent.qualifiers; l != null; l = l.tail) {
+			if (cq == null || !Strings.equal(cq.head.image, l.head.image)) return false;
+			cq = cq.tail;
+		}
+		// The next element must be parent.name() and then end.
+		return cq != null && Strings.equal(cq.head.image, parent.name()) && cq.tail == null;
+	}
+	// Check that a variant has at most one "case _" and that it comes last.
+	def checkVariantDefaultCase(decl: VstClass, cv: VstCompoundVerifier) {
+		if (decl.cases == null) return;
+		var seenDefault = false;
+		for (c in decl.cases) {
+			if (Strings.equal(c.name(), "_")) {
+				if (seenDefault) cv.errAtToken(c.token).set("VariantDeclError", "duplicate default case '_'");
+				seenDefault = true;
+			} else if (seenDefault) {
+				cv.errAtToken(c.token).set("VariantDeclError", "regular case must come before default case '_'");
+			}
+		}
+	}
+	// Returns true if the variant class has a "case _" default case.
+	def variantHasDefaultCase(decl: VstClass) -> bool {
+		for (c in decl.cases) {
+			if (Strings.equal(c.name(), "_")) return true;
+		}
+		return false;
+	}
+	// Returns the synthetic VstClass for the "case _" of a variant, or null if none.
+	def findDefaultCase(decl: VstClass) -> VstClass {
+		for (c in decl.cases) {
+			if (Strings.equal(c.name(), "_")) return c.decl;
+		}
+		return null;
+	}
+	// Returns true if this variant has at least one named "case id" (not "case _").
+	def variantHasNamedCases(decl: VstClass) -> bool {
+		if (decl.cases == null) return false;
+		for (c in decl.cases) {
+			if (!Strings.equal(c.name(), "_")) return true;
+		}
+		return false;
+	}
+	// Create a hidden "$default" VstClass as the first tag in parent's tag range.
+	// This gives a well-defined zero-like value for variant types that have no named cases.
+	def makeSyntheticDefaultClass(parent: VstClass, tag: int) {
+		var tok = Token.new(parent.token.fileName, "$default",
+			parent.token.beginLine, parent.token.beginColumn);
+		var sd = VstClass.new(false, tok, null, null, null, null, null);
+		sd.kind = Kind.VARIANT;
+		sd.isSynthetic = true;
+		sd.fullName = Strings.format1("%s.$default", parent.fullName);
+		sd.variantTag = tag;
+		sd.variantTagHi = tag;
+		parent.syntheticDefault = sd;
+	}
+	// Entry point for DFS tag assignment: only process root variants (no qualifiers).
+	// For each root variant, assigns contiguous tags via DFS preorder so that subtype
+	// variants get a range [lo, hi] covering all their descendants.
+	// "case _" gets its own leaf tag (so zero-initialization gives a well-defined value).
+	def assignVariantTagsIfRoot(decl: VstClass) {
+		if (decl.qualifiers != null) return;		// skip subtype variants
+		if (!decl.isVariant()) return;			// skip non-variants
+		if (decl.isVariantCase()) return;		// skip named case classes
+		var nextTag = 0;
+		if (decl.cases != null) {
+			// Process all named cases in declaration order, including "case _".
+			for (c in decl.cases) {
+				nextTag = assignTagsDFS(c.decl, nextTag);
+			}
+			// Process subtypes and extend "case _" tagHi to cover their range.
+			if (decl.subtypeOrder != null) {
+				for (l = decl.subtypeOrder; l != null; l = l.tail) {
+					nextTag = assignTagsDFS(l.head, nextTag);
+				}
+				var defaultCase = findDefaultCase(decl);
+				if (defaultCase != null) {
+					defaultCase.variantTagHi = nextTag - 1;
+				}
+			}
+		}
+		decl.variantTagHi = nextTag - 1;
+		// Recompute the tag type to fit all newly assigned tags.
+		var width = 1, exp = 2;
+		while (exp < nextTag) { exp = exp << 1; width++; }
+		decl.tagType = Int.getType(false, width);
+		propagateTagType(decl, decl.tagType);
+	}
+	// DFS over a case/subtype node: assigns tags starting at nextTag and returns
+	// the next available tag after this subtree.
+	// "case _" is treated as a regular leaf case with its own tag slot, placed before
+	// any subtype variants. Its tagHi is extended to cover the subtypes' range.
+	def assignTagsDFS(decl: VstClass, nextTag: int) -> int {
+		decl.variantTag = nextTag;	// lo of this node's range
+		var hasChildren = (decl.cases != null && decl.cases.length > 0) || decl.subtypeOrder != null;
+		if (!hasChildren) {
+			// Leaf: consume exactly one tag.
+			decl.variantTagHi = nextTag;
+			return nextTag + 1;
+		}
+		// Non-leaf: distribute range to children in declaration order.
+		if (decl.cases != null) {
+			for (c in decl.cases) {
+				nextTag = assignTagsDFS(c.decl, nextTag);
+			}
+		}
+		if (decl.subtypeOrder != null) {
+			for (l = decl.subtypeOrder; l != null; l = l.tail) {
+				nextTag = assignTagsDFS(l.head, nextTag);
+			}
+			// Extend "case _" tagHi to cover the subtypes' range.
+			var defaultCase = findDefaultCase(decl);
+			if (defaultCase != null) {
+				defaultCase.variantTagHi = nextTag - 1;
+			}
+		}
+		decl.variantTagHi = nextTag - 1;
+		return nextTag;
+	}
+	// Propagate the root's tagType down to all cases and subtype variants.
+	def propagateTagType(decl: VstClass, tagType: IntType) {
+		if (decl.syntheticDefault != null) decl.syntheticDefault.tagType = tagType;
+		if (decl.cases != null) {
+			for (c in decl.cases) c.decl.tagType = tagType;
+		}
+		for (l = decl.subtypeOrder; l != null; l = l.tail) {
+			l.head.tagType = tagType;
+			propagateTagType(l.head, tagType);
+		}
 	}
 	def verifyEnum(decl: VstEnum) {
 		var cv = decl.verifier;
@@ -665,7 +895,7 @@ class VstCompoundVerifier {
 				"index operation cannot be declared in component");
 			errAtDecl(decl).IndexDeclError(msg);
 		}
-		if (compound.isVariantCase() && EmptyStmt.?(decl.func.body)) {
+		if (compound.isVariantCase() && !Strings.equal(compound.name(), "_") && EmptyStmt.?(decl.func.body)) {
 			errAtStmt(decl.func.body).UnimplementedError("variant method must have a body");
 		}
 		if (decl.typeParams != null) typeEnv = decl.typeEnv = buildTypeEnv(typeEnv, decl.typeParams);
@@ -828,7 +1058,8 @@ class VstCompoundVerifier {
 				var leftType = if(x.left != null, resolveType(x.left, typeEnv));
 				if (V3.isVariant(leftType)) {
 					// Variant.Case resolution.
-					var member = ClassType.!(leftType).classDecl.memberMap[x.name.image];
+					var lct = ClassType.!(leftType);
+					var member = lct.classDecl.memberMap[x.name.image];
 					if (VstCaseMember.?(member)) {
 						var typeCon = VstCaseMember.!(member).decl.typeCon;
 						if (x.nested != null) {
@@ -836,6 +1067,31 @@ class VstCompoundVerifier {
 								x.name.image, 0, x.nested.length());
 						}
 						return x.binding = typeCon.create(leftType.nested);
+					}
+					// Subtype variant type reference (e.g. A.B).
+					// First check the parent's populated subtypes map.
+					if (lct.classDecl.subtypes != null) {
+						var subDecl = lct.classDecl.subtypes[x.name.image];
+						if (subDecl != null) {
+							if (x.nested != null) {
+								errAtRange(x.name.range()).TypeParamArityError("variant subtype",
+									x.name.image, 0, x.nested.length());
+							}
+							return x.binding = subDecl.typeCon.create0();
+						}
+					}
+					// Fall back: subtypes map may not be populated yet (early type resolution).
+					// Look the name up in the global type env and verify it is a direct subtype.
+					var subTc = verifier.prog.typeEnv.lookup(x.name.image);
+					if (subTc != null && subTc.kind == Kind.VARIANT) {
+						var subDecl = ClassType.!(subTc.create0()).classDecl;
+						if (verifier.isDirectSubtypeOf(subDecl, lct.classDecl)) {
+							if (x.nested != null) {
+								errAtRange(x.name.range()).TypeParamArityError("variant subtype",
+									x.name.image, 0, x.nested.length());
+							}
+							return x.binding = subDecl.typeCon.create0();
+						}
 					}
 				} else if (EnumType.?(leftType)) {
 					// Enum.set resolution.
@@ -1292,7 +1548,17 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		if (stmt.defcase != null) {
 			flow = FLOW_THRU;
 			mv.addDefaultCase(stmt.defcase);
-			flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
+			var defDecl = stmt.defcase.defaultDecl;
+			if (defDecl != null) {
+				// "x: _" named wildcard: bind x with the type of the match expression
+				defDecl.vtype = mv.etype;
+				var prev = methodEnv.env.enterScope();
+				methodEnv.bindVar(defDecl);
+				flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
+				methodEnv.env.exitScope(prev);
+			} else {
+				flow = mergeFlow(bf, typeCheckStmt(stmt.defcase.stmt));
+			}
 		} else {
 			flow = if(mv.allCovered(), bf, FLOW_THRU);
 		}
@@ -1339,7 +1605,10 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		mv.addValue(pat, val);
 	}
 	def bindPatternVariables(mv: MatchStmtVerifier, pat: MatchPattern) {
-		if (pat.vdecl != null) return methodEnv.bindVar(pat.vdecl);
+		if (pat.vdecl != null) {
+			if (pat.vdecl.ssa == null) methodEnv.bindVar(pat.vdecl); // skip binding for synthetic subtype vdecls
+			return;
+		}
 		if (pat.variantCase == null) return;  // already an error
 		var vt = mv.variantType;
 		if (vt == null) return;
@@ -1374,11 +1643,40 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 		if (ve.expr != null) {
 			return errAtExpr(ve).MatchError(Strings.format1("match on type %q requires unqualified case", vt.render));
 		}
-		var vc = pat.variantCase = vt.lookupCase(ve.ident.name.image);
+		var name = ve.ident.name.image;
+		var vc = pat.variantCase = vt.lookupCase(name);
 		if (vc == null) {
-			return errAtExpr(ve).MatchError(Strings.format2("unresolved case %q.%s", vt.render, ve.ident.name.image));
+			// Not a named case; check if it names a direct subtype variant.
+			if (vt.classDecl.subtypes != null) {
+				var subtypeDecl = vt.classDecl.subtypes[name];
+				if (subtypeDecl != null) {
+					var subtypeType = ClassType.!(subtypeDecl.typeCon.create0());
+					var tref = NamedTypeRef.new(null, ve.ident.name, null);
+					tref.binding = subtypeType;
+					pat.vdecl = VarDecl.new(ve.ident.name, tref, null);
+					pat.vdecl.isReadOnly = true;
+					pat.vdecl.vtype = subtypeType;
+					pat.vdecl.ssa = VstSsaVar.new();
+					return;
+				}
+			}
+			return errAtExpr(ve).MatchError(Strings.format2("unresolved case %q.%s", vt.render, name));
 		}
 		mv.addVariantPattern(pat, vc);
+	}
+	// Returns true if {candidate} is a (direct or transitive) subtype variant of {parent}.
+	// Checks that candidate.qualifiers starts with parent's qualifier chain followed by parent's name.
+	def isVariantSubtypeOf(candidate: VstClass, parent: VstClass) -> bool {
+		var cq = candidate.qualifiers;
+		if (cq == null) return false;
+		// Skip all qualifiers of parent in candidate's qualifier list.
+		for (l = parent.qualifiers; l != null; l = l.tail) {
+			if (cq == null || !Strings.equal(cq.head.image, l.head.image)) return false;
+			cq = cq.tail;
+		}
+		// The next element in candidate's qualifiers must be parent's own name.
+		if (cq == null || !Strings.equal(cq.head.image, parent.name())) return false;
+		return true;
 	}
 	def checkEnumPattern(mv: MatchStmtVerifier, pat: MatchPattern) {
 		if (!VarExpr.?(pat.expr)) return;
@@ -2394,9 +2692,11 @@ class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
 	var default: MatchCase;
 	new() {
 		if (V3.isVariant(etype)) {
-			// TODO: improve variant case matches by not going to supertype
 			var vt = ClassType.!(etype);
-			while (vt.classDecl.isVariantCase()) {
+			// Walk up through synthetic case classes (named cases) to find the owning
+			// variant type, but stop at subtype variants (isSynthetic=false) since they
+			// are proper match types with their own cases.
+			while (vt.classDecl.isVariantCase() && vt.classDecl.isSynthetic) {
 				var st = vt.getSuperType();
 				if (st == null) break;
 				vt = st;
@@ -2422,7 +2722,7 @@ class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
 			MatchError(pat.expr.range(), "duplicate variant pattern", covered[vc.tag].expr.range());
 		}
 		covered[vc.tag] = pat;
-		pat.val = Int.box(vc.tag);
+		pat.val = Int.box(vc.decl.variantTag);
 	}
 	def addEnumPattern(pat: MatchPattern, vc: VstEnumCase) {
 		if (covered[vc.tag] != null) {
@@ -2442,7 +2742,14 @@ class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
 		}
 		if (V3.isVariant(t) && variantType != null) {
 			var ct = ClassType.!(t);
-			if (ct.classDecl.isVariantCase() && TypeSystem.isSubtype(ct, variantType)) {
+			if (TypeSystem.isSubtype(ct, variantType)) {
+				if (ct.classDecl.qualifiers != null) {
+					// Subtype variant (e.g. x: B where type A.B). Generate a range
+					// test via VARIANT_QUERY; coverage is satisfied by the _ default arm.
+					return;
+				}
+				// Named case: variantTag equals the local cases[] index after DFS
+				// (DFS processes named cases before subtypes, preserving their order).
 				var tag = ct.classDecl.variantTag;
 				var vc = variantType.classDecl.cases[tag];
 				pat.variantCase = vc;
@@ -2464,6 +2771,17 @@ class MatchStmtVerifier(etype: Type, tc: TypeChecker) {
 			}
 			tc.errAtRange(default.range()).set("UnreachableCode", "unreachable default case");
 			return;
+		}
+		// If the variant has an open "case _", the match must have a default _ case.
+		if (variantType != null) {
+			for (c in variantType.classDecl.cases) {
+				if (Strings.equal(c.name(), "_")) {
+					MatchError(stmt.range(),
+						Strings.format1("match on open variant type %q requires a default case", variantType.render),
+						null);
+					return;
+				}
+			}
 		}
 		var buf: StringBuilder;
 		for (i < covered.length) {
