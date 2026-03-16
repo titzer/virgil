@@ -9,9 +9,10 @@ done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 CI_FLAG="-ci"
-CI_RUNNING=0
+export CI_RUNNING=0
 if [[ $@ =~ $CI_FLAG ]]; then 
     CI_RUNNING=1
+    shift 1
 fi
 
 EXIT_SUCCESS=0
@@ -97,7 +98,7 @@ case "$AENEAS_TEST" in
 	;;
 esac
 
-if [[ $# != 0 && ( $# != 1 && $CI_RUNNING == 1 ) ]]; then
+if [ $# != 0 ]; then
     TEST_DIRS="$@"
 else
     TEST_DIRS="unit asm/x86 asm/x86-64 redef core regalloc cast variants enums wasmgc fsi32 fsi64 float range layout funexpr readonly large pointer vmaddr darwin linux rt stacktrace gc system link lib wizeng apps bench"
@@ -156,11 +157,7 @@ for dir in unit lib; do
     td=$VIRGIL_LOC/test/$dir
     print_line
     echo "${CYAN}($V3C_STABLE) $dir${NORM}"
-    if [[ "$CI_RUNNING" -eq "1" && $dir == "unit" ]]; then
-        (cd $td && AENEAS_TEST=$V3C_STABLE $td/test.bash $CI_FLAG ) || exit $?
-    else 
-        (cd $td && AENEAS_TEST=$V3C_STABLE $td/test.bash) || exit $?
-    fi
+    (cd $td && AENEAS_TEST=$V3C_STABLE $td/test.bash) || exit $?
 done
 
 #######################################################################
