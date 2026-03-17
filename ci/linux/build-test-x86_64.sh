@@ -13,4 +13,4 @@ fi
 
 "${TEST_DIR}"/configure
 
-V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="v3i x86-64-linux" "${TEST_DIR}"/all.bash "-ci"
+V3C_OPTS="$@" PROGRESS_ARGS=c TEST_TARGETS="v3i x86-64-linux" "${TEST_DIR}"/all.bash 

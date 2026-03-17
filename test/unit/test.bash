@@ -14,6 +14,6 @@ run_v3c "" -fp -run $SRCS $AENEAS_LOC/../test/*.v3 $FATAL -version | $PROGRESS
 UNIT_TEST_STATUS=$?
 popd > /dev/null
 
-if (( $CI_RUNNING == 1 && $UNIT_TEST_STATUS != 0 )); then 
+if (( $UNITTEST == 1 && $UNIT_TEST_STATUS != 0 )); then 
     exit 1
 fi

@@ -8,10 +8,10 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-CI_FLAG="-ci"
-export CI_RUNNING=0
-if [[ $@ =~ $CI_FLAG ]]; then 
-    CI_RUNNING=1
+export UNITTEST=1
+IGNORE_UNIT_FLAG="-ignore-unit"
+if [[ $@ =~ $IGNORE_UNIT_FLAG ]]; then 
+    UNITTEST=0
     shift 1
 fi
 
