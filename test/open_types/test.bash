@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
-. ../common.bash core
+. ../common.bash open_types
+export V3C_OPTS="$V3C_OPTS -open-types"
+
 if [ $# -gt 0 ]; then
 	TESTS="$@"
 else
