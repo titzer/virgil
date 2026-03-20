@@ -116,3 +116,57 @@ if (Priority.High.?(p)) {                        // true if p is a Priority.High
 
 `T.?(v)` returns `true` if `v` is an instance of subtype `T`.
 `T.!(v)` performs the downcast and is only safe to use after a successful `?` test.
+
+## Parameterized open variants ##
+
+Open variants can have type parameters. A subtype variant passes through the same type parameters as its root — it must declare exactly the same number of type parameters.
+
+```
+type Result<T> {
+    case Ok(v: T);
+    case _;
+}
+type Result<T>.Err<T> {
+    case Error(code: int);
+}
+```
+
+You can also use the shorthand form, omitting the type arguments on the qualifier:
+
+```
+type Result.Err<T> {
+    case Error(code: int);
+}
+```
+
+Both forms have exactly the same meaning: `Err<T>` is a subtype of `Result<T>` and shares the same type parameter.
+
+### Construction and type references ###
+
+When constructing or referencing a parameterized subtype, type arguments can be provided through the parent or directly:
+
+```
+var a: Result<int> = Result<int>.Err.Error(404);   // type args on left
+var b: Result<int> = Result.Ok<int>(42);            // type args on case
+var c: Result<int>.Err<int>;                        // fully explicit
+```
+
+When the left side provides type arguments (`Result<int>.Err`), the subtype inherits them automatically.
+
+### Matching parameterized subtypes ###
+
+Match patterns on parameterized open variants work the same as non-parameterized ones — type arguments are inherited from the type being matched:
+
+```
+def unwrap<T>(r: Result<T>, fallback: T) -> T {
+    match (r) {
+        Ok(v) => return v;
+        e: Err => match (e) {      // e has type Result<T>.Err<T>
+            Error(code) => return fallback;
+        }
+        _ => return fallback;
+    }
+}
+unwrap(Result.Ok<int>(42), 0)              // returns 42
+unwrap(Result<int>.Err.Error(404), 7)      // returns 7
+```

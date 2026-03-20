@@ -36,6 +36,9 @@ VariantCase ::= 'case' id VariantCaseParams? RepHints? (';' | Members)   // name
               | 'def' DefDef
 
 DefaultCaseMembers ::= '{' (['private'] 'def' DefDef)* '}'               // only methods allowed (no 'var' or 'new')
+
+DottedId    ::= (id TypeArgs? '.')* id TypeParams?
+              // qualifier parts may carry type args; final part carries type params
 ```
 
 ### Variant subtype constraints (checked by verifier)
@@ -50,6 +53,21 @@ A `VariantDecl` whose `DottedId` has the form `D.T` (one or more dots) declares 
 - `T` must not clash with any named `case id` of the immediate parent.
 - `D.T` may be declared at most once (among all files of the program).
 - RepHints (`#boxed`, `#unboxed`, etc.) are **not** allowed on subtype variants; they are only allowed on root variants.
+
+### Subtype type parameters (pass-through)
+
+A parameterized root variant (e.g. `type Foo<T> { ... }`) may have parameterized subtypes that **pass through** the same type parameters. The subtype must declare the same number of type parameters as the root. Two declaration forms are supported:
+
+- **Explicit binding**: `type Foo<T>.Bar<T> { case B(v: T); }` — the qualifier carries matching type args.
+- **Shorthand**: `type Foo.Bar<T> { case B(v: T); }` — the qualifier omits type args (same meaning).
+
+When referencing a parameterized subtype, type arguments may be provided in several ways:
+
+- `Bar<int>` — direct reference with explicit type args.
+- `Foo<int>.Bar` — the left side provides type args; the subtype inherits them.
+- `Foo<int>.Bar<int>` — fully explicit; right-side args must match the left.
+
+In match patterns, unqualified subtype names (`Bar =>` or `b: Bar =>`) automatically inherit type arguments from the type being matched.
 
 ### Variant method inheritance
 
@@ -258,7 +276,7 @@ id          ::= IdentStart IdentMiddle*
 IdentStart  ::= [a-zA-Z]               // '_' is NOT an ident-start; it is a standalone keyword token
 IdentMiddle ::= [a-zA-Z0-9_]
 
-DottedId    ::= id ('.' id)*           // no whitespace around '.'; only valid where noted above
+DottedId    ::= (id TypeArgs? '.')* id TypeParams?   // no whitespace around '.'; qualifier parts may carry type args
 
 Number      ::= DecLiteral | HexLiteral | BinLiteral | FloatLiteral
               // suffixes: u (unsigned), i8/i16/i32/i64, u8/u16/u32/u64, f32/f64

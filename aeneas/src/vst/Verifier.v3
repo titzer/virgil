@@ -216,7 +216,8 @@ class Verifier(compiler: Compiler, prog: Program) {
 				Strings.format1("qualifier \"%s\" does not name a variant type", firstTok.image));
 			return;
 		}
-		var parentClass = ClassType.!(tc.create0()).classDecl;
+		var rootClass = ClassType.!(tc.create0()).classDecl;
+		var parentClass = rootClass;
 		if (!(parentClass.isVariant() && !parentClass.isVariantCase())) {
 			cv.errAtToken(firstTok).set("VariantDeclError",
 				Strings.format1("\"%s\" must be a top-level variant type", firstTok.image));
@@ -252,6 +253,21 @@ class Verifier(compiler: Compiler, prog: Program) {
 				Strings.format1("variant \"%s\" has no 'case _'", parentClass.name()));
 			return;
 		}
+		// Validate type parameter arity: subtype must match root's type params (pass-through).
+		var rootArity = Lists.length(rootClass.typeParams);
+		var subtypeArity = Lists.length(decl.typeParams);
+		if (rootArity > 0 && subtypeArity != rootArity) {
+			cv.errAtDecl(decl).set("VariantDeclError",
+				Strings.format2("subtype \"%s\" type parameter count must match root \"%s\"",
+					decl.name(), rootClass.name()));
+			return;
+		}
+		if (rootArity == 0 && subtypeArity > 0) {
+			cv.errAtDecl(decl).set("VariantDeclError",
+				Strings.format2("subtype \"%s\" has type parameters but root \"%s\" has none",
+					decl.name(), rootClass.name()));
+			return;
+		}
 		// Name must not clash with a named case of the parent.
 		var declName = decl.name();
 		for (c in parentClass.cases) {
@@ -274,7 +290,11 @@ class Verifier(compiler: Compiler, prog: Program) {
 		}
 		// Set up method inheritance: verify the parent first, then link the supertype chain.
 		verifyClass(parentClass);
-		var parentClassType = ClassType.!(parentClass.typeCon.create0());
+		// For parameterized subtypes, create parent type with subtype's type params as args.
+		var typeParamTypes = variantTypeParamTypes(decl);
+		var parentClassType = ClassType.!(if(typeParamTypes != null,
+			parentClass.typeCon.create(typeParamTypes),
+			parentClass.typeCon.create0()));
 		// Wire parentClassType into the ClassType chain so lookupSuperMember() and IR
 		// building can walk transitively. Variant subtypes don't use classDecl.superclass.
 		parentClassType.superType = parentClass.verifier.superType;
@@ -283,10 +303,19 @@ class Verifier(compiler: Compiler, prog: Program) {
 		var defaultCaseDecl = findDefaultCase(parentClass);
 		if (defaultCaseDecl != null) verifyClass(defaultCaseDecl);
 		var effectiveSuperDecl = if(defaultCaseDecl != null, defaultCaseDecl, parentClass);
-		var effectiveSuperType = ClassType.!(effectiveSuperDecl.typeCon.create0());
-		ClassType.!(decl.typeCon.create0()).superType = effectiveSuperType;
+		var effectiveSuperType = ClassType.!(if(typeParamTypes != null,
+			effectiveSuperDecl.typeCon.create(typeParamTypes),
+			effectiveSuperDecl.typeCon.create0()));
+		ClassType.!(if(typeParamTypes != null,
+			decl.typeCon.create(typeParamTypes),
+			decl.typeCon.create0())).superType = effectiveSuperType;
 		cv.superType = effectiveSuperType;
 		decl.numMethods = effectiveSuperDecl.numMethods;
+	}
+	// Returns the subtype's type params as a List<Type>, or null if non-parameterized.
+	def variantTypeParamTypes(decl: VstClass) -> List<Type> {
+		if (decl.typeParams == null) return null;
+		return Lists.map(decl.typeParams, Type.!<TypeParamType>);
 	}
 	// Returns true if child.qualifiers == parent.qualifiers ++ [parent.name()].
 	def isDirectSubtypeOf(child: VstClass, parent: VstClass) -> bool {
@@ -1068,16 +1097,12 @@ class VstCompoundVerifier {
 						}
 						return x.binding = typeCon.create(leftType.nested);
 					}
-					// Subtype variant type reference (e.g. A.B).
+					// Subtype variant type reference (e.g. A.B or A<int>.B).
 					// First check the parent's populated subtypes map.
 					if (lct.classDecl.subtypes != null) {
 						var subDecl = lct.classDecl.subtypes[x.name.image];
 						if (subDecl != null) {
-							if (x.nested != null) {
-								errAtRange(x.name.range()).TypeParamArityError("variant subtype",
-									x.name.image, 0, x.nested.length());
-							}
-							return x.binding = subDecl.typeCon.create0();
+							return x.binding = resolveSubtypeWithArgs(x, subDecl, leftType);
 						}
 					}
 					// Fall back: subtypes map may not be populated yet (early type resolution).
@@ -1086,11 +1111,7 @@ class VstCompoundVerifier {
 					if (subTc != null && subTc.kind == Kind.VARIANT) {
 						var subDecl = ClassType.!(subTc.create0()).classDecl;
 						if (verifier.isDirectSubtypeOf(subDecl, lct.classDecl)) {
-							if (x.nested != null) {
-								errAtRange(x.name.range()).TypeParamArityError("variant subtype",
-									x.name.image, 0, x.nested.length());
-							}
-							return x.binding = subDecl.typeCon.create0();
+							return x.binding = resolveSubtypeWithArgs(x, subDecl, leftType);
 						}
 					}
 				} else if (EnumType.?(leftType)) {
@@ -1125,6 +1146,28 @@ class VstCompoundVerifier {
 			}
 			_ => return V3.fail("unknown unbound type");
 		}
+	}
+	// Resolve a subtype variant reference, propagating type args from the left type.
+	// E.g. Foo<int>.Bar inherits type args from left; Foo<int>.Bar<int> explicit.
+	def resolveSubtypeWithArgs(x: NamedTypeRef, subDecl: VstClass, leftType: Type) -> Type {
+		var subArity = Lists.length(subDecl.typeParams);
+		if (subArity > 0) {
+			var rightNested = if(x.nested != null, Lists.map(x.nested.list, resolveType(_, typeEnv)));
+			var rightLen = Lists.length(rightNested);
+			if (rightLen > 0 && rightLen != subArity) {
+				errAtRange(x.name.range()).TypeParamArityError("variant subtype",
+					x.name.image, subArity, rightLen);
+			}
+			// Use right args if provided, else inherit from left
+			var nested = if(rightLen > 0, rightNested, leftType.nested);
+			return subDecl.typeCon.create(nested);
+		}
+		// Non-parameterized subtype
+		if (x.nested != null) {
+			errAtRange(x.name.range()).TypeParamArityError("variant subtype",
+				x.name.image, 0, x.nested.length());
+		}
+		return subDecl.typeCon.create0();
 	}
 	def resolveRefType(typeCon: V3Ref_TypeCon, tref: NamedTypeRef) -> Type {
 		var arity = if(tref.nested != null, tref.nested.length());
@@ -1568,7 +1611,24 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 	def visitMatchPattern(mv: MatchStmtVerifier, pat: MatchPattern) {
 		if (pat.vdecl != null) {
 			if (pat.params != null) errAtRange(pat.params.range()).MatchError("match type cannot have parameters");
-			var ttype = methodEnv.resolveType(pat.vdecl.tref);
+			// For "b: Bar" patterns on parameterized variant subtypes, propagate type args
+			// from the match type if the type ref has no explicit type args.
+			var ttype: Type;
+			if (mv.variantType != null && NamedTypeRef.?(pat.vdecl.tref)
+			    && mv.variantType.nested != null) {
+				var ntref = NamedTypeRef.!(pat.vdecl.tref);
+				if (ntref.nested == null && ntref.left == null) {
+					var subtypeDecl: VstClass;
+					if (mv.variantType.classDecl.subtypes != null) {
+						subtypeDecl = mv.variantType.classDecl.subtypes[ntref.name.image];
+					}
+					if (subtypeDecl != null && subtypeDecl.typeParams != null) {
+						ttype = subtypeDecl.typeCon.create(mv.variantType.nested);
+						pat.vdecl.tref.binding = ttype;
+					}
+				}
+			}
+			if (ttype == null) ttype = methodEnv.resolveType(pat.vdecl.tref);
 			pat.vdecl.vtype = ttype;
 			return mv.addTypePattern(pat, ttype);
 		}
@@ -1650,7 +1710,13 @@ class TypeChecker(ERROR: ErrorGen, file: VstFile) extends VstVisitor<Type, Type>
 			if (vt.classDecl.subtypes != null) {
 				var subtypeDecl = vt.classDecl.subtypes[name];
 				if (subtypeDecl != null) {
-					var subtypeType = ClassType.!(subtypeDecl.typeCon.create0());
+					// For parameterized subtypes, propagate type args from match type.
+					var subtypeType: ClassType;
+					if (subtypeDecl.typeParams != null && vt.nested != null) {
+						subtypeType = ClassType.!(subtypeDecl.typeCon.create(vt.nested));
+					} else {
+						subtypeType = ClassType.!(subtypeDecl.typeCon.create0());
+					}
 					var tref = NamedTypeRef.new(null, ve.ident.name, null);
 					tref.binding = subtypeType;
 					pat.vdecl = VarDecl.new(ve.ident.name, tref, null);
