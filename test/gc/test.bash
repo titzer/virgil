@@ -85,9 +85,31 @@ function do_exe_test() {
 }
 
 for target in $TEST_TARGETS; do
+    if [ "$target" = wasm ]; then
+        TESTS=$(ls $TESTS | grep -v _64.v3)
+    elif [ "$target" = x86-linux ]; then
+        TESTS=$(ls $TESTS | grep -v _64.v3)
+    elif [ "$target" = x86-darwin ]; then
+        TESTS=$(ls $TESTS | grep -v _64.v3)
+    elif [ "$target" = x86-64-linux ]; then
+        TESTS=$(ls $TESTS | grep -v _32.v3)
+    elif [ "$target" = x86-64-darwin ]; then
+        TESTS=$(ls $TESTS | grep -v _32.v3)
+    fi
     is_gc_target $target && do_exe_test || do_nothing
 done
 
 for target in $(get_io_targets); do
+    if [ "$target" = wasm ]; then
+        TESTS=$(ls $TESTS | grep -v _64.v3)
+    elif [ "$target" = x86-linux ]; then
+        TESTS=$(ls $TESTS | grep -v _64.v3)
+    elif [ "$target" = x86-darwin ]; then
+        TESTS=$(ls $TESTS | grep -v _64.v3)
+    elif [ "$target" = x86-64-linux ]; then
+        TESTS=$(ls $TESTS | grep -v _32.v3)
+    elif [ "$target" = x86-64-darwin ]; then
+        TESTS=$(ls $TESTS | grep -v _32.v3)
+    fi
     is_gc_target $target && do_int_test || do_nothing
 done
