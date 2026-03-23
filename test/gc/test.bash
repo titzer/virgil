@@ -84,32 +84,29 @@ function do_exe_test() {
     fail_fast
 }
 
-for target in $TEST_TARGETS; do
+function get_target_tests() {
     if [ "$target" = wasm ]; then
-        TESTS=$(ls $TESTS | grep -v _64.v3)
+        TARGET_TESTS=$(ls $TESTS | grep -v _64.v3)
     elif [ "$target" = x86-linux ]; then
-        TESTS=$(ls $TESTS | grep -v _64.v3)
+        TARGET_TESTS=$(ls $TESTS | grep -v _64.v3)
     elif [ "$target" = x86-darwin ]; then
-        TESTS=$(ls $TESTS | grep -v _64.v3)
+        TARGET_TESTS=$(ls $TESTS | grep -v _64.v3)
     elif [ "$target" = x86-64-linux ]; then
-        TESTS=$(ls $TESTS | grep -v _32.v3)
+        TARGET_TESTS=$(ls $TESTS | grep -v _32.v3)
     elif [ "$target" = x86-64-darwin ]; then
-        TESTS=$(ls $TESTS | grep -v _32.v3)
+        TARGET_TESTS=$(ls $TESTS | grep -v _32.v3)
+    else 
+        TARGET_TESTS=TESTS
     fi
+}
+
+TARGET_TESTS=TESTS
+for target in $TEST_TARGETS; do
+    get_target_tests 
     is_gc_target $target && do_exe_test || do_nothing
 done
 
 for target in $(get_io_targets); do
-    if [ "$target" = wasm ]; then
-        TESTS=$(ls $TESTS | grep -v _64.v3)
-    elif [ "$target" = x86-linux ]; then
-        TESTS=$(ls $TESTS | grep -v _64.v3)
-    elif [ "$target" = x86-darwin ]; then
-        TESTS=$(ls $TESTS | grep -v _64.v3)
-    elif [ "$target" = x86-64-linux ]; then
-        TESTS=$(ls $TESTS | grep -v _32.v3)
-    elif [ "$target" = x86-64-darwin ]; then
-        TESTS=$(ls $TESTS | grep -v _32.v3)
-    fi
+    get_target_tests 
     is_gc_target $target && do_int_test || do_nothing
 done
