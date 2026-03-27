@@ -3,9 +3,9 @@
 . ../common.bash gc
 
 if [ $# -gt 0 ]; then
-  TESTS="$*"
+  ALL_TESTS="$*"
 else
-  TESTS=$(cat *.gc)
+  ALL_TESTS=$(cat *.gc)
 fi
 
 function set_rt_files() {
@@ -14,15 +14,15 @@ function set_rt_files() {
     GC_SOURCES="${GC_LOC}/*.v3"
 
     if [ "$target" = "x86-darwin" ]; then
-	export RT_FILES="$RT_LOC/x86-darwin/*.v3 $N/*.v3 $GC_SOURCES"
+	export RT_FILES="$RT_LOC/x86-darwin/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
     elif [ "$target" = "x86-64-darwin" ]; then
-	export RT_FILES="$RT_LOC/x86-64-darwin/*.v3 $N/*.v3 $GC_SOURCES"
+	export RT_FILES="$RT_LOC/x86-64-darwin/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
     elif [ "$target" = "x86-linux" ]; then
-	export RT_FILES="$RT_LOC/x86-linux/*.v3 $N/*.v3 $GC_SOURCES"
+	export RT_FILES="$RT_LOC/x86-linux/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
     elif [ "$target" = "x86-64-linux" ]; then
-	export RT_FILES="$RT_LOC/x86-64-linux/*.v3 $N/*.v3 $GC_SOURCES"
+	export RT_FILES="$RT_LOC/x86-64-linux/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
     elif [ "$target" = "wasm" ]; then
-	export RT_FILES="./EmptySystem.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3 $GC_SOURCES"
+	export RT_FILES="./EmptySystem.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3 $GC_SOURCES ./TagUtils.v3"
     fi
 }
 
@@ -85,22 +85,23 @@ function do_exe_test() {
 }
 
 function get_target_tests() {
+    TAGGED_REF64_PATTERN="taggedRef.*_64.v3"
+    TAGGED_REF32_PATTERN="taggedRef.*_32.v3"
     if [ "$target" = wasm ]; then
-        TARGET_TESTS=$(ls $TESTS | grep -v _64.v3)
+        TESTS=$(ls $ALL_TESTS | grep -E -v $TAGGED_REF64_PATTERN)
     elif [ "$target" = x86-linux ]; then
-        TARGET_TESTS=$(ls $TESTS | grep -v _64.v3)
+        TESTS=$(ls $ALL_TESTS | grep -E -v $TAGGED_REF64_PATTERN)
     elif [ "$target" = x86-darwin ]; then
-        TARGET_TESTS=$(ls $TESTS | grep -v _64.v3)
+        TESTS=$(ls $ALL_TESTS | grep -E -v $TAGGED_REF64_PATTERN)
     elif [ "$target" = x86-64-linux ]; then
-        TARGET_TESTS=$(ls $TESTS | grep -v _32.v3)
+        TESTS=$(ls $ALL_TESTS | grep -E -v $TAGGED_REF32_PATTERN)
     elif [ "$target" = x86-64-darwin ]; then
-        TARGET_TESTS=$(ls $TESTS | grep -v _32.v3)
+        TESTS=$(ls $ALL_TESTS | grep -E -v $TAGGED_REF32_PATTERN)
     else 
-        TARGET_TESTS=TESTS
+        TESTS=$ALL_TESTS
     fi
 }
 
-TARGET_TESTS=TESTS
 for target in $TEST_TARGETS; do
     get_target_tests 
     is_gc_target $target && do_exe_test || do_nothing
