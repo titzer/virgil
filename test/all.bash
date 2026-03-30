@@ -8,6 +8,13 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
+export UNITTEST=1
+IGNORE_UNIT_FLAG="-ignore-unit"
+if [[ $@ =~ $IGNORE_UNIT_FLAG ]]; then 
+    UNITTEST=0
+    shift 1
+fi
+
 EXIT_SUCCESS=0
 
 #######################################################################
