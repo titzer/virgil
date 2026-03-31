@@ -120,6 +120,24 @@ def do(a: A) -> int {
 }
 ```
 
+## Named wildcard ##
+
+When a `_` arm would discard a value you still need, use `name: _` to bind it without narrowing its type.
+This gives the matched value a name in the default arm.
+
+```
+type Priority { case Low; case Med; case High; }
+def log(p: Priority) {
+    match (p) {
+        Low  => System.puts("low\n");
+        x: _ => {
+            System.puts(x.name); // x has type Priority; .name gives the case name
+            System.puts("\n");
+        }
+    }
+}
+```
+
 ## Matching on ADTs ##
 
 Virgil allows match statements to pattern-match on values of an algebraic datatype.
@@ -137,6 +155,22 @@ def do(a: A) -> int {
         C(bar) => return bar; // match and bind params of a C
     }  // match must be exhaustive
     // unreachable, because all cases return
+}
+```
+
+For *open* variants (those with `case _`), subtype variants may also appear as match arms using their unqualified name.
+A `_` arm is always required for open variants, since new subtypes may be added independently.
+
+```
+type Status { case Ok; case _; }
+type Status.Err { case Timeout; case Http(code: int); }
+
+def handle(s: Status) -> int {
+    match (s) {
+        Ok  => return 0;
+        Err => return 1;   // Status.Err named as arm (unqualified)
+        _   => return -1;  // required: other subtypes may exist
+    }
 }
 ```
 
