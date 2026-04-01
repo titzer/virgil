@@ -101,3 +101,140 @@ In fact, in this example, we also subsumed the `isWorkday()` method we wrote by 
 
 The Virgil compiler will still represent the enum value as a small integer under the hood, and field access will be a simple array access that uses the enum value as the index.
 This will typically be a single machine instruction; it's hard to beat that in terms of efficiency!
+
+## Open enums
+
+An enum may include a `case _` to mark it as *open*, or *extensible*.
+An open enum accepts values from **subtype enums** (declared elsewhere) in addition to its own named cases.
+
+```
+enum Color { RED, GREEN, BLUE, _ }
+```
+
+The `case _` must be the last case in the enum and there can be at most one per enum.
+
+## Subtype enums
+
+A *subtype enum* is declared with a dotted name `E.S`, making it an extension of an existing open enum.
+The parent must have a `case _`.
+
+```
+enum Color { RED, GREEN, BLUE, _ }
+enum Color.Pastel { PINK, LAVENDER, MINT }
+```
+
+Now `Color.Pastel.PINK`, `Color.Pastel.LAVENDER`, and `Color.Pastel.MINT` are valid `Color` values.
+A variable of type `Color` can hold any case, including those from subtype enums.
+
+```
+var c: Color = Color.Pastel.PINK;  // valid: Pastel is a subtype of Color
+```
+
+Subtype enums can themselves be open (with `case _`) and have their own subtypes, forming hierarchies of arbitrary depth.
+
+```
+enum Color { RED, GREEN, BLUE, _ }
+enum Color.Pastel { PINK, LAVENDER, _ }
+enum Color.Pastel.Spring { CORAL, PEACH }
+```
+
+## Matching open enums
+
+When matching a value of an open enum type, subtype enums may be named directly as match arms.
+A match on an open enum **always** requires a `_` arm, since new subtypes may be added independently.
+
+```
+enum Color { RED, GREEN, BLUE, _ }
+enum Color.Pastel { PINK, LAVENDER, MINT }
+def describe(c: Color) -> int {
+    match (c) {
+        RED    => return 0;
+        GREEN  => return 1;
+        BLUE   => return 2;
+        Pastel => return 3;  // matches any Color.Pastel case
+        _      => return -1; // required: covers any other subtype
+    }
+}
+```
+
+Subtype names are written *unqualified* in match patterns -- `Pastel` rather than `Color.Pastel`.
+
+## Open enums with fields
+
+Open enums can have fields, just like regular enums.
+Subtype enums inherit the parent's fields, and each case must provide values for them.
+
+There are several ways to declare a subtype's relationship to the parent's fields:
+
+```
+enum Shape(sides: int) { TRIANGLE(3), SQUARE(4), _ }
+
+// Form 1: restate the parent's parameters
+enum Shape.Round(sides: int) { CIRCLE(0) }
+
+// Form 2: use the 'super' keyword
+enum Shape.Polygon(super) { PENTAGON(5), HEXAGON(6) }
+
+// Form 3: implicit inheritance (no parameter list)
+enum Shape.Special { STAR(10) }
+```
+
+In all forms, each case must provide argument values for all of the parent's effective fields.
+
+## Subtypes with additional fields
+
+Subtypes can also declare **new fields** beyond the parent's.
+There are two ways to do this:
+
+```
+enum Vehicle(wheels: int) { CAR(4), BIKE(2), _ }
+
+// Using 'super' + extra fields
+enum Vehicle.Electric(super, range: int) { TESLA(4, 300), EBIKE(2, 50) }
+
+// Restating parent fields + extra fields
+enum Vehicle.Flying(wheels: int, altitude: int) { HELICOPTER(0, 5000) }
+```
+
+The parent's fields are always first in the argument list, followed by any extra fields.
+
+New fields are accessible only on values typed as the subtype:
+
+```
+var v: Vehicle = Vehicle.Electric.TESLA;
+var w = v.wheels;    // 4: inherited field, accessible on Vehicle
+
+var e: Vehicle.Electric = Vehicle.Electric.TESLA;
+var r = e.range;     // 300: new field, only accessible on Vehicle.Electric
+```
+
+## Multi-level field inheritance
+
+Extra fields are inherited through the hierarchy.
+In a multi-level hierarchy, `super` refers to the immediate parent's *effective* fields -- the root's fields plus all intermediate ancestors' extra fields.
+
+```
+enum Animal(legs: int) { DOG(4), BIRD(2), _ }
+enum Animal.Pet(super, name: string) { CAT(4, "cat"), _ }
+enum Animal.Pet.Exotic(super, origin: string) { PARROT(2, "parrot", "Brazil") }
+```
+
+Here `Animal.Pet.Exotic` has three effective fields: `legs` (from root), `name` (from `Animal.Pet`), and `origin` (its own).
+Each case must provide values for all three, in order.
+
+All inherited fields are accessible on subtype-typed values:
+
+```
+var p: Animal.Pet.Exotic = Animal.Pet.Exotic.PARROT;
+var l = p.legs;     // 2: from root Animal
+var n = p.name;     // "parrot": from intermediate Animal.Pet
+var o = p.origin;   // "Brazil": own field
+```
+
+## The `name` and `shortName` fields
+
+For subtype enum cases, the `name` field includes the subtype path.
+For example, `Color.Pastel.PINK.name` returns `"Pastel.PINK"`.
+The `shortName` field gives only the case name without the subtype prefix: `Color.Pastel.PINK.shortName` returns `"PINK"`.
+
+Enums can also have [methods](EnumMethods.md), including per-case overrides with virtual dispatch.
