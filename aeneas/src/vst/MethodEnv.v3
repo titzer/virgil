@@ -156,7 +156,22 @@ class MethodEnv {
 		return VarBinding.None;
 	}
 	def resolveEnumMember(expr: VarExpr, enumType: EnumType, name: string) -> ResolvedMember {
-		var member = enumType.enumDecl.memberMap[name];
+		var decl = enumType.enumDecl;
+		var member = decl.memberMap[name];
+		if (decl.qualifiers != null) {
+			if (member == null || VstField.?(member)) {
+				// Walk the ancestor chain for fields and missing members.
+				var cur = decl.parentEnum;
+				while (cur != null) {
+					var ancestorMember = cur.memberMap[name];
+					if (ancestorMember != null) { member = ancestorMember; break; }
+					cur = cur.parentEnum;
+				}
+			} else if (VstMethod.?(member) && VstMethod.!(member).root != VstMethod.!(member)) {
+				// Subtype override: return root method for virtual dispatch.
+				member = VstMethod.!(member).root;
+			}
+		}
 		if (member == null) return null;
 		var memberType = inferMemberType(member);
 		if (VstField.?(member)) {
@@ -164,6 +179,12 @@ class MethodEnv {
 			return ResolvedMember.new(enumType, member, null, memberType);
 		}
 		return if(member != null, ResolvedMember.new(enumType, member, null, memberType));
+	}
+	def findRootEnumDecl(decl: VstEnum) -> VstEnum {
+		if (decl.qualifiers == null) return decl;
+		var tc = verifier.verifier.prog.typeEnv.lookup(decl.qualifiers.head.image);
+		if (tc == null || tc.kind != Kind.ENUM) return null;
+		return EnumType.!(tc.create0()).enumDecl;
 	}
 	def resolveClassMember(expr: VarExpr, classType: ClassType, name: string) -> ResolvedMember {
 		var exprType = classType;
@@ -318,9 +339,21 @@ class MethodEnv {
 			if (width < 1) width = 1;
 			var countType = Int.getType(false, width);
 			return expr.bind(null, VarBinding.Const(Int.box(count), countType), countType);
+		} else if (Strings.equal(name, "shortName")) {
+			return newCompBinding(expr, enumType.getShortNameOperator());
 		}
 		var member = resolveEnumMember(expr, enumType, name);
-		if (member == null) return VarBinding.None;
+		if (member == null) {
+			// Check if the name is a subtype enum.
+			if (enumType.enumDecl.subtypes != null) {
+				var sub = enumType.enumDecl.subtypes[name];
+				if (sub != null) {
+					var subType = EnumType.!(sub.typeCon.singleton);
+					return expr.bind(null, VarBinding.Type(subType), subType);
+				}
+			}
+			return VarBinding.None;
+		}
 		match (member.member) {
 			x: VstField => {
 				var memberType = Function.newType(enumType, member.memberType);
@@ -337,25 +370,38 @@ class MethodEnv {
 			x: VstEnumCase => {
 				return expr.bind(null, VarBinding.EnumConst(x), enumType);
 			}
+			x: VstMethod => {
+				var methodReceiver = x.receiver.getDeclaredType();
+				var memberType = Function.prependParamType(methodReceiver, member.memberType);
+				return expr.bind(null, VarBinding.ClassMethod(methodReceiver, x, member.typeArgs), memberType);
+			}
 		}
 		return VarBinding.None;
 	}
 	def lookupEnumExprMember(expr: VarExpr, enumType: EnumType, useThis: bool) -> VarBinding {
 		// lookup (expr: enum).name
 		var name = expr.ident.name;
+		if (Strings.equal(name.image, "shortName")) {
+			return newApplyCompBinding(expr, expr.expr, enumType.getShortNameOperator());
+		}
 		var member = resolveEnumMember(expr, enumType, name.image);
 		if (member == null) return VarBinding.None;
+		var receiver = objExpr(useThis, expr.ident.name, expr);
 		match (member.member) {
 			x: VstField => {
-				return expr.bind(expr.expr, VarBinding.Apply(enumType.enumGetParamOperator(x), N), member.memberType);
+				return expr.bind(receiver, VarBinding.Apply(enumType.enumGetParamOperator(x), N), member.memberType);
 			}
 			x: VstVariantTagMember => {
 				var tagType = enumType.enumDecl.tagType;
-				return newApplyCompBinding(expr, expr.expr, V3Op.newVstSugar(VstOperator.Nop,
+				return newApplyCompBinding(expr, receiver, V3Op.newVstSugar(VstOperator.Nop,
 					[enumType, tagType], [enumType], tagType));
 			}
 			x: VstVariantNameMember => {
-				return newApplyCompBinding(expr, expr.expr, enumType.getNameOperator());
+				return newApplyCompBinding(expr, receiver, enumType.getNameOperator());
+			}
+			x: VstMethod => {
+				var methodReceiver = x.receiver.getDeclaredType();
+				return expr.bind(receiver, VarBinding.ObjectMethod(methodReceiver, x, member.typeArgs), member.memberType);
 			}
 		}
 		return VarBinding.None;
@@ -363,6 +409,14 @@ class MethodEnv {
 	def lookupEnumConstMember(expr: VarExpr, enumType: EnumType, vc: VstEnumCase) -> VarBinding {
 		// lookup (expr: enum.val).name
 		var name = expr.ident.name;
+		if (Strings.equal(name.image, "shortName")) {
+			// Return the short name as a compile-time constant using the DFS global tag.
+			var shortNames = enumType.getShortNames(verifier.verifier.prog);
+			var idx = if(vc.enumTag >= 0, vc.enumTag, vc.tag);
+			if (idx < shortNames.values.length) {
+				return expr.bind(null, VarBinding.Const(shortNames.values[idx], V3.stringType), V3.stringType);
+			}
+		}
 		var member = resolveEnumMember(expr, enumType, name.image);
 		if (member == null) return lookupEnumExprMember(expr, enumType, false);
 		match (member.member) {
@@ -377,15 +431,63 @@ class MethodEnv {
 			}
 			x: VstVariantTagMember => {
 				var tagType = enumType.enumDecl.tagType;
-				return expr.bind(null, VarBinding.Const(Int.box(vc.tag), tagType), tagType);
+				// Use DFS global tag (enumTag) for runtime; fall back to parse-order tag if unassigned.
+				var tag = if(vc.enumTag >= 0, vc.enumTag, vc.tag);
+				return expr.bind(null, VarBinding.Const(Int.box(tag), tagType), tagType);
 			}
 			x: VstVariantNameMember => {
 				var names = enumType.getNames(verifier.verifier.prog);
-				var name = names.values[vc.tag];
-				return expr.bind(null, VarBinding.Const(name, V3.stringType), V3.stringType);
+				var idx = if(vc.enumTag >= 0, vc.enumTag, vc.tag);
+				var n = if(idx < names.values.length, names.values[idx], null);
+				return expr.bind(null, VarBinding.Const(n, V3.stringType), V3.stringType);
+			}
+			x: VstMethod => {
+				// Check for per-case override, then subtype-level override.
+				var overrideMethod = findEnumCaseOverride(vc, name.image);
+				if (overrideMethod == null) overrideMethod = findEnumSubtypeOverride(enumType.enumDecl, vc, name.image);
+				if (overrideMethod != null) {
+					// Use root enum type as receiver: override IrMethods are
+					// stored in the root IrClass (not the subtype's IrClass).
+					var rootDecl = enumType.enumDecl;
+					while (rootDecl.parentEnum != null) rootDecl = rootDecl.parentEnum;
+					var methodReceiver = rootDecl.getDeclaredType();
+					var receiver = objExpr(false, expr.ident.name, expr);
+					return expr.bind(receiver, VarBinding.ObjectMethod(methodReceiver, overrideMethod, member.typeArgs), member.memberType);
+				}
+				return lookupEnumExprMember(expr, enumType, false);
 			}
 		}
 		return lookupEnumExprMember(expr, enumType, false);
+	}
+	def findEnumCaseOverride(vc: VstEnumCase, name: string) -> VstMethod {
+		if (vc.members == null) return null;
+		for (l = vc.members; l != null; l = l.tail) {
+			if (VstMethod.?(l.head) && Strings.equal(l.head.name(), name)) return VstMethod.!(l.head);
+		}
+		return null;
+	}
+	def findEnumSubtypeOverride(rootDecl: VstEnum, vc: VstEnumCase, name: string) -> VstMethod {
+		// Walk from the case's declaring enum up to the root, looking for overrides.
+		var decl = findDeclaringEnum(rootDecl, vc);
+		while (decl != null) {
+			var member = decl.memberMap[name];
+			if (member != null && VstMethod.?(member) && VstMethod.!(member).root != VstMethod.!(member)) {
+				return VstMethod.!(member);
+			}
+			decl = decl.parentEnum;
+		}
+		return null;
+	}
+	def findDeclaringEnum(rootDecl: VstEnum, vc: VstEnumCase) -> VstEnum {
+		// Find the enum that declares this case by searching the hierarchy.
+		for (c in rootDecl.cases) {
+			if (c == vc) return rootDecl;
+		}
+		for (l = rootDecl.subtypeOrder; l != null; l = l.tail) {
+			var result = findDeclaringEnum(l.head, vc);
+			if (result != null) return result;
+		}
+		return null;
 	}
 	def lookupIntTypeMember(expr: VarExpr, etype: IntType) -> VarBinding {
 		var name = expr.ident.name.image;
@@ -514,12 +616,12 @@ class MethodEnv {
 		var name = expr.ident.name.image;
 		var tc = EnumSetType.!(etype);
 		if (Strings.equal(name, "all")) {
-			return expr.bind(null, VarBinding.Const(tc.repType.max, etype), etype);
+			return expr.bind(null, VarBinding.Const(tc.allVal, etype), etype);
 		}
-		var c = tc.enumDecl.memberMap[name];
-		if (VstEnumCase.?(c)) {
+		var c = findEnumCaseInHierarchy(tc.enumDecl, name);
+		if (c != null) {
 			// simple membership check
-			var op = V3Op.newVstSugar(VstOperator.EnumSetHas(VstEnumCase.!(c)), TypeUtil.NO_TYPES, [etype], Bool.TYPE);
+			var op = V3Op.newVstSugar(VstOperator.EnumSetHas(c), TypeUtil.NO_TYPES, [etype], Bool.TYPE);
 			return expr.bind(null, VarBinding.Inst(op, N), op.sig.funcType());
 		}
 		return VarBinding.None;
@@ -527,13 +629,22 @@ class MethodEnv {
 	def lookupEnumSetExprMember(expr: VarExpr, etype: Type) -> VarBinding {
 		var name = expr.ident.name.image;
 		var tc = EnumSetType.!(etype);
-		var c = tc.enumDecl.memberMap[name];
-		if (VstEnumCase.?(c)) {
+		var c = findEnumCaseInHierarchy(tc.enumDecl, name);
+		if (c != null) {
 			// simple membership check
-			var op = V3Op.newVstSugar(VstOperator.EnumSetHas(VstEnumCase.!(c)), TypeUtil.NO_TYPES, [etype], Bool.TYPE);
+			var op = V3Op.newVstSugar(VstOperator.EnumSetHas(c), TypeUtil.NO_TYPES, [etype], Bool.TYPE);
 			return expr.bind(expr.expr, VarBinding.Apply(op, N), Bool.TYPE);
 		}
 		return VarBinding.None;
+	}
+	def findEnumCaseInHierarchy(decl: VstEnum, name: string) -> VstEnumCase {
+		var m = decl.memberMap[name];
+		if (VstEnumCase.?(m)) return VstEnumCase.!(m);
+		for (l = decl.subtypeOrder; l != null; l = l.tail) {
+			var c = findEnumCaseInHierarchy(l.head, name);
+			if (c != null) return c;
+		}
+		return null;
 	}
 	def lookupRefTypeMember(expr: VarExpr, refType: RefType) -> VarBinding {
 		var name = expr.ident.name.image;
