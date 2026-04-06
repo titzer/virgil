@@ -23,6 +23,10 @@ component RiGc {
 	def OBJ_ALIGN = Pointer.SIZE;
 	def ARRAY_LENGTH_OFFSET = INT_SIZE;
 	def ARRAY_HEADER_SIZE = INT_SIZE + INT_SIZE;
+	
+	// Used for Pointer view helper functions 
+	def PTR_LOAD_HELP_ARR = Array<u64>.new(1);
+	// def PTR_LOAD_HELP_ARR: Array<u64> = null;
 
 	// Interface between the GC, stack scanning, and globals scanning.
 	var scanRoot: Pointer -> void;			// provided by GC
@@ -32,7 +36,13 @@ component RiGc {
 	var inGC: void -> bool;
 
 	// Compute the size in bytes of the object pointed to by {oop}.
-	def objectSize(oop: Pointer) -> int {
+	def objectSize(maybeOop: Pointer) -> int {
+		var oop = maybeOop;
+		if (CiRuntime.FEATURE_TAGGED_REFS) {
+			if (!isOop(maybeOop)) return 0; // nonref case
+			oop = clearAuxTag(maybeOop);
+		}
+		
 		var tid = oop.load<int>();
 		// | 32	      tid	     0 |
 		// | typeid:30		  #0:2 | normal object
@@ -102,7 +112,13 @@ component RiGc {
 		return (-1 ^ (OBJ_ALIGN - 1)) & (size + OBJ_ALIGN - 1);
 	}
 	// Scan the object pointed to by {oop}, calling {scanRoot} for every reference in the object.
-	def scanObject(oop: Pointer) -> int {
+	def scanObject(maybeOop: Pointer) -> int {
+		var oop = maybeOop;
+		if (CiRuntime.FEATURE_TAGGED_REFS) {
+			if (!isOop(maybeOop)) return 0; // nonref case
+			oop = clearAuxTag(maybeOop);
+		}
+
 		var tid = oop.load<int>();
 		// | 32			     0 |
 		// | typeid:30		  #0:2 | normal object
@@ -212,7 +228,18 @@ component RiGc {
 		if (refmap == 0) return;
 		for (p = start; refmap != 1; p = p + REF_SIZE) {
 			var marked = (refmap & 1) != 0;
-			var oop = p.load<Pointer>();
+
+			var maybeOop = p.load<Pointer>();
+			if (!isOop(maybeOop)) {
+				o.putp(maybeOop).puts(" not a ref | ");
+				refmap = refmap >>> 1;
+				continue;
+			}
+			var oop = maybeOop;
+			if (CiRuntime.FEATURE_TAGGED_REFS) {
+				oop = clearAuxTag(maybeOop);
+			}
+
 			o.puts("@ ").putp(p).puts(" ").putc(if(marked, '*', ' ')).puts(" | ");
 
 			if (oop == Pointer.NULL) o.putp(oop).puts(" |\n");
@@ -318,6 +345,93 @@ component RiGc {
 		}
 		scanners = survivingScanners; // overwrite old scanners list with survivors only
 		survivingScanners = null;
+	}
+	// ===================== Helper functions for tagged pointers =====================
+	// TODO(stable): Replace uses of these helper functions with the actual Pointer and CiRuntime operators
+	// Checks if a pointer has its reference bit tagged
+	def isOop(ptr: Pointer) -> bool {
+		// Get the leftmost significant bit
+		// 0 means it's a reference/Oop; 1 means it's a nonref
+		def intPtr = ptr - Pointer.NULL;
+		return (intPtr & 0b1) == 0;
+	}
+	// Returns a mask where the tag bits are zero'd out 
+	def AUX_TAG_MASK() -> u64 {
+		if (Pointer.SIZE == 4) return u64.view(u32.max - 0b10u32);
+		return u64.view(((u64.max << 16) >>> 16) - 0b110u64);
+	}
+	// View an u32 as a pointer
+	def Pointer_view_u32(address: u32) -> Pointer {
+		PTR_LOAD_HELP_ARR[0] = u64.view(address);
+		def pArr = Pointer.atElement(PTR_LOAD_HELP_ARR, 0);
+		return pArr.load<Pointer>();
+	}
+	// View an u64 as a pointer
+	def Pointer_view_u64(address: u64) -> Pointer {
+		PTR_LOAD_HELP_ARR[0] = address;
+		def pArr = Pointer.atElement(PTR_LOAD_HELP_ARR, 0);
+		return pArr.load<Pointer>();
+	}
+	// Removes the auxiliary tag from a pointer
+	def clearAuxTag(ptr: Pointer) -> Pointer {
+		if (Pointer.SIZE == 4) return clearAuxTag32(ptr);
+		return clearAuxTag64(ptr);
+	}
+	// Untag a 32-bit pointer
+	def clearAuxTag32(ptr: Pointer) -> Pointer {
+		// 32 bit pointers have 1 available lower tag bit 
+		def address = u32.view(ptr - Pointer.NULL);
+		def mask: u32 = u32.view(AUX_TAG_MASK());
+		def untaggedIntPtr = address & mask;
+		return Pointer_view_u32(untaggedIntPtr);
+	}
+	// Untag a 64-bit pointer
+	def clearAuxTag64(ptr: Pointer) -> Pointer {
+		// 64 bit pointers have 2-bit lower tag and 16-bit upper tag
+		def address = u64.view(ptr - Pointer.NULL);
+		var mask = AUX_TAG_MASK();
+		def untaggedIntPtr = address & mask;
+		return Pointer_view_u64(untaggedIntPtr);
+	}
+	def getAuxTag(ptr: Pointer) -> u64 {
+		if (Pointer.SIZE == 4) return getAuxTag32(ptr);
+		return getAuxTag64(ptr);
+	}
+	// Get the auxiliary tag from a 32-bit pointer 
+	def getAuxTag32(ptr: Pointer) -> u32 {
+		def mask = ~u32.view(AUX_TAG_MASK());
+		def intPtr = u32.view(ptr - Pointer.NULL);
+		return (intPtr & mask) >>> 1;
+	}
+	// Get the auxiliary tag from a 64-bit pointer 
+	def getAuxTag64(ptr: Pointer) -> u64 {
+		def mask = ~AUX_TAG_MASK();
+		def intPtr = u64.view(ptr - Pointer.NULL);
+		def lowerTag = u64.view(u2.view(intPtr >>> 1));
+		def upperTag = (intPtr >>> 48);
+		return lowerTag | (upperTag << 2);
+	}
+	def setAuxTag(ptr: Pointer, tag: u64) -> Pointer {
+		if (Pointer.SIZE == 4) return setAuxTag32(ptr, tag);
+		return setAuxTag64(ptr, tag);
+	}
+	// Set the auxiliary tag of a 32-bit pointer
+	def setAuxTag32(ptr: Pointer, tag: u64) -> Pointer {
+		def processedTag = u32.view((tag & 1) << 1);
+		var intPtr = u32.view(ptr - Pointer.NULL);
+		intPtr = (intPtr & u32.view(AUX_TAG_MASK())); 
+		intPtr |= u32.view(processedTag);
+		return Pointer_view_u32(intPtr);
+	}
+	// Set the auxiliary tag of a 64-bit pointer
+	def setAuxTag64(ptr: Pointer, tag: u64) -> Pointer {	
+		def lowerTag = u2.view(tag);
+		def upperTag = u16.view(tag >>> 2);
+		var intPtr = u64.view(ptr - Pointer.NULL);
+		intPtr = intPtr & AUX_TAG_MASK();
+		intPtr |= (u64.view(lowerTag) << 1);
+		intPtr |= (u64.view(upperTag) << 48);
+		return Pointer_view_u64(intPtr);
 	}
 }
 // A node in the list of on-collect finalizer callbacks.
