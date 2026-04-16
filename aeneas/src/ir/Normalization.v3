@@ -114,6 +114,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				norm(ic.oldType);
 				numberVariant(ic);
 				if (!ic.isUnboxed()) makeNormFieldsAll(ic);
+			} else if (EnumType.?(ic.oldType) && EnumType.!(ic.oldType).enumDecl.subtypeOrder != null) {
+				norm(ic.oldType);
+				numberVariant(ic);
+				makeNormFieldsAll(ic);
 			} else {
 				layoutClass(ic);
 			}
@@ -319,6 +323,15 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		} else {
 			for (l = rc.children; l != null; l = l.tail) numberVariantSlot(l.head, rc.minClassId);
 		}
+		// For enum roots, ensure we reserve the full DFS tag range. Children
+		// are only subtype enum RaClasses (not individual cases), so they may
+		// not cover all tag slots.
+		if (EnumType.?(rc.oldType)) {
+			var tagHi = EnumType.!(rc.oldType).enumDecl.tagHi;
+			var endId = rc.minClassId + tagHi + 1;
+			liveClasses.grow(endId);
+			if (liveClasses.length < endId) liveClasses.length = endId;
+		}
 		rc.maxClassId = liveClasses.length;
 	}
 	// Recursively assign class IDs to a variant case/subtype using DFS tag ranges.
@@ -329,8 +342,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	// Non-leaf range nodes whose tagLo equals a child's tagLo are NOT stored in
 	// liveClasses, so layoutMtable can filter them out.
 	def numberVariantSlot(c: RaClass, rootMin: int) {
-		var decl = ClassType.!(c.oldType).classDecl;
-		var tagLo = decl.variantTag, tagHi = decl.tagHi;
+		var tagLo = getTagLo(c.oldType), tagHi = getTagHi(c.oldType);
 		c.minClassId = rootMin + tagLo;
 		c.maxClassId = rootMin + tagHi + 1;
 		liveClasses.grow(c.maxClassId);
@@ -341,10 +353,24 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			// Check if this node has its own slot (no child starts at the same tag).
 			var ownSlot = true;
 			for (l = c.children; l != null; l = l.tail) {
-				if (ClassType.!(l.head.oldType).classDecl.variantTag == tagLo) { ownSlot = false; break; }
+				if (getTagLo(l.head.oldType) == tagLo) { ownSlot = false; break; }
 			}
 			if (ownSlot) liveClasses[rootMin + tagLo] = c; // e.g. "case _" before subtypes
 			for (l = c.children; l != null; l = l.tail) numberVariantSlot(l.head, rootMin);
+		}
+	}
+	private def getTagLo(t: Type) -> int {
+		match (t) {
+			x: ClassType => return x.classDecl.variantTag;
+			x: EnumType => return x.enumDecl.tagLo;
+			_ => return 0;
+		}
+	}
+	private def getTagHi(t: Type) -> int {
+		match (t) {
+			x: ClassType => return x.classDecl.tagHi;
+			x: EnumType => return x.enumDecl.tagHi;
+			_ => return 0;
 		}
 	}
 	def mapSimple(t: Type) -> TypeNorm {
@@ -593,6 +619,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			sm.norm.flags |= IrFlag.M_OVERRIDDEN;
 		}
 		if (rm.virtual != null) virtuals = List.new(rm.virtual, virtuals);
+		if (m.flags.M_OVERRIDDEN) rm.norm.flags |= IrFlag.M_OVERRIDDEN;
 	}
 	def layoutMtable(rv: RaVirtual) {
 		if (rv.mtable != null) return;
@@ -602,30 +629,69 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		var table = Array<IrMethod>.new(size), mtable = IrMtable.new(rm.norm, rc.minClassId, table);
 		rv.mtable = mtable;
 
-		if (rc.isUnboxed()) {
+		if (rc.isUnboxed() || EnumType.?(rc.oldType)) {
 			var ft = Function.funcRefType(rm.norm.getMethodType());
 			mtable.record = ra.prog.newRecord(V3Array.newType(ft), size);
 		}
 		if (mtable.table.length > 0) {
-			for (l = rc.subtypes; l != null; l = l.tail) { // fill out mtable
-				// Skip non-leaf variant range nodes (e.g. "case _" and intermediate subtype
-				// variants). Only the actual leaf at each DFS tag slot fills the mtable.
-				if (liveClasses[l.head.minClassId] != l.head) continue;
-				var impl = resolveMethodImpl(l.head, rm);
-				var index = l.head.minClassId - mtable.rootId;
-				mtable.table[index] = impl.norm;
-				if (CLOptions.PRINT_WRAP_EXTRA.get()) {
-					FunctionWrapping.printWrap().put3("layoutMtable: slot %d  class %q  subclass %q", index, rc.orig.ctype.render, l.head.orig.ctype.render)
-							.put3("  impl %q{%d/%d}", impl.norm.render, impl.norm.index, impl.norm.uid).outln();
-				}
-				if (mtable.record != null) {
-					var ta = Arrays.replace(impl.getSpec().typeArgs, 0, impl.norm.receiver);
-					var spec = IrSpec.new(ta[0], ta, impl.norm);
-					mtable.record.values[index] = FuncVal.new(spec);
+			if (EnumType.?(rc.oldType)) {
+				// Enum: fill by walking the hierarchy. Each enum type
+				// covers a tag range; subtypes override their parent's range.
+				fillEnumMtable(mtable, rc, rm);
+			} else {
+				for (l = rc.subtypes; l != null; l = l.tail) { // fill out mtable
+					// Skip non-leaf variant range nodes (e.g. "case _" and intermediate subtype
+					// variants). Only the actual leaf at each DFS tag slot fills the mtable.
+					if (liveClasses[l.head.minClassId] != l.head) continue;
+					fillMtableSlot(mtable, l.head, rm);
 				}
 			}
 		}
 		setMtable(rc, rv); // set mtable for all child virtual methods
+	}
+	private def fillMtableSlot(mtable: IrMtable, rc: RaClass, rm: RaMethod) {
+		var impl = resolveMethodImpl(rc, rm);
+		var index = rc.minClassId - mtable.rootId;
+		mtable.table[index] = impl.norm;
+		if (mtable.record != null) {
+			var ta = Arrays.replace(impl.getSpec().typeArgs, 0, impl.norm.receiver);
+			var spec = IrSpec.new(ta[0], ta, impl.norm);
+			mtable.record.values[index] = FuncVal.new(spec);
+		}
+	}
+	private def fillEnumMtable(mtable: IrMtable, rc: RaClass, rm: RaMethod) {
+		var impl = resolveEnumMethodImpl(rc, rm);
+		if (impl == null) impl = rm; // fall back to root
+		var tagLo = if(EnumType.?(rc.oldType), EnumType.!(rc.oldType).enumDecl.tagLo, 0);
+		var tagHi = if(EnumType.?(rc.oldType), EnumType.!(rc.oldType).enumDecl.tagHi, 0);
+		if (tagLo < 0) tagLo = 0;
+		for (tag = tagLo; tag <= tagHi; tag++) {
+			mtable.table[tag] = impl.norm;
+			if (mtable.record != null) {
+				var ta = Arrays.replace(impl.getSpec().typeArgs, 0, impl.norm.receiver);
+				var spec = IrSpec.new(ta[0], ta, impl.norm);
+				mtable.record.values[tag] = FuncVal.new(spec);
+			}
+		}
+		// Subtypes override their range
+		var decl = EnumType.!(rc.oldType).enumDecl;
+		for (l = decl.subtypeOrder; l != null; l = l.tail) {
+			var childRc = ra.getClass(l.head.getDeclaredType());
+			if (childRc != null) fillEnumMtable(mtable, RaClass.!(childRc), rm);
+		}
+	}
+	// Resolve an enum method by matching VstMethod.root identity, since enum
+	// subtype IrClasses don't inherit parent's method array.
+	private def resolveEnumMethodImpl(rc: RaClass, rm: RaMethod) -> RaMethod {
+		var rootSource = rm.orig.source;
+		for (ml in rc.methods) {
+			for (l = ml; l != null; l = l.tail) {
+				var m = l.head;
+				if (m.orig.source == rootSource) return m;
+				if (VstMethod.?(m.orig.source) && VstMethod.!(m.orig.source).root == rootSource) return m;
+			}
+		}
+		return null;
 	}
 	def setMtable(rc: RaClass, rv: RaVirtual) {
 		var rm = rc.findRaMethod(rv.raMethod);
