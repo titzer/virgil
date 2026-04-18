@@ -226,6 +226,9 @@ component Parser {
 		var decl = desugar.synthesizeTopLevelClass(parseVariantCases(p, desugar));
 		decl.repHints = repHints;
 		decl.qualifiers = qualifiers;
+		for (c in decl.cases) {
+			if (Strings.equal(c.name(), "_")) { decl.hasDefault = true; break; }
+		}
 		decl.qualifierTypeArgs = qualTypeArgs;
 		file.classes.put(decl);
 		// lift case classes to top-level of file
@@ -459,34 +462,138 @@ component Parser {
 		return true;
 	}
 	def parseEnum(p: ParserState, file: VstFile, isPrivate: bool) -> bool {
+		// Parse an optional dotted qualifier prefix (e.g. "E1." in "enum E1.More") then
+		// the enum name as a plain identifier (no type params, unlike variants).
+		var qualifiers: List<Token>;
+		var d = p.input;
+		while (Char.isIdentStart(p.curByte)) {
+			var q = p.curPos + 1;
+			while (q < d.length && Char.isIdentMiddle(d[q])) q++;
+			if (q < d.length && d[q] == '.' && q + 1 < d.length && Char.isIdentStart(d[q + 1])) {
+				var qid = parseIdentVoid(p);
+				p.advance1();
+				qualifiers = List.new(qid.name, qualifiers);
+			} else {
+				break;
+			}
+		}
+		qualifiers = Lists.reverse(qualifiers);
 		var id = parseIdentVoid(p);
-		var params = parseOptionalParams(p, parseEnumParam);
-		// Synthesize "tag" and "name" members
-		var tagToken = Token.new(p.fileName, "tag", p.curLine, p.curCol);
-		var nameToken = Token.new(p.fileName, "name", p.curLine, p.curCol);
-		var list: List<VstMember>;
-		list = List.new(VstVariantTagMember.new(tagToken), list);
-		list = List.new(VstVariantNameMember.new(nameToken), list);
+		var superParams = false;
+		var params: VstList<ParamDecl>;
+		if (p.curByte == '(') {
+			var d = p.input;
+			var q = p.curPos + 1;
+			while (q < d.length && (d[q] == ' ' || d[q] == '\t')) q++;
+			if (q + 5 <= d.length && d[q] == 's' && d[q+1] == 'u' && d[q+2] == 'p'
+				&& d[q+3] == 'e' && d[q+4] == 'r'
+				&& (q + 5 >= d.length || !Char.isIdentMiddle(d[q+5]))) {
+				var r = q + 5;
+				while (r < d.length && (d[r] == ' ' || d[r] == '\t')) r++;
+				if (r < d.length && d[r] == ')') {
+					// (super) only
+					p.advance1();
+					optKeyword(p, "super");
+					p.req1(')');
+					superParams = true;
+				} else if (r < d.length && d[r] == ',') {
+					// (super, extra_params...)
+					p.advance1();             // consume '('
+					optKeyword(p, "super");   // consume 'super'
+					p.advance1();             // consume ','
+					var paramList: List<ParamDecl>;
+					paramList = List.new(parseEnumParam(p), paramList);
+					while (p.curByte == ',') {
+						p.advance1();
+						paramList = List.new(parseEnumParam(p), paramList);
+					}
+					p.req1(')');
+					params = VstList.new(id.name.range(), Lists.reverse(paramList));
+					superParams = true;
+				}
+			}
+		}
+		if (!superParams) params = parseOptionalParams(p, parseEnumParam);
+		var desugar = EnumDesugaring.new(isPrivate, id, params);
+		var list = desugar.synthesizeMembers(p.fileName, p.curLine, p.curCol);
 		// Parse case members
-		var cases = Vector<VstEnumCase>.new();
 		p.req1('{');
 		while (true) {
 			if (p.curByte == '}') { p.advance1(); break; }
-			var c = parseEnumCase(p, cases.length);
+			if (p.curByte == ';') break;  // methods section follows
+			var c = parseEnumCase(p, desugar.cases.length);
 			if (c == null) { p.opt1('}'); break; }
-			cases.put(c);
+			desugar.addCase(c);
 			list = List.new(c, list);
+			if (desugar.hasDefault) {
+				if (p.curByte == ';') break;  // methods after _
+				p.req1('}');
+				break;
+			}
 		}
-		var decl = VstEnum.new(isPrivate, id.name, params, cases.extract(), list);
+		// Parse optional enum-level methods after ';'
+		if (p.curByte == ';') {
+			p.advance1();
+			while (true) {
+				if (p.curByte == '}') { p.advance1(); break; }
+				var nlist = parseEnumMethod(p, list);
+				if (nlist == list) { p.opt1('}'); break; }
+				list = nlist;
+			}
+		}
+		var decl = desugar.synthesizeTopLevelClass(list);
+		decl.superParams = superParams;
+		decl.qualifiers = qualifiers;
 		file.enums.put(decl);
 		return true;
 	}
-	def parseEnumCase(p: ParserState, tag: int) -> VstEnumCase {
+	def parseEnumCase(p: ParserState, tag: int) -> VstCaseMember {
+		// Handle "_" default case specially (not an identifier start in Virgil).
+		if (p.curByte == '_' && !Char.isIdentMiddle(p.peek(1))) {
+			var ut = p.token(1);
+			var c = VstCaseMember.new(tag, ut, null, null);
+			if (p.curByte == '{') c.members = parseEnumCaseMembers(p);
+			p.opt1(',');
+			return c;
+		}
 		var id = parseIdentVoid(p);
 		var args = if(p.curByte == '(', parseList(0, p, '(', COMMA, ')', parseExpr));
+		if (id.name.image.length > 0) {
+			var c = VstCaseMember.new(tag, id.name, null, args);
+			if (p.curByte == '{') c.members = parseEnumCaseMembers(p);
+			p.opt1(',');
+			return c;
+		}
 		p.opt1(',');
-		if (id.name.image.length > 0) return VstEnumCase.new(tag, id.name, args);
 		return null;
+	}
+	def parseEnumCaseMembers(p: ParserState) -> List<VstMember> {
+		p.req1('{');
+		var list: List<VstMember>;
+		while (true) {
+			if (p.curByte == '}') { p.advance1(); break; }
+			var isPrivate = optKeyword(p, "private") != null;
+			if (optKeyword(p, "def") != null) {
+				var parser = if(isPrivate, PRIVATE_DEF, PUBLIC_DEF);
+				var nlist = parser.parseDef(p, list, null);
+				if (nlist == list) { p.opt1('}'); break; }
+				list = nlist;
+			} else {
+				p.error("only 'def' allowed in enum case body");
+				p.opt1('}');
+				break;
+			}
+		}
+		return Lists.reverse(list);
+	}
+	def parseEnumMethod(p: ParserState, prev: List<VstMember>) -> List<VstMember> {
+		var isPrivate = optKeyword(p, "private") != null;
+		if (optKeyword(p, "def") != null) {
+			var parser = if(isPrivate, PRIVATE_DEF, PUBLIC_DEF);
+			return parser.parseDef(p, prev, null);
+		}
+		p.error("expected 'def' in enum method section");
+		return prev;
 	}
 	def parseLayout(p: ParserState, file: VstFile) -> bool {
 		var id = parseIdentVoid(p).name;
