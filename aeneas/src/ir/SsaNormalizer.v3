@@ -256,9 +256,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 						if (sel.mtable != null && sel.mtable.record != null) {
 							var tag = obj;
 							var tagType = V3.getVariantTagType(rc.oldType);
-							var record = sel.mtable.record;
-							var table = newGraph.valConst(record.rtype, record);
-							var func = curBlock.opArrayGetElem(record.rtype, tagType, Facts.O_SAFE_BOUNDS, table, tag);
+							var func = lookupMtable(sel, tag, tagType);
 							obj = boxEnumClosureReceiver(rc, obj);
 							mapN(i_old, [func, obj]);
 						} else {
@@ -351,9 +349,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 							// enum: tag IS the value; index into mtable
 							var tag = ai_new[0];
 							var tagType = V3.getVariantTagType(rc.oldType);
-							var record = sel.mtable.record;
-							var table = newGraph.valConst(record.rtype, record);
-							var func = curBlock.opArrayGetElem(record.rtype, tagType, Facts.O_SAFE_BOUNDS, table, tag);
+							var func = lookupMtable(sel, tag, tagType);
 							if (context.compiler.NormConfig.NonRefClosureReceiver
 								&& !context.compiler.NormConfig.ExplicitRefTypeCast) {
 								// native/wasm (non-gc): CallFunctionDirect (no Oop receiver)
@@ -376,22 +372,15 @@ class SsaRaNormalizer extends SsaRebuilder {
 					} else if (rc.isUnboxed()) {
 						// use the variant tag as an index into a table of functions
 						var tag = normVariantGetTag(rc.variantNorm, ai_new);
-						var record = IrSelector.!(m.member).mtable.record;
-						var table = newGraph.valConst(record.rtype, record);
-						var func = curBlock.opArrayGetElem(record.rtype, rc.variantNorm.tagType(), Facts.O_SAFE_BOUNDS, table, tag);
+						var func = lookupMtable(IrSelector.!(m.member), tag, rc.variantNorm.tagType());
 						ai_new = Arrays.concat([func, newGraph.nullReceiver()], ai_new);
 						normCall(i_old, funcNorm, V3Op.newCallFunction(funcNorm.sub[0]), ai_new);
 					} else {
 						normCall(i_old, funcNorm, V3Op.newCallVariantSelector(m), ai_new);
 					}
 				} else {
-					if (rc.isUnboxed()) {
-						// flattened data type becomes component call and needs new receiver
-						ai_new = Arrays.prepend(newGraph.nullReceiver(), ai_new);
-					}
-					if (EnumType.?(rc.oldType)) {
-						// devirtualized enum: tag already in args
-					}
+					// devirtualized: enum tag already in args; unboxed variant needs null receiver
+					if (rc.isUnboxed()) ai_new = Arrays.prepend(newGraph.nullReceiver(), ai_new);
 					normCall(i_old, funcNorm, V3Op.newCallMethod(m), ai_new);
 				}
 			}
@@ -1153,43 +1142,8 @@ class SsaRaNormalizer extends SsaRebuilder {
 			}
 			// XXX: CLASS_QUERY special-case non-allocated classes
 			VARIANT_QUERY => {
-				if (VariantNorm.?(atn) && VariantNorm.?(rtn)) {
-					var avn = VariantNorm.!(atn), rvn = VariantNorm.!(rtn);
-					var actualTag = normVariantGetTag(avn, ai_old[offset ...]);
-					var tagType = avn.tagType();
-					var check: SsaInstr;
-					if (rvn.tagValue == rvn.tagHi || rvn.tagHi < 0) {
-						// Leaf (or uninitialized tagHi): exact equality test.
-						var expected = newGraph.intConst(rvn.tagValue);
-						check = curBlock.pure(V3Op.newIntEq(tagType), [actualTag, expected]);
-					} else {
-						// Non-leaf subtype: range test lo <= tag && tag <= hi.
-						var lo = newGraph.intConst(rvn.tagValue);
-						var hi = newGraph.intConst(rvn.tagHi);
-						var chkLo = curBlock.pure(tagType.opLtEq(), [lo, actualTag]);
-						var chkHi = curBlock.pure(tagType.opLtEq(), [actualTag, hi]);
-						check = curBlock.opBoolAnd0(chkLo, chkHi);
-					}
-					return opAnd(left, check);
-				}
-				if (EnumType.?(atn.oldType) && EnumType.?(rtn.oldType)) {
-					// Enum subtype range test: lo <= tag <= hi.
-					var aDecl = EnumType.!(atn.oldType).enumDecl;
-					var rDecl = EnumType.!(rtn.oldType).enumDecl;
-					var actualTag = ai_old[offset];  // enum value IS its tag integer
-					var tagType = IntType.!(aDecl.tagType);
-					var lo = rDecl.tagLo, hi = rDecl.tagHi;
-					var check: SsaInstr;
-					if (lo == hi) {
-						check = curBlock.pure(V3Op.newIntEq(tagType), [actualTag, newGraph.intConst(lo)]);
-					} else {
-						var chkLo = curBlock.pure(tagType.opLtEq(), [newGraph.intConst(lo), actualTag]);
-						var chkHi = curBlock.pure(tagType.opLtEq(), [actualTag, newGraph.intConst(hi)]);
-						check = curBlock.opBoolAnd0(chkLo, chkHi);
-					}
-					return opAnd(left, check);
-				}
-				// break
+				var check = normVariantQuery(atn, rtn, ai_old, offset);
+				if (check != null) return opAnd(left, check);
 			}
 			_ => ; // break
 		}
@@ -1934,6 +1888,41 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	private def funcRef(m: IrSpec) -> SsaInstr {
 		return newGraph.valConst(Function.funcRefType(m.getFuncType()), FuncVal.new(m));
+	}
+	// Normalize a VARIANT_QUERY for both variants and enums. Returns null if unhandled.
+	private def normVariantQuery(atn: TypeNorm, rtn: TypeNorm, ai_old: Array<SsaInstr>, offset: int) -> SsaInstr {
+		var actualTag: SsaInstr, tagType: IntType, lo: int, hi: int;
+		if (VariantNorm.?(atn) && VariantNorm.?(rtn)) {
+			var avn = VariantNorm.!(atn), rvn = VariantNorm.!(rtn);
+			actualTag = normVariantGetTag(avn, ai_old[offset ...]);
+			tagType = avn.tagType();
+			lo = rvn.tagValue;
+			hi = if(rvn.tagHi < 0, rvn.tagValue, rvn.tagHi);
+		} else if (EnumType.?(atn.oldType) && EnumType.?(rtn.oldType)) {
+			var rDecl = EnumType.!(rtn.oldType).enumDecl;
+			actualTag = ai_old[offset];
+			tagType = IntType.!(EnumType.!(atn.oldType).enumDecl.tagType);
+			lo = rDecl.tagLo;
+			hi = rDecl.tagHi;
+		} else {
+			return null;
+		}
+		return genTagRangeCheck(tagType, actualTag, lo, hi);
+	}
+	// Generate a tag range check: lo == hi → equality, else lo <= tag <= hi.
+	private def genTagRangeCheck(tagType: IntType, actualTag: SsaInstr, lo: int, hi: int) -> SsaInstr {
+		if (lo == hi) {
+			return curBlock.pure(V3Op.newIntEq(tagType), [actualTag, newGraph.intConst(lo)]);
+		}
+		var chkLo = curBlock.pure(tagType.opLtEq(), [newGraph.intConst(lo), actualTag]);
+		var chkHi = curBlock.pure(tagType.opLtEq(), [actualTag, newGraph.intConst(hi)]);
+		return curBlock.opBoolAnd0(chkLo, chkHi);
+	}
+	// Look up a function in an mtable record by tag. Returns the function SSA value.
+	private def lookupMtable(sel: IrSelector, tag: SsaInstr, tagType: IntType) -> SsaInstr {
+		var record = sel.mtable.record;
+		var table = newGraph.valConst(record.rtype, record);
+		return curBlock.opArrayGetElem(record.rtype, tagType, Facts.O_SAFE_BOUNDS, table, tag);
 	}
 	// For JVM/wasm-gc: box enum tag to Oop for closure receiver slot.
 	private def boxEnumClosureReceiver(rc: RaClass, obj: SsaInstr) -> SsaInstr {
