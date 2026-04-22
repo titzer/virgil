@@ -290,7 +290,16 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	// analyze the values in a graph
 	def analyzeValues(graph: SsaGraph) {
 		if (graph.values != null) {
-			for (v in graph.values) if (v != null) analyzeValue(v.val);
+			for (v in graph.values) if (v != null) {
+				analyzeValue(v.val);
+				if (V3.isEnum(v.vtype)) {
+					var tag = 0; // null/zero-init → tag 0
+					match (v.val) {
+						x: Box<int> => tag = x.val;
+					}
+					markEnumCaseLive(v.vtype, tag);
+				}
+			}
 		}
 	}
 	// gather polymorphic operators
@@ -530,32 +539,51 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		for (l = rc.subtypes; l != null; l = l.tail) {
 			analyzeVirtual(l.head, rm);
 		}
-		// For enums, _ cases have no synthetic RaClass in subtypes, so their
-		// default method impl is never discovered by analyzeVirtual above.
-		// Walk the hierarchy and mark each level's resolved method live.
-		if (rc.raFacts.RC_ENUM) markEnumDefaultMethodsLive(rc, rm);
+		if (rc.raFacts.RC_ENUM) markEnumVirtualLive(rc, rm);
 	}
-	// For cases without their own RaClass (no per-case overrides), mark the
-	// resolved method at the declaring level as live so its mtable slot gets filled.
-	private def markEnumDefaultMethodsLive(rc: RaClass, rm: RaMethod) {
-		var decl = V3.getDecl(rc.oldType);
-		// Check if any case at this level lacks per-case overrides
-		var hasGap = decl.hasDefault;
-		if (!hasGap && decl.cases != null) {
-			for (c in decl.cases) {
-				if (c.members == null) { hasGap = true; break; }
-			}
+	// Record a virtual method on an enum and resolve implementations for all live cases.
+	private def markEnumVirtualLive(rc: RaClass, rm: RaMethod) {
+		var rootRc = rc;
+		while (rootRc.parent != null && rootRc.parent.raFacts.RC_ENUM) rootRc = rootRc.parent;
+		if (rootRc.liveCaseTags == null) return;
+		rootRc.liveEnumVirtuals = List.new(rm, rootRc.liveEnumVirtuals);
+		for (tag < rootRc.liveCaseTags.length) {
+			if (rootRc.liveCaseTags[tag]) resolveEnumCaseImpl(rootRc, tag, rm);
 		}
-		if (hasGap) {
-			var spec = oldIr.resolveMethodImpl(rc.oldType, rm.getSpec());
-			var impl = makeMethod(spec.typeArgs, IrMethod.!(spec.member), null);
-			rm.virtual.addImpl(impl);
-			getMethod(null, impl);
+	}
+	// Mark an enum case as live and resolve implementations for all known virtual methods.
+	def markEnumCaseLive(enumType: Type, tag: int) {
+		var rc = RaClass.!(makeType(enumType));
+		var rootRc = rc;
+		while (rootRc.parent != null && rootRc.parent.raFacts.RC_ENUM) rootRc = rootRc.parent;
+		if (rootRc.liveCaseTags == null) return;
+		if (tag < 0 || tag >= rootRc.liveCaseTags.length) return;
+		if (rootRc.liveCaseTags[tag]) return; // already live
+		rootRc.liveCaseTags[tag] = true;
+		// If case has its own RaClass, add to parent subtypes
+		var caseRc = rootRc.enumCaseRaClasses[tag];
+		if (caseRc != null) {
+			caseRc.parent.subtypes = List.new(caseRc, caseRc.parent.subtypes);
 		}
-		for (l = decl.subtypeOrder; l != null; l = l.tail) {
-			var childRc = getClass(l.head.getDeclaredType());
-			if (childRc != null) markEnumDefaultMethodsLive(RaClass.!(childRc), rm);
+		for (l = rootRc.liveEnumVirtuals; l != null; l = l.tail) {
+			resolveEnumCaseImpl(rootRc, tag, l.head);
 		}
+	}
+	// Resolve the implementation of a virtual method for a specific case tag.
+	private def resolveEnumCaseImpl(rootRc: RaClass, tag: int, rm: RaMethod) {
+		// If case has its own RaClass, use analyzeVirtual (handles overrides)
+		var caseRc = rootRc.enumCaseRaClasses[tag];
+		if (caseRc != null) {
+			analyzeVirtual(caseRc, rm);
+			return;
+		}
+		// Otherwise resolve at the declaring enum level
+		var declType = rootRc.caseDeclaringTypes[tag];
+		if (declType == null) declType = rootRc.oldType;
+		var spec = oldIr.resolveMethodImpl(declType, rm.getSpec());
+		var impl = makeMethod(spec.typeArgs, IrMethod.!(spec.member), null);
+		rm.virtual.addImpl(impl);
+		getMethod(null, impl);
 	}
 	def getMethod(op: SsaApplyOp, rm: RaMethod) {
 		if (rm.setFact(RaFact.RM_LIVE)) return;
@@ -796,15 +824,24 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	}
 	private def addEnumCaseClasses(rc: RaClass, decl: VstClass) {
 		if (decl.cases == null) return;
+		var rootRc = rc;
+		while (rootRc.parent != null && rootRc.parent.raFacts.RC_ENUM) rootRc = rootRc.parent;
+		var totalTags = V3.getTagHi(rootRc.oldType) + 1;
+		if (rootRc.liveCaseTags == null) {
+			rootRc.liveCaseTags = Array<bool>.new(totalTags);
+			rootRc.enumCaseRaClasses = Array<RaClass>.new(totalTags);
+			rootRc.caseDeclaringTypes = Array<Type>.new(totalTags);
+		}
 		for (c in decl.cases) {
 			if (c.decl == null || !c.decl.isSynthetic) continue;
+			rootRc.caseDeclaringTypes[c.enumTag] = rc.oldType;
 			if (c.members == null) continue; // no overrides: share parent RaClass
 			var caseType = V3.getSyntheticEnumCaseType(c);
 			var caseIc = oldIr.makeIrClass(caseType);
 			var caseRc = newRaClass(caseType, caseIc, rc);
 			caseRc.raFacts |= RaFact.RC_ENUM;
 			typeMap[caseType] = caseRc;
-			rc.subtypes = List.new(caseRc, rc.subtypes);
+			rootRc.enumCaseRaClasses[c.enumTag] = caseRc;
 		}
 	}
 	def mono(t: Type, spec: IrSpec) -> Type {
@@ -845,6 +882,10 @@ class RaClass extends RaType {
 	var maxClassId = -1;			// maximum class ID
 	var newIrType: Type;
 
+	var liveCaseTags: Array<bool>;		// enum roots: which case tags are live
+	var liveEnumVirtuals: List<RaMethod>;	// enum roots: virtual methods needing dispatch
+	var enumCaseRaClasses: Array<RaClass>;	// enum roots: tag -> RaClass (cases with overrides)
+	var caseDeclaringTypes: Array<Type>;	// enum roots: tag -> declaring enum type
 	var variantNorm: VariantNorm;		// non-null for flattened variants
 	var variantFields: Array<VariantField>;
 	var origFieldTypes: Array<Type>;
