@@ -76,6 +76,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		ra.classes.apply(layoutVtable);
 		Lists.apply(virtuals, layoutMtable);
+		if (ra.compiler.CompactMtableThreshold > 0) compactEnumMtables();
 
 		if (wrappers != null) wrappers.createVirtualWrappers(this);
 
@@ -676,6 +677,95 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				if (rootRc.liveCaseTags != null && !rootRc.liveCaseTags[tag]) continue;
 				setMtableEntry(mtable, impl, tag);
 			}
+		}
+	}
+	private def compactEnumMtables() {
+		var threshold = ra.compiler.CompactMtableThreshold;
+		// Group RaVirtuals by enum root receiver.
+		// Use a parallel arrays approach: collect (rc, list of RaVirtual) pairs.
+		var enumRoots = Vector<RaClass>.new();
+		var enumVirts = Vector<Vector<RaVirtual>>.new();
+		for (l = virtuals; l != null; l = l.tail) {
+			var rv = l.head;
+			if (rv.mtable == null || rv.mtable.record == null) continue;
+			var rc = ra.getClass(rv.raMethod.receiver);
+			if (rc == null || !V3.isEnum(rc.oldType)) continue;
+			// Find or create entry for this enum root
+			var found = -1;
+			for (i < enumRoots.length) {
+				if (enumRoots[i] == rc) { found = i; break; }
+			}
+			if (found < 0) {
+				found = enumRoots.length;
+				enumRoots.put(rc);
+				enumVirts.put(Vector<RaVirtual>.new());
+			}
+			enumVirts[found].put(rv);
+		}
+		for (i < enumRoots.length) {
+			compactOneEnumMtable(enumRoots[i], enumVirts[i], threshold);
+		}
+	}
+	private def compactOneEnumMtable(rc: RaClass, rvs: Vector<RaVirtual>, threshold: int) {
+		var numTags = rc.maxClassId - rc.minClassId;
+		if (numTags <= 0) return;
+		var numMethods = rvs.length;
+		if (numMethods == 0) return;
+		// Count live tags
+		var numLive = 0;
+		for (tag < numTags) {
+			if (rc.liveCaseTags == null || rc.liveCaseTags[tag]) numLive++;
+		}
+		if (numLive == 0) return;
+		// Build per-tag implementation tuples and deduplicate.
+		// knownTuples[slot] = Array<IrMethod> of length numMethods
+		var knownTuples = Vector<Array<IrMethod>>.new();
+		var tagToSlot = Array<int>.new(numTags);
+		for (tag < numTags) {
+			if (rc.liveCaseTags != null && !rc.liveCaseTags[tag]) continue;
+			var tuple = Array<IrMethod>.new(numMethods);
+			for (m < numMethods) tuple[m] = rvs[m].mtable.table[tag];
+			// Search for matching existing tuple
+			var slot = -1;
+			for (k < knownTuples.length) {
+				if (Arrays.equal(tuple, knownTuples[k])) { slot = k; break; }
+			}
+			if (slot < 0) {
+				slot = knownTuples.length;
+				knownTuples.put(tuple);
+			}
+			tagToSlot[tag] = slot;
+		}
+		var numSlots = knownTuples.length;
+		// Check threshold: compact only if slots/liveTags <= threshold%
+		if (numSlots * 100 > threshold * numLive) return;
+		// Build the shared slotMap record on the RaClass
+		var slotType = if(numSlots <= 256, Int.getType(false, 8), Int.getType(false, 16));
+		var slotMapArrayType = V3Array.newType(slotType);
+		var slotMapRecord = ra.prog.newRecord(slotMapArrayType, numTags);
+		for (tag < numTags) {
+			slotMapRecord.values[tag] = Int.box(tagToSlot[tag]);
+		}
+		rc.compactSlotMap = slotMapRecord;
+		rc.compactSlotType = slotType;
+		// Build per-method compact records
+		for (m < numMethods) {
+			var rv = rvs[m];
+			var origRecord = rv.mtable.record;
+			var compactArrayType = origRecord.rtype;
+			var compactRec = ra.prog.newRecord(compactArrayType, numSlots);
+			for (s < numSlots) {
+				var tuple = knownTuples[s];
+				// Find a live tag with this slot to copy the FuncVal from
+				for (tag < numTags) {
+					if (rc.liveCaseTags != null && !rc.liveCaseTags[tag]) continue;
+					if (tagToSlot[tag] == s && rv.mtable.table[tag] == tuple[m]) {
+						compactRec.values[s] = origRecord.values[tag];
+						break;
+					}
+				}
+			}
+			rv.mtable.compactRecord = compactRec;
 		}
 	}
 	private def createEnumVariantNorms(rc: RaClass) {
