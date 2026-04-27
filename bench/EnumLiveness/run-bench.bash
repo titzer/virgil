@@ -54,13 +54,13 @@ compile_and_measure() {
     elif [ "$target" = "wasm-gc" ]; then
         binary="$outdir/$progname.wasm"
         rt_files="$(echo $RT/wasm-gc-wasi1/*.v3 $RT/wasm-wasi1-common/*.v3)"
-        compile_args="-target=wasm-gc"
-        can_run=false
+        compile_args="-heap-size=200m -target=wasm-gc"
+        runcmd="$VIRGIL_LOC/test/config/node --no-warnings --experimental-wasi-unstable-preview1 $VIRGIL_LOC/bench/run-wasm-entry.mjs $binary"
     elif [ "$target" = "wasm" ]; then
         binary="$outdir/$progname.wasm"
         rt_files="$(echo $RT/wasm-wasi1/*.v3 $RT/wasm-wasi1-common/*.v3 $RT/native/NativeFileStream.v3)"
-        compile_args="-target=wasm"
-        can_run=false
+        compile_args="-heap-size=200m -target=wasm"
+        runcmd="$VIRGIL_LOC/test/config/node --no-warnings --experimental-wasi-unstable-preview1 $VIRGIL_LOC/bench/run-wasm-entry.mjs $binary"
     else
         binary="$outdir/$progname"
         rt_files="$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)"
