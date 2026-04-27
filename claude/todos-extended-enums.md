@@ -26,13 +26,18 @@ in these stages:
    Example: enum E1 { A, B, _; def m1() => 0; }
      Note that the enum's methods are separated from its cases by a ';'.
    Subtype enums can override inherited methods.
-   Per-case method overrides (case { def ... }) were removed in Strategy A Step 1.
+   Per-case method overrides (case { def ... }) were re-introduced in Strategy B
+   via synthetic per-case RaClasses (branch open_enums3b) — only cases with
+   their own `{ def ... }` body get a synthetic class, the rest share the
+   parent. Strategy A (open_enums3a) keeps the type/subtype-only model.
    Todos:
    - [x] Extend the syntax (sub-stage 3.1: enum-level methods after ';')
    - [x] Extend the semantic checking (sub-stage 3.1: basic method resolution)
    - [x] Subtype method inheritance with overrides (sub-stage 3.3)
+   - [x] Per-case method overrides (Strategy B, branch open_enums3b)
    - [x] Method closures (sub-stage 3.4: `var f = e.m; f()`)
    - [x] Wasm/wasm-gc backend support (indirect adapters, sig handling, no Oop for enums)
+   - [x] JVM backend support (closure adapter, M_ABSTRACT guard in JvmV3EnumGen)
    - Implementation note: dispatch uses tag-indexed array of function values (no boxed enum
      objects needed). The tag type is prepended to the method's normalized function type.
      CallFunctionDirect (no Oop prepend) is used instead of CallFunction for enum dispatch.
@@ -40,6 +45,9 @@ in these stages:
      between variants and enums. Enum values are integers (not Records), so the interpreter,
      optimizer constant-fold, and optimizer CallClosure handler all need EnumType guards.
      The optimizer must also set O_NO_NULL_CHECK for enum receivers (tag 0 is valid).
+   - Strategy B optimizations: per-case RaClass elision (only cases with overrides
+     get a synthetic class), queue-based per-case liveness, and the optional
+     `-compact-mtable=N` (off by default) for compacting redundant mtable rows.
 4. Allow subtypes to redeclare supertype fields [DONE]
    Given supertype enum E3(x: int) { A(1), B(17), _ }, example subtype
    declarations:
