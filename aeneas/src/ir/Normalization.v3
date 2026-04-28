@@ -17,6 +17,7 @@ class NormalizerConfig {
 	var UsedScalars: Scalar.set = Scalar.B32 | Scalar.B64 | Scalar.F32 | Scalar.F64 | Scalar.Ref;
 	var WrapFuncTypeSubsume: bool;
 	var ExplicitRefTypeCast: bool;
+	var BoxEnumClosureReceiver: bool;
 
 	var GetScalar: (Compiler, Program, Type) -> Scalar.set = defaultGetScalar;
 	var GetBitWidth: Type -> byte = defaultGetBitWidth;
@@ -75,6 +76,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		ra.classes.apply(layoutVtable);
 		Lists.apply(virtuals, layoutMtable);
+		if (ra.compiler.CompactMtableThreshold > 0) compactEnumMtables();
 
 		if (wrappers != null) wrappers.createVirtualWrappers(this);
 
@@ -110,7 +112,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			var ic = rc;
 			while (ic.parent != null) ic = ic.parent; // start at root
 
-			if (V3.isVariant(ic.oldType)) {
+			if (V3.isVariant(ic.oldType) || V3.isEnum(ic.oldType)) {
 				norm(ic.oldType);
 				numberVariant(ic);
 				if (!ic.isUnboxed()) makeNormFieldsAll(ic);
@@ -130,7 +132,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				normQueue.add(normClassRecord, (rc, oldRecord, newRecord)); // XXX: inline normClassRecord
 			}
 			ra.prog.state.setComponentRecord(comp, newRecord);
-		} else if (!rc.isUnboxed()) {
+		} else if (!rc.isUnboxed() || V3.isEnum(rc.oldType)) {
 			// create and map new records to be normalized
 			for (l = rc.instances; l != null; l = l.tail) {
 				var oldRecord = l.head, newRecord = ra.prog.newRecord(tn.newType, rc.liveFields.length);
@@ -156,8 +158,12 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		if (rm.norm != null) return; // already done
 		var ftype = rm.getSpec().getMethodType();
 		if (rc.isUnboxed()) {
-			// move flattened data type receiver to function sig
-			ftype = Function.prependParamTypes(rc.variantNorm.sub, ftype);
+			if (V3.isEnum(rc.oldType) && !config.NonRefClosureReceiver
+			    && m.source != null && VstMethod.?(m.source)) {
+				ftype = Function.prependParamType(Oop.TYPE, ftype);
+			} else {
+				ftype = Function.prependParamTypes(rc.variantNorm.sub, ftype);
+			}
 		}
 		rm.funcNorm = FuncNorm.!(norm(ftype));
 		var typeParams = if(rm.spec != null, rm.spec.getTypes().methodTypeArgs);
@@ -272,7 +278,15 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				else tn = TypeNorm.new(t, t, null);
 			}
 			ENUM => {
-				tn = TypeNorm.new(t, V3.getVariantTagType(t), null);
+				var tagType = V3.getVariantTagType(t);
+				var rc = ra.getClass(t);
+				if (rc != null) {
+					var root = rc;
+					while (root.parent != null) root = root.parent;
+					if (root.variantNorm == null) createEnumVariantNorms(root);
+					tn = rc.variantNorm;
+				}
+				if (tn == null) tn = TypeNorm.new(t, tagType, null);
 			}
 			REF => {
 				var sub = [
@@ -311,9 +325,16 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	def numberVariant(rc: RaClass) {
 		rc.minClassId = liveClasses.length;
 		if (rc.children == null) {
-			liveClasses.put(rc); // special case of a data type
+			liveClasses.put(rc); // leaf
 		} else {
 			for (l = rc.children; l != null; l = l.tail) numberVariantSlot(l.head, rc.minClassId);
+		}
+		// For enum roots, ensure we reserve the full DFS tag range.
+		if (V3.isEnum(rc.oldType)) {
+			var tagHi = V3.getTagHi(rc.oldType);
+			var endId = rc.minClassId + tagHi + 1;
+			liveClasses.grow(endId);
+			if (liveClasses.length < endId) liveClasses.length = endId;
 		}
 		rc.maxClassId = liveClasses.length;
 	}
@@ -325,8 +346,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	// Non-leaf range nodes whose tagLo equals a child's tagLo are NOT stored in
 	// liveClasses, so layoutMtable can filter them out.
 	def numberVariantSlot(c: RaClass, rootMin: int) {
-		var decl = ClassType.!(c.oldType).classDecl;
-		var tagLo = decl.variantTag, tagHi = decl.variantTagHi;
+		var tagLo = V3.getTagLo(c.oldType), tagHi = V3.getTagHi(c.oldType);
 		c.minClassId = rootMin + tagLo;
 		c.maxClassId = rootMin + tagHi + 1;
 		liveClasses.grow(c.maxClassId);
@@ -337,7 +357,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			// Check if this node has its own slot (no child starts at the same tag).
 			var ownSlot = true;
 			for (l = c.children; l != null; l = l.tail) {
-				if (ClassType.!(l.head.oldType).classDecl.variantTag == tagLo) { ownSlot = false; break; }
+				if (V3.getTagLo(l.head.oldType) == tagLo) { ownSlot = false; break; }
 			}
 			if (ownSlot) liveClasses[rootMin + tagLo] = c; // e.g. "case _" before subtypes
 			for (l = c.children; l != null; l = l.tail) numberVariantSlot(l.head, rootMin);
@@ -589,6 +609,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			sm.norm.flags |= IrFlag.M_OVERRIDDEN;
 		}
 		if (rm.virtual != null) virtuals = List.new(rm.virtual, virtuals);
+		if (m.flags.M_OVERRIDDEN) rm.norm.flags |= IrFlag.M_OVERRIDDEN;
 	}
 	def layoutMtable(rv: RaVirtual) {
 		if (rv.mtable != null) return;
@@ -599,29 +620,170 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		rv.mtable = mtable;
 
 		if (rc.isUnboxed()) {
-			var ft = Function.funcRefType(rm.norm.getMethodType());
+			var methType = rm.norm.getMethodType();
+			if (!config.NonRefClosureReceiver && V3.isEnum(rc.oldType)
+			    && rm.orig.source != null && VstMethod.?(rm.orig.source)) {
+				var paramList = Function.getParamTypeList(methType);
+				if (paramList != null && paramList.head == Oop.TYPE) {
+					var userParamType: Type = Void.TYPE;
+					if (paramList.tail != null) userParamType = Tuple.fromTypeArray(Lists.toArray(paramList.tail));
+					methType = Function.newType(userParamType, Function.getReturnType(methType));
+				}
+			}
+			var ft = Function.funcRefType(methType);
 			mtable.record = ra.prog.newRecord(V3Array.newType(ft), size);
 		}
 		if (mtable.table.length > 0) {
-			for (l = rc.subtypes; l != null; l = l.tail) { // fill out mtable
-				// Skip non-leaf variant range nodes (e.g. "case _" and intermediate subtype
-				// variants). Only the actual leaf at each DFS tag slot fills the mtable.
+			for (l = rc.subtypes; l != null; l = l.tail) {
 				if (liveClasses[l.head.minClassId] != l.head) continue;
-				var impl = resolveMethodImpl(l.head, rm);
-				var index = l.head.minClassId - mtable.rootId;
-				mtable.table[index] = impl.norm;
-				if (CLOptions.PRINT_WRAP_EXTRA.get()) {
-					FunctionWrapping.printWrap().put3("layoutMtable: slot %d  class %q  subclass %q", index, rc.orig.ctype.render, l.head.orig.ctype.render)
-							.put3("  impl %q{%d/%d}", impl.norm.render, impl.norm.index, impl.norm.uid).outln();
-				}
-				if (mtable.record != null) {
-					var ta = Arrays.replace(impl.getSpec().typeArgs, 0, impl.norm.receiver);
-					var spec = IrSpec.new(ta[0], ta, impl.norm);
-					mtable.record.values[index] = FuncVal.new(spec);
-				}
+				fillMtableSlot(mtable, l.head, rm);
 			}
+			// Fill _ case slots: _ has no RaClass, so its tag slots are
+			// empty after the per-subtype fill above. Walk the hierarchy
+			// and fill unfilled slots with the appropriate default method.
+			if (V3.isEnum(rc.oldType)) fillEnumDefaultSlots(mtable, rc, rm);
 		}
 		setMtable(rc, rv); // set mtable for all child virtual methods
+	}
+	private def setMtableEntry(mtable: IrMtable, impl: RaMethod, index: int) {
+		mtable.table[index] = impl.norm;
+		if (mtable.record != null) {
+			var ta = Arrays.replace(impl.getSpec().typeArgs, 0, impl.norm.receiver);
+			var spec = IrSpec.new(ta[0], ta, impl.norm);
+			mtable.record.values[index] = FuncVal.new(spec);
+		}
+	}
+	private def fillMtableSlot(mtable: IrMtable, rc: RaClass, rm: RaMethod) {
+		var impl = resolveMethodImpl(rc, rm);
+		setMtableEntry(mtable, impl, rc.minClassId - mtable.rootId);
+	}
+	private def fillEnumDefaultSlots(mtable: IrMtable, rc: RaClass, rm: RaMethod) {
+		var rootRc = rc;
+		while (rootRc.parent != null && rootRc.parent.raFacts.RC_ENUM) rootRc = rootRc.parent;
+		// Recurse into subtypes first so deeper overrides take precedence
+		var decl = V3.getDecl(rc.oldType);
+		for (l = decl.subtypeOrder; l != null; l = l.tail) {
+			var childRc = ra.getClass(l.head.getDeclaredType());
+			if (childRc != null) fillEnumDefaultSlots(mtable, RaClass.!(childRc), rm);
+		}
+		// Fill remaining empty slots at this level (only for live tags)
+		var impl = resolveMethodImpl(rc, rm);
+		if (impl != null) {
+			var tagLo = V3.getTagLo(rc.oldType);
+			var tagHi = V3.getTagHi(rc.oldType);
+			if (tagLo < 0) tagLo = 0;
+			for (tag = tagLo; tag <= tagHi; tag++) {
+				if (mtable.table[tag] != null) continue;
+				if (rootRc.liveCaseTags != null && !rootRc.liveCaseTags[tag]) continue;
+				setMtableEntry(mtable, impl, tag);
+			}
+		}
+	}
+	private def compactEnumMtables() {
+		var threshold = ra.compiler.CompactMtableThreshold;
+		// Group RaVirtuals by enum root receiver.
+		// Use a parallel arrays approach: collect (rc, list of RaVirtual) pairs.
+		var enumRoots = Vector<RaClass>.new();
+		var enumVirts = Vector<Vector<RaVirtual>>.new();
+		for (l = virtuals; l != null; l = l.tail) {
+			var rv = l.head;
+			if (rv.mtable == null || rv.mtable.record == null) continue;
+			var rc = ra.getClass(rv.raMethod.receiver);
+			if (rc == null || !V3.isEnum(rc.oldType)) continue;
+			// Find or create entry for this enum root
+			var found = -1;
+			for (i < enumRoots.length) {
+				if (enumRoots[i] == rc) { found = i; break; }
+			}
+			if (found < 0) {
+				found = enumRoots.length;
+				enumRoots.put(rc);
+				enumVirts.put(Vector<RaVirtual>.new());
+			}
+			enumVirts[found].put(rv);
+		}
+		for (i < enumRoots.length) {
+			compactOneEnumMtable(enumRoots[i], enumVirts[i], threshold);
+		}
+	}
+	private def compactOneEnumMtable(rc: RaClass, rvs: Vector<RaVirtual>, threshold: int) {
+		var numTags = rc.maxClassId - rc.minClassId;
+		if (numTags <= 0) return;
+		var numMethods = rvs.length;
+		if (numMethods == 0) return;
+		// Count live tags
+		var numLive = 0;
+		for (tag < numTags) {
+			if (rc.liveCaseTags == null || rc.liveCaseTags[tag]) numLive++;
+		}
+		if (numLive == 0) return;
+		// Build per-tag implementation tuples and deduplicate.
+		// knownTuples[slot] = Array<IrMethod> of length numMethods
+		var knownTuples = Vector<Array<IrMethod>>.new();
+		var tagToSlot = Array<int>.new(numTags);
+		for (tag < numTags) {
+			if (rc.liveCaseTags != null && !rc.liveCaseTags[tag]) continue;
+			var tuple = Array<IrMethod>.new(numMethods);
+			for (m < numMethods) tuple[m] = rvs[m].mtable.table[tag];
+			// Search for matching existing tuple
+			var slot = -1;
+			for (k < knownTuples.length) {
+				if (Arrays.equal(tuple, knownTuples[k])) { slot = k; break; }
+			}
+			if (slot < 0) {
+				slot = knownTuples.length;
+				knownTuples.put(tuple);
+			}
+			tagToSlot[tag] = slot;
+		}
+		var numSlots = knownTuples.length;
+		// Check threshold: compact only if slots/liveTags <= threshold%
+		if (numSlots * 100 > threshold * numLive) return;
+		// Build the shared slotMap record on the RaClass
+		var slotType = if(numSlots <= 256, Int.getType(false, 8), Int.getType(false, 16));
+		var slotMapArrayType = V3Array.newType(slotType);
+		var slotMapRecord = ra.prog.newRecord(slotMapArrayType, numTags);
+		for (tag < numTags) {
+			slotMapRecord.values[tag] = Int.box(tagToSlot[tag]);
+		}
+		rc.compactSlotMap = slotMapRecord;
+		rc.compactSlotType = slotType;
+		// Build per-method compact records
+		for (m < numMethods) {
+			var rv = rvs[m];
+			var origRecord = rv.mtable.record;
+			var compactArrayType = origRecord.rtype;
+			var compactRec = ra.prog.newRecord(compactArrayType, numSlots);
+			for (s < numSlots) {
+				var tuple = knownTuples[s];
+				// Find a live tag with this slot to copy the FuncVal from
+				for (tag < numTags) {
+					if (rc.liveCaseTags != null && !rc.liveCaseTags[tag]) continue;
+					if (tagToSlot[tag] == s && rv.mtable.table[tag] == tuple[m]) {
+						compactRec.values[s] = origRecord.values[tag];
+						break;
+					}
+				}
+			}
+			rv.mtable.compactRecord = compactRec;
+		}
+	}
+	private def createEnumVariantNorms(rc: RaClass) {
+		var tagType = V3.getVariantTagType(rc.oldType);
+		var tagTypeNorm = norm(tagType);
+		var noVFields = Array<VariantField>.new(0);
+		var tagField = VariantField.new(null, tagTypeNorm, [0]);
+		createEnumVariantNorm(rc, tagType, noVFields, tagField);
+	}
+	private def createEnumVariantNorm(rc: RaClass, tagType: IntType, noVFields: Array<VariantField>, tagField: VariantField) {
+		var vn = VariantNorm.new(rc.oldType, tagType, [tagType], noVFields, tagField);
+		vn.tagValue = V3.getTagLo(rc.oldType);
+		vn.tagHi = V3.getTagHi(rc.oldType);
+		rc.variantNorm = vn;
+		for (l = rc.children; l != null; l = l.tail) {
+			createEnumVariantNorm(l.head, tagType, noVFields, tagField);
+			vn.children = List<VariantNorm>.new(l.head.variantNorm, vn.children);
+		}
 	}
 	def setMtable(rc: RaClass, rv: RaVirtual) {
 		var rm = rc.findRaMethod(rv.raMethod);
@@ -632,7 +794,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 	}
 	def resolveMethodImpl(rc: RaClass, rm: RaMethod) -> RaMethod {
 		var sm: RaMethod;
-		for (sc = rc; sc != null; sc = sc.parent) { // find super method, if any
+		for (sc = rc; sc != null; sc = sc.parent) {
 			sm = sc.findRaMethod(rm);
 			if (sm != null) return sm;
 		}
@@ -668,7 +830,11 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 							 tn.render, x.memberRef.asMethod().render, V3.render(fval)).outln();
 				}
 				array[index] = fval;
-				normValIntoArray(x.val, norm(x.memberRef.receiver), array, index + 1);
+				var recv = x.val;
+				if (V3.isEnum(x.memberRef.receiver) && config.BoxEnumClosureReceiver) {
+					recv = OopInt.new(V3.unboxI32(recv));
+				}
+				normValIntoArray(recv, norm(x.memberRef.receiver), array, index + 1);
 			}
 			x: BoxVal => {
 				// tuple: recursively normalize all of the sub
