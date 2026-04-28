@@ -77,12 +77,10 @@ In match patterns, unqualified subtype names (`Bar =>` or `b: Bar =>`) automatic
 ```
 
 EnumDecl    ::= DottedId EnumParams? '{' EnumCase* (';' EnumMethod*)? '}'
-EnumCase    ::= id ['(' Expr,* ')'] EnumCaseBody? ','?   // named case with optional per-case methods
+EnumCase    ::= id ['(' Expr,* ')'] ','?                 // named case
               | '_' ','?                                 // default case: optional, must be last, at most one
 
-EnumCaseBody ::= '{' EnumMethod* '}'                     // per-case method overrides
-
-EnumMethod  ::= ['private'] 'def' DefDef                // shared by all cases (after ';') or per-case override (in case body)
+EnumMethod  ::= ['private'] 'def' DefDef                 // shared by all cases (after ';')
 
 EnumParams  ::= '(' 'super' ')'                      // inherit parent's params
               | '(' 'super' ',' ParamDecl,+ ')'       // inherit parent's params + add new fields
@@ -121,15 +119,12 @@ Subtypes may **not** declare params if the parent has no effective params. Using
 
 ### Enum methods
 
-An `EnumMethod` declared after the `;` separator is shared by all cases (the default implementation).
-
-An `EnumMethod` declared inside an `EnumCaseBody` (`{ def ... }`) overrides the enum-level method of the same name for that specific case. The override must have the same signature as the root method.
+An `EnumMethod` declared after the `;` separator is shared by all cases of that enum (or subtype enum).
 
 ### Enum method inheritance
 
 - Methods declared on a parent enum are inherited by all subtype enums (transitively).
 - A subtype enum may override an inherited method by declaring a method with the same name and signature after its own `;` separator.
-- Individual cases (at any level) may override a method by declaring it in a case body: `case X { def m() -> int { return 42; } }`.
 - All virtual dispatch goes through the root enum's dispatch table, regardless of where the override is declared.
 
 
