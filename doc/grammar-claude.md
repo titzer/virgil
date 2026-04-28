@@ -76,9 +76,75 @@ In match patterns, unqualified subtype names (`Bar =>` or `b: Bar =>`) automatic
 
 ```
 
-EnumDecl    ::= id EnumParams? '{' EnumCase* '}'
-EnumCase    ::= id ['(' Expr,* ')'] ','?
+EnumDecl    ::= DottedId EnumParams? '{' EnumCase* (';' EnumMethod*)? '}'
+EnumCase    ::= id ['(' Expr,* ')'] EnumCaseBody? ','?   // named case with optional per-case methods
+              | '_' ','?                                 // default case: optional, must be last, at most one
 
+EnumCaseBody ::= '{' EnumMethod* '}'                     // per-case method overrides
+
+EnumMethod  ::= ['private'] 'def' DefDef                // shared by all cases (after ';') or per-case override (in case body)
+
+EnumParams  ::= '(' 'super' ')'                      // inherit parent's params
+              | '(' 'super' ',' ParamDecl,+ ')'       // inherit parent's params + add new fields
+              | '(' ParamDecl,* ')'                    // declare params (root or restate + optional extras)
+
+```
+
+### Enum subtype constraints (checked by verifier)
+
+An `EnumDecl` whose `DottedId` is a plain `id` is a **root** (top-level) enum.
+
+An `EnumDecl` whose `DottedId` has the form `D.T` (one or more dots) declares a **subtype enum**:
+
+- The first identifier in `D` must name a root enum.
+- Every intermediate identifier in `D` must name an enum that is a direct subtype of the previous one (transitively established by prior declarations).
+- The immediate parent (the enum named by all of `D`) must have a `case _`.
+- `T` must not clash with any named `case id` of the immediate parent.
+- `D.T` may be declared at most once (among all files of the program).
+
+### Enum subtype parameter rules
+
+A subtype's **effective parameters** are its parent's effective parameters plus any extra parameters the subtype itself declares. The root enum's effective parameters are simply its own declared parameters.
+
+Subtypes may reference their parent's effective parameters in several ways:
+
+- **Form 1 (restate)**: `enum E.S(x: int)` — restates the parent's effective params by name and type. May also add extra params: `enum E.S(x: int, f: float)`.
+- **Form 2 (super)**: `enum E.S(super)` — inherits the parent's effective params without restating them.
+- **Form 2+add (super + extras)**: `enum E.S(super, f: float)` — inherits parent's effective params and adds new fields.
+- **Form 3 (implicit)**: `enum E.S` — no param list; parent's effective params are inherited implicitly.
+
+In all forms, each case must provide argument values for all effective parameters (parent's effective params + own extra params, in order).
+
+In multi-level hierarchies, `super` refers to the immediate parent's effective parameters, which includes the root's parameters and all intermediate ancestors' extra parameters. For example, given `enum E(x: int)` and `enum E.S(super, y: int)`, a grandchild `enum E.S.T(super, z: int)` has effective parameters `(x, y, z)` and each case must provide all three values.
+
+Subtypes may **not** declare params if the parent has no effective params. Using `super` when the parent has no effective params is an error.
+
+### Enum methods
+
+An `EnumMethod` declared after the `;` separator is shared by all cases (the default implementation).
+
+An `EnumMethod` declared inside an `EnumCaseBody` (`{ def ... }`) overrides the enum-level method of the same name for that specific case. The override must have the same signature as the root method.
+
+### Enum method inheritance
+
+- Methods declared on a parent enum are inherited by all subtype enums (transitively).
+- A subtype enum may override an inherited method by declaring a method with the same name and signature after its own `;` separator.
+- Individual cases (at any level) may override a method by declaring it in a case body: `case X { def m() -> int { return 42; } }`.
+- All virtual dispatch goes through the root enum's dispatch table, regardless of where the override is declared.
+
+
+### Enum match pattern semantics
+
+When matching on an expression of enum type `E`, a match pattern may name:
+
+- A **named case** of `E` (e.g. `X` where `E` has `case X`) — matched by tag
+- A **subtype enum** of `E` (e.g. `S` where `E.S` is a subtype) — matched by tag range
+
+Only the **unqualified** name is legal in a match pattern. For example, if `E.S` is a subtype of `E`, write `S`, not `E.S`.
+
+A match on an enum type `E` that has `case _` must always include a `_` arm regardless of which named cases or subtypes are listed.
+
+```
 PackingDecl ::= id '(' PackingParam,* ')' ':' int '=' PackingExpr ';'
 PackingParam ::= id ':' int
 PackingExpr  ::= BitPattern                           // 0b...
@@ -135,7 +201,8 @@ TypeParam     ::= id
 ClassParams        ::= '(' ParamDecl,* ')'       // class constructor params (typed, def read-only)
 MethodParams       ::= '(' ParamDecl,* ')'       // method params (optionally typed)
 VariantCaseParams  ::= '(' ParamDecl,* ')'       // like enum params (typed, def read-only)
-EnumParams         ::= '(' ParamDecl,* ')'       // typed, immutable
+EnumParams         ::= '(' 'super' [',' ParamDecl,+] ')'   // super form (with optional extras)
+                     | '(' ParamDecl,* ')'                  // typed, immutable
 
 ParamDecl ::= ['var'] id [':' TypeRef]
 ```
