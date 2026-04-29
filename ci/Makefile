@@ -44,8 +44,8 @@ x86-runs: $(X86_RUNS)
 
 
 X86_64_RUNS = x86-64 x86-64-wfts x86-64-O1 x86-64-O1-wfts x86-64-fp x86-64-fp-wfts \
-    x86-64-O2 x86-64-O2-wfts x86-64-uv x86-64-uv-wfts \
-    x86-64-uv-O2 x86-64-uv-O2-wfts \
+    x86-64-O2 x86-64-O2-wfts x86-64-O3 x86-64-O3-wfts x86-64-uv x86-64-uv-wfts \
+    x86-64-uv-O2 x86-64-uv-O2-wfts x86-64-uv-O3 x86-64-uv-O3-wfts \
 
 x86-64-runs: $(X86_64_RUNS)
 
@@ -55,17 +55,17 @@ X86_64_DARWIN_RUNS = x86-64-darwin-bootstrap x86-64-darwin-current
 x86-64-darwin-runs: $(X86_64_DARWIN_RUNS)
 
 
-JVM_RUNS = jvm jvm-O2 jvm-uv
+JVM_RUNS = jvm jvm-O2 jvm-O3 jvm-uv
 
 jvm-runs: $(JVM_RUNS)
 
 
-WASM_RUNS = wasm wasm-wfts wasm-O2 wasm-O2-wfts
+WASM_RUNS = wasm wasm-wfts wasm-O2 wasm-O2-wfts wasm-O3 wasm-O3-wfts
 
 wasm-runs: $(WASM_RUNS)
 
 
-WASM_GC_RUNS = wasm-gc wasm-gc-O2 wasm-gc-og wasm-gc-O2-og wasm-gc-rt wasm-gc-O2-rt
+WASM_GC_RUNS = wasm-gc wasm-gc-O2 wasm-gc-O3 wasm-gc-og wasm-gc-O2-og wasm-gc-O3-og wasm-gc-rt wasm-gc-O2-rt wasm-gc-O3-rt
 
 wasm-gc-runs: $(WASM_GC_RUNS)
 
@@ -108,6 +108,12 @@ x86-64-O2:
 x86-64-O2-wfts:
 	CI_DIR=ci/$@ bash ./linux/build-test-x86_64.sh -O2 -wfts > $@-out.txt 2>&1
 
+x86-64-O3:
+	CI_DIR=ci/$@ bash ./linux/build-test-x86_64.sh -O3       > $@-out.txt 2>&1
+
+x86-64-O3-wfts:
+	CI_DIR=ci/$@ bash ./linux/build-test-x86_64.sh -O3 -wfts > $@-out.txt 2>&1
+
 x86-64-uv:
 	CI_DIR=ci/$@ bash ./linux/build-test-x86_64.sh -unbox-variants       > $@-out.txt 2>&1
 
@@ -119,6 +125,12 @@ x86-64-uv-O2:
 
 x86-64-uv-O2-wfts:
 	CI_DIR=ci/$@ bash ./linux/build-test-x86_64.sh -unbox-variants -O2 -wfts > $@-out.txt 2>&1
+
+x86-64-uv-O3:
+	CI_DIR=ci/$@ bash ./linux/build-test-x86_64.sh -unbox-variants -O3       > $@-out.txt 2>&1
+
+x86-64-uv-O3-wfts:
+	CI_DIR=ci/$@ bash ./linux/build-test-x86_64.sh -unbox-variants -O3 -wfts > $@-out.txt 2>&1
 
 #
 # x86-64-darwin
@@ -139,6 +151,9 @@ jvm:
 jvm-O2:
 	CI_DIR=ci/$@ bash ./jvm/build-test-jvm.sh -O2 > $@-out.txt 2>&1
 
+jvm-O3:
+	CI_DIR=ci/$@ bash ./jvm/build-test-jvm.sh -O3 > $@-out.txt 2>&1
+
 jvm-uv:
 	CI_DIR=ci/$@ bash ./jvm/build-test-jvm.sh -unbox-variants > $@-out.txt 2>&1
 
@@ -157,6 +172,12 @@ wasm-O2:
 wasm-O2-wfts:
 	CI_DIR=ci/$@ bash ./wasm/build-test-wasm.sh -O2 -wfts > $@-out.txt 2>&1
 
+wasm-O3:
+	CI_DIR=ci/$@ bash ./wasm/build-test-wasm.sh -O3       > $@-out.txt 2>&1
+
+wasm-O3-wfts:
+	CI_DIR=ci/$@ bash ./wasm/build-test-wasm.sh -O3 -wfts > $@-out.txt 2>&1
+
 #
 # WASM GC (wfts always enabled)
 #
@@ -166,14 +187,23 @@ wasm-gc:
 wasm-gc-O2:
 	CI_DIR=ci/$@ bash ./wasm-gc/build-test-wasm-gc.sh -O2 > $@-out.txt 2>&1
 
+wasm-gc-O3:
+	CI_DIR=ci/$@ bash ./wasm-gc/build-test-wasm-gc.sh -O3 > $@-out.txt 2>&1
+
 wasm-gc-og:
 	CI_DIR=ci/$@ bash ./wasm-gc/build-test-wasm-gc.sh -wasm-gc-one-group     > $@-out.txt 2>&1
 
 wasm-gc-O2-og:
 	CI_DIR=ci/$@ bash ./wasm-gc/build-test-wasm-gc.sh -O2 -wasm-gc-one-group > $@-out.txt 2>&1
 
+wasm-gc-O3-og:
+	CI_DIR=ci/$@ bash ./wasm-gc/build-test-wasm-gc.sh -O3 -wasm-gc-one-group > $@-out.txt 2>&1
+
 wasm-gc-rt:
 	CI_DIR=ci/$@ bash ./wasm-gc/build-test-wasm-gc.sh -wasm-gc-use-ref-test     > $@-out.txt 2>&1
 
 wasm-gc-O2-rt:
 	CI_DIR=ci/$@ bash ./wasm-gc/build-test-wasm-gc.sh -O2 -wasm-gc-use-ref-test > $@-out.txt 2>&1
+
+wasm-gc-O3-rt:
+	CI_DIR=ci/$@ bash ./wasm-gc/build-test-wasm-gc.sh -O3 -wasm-gc-use-ref-test > $@-out.txt 2>&1
