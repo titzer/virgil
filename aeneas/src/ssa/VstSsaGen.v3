@@ -95,8 +95,10 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	def addConstructorCode(decl: VstNew, env: VstSsaEnv) {
 		var isClass: bool;
 		match (decl.receiver) {
-			x: VstEnum => return addEnumParamInitCode(x, env);
-			x: VstClass => isClass = true;
+			x: VstClass => {
+				if (x.isEnum()) return addEnumParamInitCode(x, env);
+				isClass = true;
+			}
 		}
 		// Append implicit field initializing from params.
 		for (plist = decl.func.params.list; plist != null; plist = plist.tail) {
@@ -140,25 +142,62 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			}
 		}
 	}
-	def addEnumParamInitCode(receiver: VstEnum, env: VstSsaEnv) {
+	def addEnumParamInitCode(receiver: VstClass, env: VstSsaEnv) {
 		context.method.flags |= IrFlag.M_ENUM_INIT;
-		var params = receiver.params.asArray();
-		var types = Array<Type>.new(params.length);
-		var consts = Array<SsaConst>.new(params.length);
-		for (i < params.length) {
-			var r = VstField.!(params[i].member).enumVals;
-			consts[i] = context.graph.valConst(r.rtype, r);
-			types[i] = r.rtype;
+		// Find the root enum.
+		var rootEnum = receiver;
+		while (rootEnum.qualifiers != null) {
+			var tc = context.prog.typeEnv.lookup(rootEnum.qualifiers.head.image);
+			if (tc == null || tc.kind != Kind.ENUM) break;
+			rootEnum = ClassType.!(tc.create0()).classDecl;
 		}
-		var cases = receiver.cases;
-		for (i < cases.length) {
-			var c = cases[i], args = c.args.asArray();
-			for (j < args.length) {
-				var val = env.genExpr(args[j]);
-				var index = context.graph.intConst(i);
-				env.opArraySetElem(types[j], Int.TYPE, Facts.O_SAFE_BOUNDS, consts[j], index, val);
+		// Count total params: root + all ancestor extras + own extras
+		var totalParams = 0;
+		if (rootEnum.params != null) totalParams += rootEnum.params.length();
+		// Collect ancestor extras in root-to-receiver order
+		var ancestorExtras: List<VstList<ParamDecl>>;
+		var cur = receiver;
+		while (cur != null && cur != rootEnum) {
+			if (cur.extraParams != null) ancestorExtras = List.new(cur.extraParams, ancestorExtras);
+			cur = cur.parentEnum;
+		}
+		// ancestorExtras is now in root-to-receiver order (reversed during walk)
+		for (el = ancestorExtras; el != null; el = el.tail) totalParams += el.head.length();
+		if (totalParams == 0) return;
+		var types = Array<Type>.new(totalParams);
+		var consts = Array<SsaConst>.new(totalParams);
+		var offset = 0;
+		// Root params → root's enumVals arrays
+		if (rootEnum.params != null) {
+			var params = rootEnum.params.asArray();
+			for (i < params.length) {
+				var r = VstField.!(params[i].member).enumVals;
+				consts[offset] = context.graph.valConst(r.rtype, r);
+				types[offset] = r.rtype;
+				offset++;
 			}
 		}
+		// Ancestor extras → each ancestor's own enumVals arrays
+		for (el = ancestorExtras; el != null; el = el.tail) {
+			for (l = el.head.list; l != null; l = l.tail) {
+				var r = VstField.!(l.head.member).enumVals;
+				consts[offset] = context.graph.valConst(r.rtype, r);
+				types[offset] = r.rtype;
+				offset++;
+			}
+ 		}
+		// Process cases: args map positionally to [root, ancestor extras, own extras]
+ 		var cases = receiver.cases;
+ 		for (i < cases.length) {
+			var c = cases[i];
+			if (Strings.equal(c.name(), "_")) continue;
+			var args = c.args.asArray();
+ 			for (j < args.length) {
+ 				var val = env.genExpr(args[j]);
+				var index = context.graph.intConst(c.enumTag);
+ 				env.opArraySetElem(types[j], Int.TYPE, Facts.O_SAFE_BOUNDS, consts[j], index, val);
+ 			}
+ 		}
 	}
 	def getThisParam() -> SsaInstr {
 		return graph.params[0];
@@ -252,7 +291,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	}
 	def visitForeach(stmt: ForeachStmt, env: VstSsaEnv) -> SsaInstr {
 		var arrayType = stmt.expr.exactType;
-		if (EnumType.?(arrayType)) return genEnumIteration(stmt, EnumType.!(arrayType), env);
+		if (V3.isEnum(arrayType)) return genEnumIteration(stmt, ClassType.!(arrayType), env);
 		var arrayExpr = env.genExpr(stmt.expr);
 		if (env.end) return null; // expression generated a throw
 		if (EnumSetType.?(arrayType)) return genEnumSetIteration(stmt, EnumSetType.!(arrayType), arrayExpr, env);
@@ -301,14 +340,14 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		loopEnd.setEnv(env);
 		return null;
 	}
-	def genEnumIteration(stmt: ForeachStmt, enumType: EnumType, env: VstSsaEnv) -> SsaInstr {
+	def genEnumIteration(stmt: ForeachStmt, enumType: ClassType, env: VstSsaEnv) -> SsaInstr {
 		// TODO: desugar and use genThreePartFor
 		env[stmt.loopVar] = graph.zeroConst();
 		var varDecl = VarDecl.new(null, null, null);
 		varDecl.vtype = Int.TYPE;
 		varDecl.ssa = stmt.loopVar;
 		nonSsaVars[stmt.loopVar.index] = varDecl;
-		var limitExpr = graph.intConst(enumType.enumDecl.cases.length);
+		var limitExpr = graph.intConst(enumType.classDecl.cases.length);
 		env.at(exprSource(stmt.expr));
 
 		var loopCond = VstSsaMerge.new(this);   // merge point for start of loop
@@ -325,7 +364,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		loopEnv.addIf(cond, bodyEnv.block, loopEnv.loopEnd.block);
 		loopEnd.mergeIncoming(loopEnv);
 		// convert int to the enum element with the same tag
-		var elem = bodyEnv.opIntViewI0(Int.TYPE, enumType.enumDecl.tagType, loopEnv[stmt.loopVar]);
+		var elem = bodyEnv.opIntViewI0(Int.TYPE, enumType.classDecl.tagType, loopEnv[stmt.loopVar]);
 		bodyEnv[stmt.varDecl.ssa] = elem;
 
 		// generate the body
@@ -513,9 +552,9 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			// match on the variant's tag
 			key = env.addApply(null, V3Op.newVariantGetTag(keyType), [key]); // XXX: constant fold
 			keyType = V3.classDecl(keyType).tagType;
-		} else if (EnumType.?(keyType)) {
+		} else if (V3.isEnum(keyType)) {
 			// match on the enum value (represented by its tag)
-			keyType = EnumType.!(keyType).enumDecl.tagType;
+			keyType = V3.getDecl(keyType).tagType;
 		} else if (defcase == null) {
 			// materialize an empty default case if not exhaustive
 			defcase = MatchCase.new(null, null, EmptyStmt.new(null));
@@ -568,14 +607,19 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 		return null;
 	}
 	def genPatternCond(keyType: Type, cur: SsaBuilder, pat: MatchPattern, origKey: SsaInstr, key: SsaInstr) -> SsaInstr {
-		if (pat.vdecl != null && pat.variantCase == null) {
-			var t = pat.vdecl.tref.binding;
-			if (V3.isVariant(t) && ClassType.!(t).classDecl.qualifiers != null) {
-				// subtype variant pattern: generate "S.?(origKey)" using the pre-tag-extraction value
-				var query = V3Op.newTypeQuery(origKey.getType(), t);
-				return cur.addApply(null, query, [origKey]);
-			}
+		if (pat.subtypeType != null) {
+			// subtype variant pattern: generate "S.?(origKey)" using the pre-tag-extraction value
+			var origKeyType = origKey.getType();
+			var query = V3Op.newTypeQuery(origKeyType, pat.subtypeType);
+			return cur.addApply(null, query, [origKey]);
+		} else if (pat.subtypeEnumType != null) {
+			// subtype enum pattern: generate "E1.More.?(origKey)" using a VARIANT_QUERY range test
+			// Must use origKey's enum type (not the tagType) so TypeQuery resolves to VARIANT_QUERY
+			var query = V3Op.newTypeQuery(origKey.getType(), pat.subtypeEnumType);
+			return cur.addApply(null, query, [origKey]);
+		} else if (pat.vdecl != null && pat.variantCase == null) {
 			// type case (first grammar rule "id: TypeRef"), generate "T.?(key)"
+			var t = pat.vdecl.tref.binding;
 			var query = V3Op.newTypeQuery(keyType, t);
 			return cur.addApply(null, query, [key]);
 		} else {
@@ -587,17 +631,19 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 	def matchPatterns(keyType: Type, pl: List<MatchPattern>, val: Val) -> bool {
 		while (pl != null) {
 			var pat = pl.head;
-			if (pat.vdecl != null) {
-				var t = pat.vdecl.tref.binding;
-				if (V3.isVariant(t) && ClassType.!(t).classDecl.qualifiers != null) {
-					// subtype pattern: check if integer tag falls in the subtype's DFS range
-					var decl = ClassType.!(t).classDecl;
-					var tagVal = Int.unbox(val);
-					if (tagVal >= decl.variantTag && tagVal <= decl.variantTagHi) return true;
-				} else {
-					var r = Eval.doQuery0(keyType, t, val);
-					if (r) return true;
-				}
+			if (pat.subtypeType != null) {
+				// subtype variant pattern: check if integer tag falls in the subtype's DFS range
+				var decl = ClassType.!(pat.subtypeType).classDecl;
+				var tagVal = Int.unbox(val);
+				if (tagVal >= decl.variantTag && tagVal <= decl.tagHi) return true;
+			} else if (pat.subtypeEnumType != null) {
+				// subtype enum pattern: check if integer tag falls in the subtype enum's DFS range
+				var decl = V3.getDecl(pat.subtypeEnumType);
+				var tagVal = Int.unbox(val);
+				if (tagVal >= decl.tagLo && tagVal <= decl.tagHi) return true;
+			} else if (pat.vdecl != null) {
+				var r = Eval.doQuery0(keyType, pat.vdecl.tref.binding, val);
+				if (r) return true;
 			} else if (Values.equal(val, pat.val)) {
 				return true;
 			}
@@ -693,7 +739,7 @@ class VstSsaGen extends VstVisitor<VstSsaEnv, SsaInstr> {
 			Void => return env.graph.nop();
 			Const(val, vtype) => return env.graph.valConst(vtype, val);
 			EnumConst(member) => {
-				return env.graph.valConst(member.receiver.getDeclaredType(), Int.box(member.tag));
+				return env.graph.valConst(member.receiver.getDeclaredType(), Int.box(member.enumTag));
 			}
 			Local(decl) => return env[decl.ssa];
 			ObjectMethod(receiver, member, typeArgs) => {
