@@ -134,7 +134,22 @@ var x: E;
 var y = foo(x);     // E value is automatically promoted to E.set
 ```
 
+## Enum sets for open enums
+
+Open enums (those with `case _`) and their subtype enums share a single set type across the entire hierarchy.
+The set type is sized to accommodate all cases in the hierarchy, including those from subtypes.
+
+```
+enum Color { RED, GREEN, BLUE, _ }
+enum Color.Pastel { PINK, LAVENDER, MINT }
+
+var warm: Color.set = Color.RED | Color.Pastel.PINK;  // mix root and subtype cases
+var isPink = warm.PINK;                                // check for subtype case membership
+```
+
+Subtype enum values promote to the root's set type, so all set operations work uniformly across the hierarchy.
+
 ## Implementation limits
 
-In the current implementation of Virgil in this repository, enum set types are available for all enum declarations with 64 or fewer values.
+In the current implementation of Virgil in this repository, enum set types are available for all enum declarations with 64 or fewer values (including all cases across the hierarchy for open enums).
 This limitation is due to a simple approach of rewriting these operations to integer operations early in compilation and will be lifted in the future by tuples of as many integers as necessary.
