@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Quick Reference
+
+- **Language syntax** (grammar): `doc/grammar-claude.md`
+- **Practical guide** (classes, ADTs, casts, test format, optimizer): `doc/claude-guide.md`
+- **Full tutorial**: `doc/tutorial/`
+
 ## Project Overview
 
 Virgil is a statically-typed, self-hosted systems programming language. The entire compiler (called **Aeneas**), runtime, GC, and libraries are written in Virgil itself. The compiler is a whole-program optimizing compiler that produces native binaries (ELF/Mach-O), JARs, or WebAssembly modules with no separate linking step.
