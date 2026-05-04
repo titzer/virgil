@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Quick Reference
 
 - **Language syntax** (grammar): `doc/grammar-claude.md`
-- **Practical guide** (classes, ADTs, casts, test format, optimizer): `doc/claude-guide.md`
+- **Practical guide** (classes, ADTs, match, visibility, integer types, casts, method chaining, test format, optimizer): `doc/claude-guide.md`
 - **Full tutorial**: `doc/tutorial/`
 
 ## Project Overview
