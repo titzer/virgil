@@ -13,4 +13,7 @@ else
 	TESTS=*.v3
 fi
 
-#TODO execute_tests
+if [ "$EXECUTE" = 1 ]; then
+    execute_tests # TODO: make unconditional
+fi
+    
