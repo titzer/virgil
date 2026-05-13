@@ -138,6 +138,7 @@ public class V3S_Tester {
         if ("TypeCheckException".equals(name)) return ClassCastException.class;
         if ("UnimplementedException".equals(name)) return AbstractMethodError.class;
         if ("LengthCheckException".equals(name)) return NegativeArraySizeException.class;
+        if ("DescriptorCheckException".equals(name)) return IllegalArgumentException.class;
         throw new Exception("Unknown exception class " + name);
     }
 
