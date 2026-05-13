@@ -40,6 +40,15 @@ class Sub extends Base(args) { ... }   // calls super constructor with args
 class Sub extends Base { new(x: int) : super(x) { } }  // explicit super call
 ```
 
+**Method chaining with `-> this`:** a method returning `this` returns its receiver, enabling chains:
+```virgil
+class Builder {
+    def add(x: int) -> this { ... }
+}
+builder.add(1).add(2).add(3);
+```
+`StringBuilder` uses this throughout: `buf.puts("x").putc('[').putd(n).putc(']')`.
+
 ---
 
 ## ADT / Variant Cases
@@ -84,6 +93,40 @@ Fields of simple ADTs are always immutable; all loads forward to construction va
 ADT built-in fields (available on every case):
 - `.tag` — integer case index (0-based declaration order)
 - `.name` — string name of the case
+
+```virgil
+type Color { case Red; case Green; case Blue; }
+Color.Red.tag    // => 0
+Color.Green.tag  // => 1
+Color.Red.name   // => "Red"
+```
+
+---
+
+## Match Statements
+
+```virgil
+match (expr) {
+    Option.Some(v) => singleExpr;            // single-expression arm
+    Option.None    => { stmt1; stmt2; }      // block arm for multiple statements
+    _              => ;                      // catch-all, no-op arm
+}
+```
+
+- Match on a `type` (ADT) is **exhaustive**: the compiler errors if any case is unhandled
+  unless a `_` wildcard is present.
+- `_ => ;` is a valid catch-all with an empty (no-op) body.
+- OR patterns (`A | B => expr`) grouping multiple cases are **not** supported;
+  list each case separately or use `_`.
+- Short arms use `=>` (no braces); multi-statement arms use `=> { ... }`.
+
+---
+
+## Visibility
+
+- `private` — accessible only within the same **file**.
+- No other access modifiers (`public`/`protected` do not exist); members without
+  `private` are accessible from anywhere in the program.
 
 ---
 
@@ -196,6 +239,25 @@ Common scenarios worth testing:
 - **Dead store**: write to field that is never read → store can be removed
 - **Alias disambiguation**: store to `p.f` should not kill forwarded load from `q.f`
   when `p` and `q` are provably different objects
+
+---
+
+## Integer Types
+
+| Type      | Width  | Signed | Notes                  |
+|-----------|--------|--------|------------------------|
+| `i8`      | 8-bit  | yes    |                        |
+| `u8`/`byte`| 8-bit | no     | `byte` is an alias     |
+| `i16`     | 16-bit | yes    |                        |
+| `u16`     | 16-bit | no     |                        |
+| `i32`/`int`| 32-bit| yes    | `int` is the default   |
+| `u32`     | 32-bit | no     |                        |
+| `i64`/`long`| 64-bit| yes   | `long` is an alias     |
+| `u64`     | 64-bit | no     |                        |
+
+`int` = `i32`, `long` = `i64`. Integer literals default to `int`; use `u` suffix for
+unsigned, `l`/`L` for `long`. Generic methods (e.g. `StringBuilder.putd<T>`) dispatch
+on these concrete types, so `int` matches the `i32` arm.
 
 ---
 
