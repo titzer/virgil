@@ -13,7 +13,4 @@ else
 	TESTS=*.v3
 fi
 
-if [ "$EXECUTE" = 1 ]; then
-    execute_tests # TODO: make unconditional
-fi
-    
+execute_tests
