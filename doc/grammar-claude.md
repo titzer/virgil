@@ -20,8 +20,19 @@ ToplevelDecl ::=
     | 'layout'                         LayoutDecl
     | 'export'                         ExportDecl
     | 'var'  VarDef ';'
-    | 'def'  DefDef ';'
+    | ['private'] 'def'  (DefDef | ExtensionDecl)
+
+ExtensionDecl ::= ExtensionTarget '.' id TypeParams? MethodParams ReturnTypeAndBody // method extension
+                | ExtensionTarget '.' id (':' TypeRef)? ('=' Expr)? ';'             // component field extension
+
+ExtensionTarget ::= (id TypeParams? '.')* id TypeParams?
+                  // each segment may carry fresh type params; multi-level walks open subtypes
 ```
+
+A top-level `def` whose name is qualified with a dot is an **extension** of an
+existing class, component, variant, or enum (left of the dot). See
+[Extensions](#top-level-extensions) below for the constraints checked by the
+verifier.
 
 ---
 
@@ -153,6 +164,45 @@ LayoutField ::= '+' int id ':' MemoryTypeRef RepHints? ';'
 
 ExportDecl  ::= [string] ('def' DefDef | id ['=' DottedVarExpr] ';')
 ```
+
+---
+
+## Top-level Extensions
+
+A top-level `def` qualified with a dot adds a member to an existing
+declaration (target), as if the member had been declared inside the target's
+body. Examples:
+
+```
+def List<T>.length() -> int { ... }      // method on a generic class
+def Sys.greet() { ... }                  // method on a component
+def Shape.area() -> int { ... }          // method on a variant
+def Color.brightness() -> int { ... }    // method on an enum
+def Conf.flag: bool = true;              // field on a component
+def E.More.score() -> int { ... }        // method on an open enum subtype
+```
+
+### Constraints (checked by verifier)
+
+- The head of the qualifier path must name a `class`, `component`, `type`
+  (variant), or `enum`.
+- Field extensions are only allowed on `component` targets.
+- The extension's type-parameter arity (summed across all qualifier levels)
+  must equal the leaf target's type-parameter arity. Type parameter names are
+  fresh and bind positionally to the target's parameters.
+- A multi-level qualifier path (`E.More.method`) walks into open subtypes of
+  the head. Each intermediate qualifier must be an open subtype of the
+  previous one, registered globally as a top-level declaration.
+- A non-private extension whose name already exists on the target (whether by
+  a built-in member, a prior extension, or an inherited member it would
+  shadow) is an error.
+- A `private` extension is accessible only in the file in which it appears.
+  Multiple files may each declare a private extension with the same name on
+  the same target; each is visible only from its own file.
+- For a component field extension, the initializer runs after the
+  component's original initializers, in declaration order within the
+  declaring file. Order across files is unspecified, so an extension
+  initializer must not depend on fields added by another file.
 
 ---
 

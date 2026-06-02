@@ -24,6 +24,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 	def verify() {
 		var vst = prog.vst;
 		for (f in vst.files) buildFile(f);
+		attachExtensions();
 		forAll(vst.classes, resolveSuperClass);
 		forAll(vst.enums, verifyEnum);
 		forAll(vst.enums, verifyEnumQualifiers);
@@ -132,6 +133,153 @@ class Verifier(compiler: Compiler, prog: Program) {
 			cv.packings = prog.packings;
 		}
 		prog.vst.exports.putv(file.exports);
+	}
+	def attachExtensions() {
+		for (i < prog.vst.files.length) {
+			var f = prog.vst.files[i];
+			if (f == null) continue;
+			for (j < f.extensions.length) {
+				if (!ERROR.notTooMany) return;
+				attachOneExtension(f.extensions[j]);
+			}
+		}
+	}
+	def attachOneExtension(ext: VstExtension) {
+		var targetName = ext.targetPath.head;
+		// Resolve the head qualifier by name (prefer file-local for private types).
+		var tc = ext.file.typeEnv.lookup(targetName.image);
+		if (tc == null) tc = prog.typeEnv.lookup(targetName.image);
+		if (tc == null) {
+			errAtTokenInFile(targetName, ext.file).set("ExtensionError",
+				Strings.format1("\"%s\" does not name a type", targetName.image));
+			return;
+		}
+		var target: VstCompound;
+		match (tc) {
+			x: V3Class_TypeCon => target = x.classDecl;
+			x: V3Component_TypeCon => target = x.componentDecl;
+			_ => ;
+		}
+		if (target == null) {
+			errAtTokenInFile(targetName, ext.file).set("ExtensionError",
+				Strings.format1("\"%s\" is not a class, variant, enum, or component", targetName.image));
+			return;
+		}
+		// Walk additional qualifiers (E.More.method, A.B.C.method). Open subtypes are registered globally
+		// during buildFile; verify the user's path matches the declared `qualifiers` chain on the subtype.
+		var prefix: List<Token> = List.new(targetName, null);  // accumulated path, reverse order
+		for (q = ext.targetPath.tail; q != null; q = q.tail) {
+			if (!VstClass.?(target)) {
+				errAtTokenInFile(q.head, ext.file).set("ExtensionError",
+					Strings.format1("\"%s\" has no nested subtypes", target.name()));
+				return;
+			}
+			var name = q.head.image;
+			var subTc = ext.file.typeEnv.lookup(name);
+			if (subTc == null) subTc = prog.typeEnv.lookup(name);
+			var sub: VstClass;
+			match (subTc) {
+				x: V3Class_TypeCon => sub = x.classDecl;
+				_ => ;
+			}
+			if (sub == null || !tokenPathMatches(sub.qualifiers, Lists.reverse(prefix))) {
+				errAtTokenInFile(q.head, ext.file).set("ExtensionError",
+					Strings.format2("\"%s\" has no subtype \"%s\"", target.name(), name));
+				return;
+			}
+			target = sub;
+			prefix = List.new(q.head, prefix);
+		}
+		// Sum type-params provided across all qualifier levels; total must match leaf's arity.
+		var totalProvided = 0;
+		var extTpsRev: List<TypeParamType>;
+		for (l = ext.targetTypeParams; l != null; l = l.tail) {
+			if (l.head == null) continue;
+			for (m = l.head.list; m != null; m = m.tail) {
+				extTpsRev = List.new(m.head, extTpsRev);
+				totalProvided++;
+			}
+		}
+		var extTps = Lists.reverse(extTpsRev);
+		var declaredLen = Lists.length(target.typeParams);
+		if (totalProvided != declaredLen) {
+			errAtTokenInFile(targetName, ext.file).set("ExtensionError",
+				Strings.format3("\"%s\" expects %d type parameter(s), extension declares %d",
+					target.name(), declaredLen, totalProvided));
+			return;
+		}
+		var m = ext.member;
+		// Field extensions are only allowed on components.
+		if (VstField.?(m) && !VstComponent.?(target)) {
+			errAtTokenInFile(m.token, ext.file).set("ExtensionError",
+				"field extensions are only allowed on components");
+			return;
+		}
+		// Bind extension's type-param names to the target's actual TypeCons for the method body's env.
+		if (declaredLen > 0 && VstMethod.?(m)) {
+			var meth = VstMethod.!(m);
+			var env = TypeEnv.new(target.typeEnv, null, null);
+			var extL = extTps;
+			var tgtL = target.typeParams;
+			while (extL != null && tgtL != null) {
+				env.typecons[extL.head.token.image] = tgtL.head.typeCon;
+				extL = extL.tail;
+				tgtL = tgtL.tail;
+			}
+			meth.typeEnv = env;
+		}
+		// Wire receiver and declaration-file metadata.
+		m.receiver = target;
+		m.declarationFile = ext.file;
+		// Name collisions: allowed only if both are private extensions in different files.
+		var prev = target.memberMap[m.token.image];
+		if (prev != null) {
+			if (!isPrivateAlt(prev, m)) {
+				errAtTokenInFile(m.token, ext.file).set("ExtensionError",
+					Strings.format1("member \"%s\" is already defined on target", m.token.image));
+				return;
+			}
+			// Attach as a private alternative. Still append to members so the body is verified.
+			prev.privateAlts = List.new(m, prev.privateAlts);
+			target.members = appendMember(target.members, m);
+			ext.targetCompound = target;
+			return;
+		}
+		target.memberMap[m.token.image] = m;
+		// Append the extension member after the target's existing members (init order, etc.).
+		target.members = appendMember(target.members, m);
+		ext.targetCompound = target;
+	}
+	// True iff {a} and {b} are token lists of the same length with matching image strings.
+	def tokenPathMatches(a: List<Token>, b: List<Token>) -> bool {
+		while (a != null && b != null) {
+			if (!Strings.equal(a.head.image, b.head.image)) return false;
+			a = a.tail;
+			b = b.tail;
+		}
+		return a == null && b == null;
+	}
+	def isPrivateAlt(prev: VstMember, m: VstMember) -> bool {
+		if (!m.isPrivate || !prev.isPrivate) return false;
+		if (m.declarationFile == null || prev.declarationFile == null) return false;
+		if (m.declarationFile == prev.declarationFile) return false;
+		for (l = prev.privateAlts; l != null; l = l.tail) {
+			if (l.head.declarationFile == m.declarationFile) return false;
+		}
+		return true;
+	}
+	def appendMember(list: List<VstMember>, val: VstMember) -> List<VstMember> {
+		if (list == null) return List.new(val, null);
+		var rev: List<VstMember>;
+		for (l = list; l != null; l = l.tail) rev = List.new(l.head, rev);
+		rev = List.new(val, rev);
+		return Lists.reverse(rev);
+	}
+	def errAtTokenInFile(token: Token, file: VstFile) -> SourceCodeError {
+		var sourceLine = file.extractLine(token.range().beginLine);
+		var obj = SourceCodeError.new(token.range(), sourceLine);
+		ERROR.addErrorObj(obj);
+		return obj;
 	}
 	def addInitFor(decl: VstCompound) {
 		var ctype = decl.getDeclaredType();
@@ -875,8 +1023,10 @@ class Verifier(compiler: Compiler, prog: Program) {
 		return byte.view(size);
 	}
 	def typeCheckVstCompound(decl: VstCompound) {
-		var tc = TypeChecker.new(ERROR, decl.verifier.file);
+		var cv = decl.verifier;
+		var tc = TypeChecker.new(ERROR, cv.file);
 		for (members = decl.members; members != null; members = members.tail) {
+			cv.callerFile = members.head.declarationFile;
 			match (members.head) {
 				x: VstNew => {
 					typeCheckNew(decl, x, tc);
@@ -891,6 +1041,7 @@ class Verifier(compiler: Compiler, prog: Program) {
 				}
 			}
 		}
+		cv.callerFile = null;
 	}
 	def typeCheckNew(decl: VstCompound, cdecl: VstNew, tc: TypeChecker) {
 		var cv = decl.verifier, thisParam = cv.newThisParam(), pl = cdecl.func.params;
@@ -1039,6 +1190,7 @@ class VstCompoundVerifier {
 	def thisType: Type;
 	def verifier: Verifier;
 	def file: VstFile;
+	var callerFile: VstFile;	// overrides `file` for access checks while verifying an extension member's body
 	var typeEnv: TypeEnv;
 	var ERROR: ErrorGen;
 	var classDecl: VstClass;
@@ -1173,6 +1325,7 @@ class VstCompoundVerifier {
 			}
 		}
 		for (l = compound.members; l != null; l = l.tail) {
+			callerFile = l.head.declarationFile;
 			match (l.head) {
 				x: VstNew => checkNew(x);
 				x: VstField => checkField(x);
@@ -1180,6 +1333,7 @@ class VstCompoundVerifier {
 				x: VstLayoutField => checkLayoutField(x);
 			}
 		}
+		callerFile = null;
 		if (compound.constructor != null) {
 			compound.constructor.memberinits = Lists.reverse(memberinits);
 		}
@@ -1277,7 +1431,7 @@ class VstCompoundVerifier {
 			}
 			verifier.numImports++;
 		}
-		typeEnv = compound.typeEnv;
+		typeEnv = if(decl.typeEnv != null, decl.typeEnv, compound.typeEnv);
 		if (decl.isIndexed() && VstComponent.?(compound)) {
 			var msg = if (compound.isFileScope,
 				"index operation cannot be declared at top level",
@@ -1633,7 +1787,21 @@ class VstCompoundVerifier {
 		return thisParam;
 	}
 	def canAccessMember(decl: VstMember) -> bool {
-		return !decl.isPrivate || decl.receiver.verifier.file == this.file;
+		if (!decl.isPrivate) return true;
+		var declFile = decl.declarationFile;
+		if (declFile == null) declFile = decl.receiver.verifier.file;
+		var here = if(callerFile != null, callerFile, file);
+		return declFile == here;
+	}
+	// Pick the variant of {decl} accessible from this verifier's file: {decl} itself if accessible,
+	// otherwise one of its same-name private extension alternatives, otherwise null.
+	def findAccessibleMember(decl: VstMember) -> VstMember {
+		if (decl == null) return null;
+		if (canAccessMember(decl)) return decl;
+		for (l = decl.privateAlts; l != null; l = l.tail) {
+			if (canAccessMember(l.head)) return l.head;
+		}
+		return null;
 	}
 	def inferPackingExpr(env: VarEnvironment, expr: VstPackingExpr) -> byte {
 		var decl = VstPacking.!(compound);

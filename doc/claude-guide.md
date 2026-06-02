@@ -87,6 +87,43 @@ ADT built-in fields (available on every case):
 
 ---
 
+## Top-level Extensions
+
+Methods and (for components) fields can be added from outside the original
+declaration using a dotted top-level `def`:
+
+```virgil
+def Foo.method() -> int { return 0; }              // method on class Foo
+def Foo<T>.unwrap() -> T { return this.value; }    // generic; T binds to Foo's T
+def Foo<T>.tag<U>(u: U) -> U { return u; }         // both class and method tparams
+def C.x: int = 42;                                  // field on component C
+def C.y = 42;                                       // type inferred
+def C.z: int;                                       // no initializer (default value)
+def E.More.kind() -> int { ... }                    // open-subtype path
+private def Foo.helper() -> int { return 1; }       // file-scoped extension
+```
+
+Key rules:
+- The extension behaves as if declared inside the target — same access to
+  private members, same virtual dispatch, same `this` binding.
+- Type-parameter arity (summed across all qualifier levels) must equal the
+  leaf target's. Extension names for the parameters are fresh and bind
+  positionally.
+- Field extensions are component-only.
+- Component field initializers from extensions run after the component's
+  original initializers; order between extension files is not defined.
+- `private` extensions are scoped to the file they appear in. Two files may
+  independently declare a private extension with the same name on the same
+  target; each is dispatched within its own file.
+- A non-private name collision with an existing member is an error.
+
+Multi-level paths (`E.More.method`) walk into open subtypes of variants and
+enums (those declared with a dotted form like `enum E.More`). Inline variant
+cases and enum cases are not extension targets — declare per-case methods
+inside the parent declaration instead.
+
+---
+
 ## Type Casts and Views
 
 ```virgil
