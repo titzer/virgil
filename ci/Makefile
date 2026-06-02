@@ -15,7 +15,7 @@ ifneq ($(findstring x86-64-darwin,$(HOSTS)),)
 ALL += x86-64--darwin-runs
 endif
 
-ifneq ($(findstring jar,$(HOSTS)),jar)
+ifneq ($(findstring jar,$(HOSTS)),)
 ALL += jvm-runs
 endif
 
