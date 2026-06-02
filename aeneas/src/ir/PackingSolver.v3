@@ -16,117 +16,232 @@ Based on each class, the packing solver is able to squeeze other fields into the
 unassigned portions of the representation.
 */
 
-// Represents the possibilities for a single bit within a pattern.
-type PackingBit #unboxed {
-	case Unassigned;	// ?		may be chosen by the solver
-	case Fixed(v: u1);	// 0 or 1	is fixed to the given value
-	case Assigned(ch: u8);	// . 		is already assigned (a bit of {ch})
-}
 
-def UNICODE = 0u; // 0x2715u;
-def COLOR = false;
-
-// An interval from {start}, inclusive, to {end}, exclusive.
-type Interval(start: byte, end: byte) #unboxed {
-	def render(buf: StringBuilder) -> StringBuilder { return buf.put2("%d...%d", start, end); }
-	def size() -> byte { return end - start; }
-	def shl(n: byte) -> Interval { return Interval(start + n, end + n); }
-}
-
-// A fixed-length mutable pattern of bits.
-class ScalarPattern(bits: Array<PackingBit>) {
-	def size = bits.length;
-
-	def render(buf: StringBuilder) -> StringBuilder {
-		for (i < bits.length) {
-			var b = bits[bits.length - i - 1];
-			if (i != 0 && i % 8 == 0) buf.putc('_');
-			match (b) {
-				Unassigned => buf.putc('?');
-				Fixed(v) => buf.putd(v);
-				Assigned(ch) => {
-					if (COLOR) buf.puts(Terminal.CTRL_YELLOW);
-					if (ch != 0) buf.putc(ch);
-					else if (UNICODE != 0) buf.pututf8(UNICODE);
-					else buf.putc('.');
-					if (COLOR) buf.puts(Terminal.CTRL_DEFAULT);
-				}
-			}
-		}
-		return buf;
-	}
-	// Find all intervals of length at least {s}.
-	def getIntervalsForSize(s: byte) -> Array<Interval> {
-		var i: byte = 0;
-		var intervals = Vector<Interval>.new();
-
-		var start = 0;
-		for (end < size) {
-			if (bits[end] != PackingBit.Unassigned) start = end + 1;
-			else if (end + 1 - start >= s) {
-				intervals.put(Interval(byte.view(end + 1 - s), byte.view(end + 1)));
-				//TODO(dnguyen): This is a bandaid fix to speed up computation!
-				// Need to refactor packing solver
-				return intervals.extract();
-			}
-		}
-		return intervals.extract();
-	}
-	// Update the bits for the given interval to be assigned.
-	def assignInterval(i: Interval) -> this {
-		for (j = i.start; j < i.end; j++) bits[j] = PackingBit.Assigned(0);
-	}
-	// Try to assign the bits in the given interval. If any bit is already assigned, do nothing and return {false}.
-	def tryAssignInterval(i: Interval) -> bool {
-		for (j = i.start; j < i.end; j++) if (bits[j] != PackingBit.Unassigned) return false;
-		assignInterval(i);
-		return true;
-	}
-	// Reset bits in the interval to be unassigned.
-	def unassignInterval(i: Interval) -> this {
-		for (j = i.start; j < i.end; j++) bits[j] = PackingBit.Unassigned;
-	}
-	def padTo(n: byte) -> ScalarPattern {
-		return ScalarPattern.new(Arrays.grow(bits, n));
-	}
-	def extractFixed() -> u64 {
-		var result: u64;
-		for (i < size) if (bits[i] == PackingBit.Fixed(1)) result |= 1ul << byte.view(i);
-		return result;
-	}
-	def copy() -> ScalarPattern { return ScalarPattern.new(Arrays.dup(bits)); }
-}
-
-type PackingField #unboxed {
-	case Nonref(size: byte);
-	case Ref;
-}
-
-type CaseField(caseIdx: int, fieldIdx: int) {
-	def hash() -> int { return caseIdx * 31 + fieldIdx; }
-	def render(buf: StringBuilder) -> StringBuilder { return buf.put2("(%d, %d)", caseIdx, fieldIdx); }
-}
+def EMPTY_INTERVAL = Interval(0, 0);
 
 // Contains a number of routines for checking distinguishability of bit patterns and solving for
 // sets of patterns (by choosing assignments of bits).
-class PackingSolver(size: byte, refPatterns: RefPatterns) {
-	var cases: Array<Array<PackingField>>;
-	var fieldOrder: Array<CaseField>;
-	var solution: PackingSolution;
-	var tagLength: byte = 0;
+class PackingSolver(width: byte, refPatterns: RefPatterns) {
+	// ----------------- Constants -----------------
+	var SCALAR_LIMIT = 2;
+	def DEBUG = CLOptions.PRINT_PACKING.get();
+	def REF_KEY = -1;
+	def SCALAR_WIDTH = if(refPatterns != null, refPatterns.ptrref.size, width);
+	// ----------------- Data structures -----------------
+	// Array of maps for each case/variant. 
+	// For each map, keys are a width and values are a list of fields with that width
+	var widthToFieldMaps: Array<HashMap<int, List<CaseField>>>;
+	// CaseToScalars object abstracting away assignments and operations on 
+	// scalars for each case. 
+	var caseToScalars: CaseToScalars;
+	// Map of assignments for each field of a case.
+	var assignments: HashMap<CaseField, AssignedField>;
 
-	def reset() {
-		cases = null;
-		fieldOrder = null;
-		solution = null;
+	// The packing solver algorithm
+	def solve(problem: PackingProblem) -> PackingSolution {
+		def cases: Array<Array<PackingField>> = problem.cases;
+		SCALAR_LIMIT = if(problem.scalarLimit > 0, problem.scalarLimit, SCALAR_LIMIT);
+		// Build data structures
+		makeWidthToFieldMaps(problem);
+		makeCaseToScalars();
+		assignments = HashMap<CaseField, AssignedField>.new(CaseField.hash, CaseField.==);
+		// Preprocessing before regular field assignments
+		processPreassignments(problem);
+		processRefs(problem, 0);
+		if (DEBUG) Terminal.put("Finished processing preassignments and ref\n");
+		// Calc tag interval
+		def defaultTagLength = byte.view(Ints.log2Ceil(u32.view(cases.length)));
+		def tagLength = if(problem.tagLength >= 0u8, problem.tagLength, defaultTagLength);
+		var tagInterval: Interval;
+		if (tagLength > 0) tagInterval = caseToScalars.assignTagsToCases(tagLength);
+		if (tagLength > 0 && tagInterval == EMPTY_INTERVAL) {
+			if (DEBUG) Terminal.put("No tag interval found\n");
+			return null;
+		}
+		// Determine assignments for each case 
+		// TODO: Tags are treated as contiguous bits. Allow it to be flexible later
+		for (caseIdx < cases.length) {
+			for (scalarIdx < SCALAR_LIMIT) {
+				def finishedCase = assignFieldsToScalar(caseIdx, scalarIdx);
+				if (finishedCase) break;
+				if (scalarIdx == SCALAR_LIMIT - 1) return null;
+				if (scalarIdx < caseToScalars.getNumScalars() - 1) continue;
+
+				caseToScalars.putScalar(widthToFieldMaps, refPatterns);
+				if (caseToScalars.getScalarType(caseToScalars.getNumScalars() - 1) == Scalar.Ref) {
+					processRefs(problem, scalarIdx + 1);
+				}
+				if (DEBUG) Terminal.put("New scalar added\n");
+			}
+			if (DEBUG) Terminal.put("\n");
+		}
+		def solution = PackingSolution.new(caseToScalars, assignments, false, problem);
+		if (DEBUG) Terminal.put1("%q\n", solution.render);
+		if (tagInterval != EMPTY_INTERVAL) solution.explicitTag = tagInterval;
+		return solution;
+	}	
+	// Iterates over fields and constructs widthToField map for a case. 
+	def makeWidthToFieldMaps(problem: PackingProblem) {
+		def preassignmentsMap = makePreassignmentsMap(problem);
+		def cases = problem.cases;
+		widthToFieldMaps = Array<HashMap<int, List<CaseField>>>.new(cases.length);
+		for (caseIdx < cases.length) {
+			def widthToField = HashMap<int, List<CaseField>>.new(int.!<int>, int.==);
+			def fields = cases[caseIdx];
+			for (fieldIdx < fields.length) {
+				def field = fields[fieldIdx];
+				def caseField = CaseField(caseIdx, fieldIdx);
+				if (preassignmentsMap.has(caseField)) continue;
+				match (field) {
+					Ref => widthToField[REF_KEY] = List.new(caseField, widthToField[REF_KEY]);
+					Nonref(width) => widthToField[width] = List.new(caseField, widthToField[width]);
+				}
+			}
+			widthToFieldMaps[caseIdx] = widthToField;
+		}
 	}
+	// Returns a map from CaseField to interval for all assignments in input PackingProblem to solver
+	def makePreassignmentsMap(problem: PackingProblem) -> HashMap<CaseField, AssignedField> {
+		def map = HashMap<CaseField, AssignedField>.new(CaseField.hash, CaseField.==);
+		def assignments = problem.assignments;
+		for (entry in assignments) {
+			def caseField = entry.0;
+			def interval = entry.1;
+			map[caseField] = AssignedField(caseField, 0, interval);
+		}
+		return map;
+	}
+	// Initializes scalars (ScalarPatterns) for each case
+	def makeCaseToScalars() {
+		def numCases = widthToFieldMaps.length;
+		caseToScalars = CaseToScalars.new(numCases, refPatterns.ptrref.size, REF_KEY);
+		caseToScalars.putScalar(widthToFieldMaps, refPatterns);
+	}
+	// Assigns fields that were preassigned by the problem. Adds the assignments to `assignments`
+	def processPreassignments(problem: PackingProblem) {
+		def preassignments: Array<(CaseField, Interval)> = problem.assignments;
+		if (DEBUG && preassignments.length == 0) Terminal.put("No preassignments\n");
+		for (entry in preassignments) {
+			def caseField = entry.0;
+			def interval = entry.1;
+			caseToScalars.assignInterval(caseField.caseIdx, 0, interval);
+			assignments[caseField] = AssignedField(caseField, 0, interval);
+			if (DEBUG) Terminal.put1("Preassigned: %q\n", assignments[caseField].render);
+		}
+	}
+	// Assigns refs
+	def processRefs(problem: PackingProblem, scalarIdx: int) {
+		def cases: Array<Array<PackingField>> = problem.cases;
+		for (caseIdx < cases.length) {
+			def widthToField = widthToFieldMaps[caseIdx];
+			if (!widthToField.has(REF_KEY)) continue;
+			if (DEBUG) Terminal.put2("Case: %d | Scalar: %d has ref\n", caseIdx, scalarIdx);
+			caseToScalars.assignInterval(caseIdx, scalarIdx, refPatterns.refInterval);
+			def caseField = popFromWidthToField(widthToField, REF_KEY);
+			assignments[caseField] = AssignedField(caseField, byte.view(scalarIdx), refPatterns.refInterval);
+		}
+	}
+	// Pops an element from list at `key` in `widthToField`. Removes entry if list now empty
+	def popFromWidthToField(widthToField: HashMap<int, List<CaseField>>, key: int) -> CaseField {
+		def caseFieldList = widthToField[key];
+		def caseField = caseFieldList.head;
+		def newCaseFieldList = caseFieldList.tail;
+		// Update widthToField
+		if (newCaseFieldList == null) {
+			widthToField.remove(key);
+		} else {
+			widthToField[key] = newCaseFieldList;
+		}
+		return caseField;
+	}
+	// Assigns a field with size `targetSize` to `interval`. 
+	// Returns a bool for whether a field was found and the remaining interval if so.
+	def assignFieldToInterval(
+			interval: Interval,
+			targetSize: byte,
+			widthToField: HashMap<int, List<CaseField>>, 
+			scalarIdx: int
+	) -> (bool, Interval) {
+		if (DEBUG && widthToField.has(targetSize)) Terminal.put2("Found field sized %d: CaseField %q\n", targetSize, widthToField[targetSize].head.render);
+		if (!widthToField.has(targetSize)) return (false, EMPTY_INTERVAL);
+		def caseField = popFromWidthToField(widthToField, targetSize);
+		def assignedInterval = Interval(interval.start, interval.start + targetSize);
+		assignments[caseField] = AssignedField(caseField, byte.view(scalarIdx), assignedInterval);
+		caseToScalars.assignInterval(caseField.caseIdx, scalarIdx, assignedInterval);
+		if (DEBUG) Terminal.put2("\tcaseIdx: %d | %q\n", caseField.caseIdx, caseToScalars.renderScalar(caseField.caseIdx, scalarIdx, _));
+		if(targetSize == interval.size()) return (true, EMPTY_INTERVAL);
+		return (true, Interval(interval.start + targetSize, interval.end));
+	}
+	// Assigns the fields for a case to a scalar. Returns true if all fields have been assigned
+	def assignFieldsToScalar(caseIdx: int, scalarIdx: int) -> bool {
+		def widthToField: HashMap<int, List<CaseField>> = widthToFieldMaps[caseIdx];
+		if (DEBUG) Terminal.put2("Case: %d | Scalar: %d\n", caseIdx, scalarIdx);
+		var unassignedIntervals: Array<Interval> = caseToScalars.getUnassignedIntervals(caseIdx, scalarIdx);
+		if (DEBUG) Terminal.put1("Unassigned intervals: %q\n", printIntervals(unassignedIntervals, _));
+		if (DEBUG) Terminal.put2("scalar %d: %q\n", scalarIdx, caseToScalars.renderScalar(caseIdx, scalarIdx, _));
+		// Exact-fit pass 
+		unassignedIntervals = findExactFits(unassignedIntervals, widthToField, scalarIdx);
+		// Normal case
+		findBestFits(unassignedIntervals, widthToField, scalarIdx);
+		// Check widthToField is empty
+		def keys: List<int> = Maps.keyList(widthToField);
+		return keys == null;
+
+	}
+	// Perform a pass over unassigned intervals and check if any intervals have an exact fit 
+	def findExactFits(
+			unassignedIntervals: Array<Interval>, 
+			widthToField: HashMap<int, List<CaseField>>, 
+			scalarIdx: int
+	) -> Array<Interval> {
+		if (DEBUG) Terminal.put1("Finding exact fits on intervals: %q\n", printIntervals(unassignedIntervals, _));
+		def newUnassignedIntervals = Vector<Interval>.new();
+		for (interval in unassignedIntervals) {
+			def result: (bool, Interval) = assignFieldToInterval(interval, interval.size(), widthToField, scalarIdx);
+			if (!result.0) newUnassignedIntervals.put(interval);
+		}
+		return newUnassignedIntervals.extract();
+	}
+	// Find the next largest field that fits 
+	def findBestFits(
+			unassignedIntervals: Array<Interval>, 
+			widthToField: HashMap<int, List<CaseField>>, 
+			scalarIdx: int
+	) -> Array<Interval> {
+		if (DEBUG) Terminal.put1("Finding best fits on intervals: %q\n", printIntervals(unassignedIntervals, _));
+		def newUnassignedIntervals = Vector<Interval>.new();
+		for (intervalIdx < unassignedIntervals.length) {
+			var interval = unassignedIntervals[intervalIdx];
+			var i = 0;
+			while (i < interval.size()) {
+				def targetSize = byte.view(interval.size() - i);
+				def result: (bool, Interval) = assignFieldToInterval(interval, targetSize, widthToField, scalarIdx);
+				// Field not found 
+				if (!result.0) { i += 1; continue; }
+				// Field filled
+				if (result.1.size() == 0) { if (DEBUG) Terminal.put("\tInterval filled\n"); break; }
+				interval = result.1;
+				if (DEBUG) Terminal.put1("\tRemaining interval: %q\n", interval.render);
+				i = 0;
+			}
+			if (interval.size() != 0) newUnassignedIntervals.put(interval);
+		}
+		return newUnassignedIntervals.extract();
+	}
+	// Prints the intervals provided as input
+	def printIntervals(intervals: Array<Interval>, buf: StringBuilder) -> StringBuilder {
+		for (i in intervals) buf.put1(" %q", i.render);
+		return buf;
+	}
+	// --------- Distinguishability checks inherited from original packing solver ---------
 	def canDistinguish(state: Array<ScalarPattern>, elements: Array<bool>) -> bool {
+		// TODO: assumes that only one scalar is present
 		var numElements = 0;
 		for (i in elements) if (i) numElements++;
 		if (numElements <= 1) return true;
 
 		var candidates = Vector<(int, int)>.new();
-		for (i < size) {
+		for (i < width) {
 			// try to split on this bit
 			var numZeros = 0, numOnes = 0, numUnassigned = 0;
 			for (j < state.length) {
@@ -176,150 +291,53 @@ class PackingSolver(size: byte, refPatterns: RefPatterns) {
 		}
 		return false;
 	}
-	def checkDistinguishable(state: Array<ScalarPattern>) -> bool {
-		if (tryExplicitTaggingHeuristic(state)) return true;
-		return tryAssignmentHeuristic(state);
-	}
-	// Run the backtracking solver algorithm.
-	def solve(idx: int, state: Array<ScalarPattern>) -> bool {
-		if (idx == fieldOrder.length) return checkDistinguishable(state);
-
-		var CaseField = fieldOrder[idx];
-		var caseIdx = CaseField.caseIdx, fieldIdx = CaseField.fieldIdx;
-		var field = cases[caseIdx][fieldIdx];
-		var possibleIntervals = state[caseIdx].getIntervalsForSize(PackingField.Nonref.!(field).size);
-		if (possibleIntervals.length == 0) return false;
-
-		for (interval in possibleIntervals) {
-			state[caseIdx].assignInterval(interval);
-			solution.assignments[CaseField] = interval;
-			var result = solve(idx + 1, state);
-			if (result) return true;
-			state[caseIdx].unassignInterval(interval);
-		}
-		return false;
-	}
-	// Find a packing for a single scalar.
-	def solveScalar(problem: PackingProblem) -> PackingSolution {
-		cases = problem.cases;
-		var isRefScalar = false;
-		for (i < cases.length) {
-			var caseHasRef = false;
-			for (field in cases[i]) {
-				match (field) {
-					Ref => {
-						if (caseHasRef) return null; // cannot pack more than one ref into a single scalar per case
-						isRefScalar = caseHasRef = true;
-					}
-					_ => ;
-				}
-			}
-		}
-
-		var patterns = Array<ScalarPattern>.new(cases.length);
-		var assignments = HashMap<CaseField, Interval>.new(CaseField.hash, CaseField.==);
-		if (isRefScalar) {
-			for (i < cases.length) {
-				var c = cases[i];
-				var casePacking: ScalarPattern;
-
-				var containsRef = false;
-				for (j < cases[i].length) {
-					var f = cases[i][j], fl = CaseField(i, j);
-					match (f) {
-						Ref => {
-							assignments[fl] = refPatterns.refInterval;
-							casePacking = refPatterns.ptrref.copy();
-							casePacking.assignInterval(refPatterns.refInterval);
-							containsRef = true;
-						}
-						_ => ;
-					}
-				}
-
-				if (!containsRef) casePacking = refPatterns.nonptrref.copy();
-				patterns[i] = casePacking;
-			}
-		} else {
-			// can use all bits
-			for (i < cases.length) patterns[i] = refPatterns.nonref.copy();
-		}
-
-		for (assignment in problem.assignments) {
-			var cf = assignment.0, interval = assignment.1;
-			patterns[cf.caseIdx].assignInterval(interval);
-			assignments[cf] = interval;
-		}
-
-		var fieldsToSolve = Vector<CaseField>.new();
-		for (i < cases.length) {
-			for (j < cases[i].length) {
-				var cf = CaseField(i, j);
-				if (!assignments.has(cf)) fieldsToSolve.put(cf);
-			}
-		}
-		fieldOrder = fieldsToSolve.extract();
-		this.cases = cases;
-
-		solution = PackingSolution.new(patterns, assignments, isRefScalar, problem);
-		solution.explicitTag = EMPTY_INTERVAL;
-		tagLength = problem.tagLength;
-		if (!solve(0, patterns)) return null;
-		return solution;
-	}
 	// the lower the score, the more prioritized the bit position
 	private def scorePosition(numUnassigned: int, numZeros: int, numOnes: int) -> int {
 		if (numUnassigned == 0) return 0; // prioritize bits without any assignments required
 		return Ints.min(0, int.view(Ints.abs(numOnes - numZeros)) - numUnassigned);
 	}
+	// Helper function for calling Array.sort
 	private def compareIndex(a: (int, int), b: (int, int)) -> bool {
 		return a.1 < b.1;
-	}	
-	private def tryExplicitTaggingHeuristic(state: Array<ScalarPattern>) -> bool {
-		// if there are enough contiguous aligned ?s, we can just use them to tag
-		var longest: Interval = EMPTY_INTERVAL, curStart: byte = 0;
-		var allUnassigned = true;
-		for (i < size) {
-			allUnassigned = true;
-			for (j < state.length) {
-				if (state[j].bits[i] != PackingBit.Unassigned) {
-					allUnassigned = false;
-					break;
-				}
-			}
-
-			if (allUnassigned) {
-				if (i - curStart > longest.size()) longest = Interval(curStart, byte.!(i + 1));
-			} else {
-				curStart = byte.!(i + 1);
-			}
-		}
-		// fence post case
-		if (allUnassigned && (size - curStart > longest.size())) {
-			longest = Interval(curStart, byte.!(size));
-		}
-
-		if (tagLength > 0 && longest.size() >= tagLength) {
-			for (j < state.length) {
-				for (k < tagLength) {
-					var bit = u1.!((j >> k) & 1);
-					state[j].bits[longest.start + k] = PackingBit.Fixed(bit);
-				}
-			}
-			solution.explicitTag = Interval(longest.start, longest.start + tagLength);
-			return true;
-		}
-		return false;
 	}
-	private def tryAssignmentHeuristic(state: Array<ScalarPattern>) -> bool {
-		// difficult case: we have to build the decision tree and check
-		var elements = Array<bool>.new(state.length);
-		for (i < elements.length) elements[i] = true;
-		return canDistinguish(state, elements);
+}			
+// Output of the packing solver, containing info about the packing result. 
+class PackingSolution (
+	patterns: CaseToScalars,
+	assignments: HashMap<CaseField, AssignedField>,
+	isRef: bool,
+	problem: PackingProblem) {
+
+	var explicitTag: Interval;
+
+	def hasExplicitTag() -> bool { return explicitTag != EMPTY_INTERVAL; }
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		for (i < problem.cases.length) {
+			buf.put1("#%d=[", i);
+			for (j < problem.cases[i].length) {
+				if (j > 0) buf.csp();
+				match (problem.cases[i][j]) {
+					Nonref(s) => buf.putd(s);
+					Ref => buf.puts("ref");
+				}
+				var cf = CaseField(i, j);
+				if (assignments.has(cf)) buf.put1("@%q", assignments[cf].renderNoCaseField);
+			}
+			buf.puts("]\n");
+		}
+		if (hasExplicitTag()) buf.put1(" tag=%q", explicitTag.render);
+		buf.ln();
+		buf.put1("%q\n", patterns.render);
+		return buf;
 	}
 }
-
-type PackingProblem(cases: Array<Array<PackingField>>, assignments: Array<(CaseField, Interval)>, tagLength: byte) #unboxed {
+// Input to the packing solver, containing info about previous assignments and constraints. 
+type PackingProblem (
+		cases: Array<Array<PackingField>>, 
+		assignments: Array<(CaseField, Interval)>, 
+		tagLength: byte,
+		scalarLimit: int) #unboxed {
 	def render(buf: StringBuilder) -> StringBuilder {
 		var h = HashMap<CaseField, Interval>.new(CaseField.hash, CaseField.==);
 		for (a in assignments) h[a.0] = a.1;
@@ -341,80 +359,188 @@ type PackingProblem(cases: Array<Array<PackingField>>, assignments: Array<(CaseF
 		return buf;
 	}
 }
+// Defines functionality for operating on scalars of each variant/case
+class CaseToScalars {
+	// ----------------- Constants -----------------
+	def SCALAR_WIDTH: int;
+	def DEBUG = CLOptions.PRINT_PACKING.get();
+	def REF_KEY: int;
+	def NUM_CASES: int;
+	// ----------------- Data structures -----------------
+	// Stores the scalars for each case
+	var caseToScalars: Array<Vector<ScalarPattern>>;
+	// Stores the types of each scalar. See `Scalar` enum
+	var scalarTypes: Vector<Scalar>;
+	// Stores whether the case has a ref field. Populated and used in putScalar
+	var caseHasRefArr: Array<bool>;	
+	private var bNNScalarType: Scalar;
+	private var taggedRefScalarType: Scalar;
+	// NOTE: The ith scalar of every case should be the same type
 
-class PackingSolution(
-	patterns: Array<ScalarPattern>,
-	assignments: HashMap<CaseField, Interval>,
-	isRef: bool,
-	problem: PackingProblem) {
-
-	var explicitTag: Interval;
-
-	def hasExplicitTag() -> bool { return explicitTag != EMPTY_INTERVAL; }
-
-	def render(buf: StringBuilder) -> StringBuilder {
-		for (i < problem.cases.length) {
-			if (i > 0) buf.csp();
-			buf.put1("#%d=[", i);
-			for (j < problem.cases[i].length) {
-				if (j > 0) buf.csp();
-				match (problem.cases[i][j]) {
-					Nonref(s) => buf.putd(s);
-					Ref => buf.puts("ref");
-				}
-				var cf = CaseField(i, j);
-				if (assignments.has(cf)) buf.put1("@%q", assignments[cf].render);
-			}
-			buf.puts("]");
+	new (NUM_CASES, SCALAR_WIDTH, REF_KEY) {
+		// TODO: Replace with getScalar from NormConfig
+		bNNScalarType = if(SCALAR_WIDTH == 32, Scalar.B32, Scalar.B64);
+		taggedRefScalarType = if(SCALAR_WIDTH == 32, Scalar.R32, Scalar.R64);
+		caseToScalars = Array<Vector<ScalarPattern>>.new(NUM_CASES);
+		for (i < caseToScalars.length) caseToScalars[i] = Vector<ScalarPattern>.new();
+		scalarTypes = Vector<Scalar>.new();
+		caseHasRefArr = Array<bool>.new(NUM_CASES);
+	}
+	// Adds a new scalar to every case, depending on which fields remain
+	def putScalar(widthToFieldMaps: Array<HashMap<int, List<CaseField>>>, refPatterns: RefPatterns) {
+		// Populate `caseHasRefArr` for use later when determining what type of scalar to use.
+		for (i < NUM_CASES) caseHasRefArr[i] = widthToFieldMaps[i].has(REF_KEY);
+		var allCasesHaveRefs = true;
+		var oneCaseHasRef = false;
+		for (i < caseHasRefArr.length) {
+			if (allCasesHaveRefs && !caseHasRefArr[i]) { allCasesHaveRefs = false; break; }
 		}
-
-		if (hasExplicitTag()) buf.put1(" tag=%q", explicitTag.render);
+		for (i < caseHasRefArr.length) {
+			if (!oneCaseHasRef && caseHasRefArr[i]) { oneCaseHasRef = true; break; }
+		}
+		if (allCasesHaveRefs) {
+			putRefScalar(refPatterns);
+		} else if (oneCaseHasRef) {
+			putTaggedRefScalar(refPatterns);
+		} else {
+			putNonrefScalar(refPatterns);
+		}
+	}
+	// Adds a basic scalar to every case and updates scalarTypes
+	def putNonrefScalar(refPatterns: RefPatterns) {
+		for (caseScalars in caseToScalars) caseScalars.put(refPatterns.nonref.copy());
+		scalarTypes.put(bNNScalarType);
+	}
+	// Adds a tagged ref scalar to every case and updates scalarTypes. Cases on whether case has a ref
+	def putTaggedRefScalar(refPatterns: RefPatterns) {
+		for (caseIdx < caseToScalars.length) {
+			def caseScalars = caseToScalars[caseIdx];
+			def scalarPattern = if(caseHasRefArr[caseIdx], refPatterns.ptrref.copy(), refPatterns.nonptrref.copy());
+			caseScalars.put(scalarPattern);	
+		}
+		scalarTypes.put(taggedRefScalarType);
+	}
+	// Adds a ref scalar to every case and updates scalarTypes. Cases on whether case has a ref
+	def putRefScalar(refPatterns: RefPatterns) {
+		for (caseScalars in caseToScalars) caseScalars.put(refPatterns.ptrref.copy());
+		scalarTypes.put(Scalar.Ref);
+	}
+	// Returns the scalar type for the ith scalar in every case
+	def getScalarType(scalarIdx: int) -> Scalar {
+		return scalarTypes[scalarIdx];
+	}
+	// Returns the unassigned intervals for the requested scalar
+	def getUnassignedIntervals(caseIdx: int, scalarIdx: int) -> Array<Interval> {
+		return caseToScalars[caseIdx][scalarIdx].getUnassignedIntervals();
+	}
+	// Assigns an interval to a scalar in a case. 
+	def assignInterval(caseIdx: int, scalarIdx: int, interval: Interval) {
+		caseToScalars[caseIdx][scalarIdx].assignInterval(interval);
+	}
+	// Returns whether the ith scalar is a ref scalar or not 
+	def isRefScalar(scalarIdx: int) -> bool {
+		match (scalarTypes[scalarIdx]) {
+			R32, R64, Ref => return true;
+			_ => return false;
+		}
+	}
+	// Used for printing a scalar
+	def renderScalar(caseIdx: int, scalarIdx: int, buf: StringBuilder) -> StringBuilder {
+		return caseToScalars[caseIdx][scalarIdx].render(buf);
+	}
+	// Returns (true, interval) if a tag interval was found
+	// Returns (false, interval) otherwise 
+	def findTagInterval(tagLength: byte) -> (bool, Interval) {
+		// Find valid start idx
+		if (DEBUG) Terminal.put1("tagLength: %d\n", tagLength);
+		var start = 0u8;
+		for (i < SCALAR_WIDTH) {
+			def b = caseToScalars[0][0].bits[start];
+			match (b) {
+				Unassigned => break;
+				_ => start += 1;
+			}
+		}
+		var tagInterval = Interval(start, start + tagLength);
+		while (tagInterval.end <= byte.view(SCALAR_WIDTH)) {
+			def result: (bool, byte)  = isTagIntervalValid(tagInterval);
+			if (DEBUG && result.0) Terminal.put1("tagInterval: %q\n", tagInterval.render);
+			if (result.0) return (true, tagInterval);
+			def newStart: byte = result.1 + 1u8;
+			tagInterval = Interval(newStart, newStart + tagLength);
+		}
+		if (DEBUG) Terminal.put("No tag interval found\n");
+		return (false, tagInterval);
+	}
+	// Returns (true,0) if all bits in `tagInterval` across all scalars are unassigned. 
+	// Returns (false, index) otherwise, where index is the index of the non available bit.
+	def isTagIntervalValid(tagInterval: Interval) -> (bool, byte) {
+		if (tagInterval.end > caseToScalars[0][0].bits.length) return (false, 0u8);
+		for (caseScalars in caseToScalars) {
+			def scalar = caseScalars[0];
+			for (bIdx=tagInterval.start; bIdx < tagInterval.end; bIdx++) {
+				def bit = scalar.bits[bIdx];
+				if (bit != PackingBit.Unassigned) return (false, byte.view(bIdx));
+			}
+		}
+		return (true, 0u8);
+	}
+	// Searches for a tag interval and assigns the tag interval to each case. 
+	def assignTagsToCases(tagLength: byte) -> Interval {
+		def tagResult: (bool, Interval) = findTagInterval(tagLength);
+		if (!tagResult.0) return EMPTY_INTERVAL;
+		def tagInterval = tagResult.1;
+		for (caseIdx < NUM_CASES) assignInterval(caseIdx, 0, tagInterval);
+		return tagInterval;
+	}
+	// This is for regression testing and using the original representation
+	// TODO: Remove after completing implementation
+	def toArrayArray() -> Array<Array<ScalarPattern>> {
+		def vectorToArr = fun (v: Vector<ScalarPattern>) => v.extract();
+		def newCaseToScalars = Arrays.map(caseToScalars, vectorToArr);
+		return newCaseToScalars;
+	}
+	// Returns the number of scalars per case
+	def getNumScalars() -> int {
+		return scalarTypes.length;
+	}
+	// Returns a copy of the scalars for the case
+	def getScalarCopiesForCase(caseIdx: int) -> Array<ScalarPattern> {
+		return caseToScalars[caseIdx].copy();
+	}
+	// Returns a copy of the `scalaridx`th scalar in case `caseIdx`	scalar
+	def getScalarCopy(caseIdx: int, scalarIdx: int) -> ScalarPattern {
+		return caseToScalars[caseIdx][scalarIdx].copy();
+	}
+	// Used for printing the scalars of each case
+	def render(buf: StringBuilder) -> StringBuilder {
+		for (caseIdx < caseToScalars.length) {
+			buf.put1("Case %d\n", caseIdx);
+			def scalars = caseToScalars[caseIdx];
+			for (scalarIdx < scalars.length) {
+				buf.put2("\tScalar %d: %q\n", scalarIdx, scalars[scalarIdx].render);
+			}
+		}
 		return buf;
 	}
+	
 }
-
-// Represents a collection of patterns related to references and non-references.
-class RefPatterns(
-	ptrref: ScalarPattern,
-	refInterval: Interval,
-	nonptrref: ScalarPattern,
-	nonref: ScalarPattern,
-	nullref: ScalarPattern) {}
-
-def EMPTY_INTERVAL = Interval(0, 0);
-
-component ScalarPatterns {
-	def TAGGED_PTR_64 = RefPatterns.new(
-		parse("????_????_????_????_...._...._...._...._...._...._...._...._...._...._...._.??0"),
-		Interval(3, 48),
-		parse("????_????_????_????_????_????_????_????_????_????_????_????_????_????_????_???1"),
-		ScalarPattern.new(Array<PackingBit>.new(64)),
-		parse("0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_????_????_????") // XXX: bump to 1MiB?
-	);
-	def TAGGED_PTR_32 = RefPatterns.new(
-		parse("...._...._...._...._...._...._...._.??0"),
-		Interval(3, 32),
-		parse("????_????_????_????_????_????_????_???1"),
-		ScalarPattern.new(Array<PackingBit>.new(32)),
-		parse("0000_0000_0000_0000_0000_????_????_????") // XXX: bump to 64KiB?
-	);
-
-	def parse(s: string) -> ScalarPattern {
-		var bits = Vector<PackingBit>.new();
-		var min = 0;
-		if (s.length >= 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) min = 2; // skip 0b prefix if present
-		bits.grow(s.length - min);
-		for (i = s.length - 1; i >= min; i--) {
-			var c = s[i];
-			match (c) {
-				'_' => ;
-				'0' => bits.put(PackingBit.Fixed(0));
-				'1' => bits.put(PackingBit.Fixed(1));
-				'.' => bits.put(PackingBit.Assigned(0));
-				'?' => bits.put(PackingBit.Unassigned);
-				_ => bits.put(PackingBit.Assigned(c));
-			}
-		}
-		return ScalarPattern.new(bits.extract());
+// Represents possible fields that could be packed.
+type PackingField #unboxed {
+	case Nonref(size: byte);
+	case Ref;
+}
+// Holds info about a field: the case it belongs to and its index in the input fields array
+type CaseField(caseIdx: int, fieldIdx: int) {
+	def hash() -> int { return caseIdx * 31 + fieldIdx; }
+	def render(buf: StringBuilder) -> StringBuilder { return buf.put2("(%d, %d)", caseIdx, fieldIdx); }
+}
+// Holds info about a field's assignment
+type AssignedField(caseField: CaseField, scalarIdx: byte, interval: Interval) {
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.put3("CaseField: %q @ scalar %d interval %q", caseField.render, scalarIdx, interval.render);
+	}
+	def renderNoCaseField(buf: StringBuilder) -> StringBuilder {
+		return buf.put2("scalar %d interval %q", scalarIdx, interval.render);
 	}
 }
