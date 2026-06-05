@@ -12,7 +12,7 @@ ALL += x86-64-runs
 endif
 
 ifneq ($(findstring x86-64-darwin,$(HOSTS)),)
-ALL += x86-64--darwin-runs
+ALL += x86-64-darwin-runs
 endif
 
 ifneq ($(findstring jar,$(HOSTS)),)
