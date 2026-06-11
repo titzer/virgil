@@ -60,6 +60,18 @@ public class MathRef {
     }
 
     static double parseVal(String s) {
+        // Support leading '-' on any named token
+        if (s.startsWith("-") && s.length() > 1) {
+            String rest = s.substring(1);
+            double v = parseNamedVal(rest);
+            if (!Double.isNaN(v) || rest.equals("NaN")) return -v;
+        }
+        double named = parseNamedVal(s);
+        if (!Double.isNaN(named) || s.equals("NaN")) return named;
+        return Double.parseDouble(s);
+    }
+
+    static double parseNamedVal(String s) {
         switch (s) {
             case "PI":      return Math.PI;
             case "E":       return Math.E;
@@ -76,13 +88,23 @@ public class MathRef {
             case "sqrt3/2": return Math.sqrt(3) / 2;
             case "1/sqrt3": return 1.0 / Math.sqrt(3);
             case "Inf":     return Double.POSITIVE_INFINITY;
-            case "-Inf":    return Double.NEGATIVE_INFINITY;
             case "NaN":     return Double.NaN;
         }
-        return Double.parseDouble(s);
+        return Double.NaN; // sentinel: not a named token
     }
 
     static String fmtArg(String s) {
+        // Support leading '-' on any named token
+        if (s.startsWith("-") && s.length() > 1) {
+            String rest = s.substring(1);
+            String inner = fmtNamedArg(rest);
+            if (inner != null) return "-" + inner;
+        }
+        String named = fmtNamedArg(s);
+        return named != null ? named : s;
+    }
+
+    static String fmtNamedArg(String s) {
         switch (s) {
             case "PI":      return "Math.PI";
             case "E":       return "Math.E";
@@ -102,7 +124,7 @@ public class MathRef {
             case "-Inf":    return "0d - double.infinity";
             case "NaN":     return "double.nan";
         }
-        return s;
+        return null; // not a named token
     }
 
     static String fmtResult(double x) {
