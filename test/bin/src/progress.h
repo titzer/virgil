@@ -8,7 +8,8 @@ enum output_mode {
     INLINE,
     CHARACTER,
     LINES,
-    SUMMARY
+    SUMMARY,
+    ERRORS
 };
 
 struct failure {

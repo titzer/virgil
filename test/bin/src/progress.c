@@ -62,6 +62,9 @@ int main(int argc, char *argv[]) {
                 case 'l':
                     mode = LINES;
                     break;
+                case 'e':
+                    mode = ERRORS;
+                    break;
                 case 's':
                     mode = SUMMARY;
                     break;
@@ -265,6 +268,7 @@ void report_test_passed() {
             outln();
             fflush(stdout);
             break;
+        case ERRORS: ;
         case SUMMARY: ;
     }
 }
@@ -297,6 +301,11 @@ void report_test_failed(char *error, int is_dynamic) {
             outln();
             fflush(stdout);
             break;
+        case ERRORS:
+            outs(f->name);
+            outln();
+            fflush(stdout);
+            break;
         case SUMMARY: ;
     }
 }
@@ -320,6 +329,8 @@ int report_finish() {
                 outi(failed);
                 outs(" failed\n");
             }
+            break;
+        case ERRORS:
             break;
         default:
             if (mode == CHARACTER) {
