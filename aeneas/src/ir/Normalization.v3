@@ -44,6 +44,7 @@ def defaultGetBitWidth(t: Type) -> byte {
 // Normalizes a program based on the results of reachability analysis.
 def TRANSFERRABLE_FLAGS = (IrFlag.M_ABSTRACT | IrFlag.M_INLINE | IrFlag.M_NEVER_INLINE | IrFlag.M_ENUM_INIT | IrFlag.M_NEW | IrFlag.M_EMPTY | IrFlag.M_EQUALS | IrFlag.M_WRAPPER | IrFlag.M_MAPPER | IrFlag.M_UNMAPPER);
 class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer) {
+	def classOrder = Vector<RaClass>.new();
 	def liveClasses = Vector<RaClass>.new();
 	def context = SsaContext.new(ra.compiler, ra.prog);
 	def typeMap = TypeUtil.newTypeMap<TypeNorm>();
@@ -66,9 +67,13 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		if (wrappers != null) wrappers.createMappersUnmappers(ra);
 
 		ra.prog.state.resetComponentRecords();
-		// layout fields into classes
+		// Order and number classes, variants, and components.
+		ra.classes.apply(orderClass);
+		// Compute the representation of arrays.
 		ra.arrays.apply(visitArrayType);
-		ra.classes.apply(visitClassType);
+		// Compute the representation of classes, components, and variants, including field layout.
+		classOrder.apply(visitClassType);
+
 		if (ra.compiler.PartialSpecialization) {
 			// if partial specialization is enabled, do specialization analysis
 			(specializer = Specializer.new(ra, this)).specialize();
@@ -105,19 +110,49 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		normQueue.drain();  // may run wrapper/mapper normalization updates
 		if (ovfAlloc != null) allocOverflowFieldRecord();
 	}
-	def visitClassType(rc: RaClass) {
-		if (rc.minClassId < 0) {
-			var ic = rc;
-			while (ic.parent != null) ic = ic.parent; // start at root
-
-			if (V3.isVariant(ic.oldType)) {
-				norm(ic.oldType);
-				numberVariant(ic);
-				if (!ic.isUnboxed()) makeNormFieldsAll(ic);
-			} else {
-				layoutClass(ic);
-			}
+	def orderClass(rc: RaClass) {
+		if (rc.minClassId >= 0) return;
+		rc = rc.root();
+		numberClass(rc, 0);
+		// XXX: avoid source tag tables if a small number of holes allows rep tags to match.
+		if (V3.isVariant(rc.oldType)) makeSourceTagTable(rc);
+	}
+	def numberClass(rc: RaClass, depth: int) {
+		rc.minClassId = liveClasses.length;
+		classOrder.put(rc);
+		var isLive = live(rc.raFacts) && !V3.isComponent(rc.oldType);
+		if (CLOptions.PRINT_RA.val) {
+			if (depth == 0) Terminal.put1("classes[%d] = ", rc.minClassId);
+			else { for (i < depth) Terminal.put("  "); Terminal.put1("[%d] = ", rc.minClassId); }
+			Terminal.put1("%q ", rc.oldType.render);
+			if (isLive) Terminal.put("[live]");
+			Terminal.ln();
 		}
+		if (isLive) liveClasses.put(rc);
+		for (l = rc.children; l != null; l = l.tail) numberClass(l.head, depth + 1);
+		rc.maxClassId = liveClasses.length;
+	}
+	def makeSourceTagTable(rc: RaClass) {
+		// Build a source tag table if the representation tag doesn't map 1-1 to source tags.
+		for (i = rc.minClassId; i < rc.maxClassId; i++) {
+			var child = liveClasses[i];
+			var tagValue = V3.getVariantTag(child.oldType);
+			if (tagValue != i - rc.minClassId) return buildSourceTagTable(rc);
+		}
+	}
+	def buildSourceTagTable(rc: RaClass) {
+		var size = rc.maxClassId - rc.minClassId;
+		var arrayType = V3Array.newType(V3.getVariantTagType(rc.oldType));
+		var record = ra.prog.newRecord(arrayType, size);
+		ra.analyzeRecord(record); // XXX: nominally, reachability is done, but mark array type as live.
+		for (i < size) {
+			var inst = liveClasses[rc.minClassId + i];
+			record.values[i] = Int.box(V3.getVariantTag(inst.oldType));
+		}
+		rc.sourceTagTable = record;
+	}
+	def visitClassType(rc: RaClass) {
+		if (!rc.isUnboxed()) makeNormFields(rc);
 		var tn = norm(rc.oldType);
 		if (V3.isComponent(rc.oldType)) {
 			var comp = V3.componentDecl(rc.oldType), newRecord: Record;
@@ -296,62 +331,10 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		var t = Tuple.fromTypeArray(Arrays.range(tn.sub, 0, len));
 		return (t, Arrays.range(tn.sub, len, tn.sub.length));
 	}
-	// number a class and lay out its fields, recursively visiting children
-	def layoutClass(rc: RaClass) {
-//		XXX.put1("layoutClass %q\n", rc.oldType.render);
-		rc.minClassId = liveClasses.length;
-		if (live(rc.raFacts) && !V3.isComponent(rc.oldType)) {
-			liveClasses.put(rc);
-		}
-		makeNormFields(rc);
-		for (l = rc.children; l != null; l = l.tail) layoutClass(l.head);
-		rc.maxClassId = liveClasses.length;
-	}
-	// number a variant and children consistent with tagging order
-	def numberVariant(rc: RaClass) {
-		rc.minClassId = liveClasses.length;
-		if (rc.children == null) {
-			liveClasses.put(rc); // special case of a data type
-		} else {
-			for (l = rc.children; l != null; l = l.tail) numberVariantSlot(l.head, rc.minClassId);
-		}
-		rc.maxClassId = liveClasses.length;
-	}
-	// Recursively assign class IDs to a variant case/subtype using DFS tag ranges.
-	// A node is stored in liveClasses at its minTag slot if:
-	//   (a) it has no children (pure leaf), OR
-	//   (b) none of its children share its minTag (i.e. it has its own distinct slot,
-	//       e.g. "case _" which gets a tag before its subtype variants).
-	// Non-leaf range nodes whose minTag equals a child's minTag are NOT stored in
-	// liveClasses, so layoutMtable can filter them out.
-	def numberVariantSlot(c: RaClass, rootMin: int) {
-		var decl = ClassType.!(c.oldType).classDecl;
-		var minTag = decl.minTag, maxTag = decl.maxTag;
-		c.minClassId = rootMin + minTag;
-		c.maxClassId = rootMin + maxTag + 1;
-		liveClasses.grow(c.maxClassId);
-		if (liveClasses.length < c.maxClassId) liveClasses.length = c.maxClassId;
-		if (c.children == null) {
-			liveClasses[rootMin + minTag] = c; // leaf: store so layoutMtable can find it
-		} else {
-			// Check if this node has its own slot (no child starts at the same tag).
-			var ownSlot = true;
-			for (l = c.children; l != null; l = l.tail) {
-				if (ClassType.!(l.head.oldType).classDecl.minTag == minTag) { ownSlot = false; break; }
-			}
-			if (ownSlot) liveClasses[rootMin + minTag] = c; // e.g. "case _" before subtypes
-			for (l = c.children; l != null; l = l.tail) numberVariantSlot(l.head, rootMin);
-		}
-	}
 	def mapSimple(t: Type) -> TypeNorm {
 		return typeMap[t] = TypeNorm.new(t, t, null);
 	}
-	// Recursively lay out fields for a boxed variant hierarchy (parent before children).
-	def makeNormFieldsAll(rc: RaClass) {
-		makeNormFields(rc);
-		for (l = rc.children; l != null; l = l.tail) makeNormFieldsAll(l.head);
-	}
-	// layout fields for classes and components
+	// Lay out fields for classes, variants and components.
 	def makeNormFields(rc: RaClass) {
 		if (rc.liveFields != null) return;
 		var fields = Vector<IrSpec>.new().grow(rc.fields.length);  // gather fields into vector
@@ -453,6 +436,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		return complexRecordMap[oldRecord] = result;
 	}
 	def packScalar(field_type: Type, scalar_type: Type, scalar: Val, val: Val, interval: Interval) -> Val {
+		if (field_type == scalar_type) return val; // special case of 1-1 mapping
 		match (scalar_type) {
 			// TODO: masking of negative integer values
 			it: IntType => {
@@ -612,7 +596,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 			for (l = rc.subtypes; l != null; l = l.tail) { // fill out mtable
 				// Skip non-leaf variant range nodes (e.g. "case _" and intermediate subtype
 				// variants). Only the actual leaf at each DFS tag slot fills the mtable.
-				if (liveClasses[l.head.minClassId] != l.head) continue;
+				if (liveClasses[l.head.minClassId] != l.head) void(1/0);
 				var impl = resolveMethodImpl(l.head, rm);
 				var index = l.head.minClassId - mtable.rootId;
 				mtable.table[index] = impl.norm;
@@ -629,7 +613,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 		setMtable(rc, rv); // set mtable for all child virtual methods
 	}
-	def setMtable(rc: RaClass, rv: RaVirtual) {
+	def setMtable(rc: RaClass, rv: RaVirtual) { // XXX: use rc.visitChildrenPreOrder
 		var rm = rc.findRaMethod(rv.raMethod);
 		if (rm != null && rm.virtual != null) rm.virtual.mtable = rv.mtable;
 		for (l = rc.children; l != null; l = l.tail) {
@@ -654,8 +638,7 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 				if (VariantNorm.?(tn)) {
 					// potentially flattened data type
 					// find the correct variant norm
-					var vn = VariantNorm.!(tn);
-					if (vn.oldType != x.rtype) vn = vn.getChildVariantNorm(x.rtype);
+					var vn = VariantNorm.!(norm(x.rtype));
 					var result = normVariantRecord(vn, x);
 					for (i < result.length) array[index + i] = result[i];
 				} else {
@@ -794,28 +777,15 @@ class ReachabilityNormalizer(config: NormalizerConfig, ra: ReachabilityAnalyzer)
 		}
 	}
 	def normCode(rm: RaMethod) {
+		// TODO: equality methods are generated before unboxing decisions are made.
+		var emptyBody = rm.orig.flags.M_EQUALS && ra.getClass(rm.receiver).isUnboxed();
 		context.spec = rm.spec;
 		context.enterMethod(rm.orig);
-		if (rm.orig.ssa == null && rm.orig.flags.M_EQUALS) {
-			// generate SSA for variant equals method
-			var ctype = rm.orig.receiver;
-			var receiver = ra.oldIr.getIrClass(ctype);
-			var root = ra.oldIr.getIrClass(V3.getRootType(ctype));
-			var rc = ra.getClass(rm.receiver);
-			if (rc.isUnboxed()) { // TODO: disable generation of compare method bodies
-				// flattened data types will have inlined compare
-				rm.orig.ssa = SsaGraph.new([SsaParam.new(0, receiver.ctype), SsaParam.new(1, root.ctype)], Bool.TYPE);
-				rm.orig.ssa.startBlock.append(SsaReturn.new([rm.orig.ssa.falseConst()]));
-			} else {
-				rm.orig.ssa = VariantComparatorGen.new(context, root, receiver, rm.orig).generate();
-			}
-			context.graph = rm.orig.ssa;
-		}
 		if (specializer != null && rm.spec != null) {
 			// use specializer to generate appropriate code for method
-			if (specializer.normCode(context, rm)) return;
+			if (specializer.normCode(context, rm, emptyBody)) return;
 		}
-		SsaRaNormalizer.new(context, this).build(rm.norm);
+		SsaRaNormalizer.new(context, this).build(rm.norm, emptyBody);
 		newIr.methods.put(rm.norm);
 	}
 	def allocOverflowFields(fnorm: FuncNorm) -> FuncNorm {
