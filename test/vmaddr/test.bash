@@ -3,9 +3,9 @@
 . ../common.bash vmaddr
 
 if [ $# -gt 0 ]; then
-	TESTS="$@"
+    TEST_LIST="$@"
 else
-	TESTS=*.v3
+    TEST_LIST=*.v3
 fi
 
 
@@ -20,9 +20,11 @@ for target in $TEST_TARGETS; do
     case "$(get_vm_addr_width $target)" in
 	"32")
 	    ADDRS="$ADDRS_32"
+	    TESTS=$(ls $TEST_LIST | grep -v _64.v3)
 	    ;;
 	"48")
 	    ADDRS="$ADDRS_32 $ADDRS_48"
+	    TESTS="$TEST_LIST"
 	    ;;
 	*)
 	    continue
