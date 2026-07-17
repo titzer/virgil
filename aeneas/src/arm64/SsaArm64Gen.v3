@@ -23,6 +23,9 @@ def I_MOVZ: byte = 0x30;
 def I_MOVK: byte = 0x31;
 def I_LDR: byte = 0x32;
 def I_STR: byte = 0x33;
+def I_B: byte = 0x40;		// unconditional branch (26-bit PC-relative)
+def I_CBZ: byte = 0x41;	// compare and branch if zero (19-bit PC-relative)
+def I_CBNZ: byte = 0x42;	// compare and branch if nonzero (19-bit PC-relative)
 
 def I_QD_DIFF: byte = I_ADDQ - I_ADDD;
 
@@ -31,6 +34,7 @@ def AM_NONE: byte = 0x00;
 def AM_R_R_I_I: byte = 0x01;
 def AM_R_R_R_SH_I: byte = 0x02;
 def AM_R_R_R_EX_I: byte = 0x03;
+def AM_R: byte = 0x04;		// first operand is a register
 
 // arguments
 def ARG_NONE: byte = 0x00;
@@ -86,21 +90,39 @@ class SsaArm64Gen extends SsaMachGen {
 	}
 
 	def visitThrow(block: SsaBlock, i: SsaThrow) { unimplemented(); }
-	def visitIf(block: SsaBlock, i: SsaIf) { unimplemented(); }
+	def visitIf(block: SsaBlock, i: SsaIf) {
+		var key = i.input0();
+		var succ = i.block().succ;
+		var s0 = succ(0).dest;  // true block
+		var s1 = succ(1).dest;  // false block
+		if (blocks.isImmediatelyAfter(context.block, s1)) {
+			// fall through to s1 (false path); branch to s0 (true path) if nonzero
+			emit2(ArchInstrs.FLAG_NO_GAP | makeOpcode(I_CBNZ, AM_R, ARG_NONE, ARG_NONE),
+				useReg(key), useLabel(s0));
+		} else if (blocks.isImmediatelyAfter(context.block, s0)) {
+			// fall through to s0 (true path); branch to s1 (false path) if zero
+			emit2(ArchInstrs.FLAG_NO_GAP | makeOpcode(I_CBZ, AM_R, ARG_NONE, ARG_NONE),
+				useReg(key), useLabel(s1));
+		} else {
+			// no fallthrough: branch to s0 if nonzero, then unconditional jump to s1
+			emit2(ArchInstrs.FLAG_NO_GAP | makeOpcode(I_CBNZ, AM_R, ARG_NONE, ARG_NONE),
+				useReg(key), useLabel(s0));
+			emit1(ArchInstrs.FLAG_NO_GAP | makeOpcode(I_B, AM_NONE, ARG_NONE, ARG_NONE),
+				useLabel(s1));
+		}
+	}
 	def visitSwitch(block: SsaBlock, i: SsaSwitch) { unimplemented(); }
-	def visitGoto(block: SsaBlock, target: SsaGoto) { unimplemented(); }
+	def visitGoto(block: SsaBlock, i: SsaGoto) {
+		var target = i.target();
+		if (!blocks.isImmediatelyAfter(context.block, target)) {
+			emit1(makeOpcode(I_B, AM_NONE, ARG_NONE, ARG_NONE), useLabel(target));
+		}
+	}
 
 	// Regalloc callbacks to add moves
 	def genMoveLocLoc(src: Operand.Use, dst: Operand.Def, regClass: RegClass) { unimplemented(); }
 	def genMoveConstReg(val: SsaConst, dst: Operand.Def, regClass: RegClass) {
-		var reg = toGpr(dst);
-		match (val.val) {
-			null          => asm.movd_r_u16(reg, 0);
-			x: Box<int>   => emitMovImm32(reg, x.val);
-			x: Box<long>  => emitMovImm64(reg, x.val);
-			x: Box<bool>  => emitMovImm32(reg, if(x.val, 1, 0));
-			_ => context.fail("genMoveConstReg: unhandled Val type");
-		}
+		emit2(makeOpcode(I_MOVK, AM_R, ARG_NONE, ARG_NONE), op(dst), op(Operand.Immediate(val.val)));
 	}
 	def emitMovImm32(reg: Arm64Gpr, val: int) {
 		var lo = u16.view(val);
@@ -128,7 +150,24 @@ class SsaArm64Gen extends SsaMachGen {
 					// allocate frame
 					if (adjust > 0) asm.subq_r_r_u12_u1(Regs.SP, Regs.SP, u12.view(adjust), 0);
 				}
-				ArchInstrs.ARCH_BLOCK => return; // TODO
+				ArchInstrs.ARCH_BLOCK => {
+					// Bind the block's label and patch any forward branches that targeted it.
+					var label = toLabel(a[0]);
+					label.pos = asm.pos();
+					for (l = label.near_uses; l != null; l = l.tail) {
+						var encoded = l.head;
+						if (encoded >= 0) {
+							// B (26-bit offset): stored as positive position
+							asm.patch_REL_i26(encoded, i26.view((label.pos - encoded) / 4));
+						} else {
+							// CBZ / CBNZ (19-bit offset): stored as ~position
+							var pos = ~encoded;
+							asm.patch_REL_i19(pos, i19.view((label.pos - pos) / 4));
+						}
+					}
+					label.near_uses = null;
+					return;
+				}
 				ArchInstrs.ARCH_RET => {
 					var adjust = frameAdjust();
 					// deallocate frame
@@ -136,15 +175,22 @@ class SsaArm64Gen extends SsaMachGen {
 					asm.ret();
 					return;
 				}
-				ArchInstrs.ARCH_BLOCK_END => return; //TODO
-				ArchInstrs.ARCH_END => return;
+				ArchInstrs.ARCH_BLOCK_END => return; // nothing to do
+				ArchInstrs.ARCH_END => return; // nothing to do
 				_ => unimplemented();
 			}
 			return;
 		}
 
 		def am = getAM(opcode);
-		match (getAM(opcode)) {
+		match (am) {
+			AM_NONE => {
+				match (getCode(opcode)) {
+					I_B => assemble_label(toLabel(a[0]), true, emit_b);
+					_ => invalidOpcode(opcode);
+				}
+			}
+			AM_R => assemble_r(opcode, a);
 			AM_R_R_I_I => {
 				def imm = u12.view(toB32(toImm(a[2])));
 				def lsl12 = u1.view(getArg1(opcode));
@@ -165,6 +211,36 @@ class SsaArm64Gen extends SsaMachGen {
 			I_ADDQ => asm.addq_r_r_u12_u1(rd, rn, imm, lsl12);
 			I_SUBD => asm.subd_r_r_u12_u1(rd, rn, imm, lsl12);
 			I_SUBQ => asm.subq_r_r_u12_u1(rd, rn, imm, lsl12);
+			_ => invalidOpcode(opcode);
+		}
+	}
+	def assemble_label(label: Label, is26: bool, emit: i26 -> void) {
+		if (label.pos >= 0) {
+			emit(i26.view((label.pos - asm.pos()) / 4));
+		} else {
+			var pos = asm.pos();
+			label.near_uses = List.new(if(is26, pos, ~pos), label.near_uses);
+			emit(i26.view(0));
+		}
+	}
+	def emit_b(off: i26) { asm.b_i26(off); }
+	def emit_cbzd(reg: Arm64Gpr, off: i26) { asm.cbzd_r_i19(reg, i19.view(off)); }
+	def emit_cbnzd(reg: Arm64Gpr, off: i26) { asm.cbnzd_r_i19(reg, i19.view(off)); }
+	def assemble_r(opcode: int, a: Array<Operand>) {
+		var reg = toGpr(a[0]);
+		match (getCode(opcode)) {
+			I_MOVK => {
+				// Move constant to register; a[1]=immediate value.
+				match (toImm(a[1])) {
+					null          => asm.movd_r_u16(reg, 0);
+					x: Box<int>   => emitMovImm32(reg, x.val);
+					x: Box<long>  => emitMovImm64(reg, x.val);
+					x: Box<bool>  => emitMovImm32(reg, if(x.val, 1, 0));
+					_ => context.fail("I_MOVK: unhandled Val type");
+				}
+			}
+			I_CBZ  => assemble_label(toLabel(a[1]), false, emit_cbzd(reg, _));
+			I_CBNZ => assemble_label(toLabel(a[1]), false, emit_cbnzd(reg, _));
 			_ => invalidOpcode(opcode);
 		}
 	}
@@ -218,7 +294,7 @@ class SsaArm64Gen extends SsaMachGen {
 			Overwrite(dst, src, assignment) => return assignment;
 			Def(vreg, assignment) => return assignment;
 			Use(vreg, assignment) => return assignment;
-			_ => return V3.fail("expected operand with assignment");
+			_ => { context.fail("expected operand with assignment"); return 0; }
 		}
 	}
 
@@ -228,7 +304,7 @@ class SsaArm64Gen extends SsaMachGen {
 
 	def loc_r(loc: int) -> Arm64Gpr {
 		var gpr = MRegs.toGpr(loc);
-		if (gpr == null) return V3.fail1("expected GPR, got %s", regSet.identify(loc));
+		if (gpr == null) { context.fail1("expected GPR, got %s", regSet.identify(loc)); return Arm64Regs.R0; }
 		return gpr;
 	}
 
@@ -293,6 +369,9 @@ class SsaArm64Buffer extends ArchInstrBuffer {
 			I_MOVK => name = "mov";
 			I_LDR => name = "ldr";
 			I_STR => name = "str";
+			I_B    => name = "b";
+			I_CBZ  => name = "cbz";
+			I_CBNZ => name = "cbnz";
 		}
 		putIndent(indent);
 		puts(name);
