@@ -21,6 +21,8 @@ function set_rt_files() {
 	export RT_FILES="$RT_LOC/x86-linux/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
     elif [ "$target" = "x86-64-linux" ]; then
 	export RT_FILES="$RT_LOC/x86-64-linux/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
+    elif [ "$target" = "arm64-linux" ]; then
+	export RT_FILES="$RT_LOC/arm64-linux/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
     elif [ "$target" = "wasm" ]; then
 	export RT_FILES="./EmptySystem.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3 $GC_SOURCES ./TagUtils.v3"
     fi
@@ -97,7 +99,9 @@ function get_target_tests() {
         TESTS=$(ls $ALL_TESTS | grep -E -v $TAGGED_REF32_PATTERN)
     elif [ "$target" = x86-64-darwin ]; then
         TESTS=$(ls $ALL_TESTS | grep -E -v $TAGGED_REF32_PATTERN)
-    else 
+    elif [ "$target" = arm64-linux ]; then
+        TESTS=$(ls $ALL_TESTS | grep -E -v $TAGGED_REF32_PATTERN)
+    else
         TESTS=$ALL_TESTS
     fi
 }
