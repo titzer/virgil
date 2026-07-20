@@ -2,7 +2,7 @@
 
 . ../common.bash readonly
 
-V3C_OPTS="$V3C_OPTS -read-only-arrays"
+V3C_OPTS="$V3C_OPTS -lang:read-only-arrays"
 
 if [ $# -gt 0 ]; then
 	TESTS="$@"

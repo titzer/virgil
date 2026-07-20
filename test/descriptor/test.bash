@@ -2,7 +2,7 @@
 
 . ../common.bash descriptors
 
-V3C_OPTS="$V3C_OPTS -descriptors"
+V3C_OPTS="$V3C_OPTS -lang:descriptors"
 
 if [ $# -gt 0 ]; then
 	TESTS="$@"
