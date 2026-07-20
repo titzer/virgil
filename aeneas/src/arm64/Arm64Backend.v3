@@ -16,11 +16,23 @@ component Arm64Common {
 		config.IntConvertFMapsNanToZero = false;
 		config.IntConvertFPosSaturates = false;
 		config.FloatConvertIUnsigned = false;
+		config.ExEntrySize = 8; // B instruction targets must be 4-byte aligned
 		return config;
   	}
 
-	def KERNEL_PARAM_REGS: Array<Arm64Reg> = [];
-	def KERNEL_RETURN_REGS: Array<Arm64Reg> = [];
+	def KERNEL_PARAM_REGS = [
+		Arm64RegSet.R8,   // syscall number (X8)
+		Arm64RegSet.R0,   // param 0 (X0)
+		Arm64RegSet.R1,   // param 1 (X1)
+		Arm64RegSet.R2,   // param 2 (X2)
+		Arm64RegSet.R3,   // param 3 (X3)
+		Arm64RegSet.R4,   // param 4 (X4)
+		Arm64RegSet.R5    // param 5 (X5)
+	];
+	def KERNEL_RETURN_REGS = [
+		Arm64RegSet.R0,   // return value 0 (X0)
+		Arm64RegSet.R1    // return value 1 (X1)
+	];
 }
 
 // TODO: negative object headers
@@ -43,15 +55,21 @@ class Arm64Backend extends MachBackend {
 
 		if (ri_gc != null) {
 			// call the RiRuntime.gc() method
-			unimplemented();
+			var frame = computeFrameSize(getFrame(ri_gc.ssa)), c = frame.conv;
+			objReg = MRegs.toGpr(c.calleeRet(0));
+			sizeReg = MRegs.toGpr(c.calleeParam(1));
+			ipReg = MRegs.toGpr(c.calleeParam(2));
+			spReg = MRegs.toGpr(c.calleeParam(3));
 		} else {
 			// there is no appropriate RiRuntime.gc() method
 			objReg = Arm64Regs.R0;
-			sizeReg = Arm64Regs.R0;
+			sizeReg = Arm64Regs.R1;
 		}
 		asm = Arm64Assembler.new(w);
 		patcher = Arm64AddrPatcher.new(w, mach, asm);
 		codegen = SsaArm64Gen.new(context, mach, asm, w, dwarf);
+		// ARM64 requires 16-byte stack alignment
+		if (mach.stackAlign < 16) mach.stackAlign = 16;
 
 		if (compiler.useGlobalRegAllocMatcher != VstMatcher.None) allocateRegsGlobal = GlobalRegAlloc.new(MRegs.SET, codegen).allocate;
 		if (compiler.LocalRegAlloc) allocateRegs = LocalRegAlloc.new(MRegs.SET, codegen).allocate;
@@ -64,17 +82,31 @@ class Arm64Backend extends MachBackend {
 		if (mainSpec == null) return;
 		def main = mainSpec.asMethod();
 		def frame = computeFrameSize(getFrame(main.ssa));
-		genTestInputs(main, frame);
+		// initialize runtime if necessary
+		genMainInit(frame);
+		if (test) genTestInputs(main, frame);
+		// switch to compiler-provided stack before calling main
+		if (CLOptions.STACK_SIZE.get() > 0) {
+			codegen.emitPoolLoad(Arm64Regs.R16, CiRuntimeModule.STACK_END);
+			asm.addq_r_r_u12_u1(Regs.SP, Arm64Regs.R16, 0, 0); // MOV SP, R16
+			// Branch over the constant pool data
+			var endAddr = Addr.new(mach.codeRegion, null, 0);
+			asm.b_i26(patcher.REL_IMM26_MARKER);
+			patcher.record(PatchKind.ARM64_REL_IMM26, endAddr);
+			codegen.flushPool();
+			w.bind(endAddr);
+		}
 
 		def mainAddr = mach.addrOfMethod(main);
 		asm.bl_i26(patcher.REL_IMM26_MARKER);
 		patcher.record(PatchKind.ARM64_REL_IMM26, mainAddr);
 
 		// write return value to stdout if this is a test
-		genTestOutput(main, frame);
+		if (test) genTestOutput(main, frame);
 
-		// Exit successfully
-		asm_exit_code(0);
+		// exit with the return value of main
+		if (test || main.sig.returnTypes.length == 0) asm_exit_code(0);
+		else asm_exit_r(loc_gpr(frame, frame.conv.callerRet(0)));
 	}
 	def genCodeFromSsa() {
 		var frame = getFrame(context.method.ssa);
@@ -105,7 +137,105 @@ class Arm64Backend extends MachBackend {
 		return frame;
 	}
 	def genMainInit(frame: MachFrame) {
-		unimplemented();
+		// call RiRuntime.init() if it exists
+		if (mach.runtime.ri_init >= 0) return genRiInit();
+		// if this is a test, install custom signal handlers
+		if (test) return genSigInstalls();
+	}
+	def genRiInit() {
+		// generate a call to the RiRuntime.init() method
+		var init_meth = mach.runtime.getRiInit();
+		var conv = getFrame(init_meth.ssa).conv;
+		// arg 0 = "this" = null
+		var thisReg = MRegs.toGpr(conv.calleeParam(0));
+		asm.movq_r_u16(thisReg, 0); // "this" = null
+		// arg 1 = argc @ [sp]
+		var argcReg = MRegs.toGpr(conv.calleeParam(1));
+		asm.ldrunsignedq_r_r_u12(argcReg, Regs.SP, 0); // load argc from stack
+		// arg 2 = argv
+		var argvReg = MRegs.toGpr(conv.calleeParam(2));
+		if (test) {
+			// if testing, arg 2 = argv = NULL
+			asm.movq_r_u16(argvReg, 0);
+		} else {
+			// otherwise arg 2 = argv @ [sp + 8]
+			asm.addq_r_r_u12_u1(argvReg, Regs.SP, u12.view(mach.data.addressSize), 0);
+		}
+		// arg 3 = envp = null
+		var envpReg = MRegs.toGpr(conv.calleeParam(3));
+		asm.movq_r_u16(envpReg, 0);
+		// call RiRuntime.init(argc: int, argv: Pointer, envp: Pointer) -> Array<string>
+		asm.bl_i26(patcher.REL_IMM26_MARKER);
+		patcher.record(PatchKind.ARM64_REL_IMM26, mach.addrOfMethod(init_meth));
+		// ret -> dest (move return value to main's param register)
+		if (!test) {
+			var retReg = MRegs.toGpr(conv.calleeRet(0));
+			var dest = MRegs.toGpr(conv.callerParam(1));
+			if (retReg != dest) asm.movq_r_r(dest, retReg);
+		}
+	}
+	def genSigInstalls() {
+		genSigHandlerInstall(8, mach.runtime.getFatalAddress(V3Exception.DivideByZero));
+		genSigHandlerInstall(10, mach.runtime.getFatalAddress(V3Exception.NullCheck));
+		genSigHandlerInstall(11, mach.runtime.getFatalAddress(V3Exception.NullCheck));
+		// Branch over the constant pool data to avoid falling through into it
+		var endAddr = Addr.new(mach.codeRegion, null, 0);
+		asm.b_i26(patcher.REL_IMM26_MARKER);
+		patcher.record(PatchKind.ARM64_REL_IMM26, endAddr);
+		codegen.flushPool();
+		w.bind(endAddr);
+	}
+	def genAllocStub() {
+		if (alwaysGc) return jumpRiGc();
+		// Bump-pointer allocator: sizeReg (R1) = size input, objReg (R0) = result
+		// R16, R17 = scratch
+		// Load heap current pointer into objReg (R0)
+		codegen.emitPoolLoad(Arm64Regs.R16, CiRuntimeModule.HEAP_CUR_LOC);
+		asm.ldur_x_r_r_i9(objReg, Arm64Regs.R16, 0); // objReg = *heapCurLoc
+		// Compute new = cur + size
+		asm.addq_r_r_r_sh_u6(sizeReg, objReg, sizeReg, RegShift.LSL, 0); // sizeReg = cur + size
+		// Compare with heap end
+		codegen.emitPoolLoad(Arm64Regs.R17, CiRuntimeModule.HEAP_END_LOC);
+		asm.ldur_x_r_r_i9(Arm64Regs.R17, Arm64Regs.R17, 0); // R17 = *heapEndLoc
+		asm.cmpq_r_r_sh_u6(sizeReg, Arm64Regs.R17, RegShift.LSL, 0);
+
+		var slowPath = Addr.new(mach.codeRegion, null, 0);
+		if (ri_gc == null) {
+			// No GC: branch to fatal on overflow
+			var fatal = mach.runtime.getFatalAddress(V3Exception.HeapOverflow);
+			asm.b_cond_i19(Arm64Conds.HI, 0);
+			patcher.record(PatchKind.ARM64_REL_IMM19, fatal);
+		} else {
+			// GC: branch to slow path on overflow
+			asm.b_cond_i19(Arm64Conds.HI, 0);
+			patcher.record(PatchKind.ARM64_REL_IMM19, slowPath);
+		}
+
+		// Fast path: store new heap pointer, return old pointer in objReg
+		asm.stur_x_r_r_i9(sizeReg, Arm64Regs.R16, 0); // *heapCurLoc = new
+		// objReg already has the old pointer (result)
+		asm.ret();
+
+		if (ri_gc == null) {
+			codegen.flushPool();
+			return;
+		}
+		// Slow path: call RiRuntime.gc
+		w.bind(slowPath);
+		// Recover original size: size = new - cur
+		asm.subq_r_r_r_sh_u6(sizeReg, sizeReg, objReg, RegShift.LSL, 0);
+		jumpRiGc();
+		codegen.flushPool();
+	}
+	def jumpRiGc() {
+		// Set up args for RiRuntime.gc(this=null, size, ip, sp) and tail-call
+		// sizeReg already has size (calleeParam(1))
+		if (ipReg != Arm64Regs.R30) asm.movq_r_r(ipReg, Arm64Regs.R30); // ip = LR
+		asm.addq_r_r_u12_u1(spReg, Regs.SP, 0, 0); // sp = SP (ADD for SP access)
+		asm.movq_r_u16(objReg, 0); // this = null (calleeParam(0) = calleeRet(0) = R0)
+		// Tail call to ri_gc
+		asm.b_i26(patcher.REL_IMM26_MARKER);
+		patcher.record(PatchKind.ARM64_REL_IMM26, mach.addrOfMethod(ri_gc));
 	}
 	def unimplemented() {
 		mach.fail("unimplemented");
@@ -115,9 +245,8 @@ class Arm64Backend extends MachBackend {
 		asm.ldrd_r_r_i9(Regs.R8, Regs.SP, 0); // load "argc"
 		def params = main.ssa.params, conv = frame.conv;
 		if (conv.overflow > 0) {
-			// allocate space for overflow arguments
-			// TODO: will this always fit?
-			def overflowSpace = u12.view(conv.overflow * mach.data.addressSize);
+			// allocate space for overflow arguments, maintaining 16-byte stack alignment
+			def overflowSpace = u12.view(mach.alignTo(conv.overflow * mach.data.addressSize, mach.stackAlign));
 			asm.subq_r_r_u12_u1(Regs.SP, Regs.SP, overflowSpace, 0);
 		}
 
@@ -129,16 +258,14 @@ class Arm64Backend extends MachBackend {
 		for (i = 1; i < conv.paramLocs.length; i++) {
 			def loc = conv.callerParam(i), dest = MRegs.toGpr(loc);
 
-			// load the register value from the table to follow
-			def tableLow16 = Addr.new(mach.codeRegion, null, 0);
-			def tableHigh16 = Addr.new(mach.codeRegion, null, 0);
-
-			// Move low 16 bits of table addr
-			asm.movd_r_u16(Regs.R9, patcher.ABS_IMM16_MARKER);
-			patcher.record(PatchKind.ARM64_ABS_IMM16, tableLow16);
-			// Move high 16 bits of table addr
-			asm.movkd_r_u16_u1(Regs.R9, patcher.ABS_IMM16_MARKER, 1);
-			patcher.record(PatchKind.ARM64_ABS_IMM16, tableHigh16);
+			// load the register value from the table to follow. The table sits a few
+			// instructions ahead, so its address is computed PC-relatively with ADR;
+			// that keeps the sequence independent of where the image is loaded, in
+			// particular above 4GB, where materializing an absolute address is easy
+			// to truncate.
+			def tableRef = Addr.new(mach.codeRegion, null, 0);
+			asm.adr_r_i21(Regs.R9, patcher.REL_ADR21_MARKER);
+			patcher.record(PatchKind.ARM64_REL_ADR21, tableRef);
 
 			if (dest == null) {
 				// destination is a stack location
@@ -147,8 +274,10 @@ class Arm64Backend extends MachBackend {
 				def offset = i9.view(mach.data.addressSize * (loc - frame.conv.regSet.callerStart));
 				// table value is at tableAddr + argc * 4
 				asm.ldrd_r_r_r_ex_u1(scratchReg, Regs.R9, Regs.R8, MemRegExtend.LSL, 1);
-				// Store table value on stack
-				asm.strd_r_r_i9(scratchReg, Regs.SP, offset);
+				// Store table value on stack, writing the whole 8-byte slot: the
+				// callee reloads argument slots at their full width, so leaving the
+				// top half of the slot uninitialized would feed it garbage.
+				asm.stur_x_r_r_i9(scratchReg, Regs.SP, offset);
 			} else {
 				asm.ldrd_r_r_r_ex_u1(dest, Regs.R9, Regs.R8, MemRegExtend.LSL, 1);
 			}
@@ -158,9 +287,7 @@ class Arm64Backend extends MachBackend {
 			asm.b_i26(patcher.REL_IMM26_MARKER);
 			patcher.record(PatchKind.ARM64_REL_IMM26, endAddr);
 			// Now we know the start address of the table
-			def tableAddr = w.addr() - 4; // argc = 1 adjustment
-			tableLow16.absolute = u16.view(tableAddr);
-			tableHigh16.absolute = u16.view(tableAddr >> 16);
+			tableRef.absolute = w.addr() - 4; // argc = 1 adjustment
 			// emit table of argument values
 			for (v in vals) w.put_b32(V3.unboxI32(v[i - 1]));
 			// Now we know the end address of the table
