@@ -271,6 +271,13 @@ function run_or_skip_io_tests() {
     done
 }
 
+# Does the compiler under test know the target? The stable compiler may predate
+# a target that the current sources add, e.g. the unit and lib suites run on
+# stable while the targets under test include a newer native target.
+function is_known_target() {
+    ! $AENEAS_TEST -target=$1 < /dev/null 2>&1 | grep -q "Unknown target"
+}
+
 function run_v3c() {
     local target=$1
     shift

@@ -15,6 +15,10 @@ ifneq ($(findstring x86-64-darwin,$(HOSTS)),)
 ALL += x86-64-darwin-runs
 endif
 
+ifneq ($(findstring arm64-linux,$(HOSTS)),)
+ALL += arm64-runs
+endif
+
 ifneq ($(findstring jar,$(HOSTS)),)
 ALL += jvm-runs
 endif
@@ -55,6 +59,11 @@ X86_64_DARWIN_RUNS = x86-64-darwin-bootstrap x86-64-darwin-current
 x86-64-darwin-runs: $(X86_64_DARWIN_RUNS)
 
 
+ARM64_RUNS = arm64
+
+arm64-runs: $(ARM64_RUNS)
+
+
 JVM_RUNS = jvm jvm-O2 jvm-uv
 
 jvm-runs: $(JVM_RUNS)
@@ -70,7 +79,7 @@ WASM_GC_RUNS = wasm-gc wasm-gc-O2 wasm-gc-og wasm-gc-O2-og wasm-gc-rt wasm-gc-O2
 wasm-gc-runs: $(WASM_GC_RUNS)
 
 
-.PHONY: $(ALL) $(X86_RUNS) $(X86_64_RUNS) $(JVM_RUNS) $(WASM_RUNS) $(WASM_GC_RUNS)
+.PHONY: $(ALL) $(X86_RUNS) $(X86_64_RUNS) $(ARM64_RUNS) $(JVM_RUNS) $(WASM_RUNS) $(WASM_GC_RUNS)
 
 #
 # x86-linux
@@ -129,6 +138,12 @@ x86-64-darwin-bootstrap:
 x86-64-darwin-current:
 	CI_DIR=ci/$@ AENEAS_TEST=current   bash ./macos/build-test-x86_64.sh > $@-out.txt 2>&1
 
+
+#
+# arm64-linux
+#
+arm64:
+	CI_DIR=ci/$@ bash ./linux/build-test-arm64.sh > $@-out.txt 2>&1
 
 #
 # JVM (wfts always enabled)
