@@ -7,46 +7,82 @@ Focus: arm64-linux first. arm64-darwin later (shares most backend code; only OS 
 
 ## Current Status
 
-**Working:**
-- Assembler (`lib/asm/arm64/Arm64Assembler.v3`, 692 lines): integer instructions, most load/store forms, branch instructions, some FP instructions, patching for REL_IMM26 (BL) and ABS_IMM16 (MOVZ/MOVK)
+**Working (Phase 1 complete):**
+- Assembler (`lib/asm/arm64/Arm64Assembler.v3`): integer instructions, most load/store forms, branch instructions, some FP instructions, patching for REL_IMM26 (BL) and ABS_IMM16 (MOVZ/MOVK)
 - Assembler test suite: `test/asm/arm64/` compares against native `as` output
-- Code generator (`aeneas/src/arm64/SsaArm64Gen.v3`, 381 lines): IntAdd, IntSub, CBZ/CBNZ, B (unconditional branch), ARCH_ENTRY/ARCH_BLOCK/ARCH_RET
+- Code generator (`aeneas/src/arm64/SsaArm64Gen.v3`): IntAdd, IntSub, CBZ/CBNZ, B (unconditional branch), ARCH_ENTRY/ARCH_BLOCK/ARCH_RET
 - `genMoveConstReg`: emits MOVZ+MOVK for 32-bit and 64-bit constants
+- `genMoveLocLoc`: GPR↔GPR, GPR↔stack, stack↔stack (via scratch R16); I_MOVR/I_MOVRQ opcodes with AM_R_OP/AM_OP_R addressing modes
+- `genMoveConstStack`: loads constant to scratch, then stores to stack slot
+- `tryUseImm12`: fixed to only accept 12-bit unsigned (0–4095) for ARM64 ADD/SUB (was incorrectly accepting any int)
+- `loc_sp_offset`: computes SP-relative byte offset from spill slot loc (handles regular/caller/callee slots)
 - Backend driver (`aeneas/src/arm64/Arm64Backend.v3`): frame setup, genTestInputs, genTestOutput (for arm64-linux-test target), asm_exit_code
-- Test runner: `test/bin/test-arm64-linux` and Docker runner exist
+- Test runner: `test/bin/test-arm64-linux` and Docker runner (`test/bin/test-arm64-linux@docker`) exist
 - PatchKind enum already includes ARM64_REL_IMM19, ARM64_ABS_IMM16, ARM64_REL_IMM26
+- **test/configure** sets up `test/config/test-arm64-linux@docker` symlink when Docker with linux/arm64 support is available
+- Test results: `test/core/add00-03.v3` pass (4 of 5 add tests pass; add04 needs CallAddress)
 
-**Missing — code generator:**
-- `genMoveLocLoc` — register-to-register moves (critical for register allocator)
-- `genMoveConstStack` — constant to stack slot
-- All integer ops except Add/Sub: Mul, Div, Mod, And, Or, Xor, Shl, Sar, Shr
-- All comparisons: IntEq, IntLt, IntLteq, BoolEq, BoolNot, BoolAnd, BoolOr, RefEq
-- visitSwitch (switch/match dispatch)
-- visitThrow
-- Address constants in SSA (method pointers, record pointers): need constant pool
-- Direct and indirect calls: CallAddress
-- PtrLoad, PtrStore (loads/stores to memory)
-- PtrAdd, PtrSub, Alloc
+**Working (Phase 2 complete):**
+- Assembler additions: LSLV, LSRV, ASRV (variable shifts), MSUB, NEG, CSET in both 32-bit and 64-bit forms
+- All integer binary ops: Mul, Div (signed/unsigned), Mod (via SDIV/UDIV+MSUB), And, Or, Xor, Shl, Sar, Shr
+- All comparisons: IntEq, IntLt (signed/unsigned), IntLteq (signed/unsigned), BoolEq, RefEq (CMP+CSET pattern)
+- Bool ops: BoolAnd, BoolOr (AM_R_R_R with AND/ORR), BoolNot (CMP #0 + CSET EQ)
+- visitSwitch: linear CMP+B.EQ chain via AM_SWITCH addressing mode
+- visitThrow: emits UDF instruction
+- ARCH_SAVE/ARCH_RESTORE: handled in assemble() for register allocator spill/reload
+- Test results: 1238 of 3900 core tests pass (all tests not requiring calls, loads/stores, or type conversions)
+
+**Working (Phase 3+4 complete):**
+- Constant pool: per-method pool of 8-byte entries emitted after RET at ARCH_END, loaded via `LDR Xn, [PC, #offset]` (ARM64_REL_IMM19 patch), target addresses resolved via ABS_64 patch
+- `genMoveConstReg` handles Addr values: emits `LDR Xn, [PC, #pool_offset]` via `emitPoolLoad`
+- Fixed latent LDR literal encoding bugs: `ldrliterald_r_i19` (0x0C→0x18) and `ldrliteralq_r_i19` (0x2C→0x58)
+- ARM64_REL_IMM19 patch handler added to `MachDataWriter.patchWithCallback`
+- Direct calls (I_BL): `BL imm26` with ARM64_REL_IMM26 patch for known method addresses
+- Indirect calls (I_BLR): `BLR R16` for function pointers in registers
+- `emitCall`: handles CallAddress — sets up calling convention, return values, kill set, refmap, params
+- TupleGetElem: handled implicitly by call's dfnFixed return value projections
+- Scratch registers added to `Arm64RegSet` (R16 for all RegClasses) for parallel move resolution
+- Test results: 1942 of 3900 core tests compile (remaining failures are mostly PtrLoad/PtrStore)
+
+**Working (Phase 5 complete):**
+- PtrAdd / PtrSub: 64-bit ADD/SUB via `emitPtrBinop` using `m.binop()` (not `m.intbinop()` which crashes on pointer types)
+- PtrLoad: unscaled load with address folding (`matchBaseImm9`), dispatches to LDURB/LDURH/LDUR_W/LDUR_X/LDURSB/LDURSH/LDURSW by size/sign
+- PtrStore: unscaled store with address folding, dispatches to STURB/STURH/STUR_W/STUR_X by size
+- Zero-size PtrLoad/PtrStore: emits LDURB into scratch register for null-check trapping effect
+- Alloc (with allocStub): emits BL to allocation stub (objReg=R0, sizeReg=R1)
+- Alloc (without allocStub, test target): inline bump-pointer via I_ALLOC opcode — pool-loads HEAP_CUR_LOC address, loads/bumps/stores heap pointer
+- `genAllocStub` in Arm64Backend: bump-pointer stub using pool-loaded HEAP_CUR_LOC
+- New assembler methods: LDURB, STURB, LDURH, STURH, LDURSB, LDURSH, LDURSW, LDUR_W, STUR_W, LDUR_X, STUR_X (all unscaled immediate forms)
+- New addressing mode AM_BASE_IMM9 with ARG size constants (ARG_B/H/W/Q/SB/SH/SW)
+- Fixed ADD/SUB in `assemble_r_r_r` (needed by PtrAdd/PtrSub AM_R_R_R path)
+- Fixed sizeReg: R0→R1 (was same as objReg)
+
+**Bug fixes (during Phase 5 debugging):**
+- R17 made non-allocatable: used as scratch in I_ALLOC inline sequence, was corrupting live values
+- Link register (x30) save/restore: prologue now saves x30 to [sp + frameSize - 8], epilogue restores before ret (ARM64 `bl` puts return address in x30, not on stack like x86 `call`)
+- Stack alignment: enforced 16-byte SP alignment for ARM64 (was 8, causing SIGBUS on memory accesses from misaligned SP)
+- Spill slot offset encoding: fixed double-division bug where callers pre-divided byte offsets and assembler divided again (strunsignedd/q_r_r_u12 and ldrunsignedd/q_r_r_u12 expect raw byte offsets)
+
+- Test results: 3187 of 3900 core tests compile; **2859 of 3187 execute correctly (90%)**
+
+**Missing — code generator (Phase 6+):**
 - All type conversions: IntViewI, IntViewB, IntViewP, FloatViewI/IntViewF, etc.
 - ConditionalThrow, NullCheck, BoundsCheck
 - All floating point: FP register allocation, FP arithmetic, FP comparisons, FP conversions
-- KillRegisters, CallerIp, CallerSp, CallKernel, TupleGetElem
+- KillRegisters, CallerIp, CallerSp, CallKernel
+- visitThrow: currently just UDF; should call a fatal stub via BL
 
 **Missing — backend:**
 - `genSignalHandlerStub` (signal handler stub)
 - `genFatalStub` (fatal exception stub)
 - `asm_exit_r` (exit with register value)
 - Signal handler installation logic
-- Constant pool management (flush pool between method chunks)
 
 **Missing — runtime:**
 - `rt/arm64-linux/` directory does not exist (no DEPS, LinuxConst.v3, RiOs.v3, System.v3)
 
 **Known issues / fixmes in existing code:**
-- `tryUseImm32`: comment says "imm32 is incorrect" (line 268, SsaArm64Gen.v3) — ARM64 immediate for ADD/SUB is 12-bit unsigned, not 32-bit
-- `sfrCount = 0` in Arm64RegSet: FP registers not allocated (line 11)
-- CALLER_SPILL_START / CALLEE_SPILL_START need to work with 31-bit limit
-- `Arm64AddrPatcher.patch()` handles REL_IMM26 and ABS_IMM16, but ARM64_REL_IMM19 case in MachDataWriter falls through to error
+- `sfrCount = 0` in Arm64RegSet: FP registers not allocated
 
 ## Architecture Overview
 
@@ -510,6 +546,40 @@ Generate code that calls `rt_sigaction` to install the signal handler stub for t
 
 ## Testing Strategy
 
+**Helper scripts (recommended):**
+```bash
+# After making compiler changes:
+make bootstrap
+
+# Quick compile check: reports pass/fail counts and failure categories
+bash tasks/test-arm64-compile.sh                      # all core tests
+bash tasks/test-arm64-compile.sh test/core/add*.v3    # specific tests
+
+# Full compile + execute via Docker: compiles, filters passing tests, runs them
+bash tasks/test-arm64-run.sh                          # all core tests
+bash tasks/test-arm64-run.sh test/core/add*.v3        # specific tests
+```
+
+**Compile-only check (no Docker needed):**
+```bash
+# Compile all core tests individually, count passes:
+bin/v3c -multiple -target=arm64-linux-test -output=/tmp/arm64test test/core/*.v3 2>&1 | grep -c '##-ok'
+
+# See failure reasons:
+bin/v3c -multiple -target=arm64-linux-test -output=/tmp/arm64test test/core/*.v3 2>&1 | grep '##-fail' | head -20
+```
+
+Note: `-test` flag runs tests in the interpreter. Use `-target=arm64-linux-test` (without `-test`) to compile for the arm64 test target.
+
+**Running tests via test.bash directly:**
+```bash
+# test.bash expects test filenames as arguments, run from test/core/:
+cd test/core && TEST_TARGETS="arm64-linux" bash test.bash add00.v3 add01.v3
+
+# If any test fails to compile, test.bash won't run any of them.
+# Use tasks/test-arm64-run.sh to filter to only compilable tests first.
+```
+
 **Single test (fast iteration with v3c-dev):**
 ```bash
 v3c-dev -target=arm64-linux-test -output=/tmp test/core/add00.v3
@@ -583,7 +653,9 @@ For debugging miscompilation, inject `asm.udf()` (undefined instruction → SIGI
 
 Virgil's arm64 calling convention deliberately deviates from the System-V ARM64 ABI:
 - **All registers are caller-save.** No callee-save save/restore is needed in prologues or epilogues. The register allocator can freely use any register.
-- **Stack walking** uses a PC-indexed side-table of frame sizes, not the X29 frame pointer chain. X29 and X30 do not need to be saved.
+- **Link register (X30)** is always saved/restored in function prologues/epilogues at [SP + frameSize - 8]. Unlike x86 `call` which pushes the return address, ARM64 `bl` stores it in X30, so it must be explicitly preserved.
+- **Stack walking** uses a PC-indexed side-table of frame sizes, not the X29 frame pointer chain. X29 does not need to be saved.
+- **R16 and R17** are reserved (non-allocatable). R16 is the scratch register for parallel move resolution. R17 is scratch for inline allocation sequences.
 
 This is consistent with the other Virgil native backends (x86-64, x86).
 

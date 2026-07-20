@@ -24,17 +24,107 @@ class Arm64LinuxBackend extends Arm64Backend {
 	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, dwarf: Dwarf,
 		test: bool) super(compiler, prog, mach, w, dwarf, test) { }
 	
-	def unimplemented() {
-		mach.fail("unimplemented");
-	}
+	// Override Arm64Backend
+	def genSignalHandlerStub() {
+		var handler_meth = mach.runtime.getRiSignal();
+		if (handler_meth == null) return;
+		var frame = getFrame(handler_meth.ssa);
+		mach.runtime.bindAddr(CiRuntimeModule.SIGNAL_STUB, w);
+		// Kernel delivers: R0=signum, R1=siginfo, R2=ucontext
+		// Need to call: RiRuntime.signal(this=null, signum, siginfo, ucontext)
+		// V3 calling convention: R0=this, R1=param1, R2=param2, R3=param3
 
-	// Override Arm64Backend	
-	def genSigHandlerInstall(signo: int, handler: Addr) { unimplemented(); }
-	def asm_exit_r(r: Arm64Gpr) { unimplemented(); }
+		// Save LR (points to kernel's rt_sigreturn trampoline) and FP
+		asm.subq_r_r_u12_u1(Regs.SP, Regs.SP, 16, 0);
+		asm.stur_x_r_r_i9(Regs.R29, Regs.SP, 0);
+		asm.stur_x_r_r_i9(Regs.R30, Regs.SP, 8);
+
+		// Move parameters in reverse order to avoid clobbering
+		asm.movq_r_r(Regs.R3, Regs.R2);  // ucontext → param3
+		asm.movq_r_r(Regs.R2, Regs.R1);  // siginfo → param2
+		asm.movq_r_r(Regs.R1, Regs.R0);  // signum → param1
+		asm.movq_r_u16(Regs.R0, 0);      // this = null
+
+		// Call RiRuntime.signal
+		asm.bl_i26(patcher.REL_IMM26_MARKER);
+		patcher.record(PatchKind.ARM64_REL_IMM26, mach.addrOfMethod(handler_meth));
+
+		// Restore LR and FP
+		asm.ldur_x_r_r_i9(Regs.R29, Regs.SP, 0);
+		asm.ldur_x_r_r_i9(Regs.R30, Regs.SP, 8);
+		asm.addq_r_r_u12_u1(Regs.SP, Regs.SP, 16, 0);
+
+		// Return to kernel's rt_sigreturn trampoline (via LR)
+		asm.ret();
+
+		// Signal restorer stub (not typically needed on ARM64, but bind the address)
+		mach.runtime.bindAddr(CiRuntimeModule.SIGNAL_RESTORER, w);
+		// ARM64 Linux handles signal return via kernel VDSO trampoline,
+		// but emit a minimal restorer just in case:
+		asm.movd_r_u16(SYSNUM, 139);  // sys_rt_sigreturn = 139
+		asm.svc();
+	}
+	def genSigHandlerInstall(signo: int, handler: Addr) {
+		// Construct sigaction struct on the stack.
+		// ARM64 sigaction (no sa_restorer):
+		//   [0]:  sa_handler (8 bytes)
+		//   [8]:  sa_flags (8 bytes)
+		//   [16]: sa_mask (8 bytes)
+		// Total: 24 bytes, but allocate 32 for 16-byte stack alignment.
+
+		asm.subq_r_r_u12_u1(Regs.SP, Regs.SP, 32, 0);
+
+		// Store handler address from constant pool into sa_handler
+		codegen.emitPoolLoad(Regs.R16, handler);
+		asm.stur_x_r_r_i9(Regs.R16, Regs.SP, 0);      // sa_handler
+
+		// Store sa_flags = SA_SIGINFO (4) so kernel delivers siginfo+ucontext in R1/R2
+		asm.movd_r_u16(Regs.R16, 4);                    // SA_SIGINFO = 4
+		asm.stur_x_r_r_i9(Regs.R16, Regs.SP, 8);       // sa_flags = SA_SIGINFO
+
+		// Store sa_mask = 0
+		asm.stur_x_r_r_i9(Regs.RZR, Regs.SP, 16);     // sa_mask = 0
+
+		// syscall: rt_sigaction(signo, &new_sigaction, NULL, sigsetsize=8)
+		asm.movd_r_u16(SYSNUM, 134);                   // SYS_rt_sigaction = 134
+		asm.movd_r_u16(PARAM0, u16.view(signo));        // param 0: signal number
+		asm.addq_r_r_u12_u1(PARAM1, Regs.SP, 0, 0);     // param 1: &sigaction (ADD to copy SP)
+		asm.movq_r_u16(PARAM2, 0);                      // param 2: NULL (old sigaction)
+		asm.movd_r_u16(PARAM3, 8);                      // param 3: sigsetsize
+		asm.svc();
+
+		// Restore stack
+		asm.addq_r_r_u12_u1(Regs.SP, Regs.SP, 32, 0);
+	}
+	def asm_exit_r(r: Arm64Gpr) {
+		asm.movd_r_u16(SYSNUM, 94);		// sys_exit_group = 94
+		if (r != PARAM0) asm.movq_r_r(PARAM0, r);
+		asm.svc();
+	}
 	def asm_exit_code(code: int) { 
 		asm.movd_r_u16(SYSNUM, 94);
 		asm.movd_r_u16(PARAM0, u16.view(code));
 		asm.svc();
+	}
+	def genFatalStub(ex: string, addr: Addr) {
+		w.bind(addr);
+		// 1. encode a call to write() on stderr
+		var msgAddr = Addr.new(mach.codeRegion, null, 0);
+		asm.movd_r_u16(SYSNUM, 64);			// sys_write() = 64 on arm64
+		asm.movd_r_u16(PARAM0, 2);			// stderr
+		// Load message address from constant pool
+		codegen.emitPoolLoad(PARAM1, msgAddr);		// buffer address
+		asm.movd_r_u16(PARAM2, u16.view(ex.length + 1));	// write size
+		asm.svc();
+		// 2. encode a call to exit_group()
+		asm_exit_code(-1);
+		// 3. flush constant pool
+		codegen.flushPool();
+		// 4. output message at end of code
+		w.bind(msgAddr);
+		w.putb('!');
+		w.puta(ex);
+		w.atEnd();
 	}
 	def genTestOutput(main: IrMethod, frame: MachFrame) {
 		// output the return register as a 4-byte integer to stdout

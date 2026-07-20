@@ -2,6 +2,11 @@
 
 . ../../common.bash x86-64-asm
 
+if [ "$TEST_ASM" = 0 ]; then
+    echo "x86-64 assembler tests skipped."
+    exit 0
+fi
+
 S=${OUT}/test.s
 L=${OUT}/test.list
 
