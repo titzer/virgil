@@ -177,8 +177,9 @@ class MachProgram extends TargetProgram {
 		} else {
 			arrayRep.elemScale = sizeOf(elemType);
 			// 3. compute the type tag for the array
-			var tag = if(isRefType(elemType), MachObjectTags.REF_ARRAY_TAG, MachObjectTags.PRIM_ARRAY_TAG);
-			arrayRep.typeTag = Int.box((arrayRep.elemScale << 2) | tag);
+			var arrayType = ArrayType.!(arrayRep.origType);
+			var tag = if(isRefType(elemType), runtime.getRefArrayTag(arrayType), runtime.getPrimArrayTag(arrayType, arrayRep.elemScale));
+			arrayRep.typeTag = tag;
 		}
 		return arrayRep;
 	}
@@ -197,14 +198,13 @@ class MachProgram extends TargetProgram {
 			for (i < ets.length) {
 				if (isRefType(ets[i])) refmap |= 1 << byte.!(arrayRep.offsets[i] / refSize);
 			}
-			var tag = MachObjectTags.MIXED_ARRAY_TAG;
-			arrayRep.typeTag = Int.box((refmap << 2) | tag);
+			var arrayType = ArrayType.!(arrayRep.origType);
+			arrayRep.typeTag = runtime.getMixedArrayTag(arrayType, refmap);
 			arrayRep.refmap = refmap;
 			return;
 		}
 		// no references; encode as a primitive array tag
-		var tag = MachObjectTags.PRIM_ARRAY_TAG;
-		arrayRep.typeTag = Int.box((arrayRep.elemScale << 2) | tag);
+		arrayRep.typeTag = runtime.getPrimArrayTag(ArrayType.!(arrayRep.origType), arrayRep.elemScale);
 	}
 	def machType(t: Type) -> Type {
 		var r: MachRep;
@@ -332,21 +332,8 @@ class MachProgram extends TargetProgram {
 		if (ar == null) typeReps[t] = ar = makeMachArray(t); // create array representation
 		return ar;
 	}
-	def classIdRange(t: Type) -> (int, int) {
-		var r = prog.ir.getIrClass(t);
-		return if(r != null, (r.minClassId * code.addressSize, r.maxClassId * code.addressSize));
-	}
 	def unexpectedType<T>(t: Type, v: T) -> T {
 		return prog.ERROR.unexpectedType(t, v);
-	}
-	def objectTag(t: Type) -> Val {
-		if (V3.isClass(t)) {
-			var ic = prog.ir.getIrClass(t);
-			if (ic == null) return Values.BOTTOM; // XXX: special case of completely dead class
-			return Int.box(ic.minClassId * code.addressSize);
-		}
-		if (V3.isArray(t)) return arrayRep(t).typeTag;
-		return unexpectedType(t, null);
 	}
 	def sizeOf(t: Type) -> int {
 		if (PrimType.?(t)) return PrimType.!(t).byteSize;
@@ -409,37 +396,38 @@ class MachProgram extends TargetProgram {
 	def encodeRecord(w: DataWriter, r: Record) {
 		var v = r.values;
 		var start = w.pos;
-		if (V3.isArray(r.rtype)) {
-			// encode an array record
-			var rep = arrayRep(r.rtype);
-			w.put_b32(Int.unbox(rep.typeTag));
-			w.at(start + rep.lengthOffset).put_b32(v.length);
-			if (rep.offsets != null) {
-				// mixed array
-				var et = V3Array.elementType(r.rtype), ets = Tuple.toTypeArray(et);
-				for (i < v.length) {
-					var tv = BoxVal.!(v[i]), elemBegin = start + i * rep.elemScale + rep.headerSize;
-					for (j < ets.length) {
+		match (r.rtype) {
+			x: ArrayType => {
+				// encode an array record
+				var et = x.elementType(), rep = arrayRep(x);
+				w.put_b32(rep.typeTag);
+				w.at(start + rep.lengthOffset).put_b32(v.length);
+				if (rep.offsets != null) {
+					// mixed array
+					var ets = Tuple.toTypeArray(et);
+					for (i < v.length) {
+						var tv = BoxVal.!(v[i]), elemBegin = start + i * rep.elemScale + rep.headerSize;
+						for (j < ets.length) {
+							// XXX: special case Array<byte>, Array<Record>, Array<int> for performance
+							encodeVal(w.at(elemBegin + rep.offsets[j]), if(tv == null, null, tv.values[j]), ets[j]);
+						}
+					}
+				} else if (rep.elemScale > 0) {
+					for (i < v.length) {
 						// XXX: special case Array<byte>, Array<Record>, Array<int> for performance
-						encodeVal(w.at(elemBegin + rep.offsets[j]), if(tv == null, null, tv.values[j]), ets[j]);
+						encodeVal(w.at(start + i * rep.elemScale + rep.headerSize), v[i], et);
 					}
 				}
-			} else if (rep.elemScale > 0) {
-				var et = V3Array.elementType(r.rtype);
+			}
+			x: ClassType => {
+				// encode a class record
+				var ic = prog.ir.getIrClass(x), f = ic.fields;
+				w.put_b32(runtime.getSimpleObjectTag(x));
 				for (i < v.length) {
-					// XXX: special case Array<byte>, Array<Record>, Array<int> for performance
-					encodeVal(w.at(start + i * rep.elemScale + rep.headerSize), v[i], et);
+					encodeVal(w.at(start + f[i].machOffset), v[i], f[i].fieldType);
 				}
 			}
-		} else if (V3.isClass(r.rtype)) {
-			// encode a class record
-			var ic = prog.ir.getIrClass(r.rtype), f = ic.fields;
-			w.put_b32(ic.minClassId * code.addressSize);
-			for (i < v.length) {
-				encodeVal(w.at(start + f[i].machOffset), v[i], f[i].fieldType);
-			}
-		} else {
-			return unexpectedType(r.rtype, ());
+			_ => return unexpectedType(r.rtype, ());
 		}
 		if (CLOptions.PRINT_MACH_DATA.get()) {
 			var size = w.pos - start;
@@ -690,7 +678,7 @@ class Mach_V3Array extends MachRep {
 	var lengthOffset: int;
 	var headerSize: int;
 	var elemScale: int;
-	var typeTag: Box<int>;
+	var typeTag: int;
 	// for compound arrays
 	var elemTypes: Array<Type>;
 	var offsets: Array<int>;
@@ -775,11 +763,4 @@ class MachRtPageTable(
 	def grow(len: int) -> this {
 		entries.grow(len);
 	}
-}
-// Constants for object tags.
-component MachObjectTags {
-	def OBJECT_TAG = 0;
-	def MIXED_ARRAY_TAG = 2;
-	def PRIM_ARRAY_TAG = 1;
-	def REF_ARRAY_TAG = 3;
 }
