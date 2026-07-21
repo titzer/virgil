@@ -515,7 +515,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			ArraySetElemElem(index) => 	return genArraySetElem(i_old, index);
 			ArrayGetLength => 		i_new = genArrayGetLength(i_old);
 			ClassAlloc => 			return genClassAlloc(i_old, null);
-			ClassAllocWithDescriptor(field) => return genClassAllocWithDescriptor(i_old, field);
+			ClassAllocWithDescriptor =>	return genClassAllocWithDescriptor(i_old);
 			ClassNew(method) => 		return genClassAlloc(i_old, method);
 			ClassGetField(field) => 	return genClassGetField(false, i_old, field);
 			ClassInitField(field) =>	return genClassSetField(i_old, field, true);
@@ -1391,7 +1391,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			apply(i_old.source, V3Op.newConditionalThrow(V3Exception.TypeCheck), [cmp]);
 			i_new = context.graph.nullConst(tt);
 		} else {
-			i_new = genIfNull(i_old, mach.machType(tt), i_new, null, genClassIdCheck(i_old, low, high, _));
+			i_new = genIfNull(i_old, mach.machType(tt), i_new, null, genClassIdCheck(i_old, tt, low, high, _));
 		}
 		return i_new;
 	}
@@ -1401,12 +1401,12 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		if (low == high) {
 			i_new = addThrow(i_old.source, V3Exception.TypeCheck); // no variant values can match
 		} else {
-			i_new = genClassIdCheck(i_old, low, high, i_new);
+			i_new = genClassIdCheck(i_old, tt, low, high, i_new);
 		}
 		return i_new;
 	}	
-	def genClassIdCheck(i_old: SsaApplyOp, low: int, high: int, i_new: SsaInstr) -> SsaInstr {
-		var i_tid = ptrLoad(mach.tagType, i_new, 0);
+	def genClassIdCheck(i_old: SsaApplyOp, tt: Type, low: int, high: int, i_new: SsaInstr) -> SsaInstr {
+		var i_tid = loadTypeId(i_new, tt);
 		curBlock.opIntRangeCheck(mach.code.addressSize, low, high, i_tid);
 		return i_new;
 	}
@@ -1420,12 +1420,12 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			CLASS_QUERY => {
 				var t = mach.runtime.classIdRange(tt), low = t.0, high = t.1;
 				if (low == high) return context.graph.falseConst(); // no live classes match
-				return genIfNull(i_old, Bool.TYPE, i_new, null, genClassIdQuery(i_old, low, high, _));
+				return genIfNull(i_old, Bool.TYPE, i_new, null, genClassIdQuery(i_old, tt, low, high, _));
 			}
 			VARIANT_QUERY => {
 				var t = mach.runtime.classIdRange(tt), low = t.0, high = t.1;
 				if (low == high) return context.graph.falseConst();
-				return genClassIdQuery(i_old, low, high, i_new);
+				return genClassIdQuery(i_old, tt, low, high, i_new);
 			}
 			_ => {
 				context.fail1("unexpected type query: %s", query.name);
@@ -1433,8 +1433,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			}
 		}
 	}
-	def genClassIdQuery(i_old: SsaApplyOp, low: int, high: int, nobj: SsaInstr) -> SsaInstr {
-		var tid = ptrLoad(mach.tagType, nobj, 0);
+	def genClassIdQuery(i_old: SsaApplyOp, tt: Type, low: int, high: int, nobj: SsaInstr) -> SsaInstr {
+		var tid = loadTypeId(nobj, tt);
 		return genRangeQuery(i_old, low, high, tid);
 	}
 	def genRangeQuery(i_old: SsaApplyOp, low: int, high: int, val: SsaInstr) -> SsaInstr {
@@ -1697,15 +1697,17 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
 	}
 	// Allocate a described object, whose size is read from its descriptor at runtime. No object
-	// tag is stored; the descriptor field is at offset 0, so the descriptor pointer doubles as
-	// the object header (low bits 00).
-	def genClassAllocWithDescriptor(i_old: SsaApplyOp, field: IrField) {
+	// tag is stored; the header is the descriptor pointer, written by the ordinary field store
+	// that follows this allocation.
+	def genClassAllocWithDescriptor(i_old: SsaApplyOp) {
 		var classType = i_old.getType();
 		mach.allocates = true;
 		var i_desc = normRef1(i_old.inputs[0]);
 		var i_size = ptrLoad(mach.tagType, i_desc, mach.runtime.descSizeOffset);
 		var nobj = genAlloc(i_old.source, mach.machType(classType), i_size);
-		ptrStore(i_desc.getType(), nobj, getClassFieldOffset(V3Op.extractIrSpec(i_old.op, field)), i_desc);
+		// The allocated object may itself be a descriptor, so initialize its metadata slots.
+		var ic = context.prog.ir.getIrClass(classType);
+		if (ic != null && ic.flags.C_IS_DESCRIPTOR) initDescriptorSlots(nobj, ClassType.!(classType));
 		return map1(i_old, nobj);
 	}
 	def genClassAlloc(i_old: SsaApplyOp, method: IrMethod) {
@@ -1740,10 +1742,23 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var i_desc = normRef1(i_old.inputs[0]);
 		// Check for non-null descriptor that has exact type of C.descriptor
 		genNullCheck0(i_old.source, i_desc);
-		var i_tid = ptrLoad(mach.tagType, i_desc, 0);
 		var descType = ClassType.!(i_old.op.typeArgs[0]);
-		var k_descTag = context.graph.intConst(mach.runtime.getObjectTag(descType));
-		var i_neq = curBlock.opBoolNot(curBlock.pure2(mach.tagType.opEq(), i_tid, k_descTag));
+		var i_tid: SsaInstr, tag: int;
+		var ic = context.prog.ir.getIrClass(descType);
+		var described = if(ic != null && ic.flags.C_IS_DESCRIPTOR, descType.getDescribesType());
+		if (described != null) {
+			// Check the type id of the class the descriptor describes, which is always stored
+			// in the descriptor. The descriptor's own header cannot be used, because it is
+			// itself a descriptor pointer if the descriptor's class has a descriptor.
+			i_tid = ptrLoad(mach.tagType, i_desc, mach.runtime.descTidOffset);
+			tag = mach.runtime.getSimpleObjectTag(described);
+		} else {
+			// Without runtime extensions a descriptor has no metadata slots, so check the
+			// descriptor's own object header.
+			i_tid = ptrLoad(mach.tagType, i_desc, 0);
+			tag = mach.runtime.getObjectTag(descType);
+		}
+		var i_neq = curBlock.opBoolNot(curBlock.pure2(mach.tagType.opEq(), i_tid, context.graph.intConst(tag)));
 		curBlock.opConditionalThrow(V3Exception.DescriptorCheck, i_neq);
 		return i_desc;
 	}
@@ -1848,7 +1863,14 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	def genMtableLookup(i_old: SsaApplyOp, oobj: SsaDfEdge, nobj: SsaInstr, funcRep: Mach_FuncRep, methodRef: IrSpec) -> SsaInstr {
 		// use method-table based dispatch
 		var nullity = context.compiler.nullity(i_old, oobj.dest);
-		var tid = refLoad(nullity, mach.tagType, i_old, oobj, nobj, 0);
+		var tid: SsaInstr;
+		if (hasDescriptorHeader(methodRef.receiver)) {
+			// The type id lives in the descriptor, which is the object header.
+			var i_desc = refLoad(nullity, mach.data.ptrType, i_old, oobj, nobj, 0);
+			tid = ptrLoad(mach.tagType, i_desc, mach.runtime.descTidOffset);
+		} else {
+			tid = refLoad(nullity, mach.tagType, i_old, oobj, nobj, 0);
+		}
 		var mtbl = context.graph.valConst(mach.data.ptrType, makeMethodTable(methodRef));
 		return ptrLoad(funcRep.machType, ptrAdd(mtbl, tid), 0);
 	}
@@ -1981,8 +2003,29 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		return nobj;
 	}
 	def storeObjectTag(nobj: SsaInstr, t: Type) {
+		// A class in a descriptor hierarchy has a descriptor pointer as its header instead of
+		// a tag. Classes with a descriptor of their own store it at allocation; the rest get
+		// the empty descriptor synthesized for their class.
+		if (hasDescriptorHeader(t)) {
+			var addr = mach.emptyDescriptorAddr(t);
+			ptrStore(mach.data.ptrType, nobj, 0, context.graph.valConst(mach.data.ptrType, addr));
+			return;
+		}
 		var tag = context.graph.intConst(mach.runtime.getObjectTag(t));
 		ptrStore(mach.tagType, nobj, 0, tag);
+	}
+	// Returns {true} if objects of type {t} use a descriptor pointer as their object header.
+	def hasDescriptorHeader(t: Type) -> bool {
+		var ic = context.prog.ir.getIrClass(t);
+		return ic != null && ic.flags.C_HAS_DESCRIPTOR;
+	}
+	// Load the type id of an object, which lives in the descriptor for described objects and
+	// in the object header itself otherwise. Whether a class is described is known statically,
+	// because the whole hierarchy shares one header encoding.
+	def loadTypeId(nobj: SsaInstr, t: Type) -> SsaInstr {
+		if (!hasDescriptorHeader(t)) return ptrLoad(mach.tagType, nobj, 0);
+		var i_desc = ptrLoad(mach.data.ptrType, nobj, 0);
+		return ptrLoad(mach.tagType, i_desc, mach.runtime.descTidOffset);
 	}
 	def genIfNull(i_old: SsaApplyOp, resultType: Type, nobj: SsaInstr, nullVal: Val, gen: SsaInstr -> SsaInstr) -> SsaInstr {
 		if (nobj.facts.V_ZERO) {
