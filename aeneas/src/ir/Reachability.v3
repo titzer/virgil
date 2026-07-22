@@ -6,6 +6,7 @@ enum RaFact {
 	RM_LIVE,
 	RF_NORMALIZED,
 	RF_READ,
+	RF_RETAIN,
 	RF_WRITTEN,
 	RF_INIT,
 	RF_VAL_ONE,
@@ -48,6 +49,10 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	var defaultValues: HashMap<Type, Val>;
 	var liveMethods = Vector<RaMethod>.new();
 	var normalizer: ReachabilityNormalizer;
+	// Set if the program brands descriptors with runtime extensions, which requires described
+	// objects to use the descriptor pointer as their object header. Can be forced on, so that
+	// the encoding can be tested independently of a program actually branding a descriptor.
+	var descriptorExtensions = CLOptions.DESCEXT.get();
 
 	// perform the analysis, starting from the roots
 	def analyze() {
@@ -323,6 +328,15 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			ClassAlloc => {
 				allocation(makeType(mono(op.op.typeArgs[0], context)));
 			}
+			ClassAllocWithDescriptor => {
+				var raType = makeType(mono(op.op.typeArgs[0], context));
+				allocation(raType);
+				readDescriptorField(op, raType, context); // GC implicitly reads descriptor field
+			}
+			SetDescriptorExtension => {
+				descriptorExtensions = true; // described objects need a full descriptor, must be retained
+				// TODO: readDescriptorField(op, raType of described class, context)
+			}
 			ClassNew(method) => {
 				var m = opMethod(op, method, context);
 				allocation(makeType(m.receiver));
@@ -363,7 +377,13 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			PtrAtComponentField(field) => if (op.useList != null) getPointerAtField(makeField(op, field, context), op, true);
 			PtrAtUnboxedObjectField(specs) => if (op.useList != null) getPointerAtUnboxedField(op, specs, context);
 			PtrAtUnboxedComponentField(specs) => if (op.useList != null) getPointerAtUnboxedField(op, specs, context);
+			TypeQuery => {
+				// Lowered to a load of the type id out of the descriptor.
+				readDescriptorField(op, makeType(mono(op.op.typeArgs[1], context)), context);
+			}
 			TypeSubsume, TypeCast => {
+				// A class cast is lowered to a load of the type id out of the descriptor.
+				readDescriptorField(op, makeType(mono(op.op.typeArgs[1], context)), context);
 				if (compiler.NormConfig.WrapFuncTypeSubsume) {
 					var ft = mono(op.op.typeArgs[0], context);
 					var tt = mono(op.op.typeArgs[1], context);
@@ -562,9 +582,9 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 				ERROR.addError(op.source.range, null, "TypeError", msg);
 			}
 		}
-		// Treat the field as both read and written, with unknown values
+		// Treat the field as both read and written, with unknown values, and retain so it won't be deleted.
 		getField(rf);
-		rf.raFacts |= RaFact.RF_WRITTEN;
+		rf.raFacts |= RaFact.RF_WRITTEN | RaFact.RF_RETAIN;
 		var none: Fact.set;
 		rf.writeFacts = none;
 		rf.setFact(RaFact.RF_VAL_MANY);
@@ -602,6 +622,19 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 		} else {
 			// not the first initialization seen
 			rf.initFacts = rf.initFacts & val.facts & Facts.V_FACTS;
+		}
+	}
+	// Descriptor fields are used in the implementation of some operators and must be marked
+	// explicitly to keep them from being dead-code-eliminated.
+	def readDescriptorField(op: SsaApplyOp, raType: RaType, context: IrSpec) {
+		if (!descriptorExtensions || !RaClass.?(raType)) return;
+		var rc = RaClass.!(raType);
+		if (rc.orig == null || !rc.orig.flags.C_HAS_DESCRIPTOR) return;
+		var f = rc.orig.descriptorField();
+		if (f != null) {
+			var rf = makeField3(rc.oldType, f, context);
+			getField(rf);
+			rf.raFacts |= RaFact.RF_RETAIN;
 		}
 	}
 	def makeField(op: SsaApplyOp, f: IrField, context: IrSpec) -> RaField {
