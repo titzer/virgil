@@ -111,6 +111,21 @@ var s = u4.pack<E.set>(E.B | E.D);  // == 0b1010
 
 An enum with 5 cases needs 3 bits, so `u2.pack<E>` would be a compile-time error for that enum.
 
+### Invalid tags
+
+An enum's bit-width often admits more patterns than the enum has cases -- a 5-case enum needs 3 bits, which can hold 8 values.
+Since the integer being unpacked may come from anywhere, `unpack` may encounter a pattern that is not a valid tag.
+Such values map to tag 0, rather than trapping or producing an invalid enum value.
+
+```
+enum E { A, B, C, D, F }   // 5 cases, 3 bits
+
+var a = u3.unpack<E>(4);   // == E.F
+var b = u3.unpack<E>(5);   // == E.A; 5 is not a valid tag
+```
+
+This is the same rule Virgil already uses when reading an enum field of a [layout](Layouts.md), where the underlying bytes are likewise outside the program's control.
+
 ## Data types
 
 A data type -- a `type` declared with fields but no `case`s -- packs as though its fields were a tuple, in declaration order.
@@ -128,6 +143,15 @@ Data types compose with tuples, so larger encodings can be built from named piec
 
 ```
 var f = u32.pack<(bool, Rgb)>((true, Rgb(0xAA, 0xBB, 0xCC))); // == 0x1AABBCC
+```
+
+Data types may be generic; the layout is computed from the *instantiated* field types.
+
+```
+type Pair<T>(x: T, y: T) { }
+
+var g = u8.pack<Pair<u4>>(Pair<u4>(0xA, 0xB));    // == 0xAB, 4 + 4 bits
+var h = u24.pack<Pair<u12>>(Pair<u12>(1, 2));     // 12 + 12 bits
 ```
 
 ## Errors are caught at compile time
@@ -172,14 +196,40 @@ Integer literals default to `int`, so `u16.pack((0xA, 0xB))` infers `(int, int)`
 
 ## Limitation: variants with cases
 
-Packing is currently supported only for the types listed above.
-A variant declared with `case`s -- as opposed to a data type with no cases -- is **not** supported, because the layout does not reserve any bits for the case tag.
+Packing works for a *data type* -- a `type` declared with fields and no `case`s -- but not for a variant declared with `case`s.
+The packed layout reserves no bits for a case tag, so there is nowhere to record *which* case a value is.
+This is a compile-time error.
 
 ```
 type T { case A(x: u4); case B(y: u4); }
-var bad = u8.pack<T>(T.B(3));  // does not work
+var bad = u8.pack<T>(T.B(3));
+// TypeError: byte.pack cannot represent values of type T, because T is a variant with cases
 ```
 
-Unfortunately this is not currently rejected by the type checker; see `doc/aeneas-issues.txt`.
-Until it is fixed, pack only data types (`type P(...) { }`), tuples, and the primitive types above.
-If you need to encode a tagged union by hand, pack the tag and the payload as separate tuple elements.
+The restriction applies to any variant declared with `case`s, even one with only a single case.
+It applies to nested positions too, so a tuple or data type is rejected if any field, at any depth, is such a variant.
+
+```
+type P(a: u4, t: T) { }
+var e = u16.pack<P>(P(1, T.B(3)));
+// TypeError: u16.pack cannot represent values of type P, because T is a variant with cases
+```
+
+An individual *case type*, however, packs perfectly well.
+A case type such as `T.A` denotes exactly one case, so no tag is needed and its fields are packed just like a data type's.
+
+```
+var g = u8.pack<T.A>(T.A(0xA, 0xB));  // == 0xAB
+var h = u8.unpack<T.A>(0xAB);         // T.A(0xA, 0xB)
+var i: T = h;                         // and it is a real T
+```
+
+So when you know statically which case you have, pack the case type.
+To encode a tagged union where the case is *not* statically known, pack the tag and the payload as separate fields, and switch on the tag after unpacking.
+
+```
+enum Kind { A, B }
+type Tagged(kind: Kind, payload: u4) { }
+
+var f = u8.pack<Tagged>(Tagged(Kind.B, 3)); // == 0b1_0011
+```
