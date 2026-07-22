@@ -1,0 +1,491 @@
+//@execute 0=-185342687; 1=1585996730; 2=-1095598350; 3=1581302121; 4=-1702012267; 5=-836291957
+// Smoke test: recursive algebraic data types under allocation pressure.
+// Builds, traverses, rewrites and compares trees, association lists and
+// expression graphs, mixing boxed and unboxed variants with class references,
+// tuples, arrays and ranges. Every observed value folds into a running CRC so
+// no traversal can be optimized away. Input selects the section.
+
+//======================================================================
+// CRC accumulator
+//======================================================================
+var crc: int;
+
+def acci(x: int) {
+	var h = crc ^ x;
+	h = h * 0x01000193;
+	crc = h ^ (h >>> 15);
+}
+def accl(x: long) {
+	acci(int.view(u32.view(x)));
+	acci(int.view(u32.view(x >> 32)));
+}
+def accb(x: bool) {
+	acci(if(x, 0x5A5A5A5A, 0x0F0F0F0F));
+}
+def accs(s: string) {
+	if (s == null) { acci(-1); return; }
+	acci(s.length);
+	for (i < s.length) acci(s[i]);
+}
+
+// Deterministic pseudo-random source; reset by every section that uses it.
+var seed: int;
+def srand(s: int) { seed = s; }
+def rand() -> int {
+	seed = seed * 1664525 + 1013904223;
+	seed = seed ^ (seed >>> 16);
+	return seed;
+}
+def randn(n: int) -> int { return (rand() & 0x7FFFFFFF) % n; }
+
+//======================================================================
+// Types
+//======================================================================
+type Tree {
+	case Leaf;
+	case Node(left: Tree, key: int, val: string, right: Tree);
+}
+type List<T> {
+	case Nil;
+	case Cons(head: T, tail: List<T>);
+}
+type Expr {
+	case Lit(v: long);
+	case Neg(e: Expr);
+	case Add(l: Expr, r: Expr);
+	case Mul(l: Expr, r: Expr);
+	case Div(l: Expr, r: Expr);
+	case Var(idx: int);
+}
+type Small #unboxed {
+	case A(x: int);
+	case B(x: int, y: byte);
+	case C;
+}
+class Cell(id: int) {
+	var next: Cell;
+	var payload: Tree;
+}
+type Holder {
+	case Ref(c: Cell);
+	case Val(s: Small);
+	case Empty;
+}
+
+def NAMES: Array<string> = [
+	"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"
+];
+
+//======================================================================
+// Section 1: binary search tree insert / lookup / delete-by-rebuild
+//======================================================================
+def insert(t: Tree, k: int, v: string) -> Tree {
+	match (t) {
+		Leaf => return Tree.Node(Tree.Leaf, k, v, Tree.Leaf);
+		Node(l, key, val, r) => {
+			if (k < key) return Tree.Node(insert(l, k, v), key, val, r);
+			if (k > key) return Tree.Node(l, key, val, insert(r, k, v));
+			return Tree.Node(l, key, v, r);		// replace value
+		}
+	}
+}
+def lookup(t: Tree, k: int) -> string {
+	match (t) {
+		Leaf => return null;
+		Node(l, key, val, r) => {
+			if (k < key) return lookup(l, k);
+			if (k > key) return lookup(r, k);
+			return val;
+		}
+	}
+}
+def size(t: Tree) -> int {
+	match (t) {
+		Leaf => return 0;
+		Node(l, _, _, r) => return 1 + size(l) + size(r);
+	}
+}
+def depth(t: Tree) -> int {
+	match (t) {
+		Leaf => return 0;
+		Node(l, _, _, r) => {
+			var a = depth(l), b = depth(r);
+			return 1 + if(a > b, a, b);
+		}
+	}
+}
+def inorder(t: Tree) {
+	match (t) {
+		Leaf => acci(0x1EAF);
+		Node(l, key, val, r) => {
+			inorder(l);
+			acci(key);
+			accs(val);
+			inorder(r);
+		}
+	}
+}
+// Rebuild the tree without any key for which drop() holds.
+def filter(t: Tree, m: int) -> Tree {
+	match (t) {
+		Leaf => return Tree.Leaf;
+		Node(l, key, val, r) => {
+			var nl = filter(l, m), nr = filter(r, m);
+			if ((key % m) == 0) {
+				// splice: hang the right subtree's keys onto the left
+				var merged = nl;
+				merged = graft(merged, nr);
+				return merged;
+			}
+			return Tree.Node(nl, key, val, nr);
+		}
+	}
+}
+def graft(dst: Tree, src: Tree) -> Tree {
+	match (src) {
+		Leaf => return dst;
+		Node(l, key, val, r) => return graft(graft(insert(dst, key, val), l), r);
+	}
+}
+def trees() {
+	srand(0x5EED01);
+	var t: Tree = Tree.Leaf;
+	for (i < 400) {
+		var k = randn(1000);
+		t = insert(t, k, NAMES[k % NAMES.length]);
+	}
+	acci(size(t));
+	acci(depth(t));
+	inorder(t);
+	for (i < 200) accs(lookup(t, randn(1000)));
+
+	var f = filter(t, 7);
+	acci(size(f));
+	acci(depth(f));
+	inorder(f);
+	accb(t == f);
+	accb(t == t);
+	accb(Tree.Leaf == Tree.Leaf);
+	accb(Tree.Node.?(t));
+	acci(t.tag);
+	acci(Tree.Leaf.tag);
+
+	// rebuilding from the same key sequence must produce an equal tree
+	srand(0x5EED01);
+	var t2: Tree = Tree.Leaf;
+	for (i < 400) {
+		var k = randn(1000);
+		t2 = insert(t2, k, NAMES[k % NAMES.length]);
+	}
+	accb(t == t2);
+	accb(f == t2);
+}
+
+//======================================================================
+// Section 2: polymorphic lists
+//======================================================================
+def len<T>(l: List<T>) -> int {
+	var n = 0, p = l;
+	while (true) {
+		match (p) {
+			Nil => return n;
+			Cons(_, tail) => { n++; p = tail; }
+		}
+	}
+	return n;
+}
+def rev<T>(l: List<T>) -> List<T> {
+	var acc: List<T> = List<T>.Nil, p = l;
+	while (true) {
+		match (p) {
+			Nil => return acc;
+			Cons(head, tail) => { acc = List<T>.Cons(head, acc); p = tail; }
+		}
+	}
+	return acc;
+}
+def mapl<A, B>(f: A -> B, l: List<A>) -> List<B> {
+	match (l) {
+		Nil => return List<B>.Nil;
+		Cons(head, tail) => return List<B>.Cons(f(head), mapl(f, tail));
+	}
+}
+def sumIntList(l: List<int>) -> int {
+	match (l) {
+		Nil => return 0;
+		Cons(head, tail) => return head + sumIntList(tail);
+	}
+}
+def dbl(x: int) -> int { return x * 2; }
+def tostr(x: int) -> string { return NAMES[(x & 0x7FFFFFFF) % NAMES.length]; }
+def lists() {
+	srand(0x5EED02);
+	var li: List<int> = List<int>.Nil;
+	for (i < 300) li = List<int>.Cons(randn(10000) - 5000, li);
+	acci(len(li));
+	acci(sumIntList(li));
+
+	var r = rev(li);
+	acci(len(r));
+	acci(sumIntList(r));
+	accb(li == r);
+	accb(rev(r) == li);
+
+	var d = mapl(dbl, li);
+	acci(sumIntList(d));
+	var s = mapl(tostr, li);
+	acci(len(s));
+	var p = s;
+	while (true) {
+		match (p) {
+			Nil => break;
+			Cons(head, tail) => { accs(head); p = tail; }
+		}
+	}
+	// lists of tuples and of lists
+	var lt: List<(int, string)> = List<(int, string)>.Nil;
+	for (i < 100) lt = List<(int, string)>.Cons((i, NAMES[i % NAMES.length]), lt);
+	acci(len(lt));
+	var pp = lt;
+	while (true) {
+		match (pp) {
+			Nil => break;
+			Cons(head, tail) => { acci(head.0); accs(head.1); pp = tail; }
+		}
+	}
+	var ll: List<List<int>> = List<List<int>>.Nil;
+	for (i < 20) {
+		var inner: List<int> = List<int>.Nil;
+		for (j < i) inner = List<int>.Cons(i * j, inner);
+		ll = List<List<int>>.Cons(inner, ll);
+	}
+	acci(len(ll));
+	var q = ll;
+	while (true) {
+		match (q) {
+			Nil => break;
+			Cons(head, tail) => { acci(len(head)); acci(sumIntList(head)); q = tail; }
+		}
+	}
+}
+
+//======================================================================
+// Section 3: expression trees -- build, evaluate, rewrite
+//======================================================================
+def VARS: Array<long> = [3, -7, 11, 0, 1000000007, -2, 5, 1];
+
+def build(d: int) -> Expr {
+	if (d <= 0) {
+		if ((rand() & 1) == 0) return Expr.Lit(randn(100) - 50);
+		return Expr.Var(randn(VARS.length));
+	}
+	match (randn(5)) {
+		0 => return Expr.Neg(build(d - 1));
+		1 => return Expr.Add(build(d - 1), build(d - 1));
+		2 => return Expr.Mul(build(d - 1), build(d - 1));
+		3 => return Expr.Div(build(d - 1), build(d - 1));
+		_ => return Expr.Add(build(d - 1), Expr.Lit(randn(10)));
+	}
+}
+def eval(e: Expr) -> long {
+	match (e) {
+		Lit(v) => return v;
+		Neg(x) => return 0 - eval(x);
+		Add(l, r) => return eval(l) + eval(r);
+		Mul(l, r) => return eval(l) * eval(r);
+		Div(l, r) => {
+			var d = eval(r);
+			if (d == 0) return 0;			// avoid DivideByZeroException
+			if (d == -1) return 0 - eval(l);	// avoid long.min / -1 overflow
+			return eval(l) / d;
+		}
+		Var(i) => return VARS[i];
+	}
+}
+// Constant-fold the expression; eval() of the result must be unchanged.
+def fold(e: Expr) -> Expr {
+	match (e) {
+		Lit(_) => return e;
+		Var(_) => return e;
+		Neg(x) => {
+			var f = fold(x);
+			if (Expr.Lit.?(f)) return Expr.Lit(0 - Expr.Lit.!(f).v);
+			return Expr.Neg(f);
+		}
+		Add(l, r) => {
+			var a = fold(l), b = fold(r);
+			if (Expr.Lit.?(a) && Expr.Lit.?(b)) return Expr.Lit(Expr.Lit.!(a).v + Expr.Lit.!(b).v);
+			return Expr.Add(a, b);
+		}
+		Mul(l, r) => {
+			var a = fold(l), b = fold(r);
+			if (Expr.Lit.?(a) && Expr.Lit.?(b)) return Expr.Lit(Expr.Lit.!(a).v * Expr.Lit.!(b).v);
+			return Expr.Mul(a, b);
+		}
+		Div(l, r) => {
+			var a = fold(l), b = fold(r);
+			if (Expr.Lit.?(a) && Expr.Lit.?(b)) {
+				var d = Expr.Lit.!(b).v;
+				if (d != 0 && d != -1) return Expr.Lit(Expr.Lit.!(a).v / d);
+			}
+			return Expr.Div(a, b);
+		}
+	}
+}
+def nodes(e: Expr) -> int {
+	match (e) {
+		Lit(_) => return 1;
+		Var(_) => return 1;
+		Neg(x) => return 1 + nodes(x);
+		Add(l, r) => return 1 + nodes(l) + nodes(r);
+		Mul(l, r) => return 1 + nodes(l) + nodes(r);
+		Div(l, r) => return 1 + nodes(l) + nodes(r);
+	}
+}
+def exprs() {
+	srand(0x5EED03);
+	for (i < 60) {
+		var e = build(6);
+		var v = eval(e);
+		var f = fold(e);
+		accl(v);
+		accl(eval(f));
+		accb(eval(e) == eval(f));	// folding must preserve meaning
+		acci(nodes(e));
+		acci(nodes(f));
+		accb(nodes(f) <= nodes(e));
+		acci(e.tag);
+		accb(e == f);
+		accb(e == e);
+	}
+	// arrays of expressions, and expressions reachable only through a range
+	var arr = Array<Expr>.new(40);
+	for (i < arr.length) arr[i] = build(4);
+	var rg: Range<Expr> = arr;
+	var sub = rg[10 ... 30];
+	for (i < sub.length) accl(eval(sub[i]));
+	for (i < arr.length) accl(eval(fold(arr[i])));
+}
+
+//======================================================================
+// Section 4: unboxed variants mixed with class references
+//======================================================================
+def sm(s: Small) -> int {
+	match (s) {
+		A(x) => return x;
+		B(x, y) => return x + int.!(y);
+		C => return -1;
+	}
+}
+def hv(h: Holder) -> int {
+	match (h) {
+		Ref(c) => return if(c == null, -2, c.id + size(c.payload));
+		Val(s) => return sm(s);
+		Empty => return -3;
+	}
+}
+def unboxed() {
+	srand(0x5EED04);
+	var smalls = Array<Small>.new(64);
+	for (i < smalls.length) {
+		match (i % 3) {
+			0 => smalls[i] = Small.A(randn(1000));
+			1 => smalls[i] = Small.B(randn(1000), byte.view(randn(256)));
+			_ => smalls[i] = Small.C;
+		}
+	}
+	for (i < smalls.length) {
+		acci(sm(smalls[i]));
+		acci(smalls[i].tag);
+		accb(Small.B.?(smalls[i]));
+		accb(smalls[i] == smalls[(i + 1) % smalls.length]);
+		accb(smalls[i] == smalls[i]);
+	}
+	// unboxed variants inside a boxed variant, alongside class references
+	var cells = Array<Cell>.new(32);
+	for (i < cells.length) {
+		var c = Cell.new(i);
+		var t: Tree = Tree.Leaf;
+		for (j < i) t = insert(t, randn(100), NAMES[j % NAMES.length]);
+		c.payload = t;
+		if (i > 0) c.next = cells[i - 1];
+		cells[i] = c;
+	}
+	var hs = Array<Holder>.new(96);
+	for (i < hs.length) {
+		match (i % 3) {
+			0 => hs[i] = Holder.Ref(cells[i % cells.length]);
+			1 => hs[i] = Holder.Val(smalls[i % smalls.length]);
+			_ => hs[i] = Holder.Empty;
+		}
+	}
+	for (i < hs.length) {
+		acci(hv(hs[i]));
+		acci(hs[i].tag);
+		accb(Holder.Ref.?(hs[i]));
+	}
+	acci(hv(Holder.Ref(null)));
+	// walk the class chain hanging off the last cell
+	var p = cells[cells.length - 1];
+	var n = 0;
+	while (p != null) {
+		acci(p.id);
+		acci(size(p.payload));
+		p = p.next;
+		n++;
+	}
+	acci(n);
+}
+
+//======================================================================
+// Section 5: allocation churn -- most trees become garbage immediately
+//======================================================================
+def churn() {
+	srand(0x5EED05);
+	var keep = Array<Tree>.new(8);
+	for (i < keep.length) keep[i] = Tree.Leaf;
+	var live: List<int> = List<int>.Nil;
+	for (i < 600) {
+		// build a tree that is dropped on the floor except every 37th
+		var t: Tree = Tree.Leaf;
+		for (j < 20) t = insert(t, randn(500), NAMES[j % NAMES.length]);
+		if ((i % 37) == 0) {
+			keep[(i / 37) % keep.length] = t;
+			live = List<int>.Cons(size(t), live);
+		}
+		if ((i % 11) == 0) acci(size(t));
+	}
+	for (i < keep.length) {
+		acci(size(keep[i]));
+		acci(depth(keep[i]));
+		inorder(keep[i]);
+	}
+	acci(len(live));
+	acci(sumIntList(live));
+	// long-lived expression graph interleaved with short-lived trees
+	var graph = Array<Expr>.new(16);
+	for (i < graph.length) graph[i] = build(5);
+	for (i < 300) {
+		var junk: Tree = Tree.Leaf;
+		for (j < 8) junk = insert(junk, randn(100), "x");
+		if ((i % 50) == 0) acci(size(junk));
+	}
+	for (i < graph.length) {
+		accl(eval(graph[i]));
+		acci(nodes(graph[i]));
+	}
+}
+
+//======================================================================
+def run(a: int) {
+	crc = a * 0x9E3779B9;
+	if (a == 0 || a == 1) trees();
+	if (a == 0 || a == 2) lists();
+	if (a == 0 || a == 3) exprs();
+	if (a == 0 || a == 4) unboxed();
+	if (a == 0 || a == 5) churn();
+}
+def main(a: int) -> int {
+	run(a);
+	return crc;
+}

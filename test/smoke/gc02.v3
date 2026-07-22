@@ -1,0 +1,335 @@
+//@execute 0=-2096994854; 1=1568207007; 2=-1112496640; 3=336124472; 4=805364874; 5=-863166396; 6=92281670
+//@heap-size=2000000
+// Smoke test: references held live across deep call frames.
+// Allocation is driven from the bottom of deep recursions while references are
+// pinned in caller frames, in spilled locals, in tuples, in arrays, in variant
+// payloads and in globals -- so a collection triggered at depth must find and
+// forward every one of them. Each section verifies that its live objects are
+// unchanged after the churn and folds the results into a running CRC.
+// Input selects the section.
+
+//======================================================================
+// CRC accumulator
+//======================================================================
+var crc: int;
+
+def acci(x: int) {
+	var h = crc ^ x;
+	h = h * 0x01000193;
+	crc = h ^ (h >>> 15);
+}
+def accl(x: long) {
+	acci(int.view(u32.view(x)));
+	acci(int.view(u32.view(x >> 32)));
+}
+def accb(x: bool) {
+	acci(if(x, 0x5A5A5A5A, 0x0F0F0F0F));
+}
+
+var seed: int;
+def srand(s: int) { seed = s; }
+def rand() -> int {
+	seed = seed * 1664525 + 1013904223;
+	seed = seed ^ (seed >>> 16);
+	return seed;
+}
+def randn(n: int) -> int { return (rand() & 0x7FFFFFFF) % n; }
+
+//======================================================================
+// Types. Objects carry a checkable fingerprint so that a mis-forwarded
+// reference shows up as a wrong value rather than a crash.
+//======================================================================
+class Obj {
+	def id: int;
+	var a: int;
+	var b: long;
+	var link: Obj;
+	var data: Array<int>;
+	new(id) {
+		a = id * 3 + 1;
+		b = long.!(id) * 0x1234_5678L;
+		data = Array<int>.new(1 + (id % 7));
+		for (i < data.length) data[i] = id * 100 + i;
+	}
+	def check() -> int {
+		var s = id ^ a;
+		for (i < data.length) s = s ^ (data[i] * (i + 1));
+		return s ^ int.view(u32.view(b)) ^ int.view(u32.view(b >> 32));
+	}
+}
+type Payload {
+	case One(o: Obj);
+	case Two(o: Obj, p: Obj);
+	case Arr(a: Array<Obj>);
+	case Nothing;
+}
+
+// A big allocation burst, called from the bottom of a recursion.
+def burn(n: int) -> int {
+	var s = 0;
+	for (i < n) {
+		var o = Obj.new(i);
+		s = s + o.a;
+		if ((i % 5) == 0) {
+			var junk = Array<Obj>.new(4);
+			for (j < 4) junk[j] = Obj.new(i + j);
+			s = s ^ junk[i % 4].check();
+		}
+	}
+	return s;
+}
+
+//======================================================================
+// Section 1: a reference pinned in every frame of a deep recursion
+//======================================================================
+def deepHold(d: int, o: Obj) -> int {
+	if (d == 0) {
+		acci(burn(400));
+		return o.check();
+	}
+	var mine = Obj.new(d);			// live across the recursive call
+	var got = deepHold(d - 1, o);
+	// both the parameter and the local must have survived
+	acci(mine.check());
+	accb(mine.id == d);
+	return got ^ mine.a;
+}
+def pinnedFrames() {
+	srand(0x6C01);
+	var root = Obj.new(999);
+	var before = root.check();
+	acci(deepHold(120, root));
+	acci(root.check());
+	accb(root.check() == before);
+	accb(root.id == 999);
+	acci(root.data.length);
+	for (i < root.data.length) acci(root.data[i]);
+}
+
+//======================================================================
+// Section 2: many simultaneously-live locals in one deep frame
+//======================================================================
+def deepMany(d: int, seedv: int) -> int {
+	if (d == 0) {
+		acci(burn(300));
+		return seedv;
+	}
+	// enough live references to force spilling on every backend
+	var o0 = Obj.new(d * 16 + 0), o1 = Obj.new(d * 16 + 1);
+	var o2 = Obj.new(d * 16 + 2), o3 = Obj.new(d * 16 + 3);
+	var o4 = Obj.new(d * 16 + 4), o5 = Obj.new(d * 16 + 5);
+	var o6 = Obj.new(d * 16 + 6), o7 = Obj.new(d * 16 + 7);
+	var a0 = Array<int>.new(3); a0[0] = d; a0[1] = d * 2; a0[2] = d * 3;
+	var t0 = (o0, o1, d);
+	var p0: Payload = Payload.Two(o2, o3);
+
+	var got = deepMany(d - 1, seedv ^ d);
+
+	var s = got;
+	s = s ^ o0.check() ^ o1.check() ^ o2.check() ^ o3.check();
+	s = s ^ o4.check() ^ o5.check() ^ o6.check() ^ o7.check();
+	s = s ^ a0[0] ^ a0[1] ^ a0[2];
+	s = s ^ t0.0.check() ^ t0.1.check() ^ t0.2;
+	match (p0) {
+		Two(x, y) => { s = s ^ x.check() ^ y.check(); }
+		_ => { s = s ^ -1; }
+	}
+	accb(o0.id == d * 16 + 0);
+	accb(o7.id == d * 16 + 7);
+	return s;
+}
+def manyLive() {
+	srand(0x6C02);
+	acci(deepMany(60, 12345));
+}
+
+//======================================================================
+// Section 3: references reachable only through globals
+//======================================================================
+var gObj: Obj;
+var gArr: Array<Obj>;
+var gTup: (Obj, Obj, int);
+var gPay: Payload;
+var gNest: Array<Array<Obj>>;
+
+def deepGlobal(d: int) {
+	if (d == 0) { acci(burn(500)); return; }
+	deepGlobal(d - 1);
+}
+def globalRoots() {
+	srand(0x6C03);
+	gObj = Obj.new(11);
+	gArr = Array<Obj>.new(32);
+	for (i < gArr.length) gArr[i] = Obj.new(i + 200);
+	gTup = (Obj.new(21), Obj.new(22), 23);
+	gPay = Payload.Arr(gArr);
+	gNest = Array<Array<Obj>>.new(8);
+	for (i < gNest.length) {
+		gNest[i] = Array<Obj>.new(4);
+		for (j < 4) gNest[i][j] = Obj.new(i * 4 + j + 300);
+	}
+	// build a long chain reachable only from gObj
+	var p = gObj;
+	for (i < 200) {
+		var n = Obj.new(i + 400);
+		p.link = n;
+		p = n;
+	}
+
+	deepGlobal(80);
+
+	acci(gObj.check());
+	for (i < gArr.length) acci(gArr[i].check());
+	acci(gTup.0.check());
+	acci(gTup.1.check());
+	acci(gTup.2);
+	match (gPay) {
+		Arr(a) => { accb(a == gArr); for (i < a.length) acci(a[i].check()); }
+		_ => acci(-1);
+	}
+	for (i < gNest.length) for (j < 4) acci(gNest[i][j].check());
+	var q = gObj;
+	var n = 0;
+	while (q != null) { acci(q.check()); q = q.link; n++; }
+	acci(n);
+
+	// drop the globals and make sure a later section is unaffected
+	gObj = null;
+	gArr = null;
+	gTup = (null, null, 0);
+	gPay = Payload.Nothing;
+	gNest = null;
+}
+
+//======================================================================
+// Section 4: allocation inside the arguments of a pending call
+//======================================================================
+def combine4(a: Obj, b: Obj, c: Obj, d: Obj) -> int {
+	acci(burn(200));
+	return a.check() ^ b.check() ^ c.check() ^ d.check();
+}
+def alloc(id: int) -> Obj {
+	// allocating here can collect while earlier arguments are already evaluated
+	var o = Obj.new(id);
+	var junk = Array<Obj>.new(8);
+	for (i < junk.length) junk[i] = Obj.new(id + i);
+	o.link = junk[id % junk.length];
+	return o;
+}
+def pendingArgs() {
+	srand(0x6C04);
+	for (i < 40) {
+		acci(combine4(alloc(i), alloc(i + 1), alloc(i + 2), alloc(i + 3)));
+	}
+	// nested: each argument itself makes a call that allocates
+	for (i < 20) {
+		acci(combine4(alloc(i), alloc(i * 2), grow(i).0, grow(i).1));
+	}
+}
+def grow(id: int) -> (Obj, Obj) {
+	var a = Obj.new(id + 50);
+	var b = Obj.new(id + 60);
+	acci(burn(50));
+	return (a, b);
+}
+
+//======================================================================
+// Section 5: a live object graph rewritten while garbage is produced
+//======================================================================
+def mazeRounds() {
+	srand(0x6C05);
+	var size = 24;
+	var master = Array<Array<Obj>>.new(size);
+	for (i < size) {
+		master[i] = Array<Obj>.new(size);
+		for (j < size) master[i][j] = Obj.new(i * size + j);
+	}
+	for (round < 300) {
+		var i = randn(size), j = randn(size);
+		match (round % 4) {
+			0 => {
+				// replace a whole row; the old row becomes garbage
+				var row = Array<Obj>.new(size);
+				for (k < size) row[k] = Obj.new(round * 7 + k);
+				master[i] = row;
+			}
+			1 => {
+				// swap two entries
+				var t = master[i][j];
+				master[i][j] = master[j][i];
+				master[j][i] = t;
+			}
+			2 => {
+				// link entries into a chain, keeping older objects live
+				master[i][j].link = master[j][i];
+			}
+			_ => {
+				acci(burn(60));
+			}
+		}
+		if ((round % 25) == 0) acci(master[i][j].check());
+	}
+	var total = 0;
+	for (i < size) for (j < size) {
+		var o = master[i][j];
+		total = total ^ o.check();
+		var p = o.link;
+		var hops = 0;
+		while (p != null && hops < 8) { total = total ^ p.check(); p = p.link; hops++; }
+	}
+	acci(total);
+}
+
+//======================================================================
+// Section 6: long-lived objects surviving many collections
+//======================================================================
+def survivors() {
+	srand(0x6C06);
+	var old = Array<Obj>.new(64);
+	for (i < old.length) old[i] = Obj.new(i + 1000);
+	var fingerprints = Array<int>.new(old.length);
+	for (i < old.length) fingerprints[i] = old[i].check();
+
+	for (round < 12) {
+		acci(burn(400));
+		// verify every long-lived object after each burst
+		for (i < old.length) {
+			accb(old[i].check() == fingerprints[i]);
+			accb(old[i].id == i + 1000);
+		}
+	}
+	for (i < old.length) acci(old[i].check());
+	// promote some of them into a variant payload and burn again
+	var pays = Array<Payload>.new(old.length);
+	for (i < old.length) {
+		match (i % 3) {
+			0 => pays[i] = Payload.One(old[i]);
+			1 => pays[i] = Payload.Two(old[i], old[(i + 1) % old.length]);
+			_ => pays[i] = Payload.Arr(old);
+		}
+	}
+	acci(burn(600));
+	for (i < pays.length) {
+		match (pays[i]) {
+			One(o) => acci(o.check());
+			Two(o, p) => { acci(o.check()); acci(p.check()); }
+			Arr(a) => { accb(a == old); acci(a.length); }
+			Nothing => acci(-1);
+		}
+	}
+}
+
+//======================================================================
+def run(a: int) {
+	crc = a * 0x9E3779B9;
+	if (a == 0 || a == 1) pinnedFrames();
+	if (a == 0 || a == 2) manyLive();
+	if (a == 0 || a == 3) globalRoots();
+	if (a == 0 || a == 4) pendingArgs();
+	if (a == 0 || a == 5) mazeRounds();
+	if (a == 0 || a == 6) survivors();
+}
+def main(a: int) -> int {
+	run(a);
+	return crc;
+}
