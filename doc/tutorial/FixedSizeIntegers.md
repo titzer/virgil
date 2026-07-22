@@ -195,6 +195,9 @@ var x = byte.view<int>;          // of type int -> byte
 var y: int -> byte = byte.!;     // type argument inferred
 ```
 
+Integer types also have `pack` and `unpack` members, which combine *several* values into the bits of a single integer, and take them apart again.
+See [Packing](Packing.md).
+
 ## Explicit widths on literals
 
 Recently, Virgil added support for explicitly specifying the bit-width of an integer directly as a suffix to the literal.
