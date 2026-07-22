@@ -27,6 +27,7 @@ class MachProgram extends TargetProgram {
 	var exportAddrs: PartialMap<string, Addr>;
 	def stubMap       = Strings.newMap<(Addr, (Addr, MachDataWriter) -> void)>();
 	var longMap: HashMap<long, Addr>;
+	var emptyDescMap: HashMap<Type, Addr>;
 	def entryStub = Addr.new(codeRegion, null, 0);
 	var allocMethod: IrMethod;
 	var allocStub: Addr;
@@ -125,15 +126,16 @@ class MachProgram extends TargetProgram {
 		if (ic.parent != null) {
 			mlayout.size = ic.parent.machSize;
 			start = ic.parent.fields.length;
-		} else if (ic.flags.C_HAS_DESCRIPTOR) {
-			// No header word: the descriptor pointer occupies offset 0, so declared
-			// fields start after it.
-			mlayout.size = refSize;
 		} else {
-			mlayout.addType(tagType);
+			// The object header is a tag, or a descriptor pointer for a described object,
+			// which occupies offset 0 so that declared fields start after it.
+			if (ic.flags.C_HAS_DESCRIPTOR) mlayout.size = refSize;
+			else mlayout.addType(tagType);
 			if (ic.flags.C_IS_DESCRIPTOR) {
-				// Reserve slots for the described objects' type id, reference map, and size,
-				// immediately after the descriptor's own header word.
+				// Reserve slots for the described objects' type id, reference map, and size.
+				// They always follow a reference-sized header, so that a descriptor's metadata
+				// is at the same offsets whether or not the descriptor is itself described.
+				mlayout.size = refSize;
 				mlayout.addType(tagType); // descTidOffset
 				mlayout.addType(tagType); // descRefmapOffset
 				mlayout.addType(tagType); // descSizeOffset
@@ -161,6 +163,13 @@ class MachProgram extends TargetProgram {
 			}
 		}
 		ic.machSize = mlayout.size;
+		// A class in a descriptor hierarchy with no descriptor of its own needs an empty
+		// descriptor for its header. Reserve it now, since the data region cannot grow once
+		// its contents are being laid out.
+		// Reserve one for every described class, since even a class with a descriptor may have
+		// a record whose descriptor value is null, and the data region cannot grow once its
+		// contents are being laid out.
+		if (runtime != null && ic.flags.C_HAS_DESCRIPTOR) emptyDescriptorAddr(t);
 		// create GC maps for object if necessary
 		if (runtime != null && runtime.gc != null && IrUtil.isLive(ic)) runtime.gc.recordTypeRefMap(ic);
 	}
@@ -341,15 +350,47 @@ class MachProgram extends TargetProgram {
 	def descriptorMetadata(descType: ClassType) -> (int, int, int) {
 		var described = descType.getDescribesType();
 		if (described == null) return (0, 0, 0);
+		return describedMetadata(described);
+	}
+	// Compute the metadata slots for a described class directly.
+	def describedMetadata(described: Type) -> (int, int, int) {
 		var ic = prog.ir.getIrClass(described);
 		if (ic == null) return (0, 0, 0);
-		var tid = runtime.getSimpleObjectTag(described);
-		var size = if(ic.machSize >= 0, ic.machSize, 0);
+		var tid = runtime.getSimpleObjectTag(ClassType.!(described));
+		// Must be the allocated size, not the raw layout size, or the collector would
+		// misalign the heap when it steps over a described object.
+		var size = if(ic.machSize >= 0, data.addrAlign.alignUp_i32(ic.machSize), 0);
 		var refmap = 0;
 		if (runtime.gc != null && ic.minClassId < runtime.gc.typeRefMaps.length) {
 			refmap = runtime.gc.typeRefMaps[ic.minClassId];
 		}
 		return (tid, refmap, size);
+	}
+	// A class in a descriptor hierarchy that has no descriptor of its own still uses a
+	// descriptor pointer as its object header. Such classes share a single empty descriptor
+	// per class, allocated in the data region and holding only the metadata slots.
+	def emptyDescriptorAddr(t: Type) -> Addr {
+		if (emptyDescMap == null) emptyDescMap = TypeUtil.newTypeMap();
+		var addr = emptyDescMap[t];
+		if (addr == null) {
+			dataRegion.align(data.addrAlign.size);
+			emptyDescMap[t] = addr = dataRegion.allocate(EmptyDescriptor.new(t), runtime.descSizeOffset + 4);
+		}
+		return addr;
+	}
+	// Returns the value of a record's descriptor field, or null if it has none.
+	def descriptorValueOf(ic: IrClass, v: Array<Val>) -> Val {
+		var f = ic.fields;
+		for (i < v.length) if (f[i].flags.F_DESCRIPTOR) return v[i];
+		return null;
+	}
+	def encodeEmptyDescriptor(w: DataWriter, ed: EmptyDescriptor) {
+		var start = w.pos;
+		w.put_b32(0); // no object tag; an empty descriptor is never itself a described object
+		var m = describedMetadata(ed.described);
+		w.at(start + runtime.descTidOffset).put_b32(m.0);
+		w.at(start + runtime.descRefmapOffset).put_b32(m.1);
+		w.at(start + runtime.descSizeOffset).put_b32(m.2);
 	}
 	def alignTo(i: int, a: int) -> int { // XXX: replace uses with Alignment
 		// XXX: use masks for powers of two
@@ -401,6 +442,7 @@ class MachProgram extends TargetProgram {
 	}
 	def encodeData(region: Region, w: DataWriter, a: Addr) {
 		if (a.is<Record>()) encodeRecord(w, a.get<Record>());
+		else if (a.is<EmptyDescriptor>()) encodeEmptyDescriptor(w, a.get<EmptyDescriptor>());
 		else if (a.is<IrMtable>()) encodeMtable(w, a.get<IrMtable>());
 		else if (a.is<IrField>()) encodeField(w, a.get<IrField>());
 		else if (a.is<long>()) {
@@ -451,7 +493,16 @@ class MachProgram extends TargetProgram {
 			x: ClassType => {
 				// encode a class record
 				var ic = prog.ir.getIrClass(x), f = ic.fields;
-				w.put_b32(runtime.getSimpleObjectTag(x));
+				// A described object's header is its descriptor field. If the object has no
+				// descriptor, it uses the empty descriptor synthesized for its class, and the
+				// null field value below must not overwrite it.
+				var emptyDesc = ic.flags.C_HAS_DESCRIPTOR && descriptorValueOf(ic, v) == null;
+				if (emptyDesc) {
+					encodeAddr(w, data, emptyDescriptorAddr(x));
+				} else {
+					// For a class with a descriptor this tag is overwritten by field 0 below.
+					w.put_b32(runtime.getSimpleObjectTag(x));
+				}
 				if (ic.flags.C_IS_DESCRIPTOR) {
 					// initialize the reserved metadata slots for the described objects
 					var m = descriptorMetadata(x);
@@ -460,6 +511,7 @@ class MachProgram extends TargetProgram {
 					w.at(start + runtime.descSizeOffset).put_b32(m.2);
 				}
 				for (i < v.length) {
+					if (emptyDesc && f[i].flags.F_DESCRIPTOR) continue; // keep the empty descriptor
 					encodeVal(w.at(start + f[i].machOffset), v[i], f[i].fieldType);
 				}
 			}
@@ -697,6 +749,10 @@ class MachProgram extends TargetProgram {
 		return addr;
 	}
 }
+// Identifies the empty descriptor synthesized for a class in a descriptor hierarchy that has
+// no descriptor of its own. It exists only to give such objects a header that carries the
+// class's type id, reference map, and size.
+class EmptyDescriptor(described: Type) { }
 // Machine representation of a type.
 class MachRep(origType: Type, machType: Type) { }
 class Mach_FuncRep extends MachRep {
