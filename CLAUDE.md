@@ -43,13 +43,20 @@ v3i apps/HelloWorld/HelloWorld.v3
 # Compile to native (use platform-specific script)
 v3c-x86-64-linux apps/HelloWorld/HelloWorld.v3
 
-# Compile to other targets: v3c-x86-linux, v3c-x86-64-darwin, v3c-arm64-linux, v3c-jar, v3c-wasm
+# Compile to other targets, with runtime system and GC: v3c-x86-linux, v3c-x86-64-darwin, v3c-arm64-linux, v3c-jar, v3c-wasm
+# Compile to other targets, without runtime: v3c -target=x86-linux, v3c -target=x86-linux-test, 
+
+# Run the current compiler on the stable compiler's interpreter, which skips a build step
+v3c-dev
 ```
 
 ## Testing
 
 ```bash
-# Run all test suites (requires VIRGIL_LOC to be set or run from repo root)
+# Run simple tests on the interpreter
+v3c -test foo.v3 bar.v3
+
+# Run all test suites
 ./test/all.bash
 
 # Run a specific subset of test suites (pass suite names as args)
@@ -69,7 +76,7 @@ cd test/asm/x86-64 && ./test.bash
 **Key environment variables for testing:**
 - `TEST_HOST` — override assumed host platform
 - `TEST_TARGETS` — override set of targets (e.g., `"v3i x86-64-linux"`)
-- `AENEAS_TEST` — use a specific compiler binary (`stable`, `bootstrap`, `current`, or path)
+- `AENEAS_TEST` — use a specific compiler binary (`stable`, `bootstrap`, `current`, or path: current is default)
 - `V3C_OPTS` — add extra compiler options
 
 ## Architecture
@@ -82,7 +89,8 @@ Source flows through these phases in order:
 2. **Semantic Analysis** (`vst/Verifier.v3`) — type-checking, name resolution, semantic validation
 3. **SSA Generation** (`ssa/VstSsaGen.v3`) — lowers VST to Static Single Assignment form
 4. **SSA Optimization** (`ssa/SsaOptimizer.v3`) — inlining, constant folding, devirtualization, etc.
-5. **IR Normalization** (`ir/SsaNormalizer.v3`) — lowers to target-normalized IR
+5. **IR Normalization** (`ir/SsaNormalizer.v3`) — computes reachable program and lowers to target-normalized IR
+6. **Machine Lowering** (`mach/MachLowering.v3`) - replaces mid-level operations with machine operations
 6. **Code Generation** — target-specific backends emit machine code
 7. **Binary Emission** (`exe/`) — writes ELF (Linux), Mach-O (Darwin), JAR, or `.wasm` files
 
@@ -132,7 +140,7 @@ Optional utility libraries (not part of the language core): `lib/util/`, `lib/as
 The `make bootstrap` command runs `bin/dev/aeneas bootstrap`, which:
 1. Compiles `aeneas/src/` with `bin/stable/<host>/Aeneas` → produces `bin/bootstrap/`
 2. Compiles `aeneas/src/` with `bin/bootstrap/<host>/Aeneas` → produces `bin/current/`
-3. Verifies the two outputs are bit-for-bit identical (fixpoint check)
+3. test/bootstrap/test.sh Verifies the two outputs are bit-for-bit identical (fixpoint check)
 
 ### Compiler Invocation
 

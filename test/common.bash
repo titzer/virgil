@@ -469,6 +469,8 @@ function is_gc_target() {
 	return 0
     elif [ "$target" = "x86-64-linux" ]; then
 	return 0
+    elif [ "$target" = "arm64-linux" ]; then
+	return 0
     elif [[ "$target" = "wasm" && "$TEST_GC_WASM" != 0 ]]; then
         return 0
     fi
@@ -483,6 +485,8 @@ function get_vm_addr_width() {
     elif [ "$target" = "x86-linux" ]; then
 	echo 32
     elif [ "$target" = "x86-64-linux" ]; then
+	echo 48
+    elif [ "$target" = "arm64-linux" ]; then
 	echo 48
     elif [ "$target" = "wasm" ]; then
         echo 32
