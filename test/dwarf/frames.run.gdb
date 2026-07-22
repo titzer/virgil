@@ -13,8 +13,12 @@ select-frame 2
 if o == 3
   printf "ok: outer frame\n"
 end
-select-frame 3
-if r == 0
-  printf "ok: main frame\n"
+# main has no local to read here: its own locals are all assigned after the call
+# chain returns, so they are correctly reported as unavailable. Assert instead
+# that the unwind reaches main, which is what the call frame information buys.
+# $_caller_is counts from the selected frame, so reset it to the innermost one.
+select-frame 0
+if $_caller_is("main", 3)
+  printf "ok: unwound to main\n"
 end
 kill

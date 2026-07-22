@@ -32,6 +32,9 @@ function normalize() {
 	-e '/^\[New /d' \
 	-e '/^During startup/d' \
 	-e '/^Breakpoint [0-9]* at /d' \
+	-e '/^The target architecture is set to /d' \
+	-e '/^Reading .* from remote target/d' \
+	-e '/^0xADDR in ?? ()$/d' \
 	-e '/^Breakpoint [0-9]*, /d' \
 	-e '/^Continuing\./d' \
 	-e '/^[0-9][0-9]*	/d' \
@@ -65,7 +68,9 @@ function run_gdb_tests() {
 	local P=$T/$base.$kind
 	# copy the script next to the binary; the gdb runner may be sandboxed
 	cp $script $P.gdb
-	$GDB $T $T/$base $P.gdb > $P.raw 2>&1
+	local runner=$GDB
+	if [ "$kind" = run ]; then runner=$GDBRUN; fi
+	$runner $T $T/$base $P.gdb > $P.raw 2>&1
 	normalize $P.raw > $P.out
 	diff $base.$kind.out $P.out > $P.diff
 	if [ $? = 0 ]; then trace_test_ok; else trace_test_fail $P.diff; fi
@@ -78,7 +83,7 @@ function run_gdb_tests() {
 function gdb_can_run() {
     local probe=$1
     echo 'run' > $T/probe.gdb
-    $GDB $T $T/$probe $T/probe.gdb > $T/probe.out 2>&1
+    $GDBRUN $T $T/$probe $T/probe.gdb > $T/probe.out 2>&1
     grep -q 'exited normally' $T/probe.out
 }
 
@@ -88,6 +93,12 @@ function run_gdb_tiers() {
 	print_status Gdb $target
 	echo "${YELLOW}skipped${NORM} (no gdb configured for $target)"
 	return 0
+    fi
+    # Reading the debug info and executing under the debugger are separate
+    # capabilities; a host may have the first without the second.
+    GDBRUN=$(echo $CONFIG/gdbrun-$target*)
+    if [ "$GDBRUN" = "$CONFIG/gdbrun-$target*" ] || [ ! -x "$GDBRUN" ]; then
+	GDBRUN=""
     fi
 
     local static_tests=$(ls *.static.gdb 2> /dev/null)
@@ -100,7 +111,9 @@ function run_gdb_tiers() {
     local run_tests=$(ls *.run.gdb 2> /dev/null)
     if [ ! -z "$run_tests" ]; then
 	print_status Gdb "$target run"
-	if gdb_can_run $(basename $(echo $run_tests | cut -d' ' -f1) .run.gdb); then
+	if [ -z "$GDBRUN" ]; then
+	    echo "${YELLOW}skipped${NORM} (no gdbrun runner for $target)"
+	elif gdb_can_run $(basename $(echo $run_tests | cut -d' ' -f1) .run.gdb); then
 	    run_gdb_tests run $run_tests | tee $T/gdb-run.out | $PROGRESS
 	    fail_fast
 	else
