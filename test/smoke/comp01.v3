@@ -1,0 +1,706 @@
+//@execute 0=1971448484; 1=-719197898; 2=-937553402; 3=-1083909360; 4=-1883598268; 5=2074880849; 6=66281638; 7=-1661458080; 8=-1468666115
+//@heap-size=1000000
+// Smoke test: components and global state.
+// Several components with `var` and `def` fields, program initialization order,
+// component methods used as first-class values, mutual references between
+// components, and top-level globals of many types (ints, longs, floats, arrays,
+// tuples, classes, variants). Results are mixed into a running CRC that main()
+// returns, so no computation can be deleted as dead. Interleaved are assert()s
+// over compile-time constants, which the optimizer is expected to fold away; a
+// folding bug sets the failure flag instead. Input selects the section.
+//
+// Every section that writes global or component state resets that state on
+// entry: the harness may run all inputs in one process or one process per
+// input, and the two models must agree.
+
+//======================================================================
+// Accumulator and assertions
+//======================================================================
+var crc: int;
+var failed: int;
+
+def mix(h: int, x: int) -> int {
+	var t = h ^ x;
+	t = t * 0x01000193;
+	return t ^ (t >>> 15);
+}
+def mixl(h: int, x: long) -> int {
+	return mix(mix(h, int.view(u32.view(x))), int.view(u32.view(x >> 32)));
+}
+def mixf(h: int, f: float) -> int {
+	return mix(h, if(f != f, 0x4E614E00, int.view(f)));
+}
+def mixd(h: int, d: double) -> int {
+	if (d != d) return mix(h, 0x4E614E01);
+	return mixl(h, long.view(d));
+}
+def mixb(h: int, b: bool) -> int {
+	return mix(h, if(b, 0x5A5A5A5A, 0x0F0F0F0F));
+}
+def mixs(h: int, s: string) -> int {
+	if (s == null) return mix(h, -1);
+	var t = mix(h, s.length);
+	for (i < s.length) t = mix(t, s[i]);
+	return t;
+}
+def acci(x: int) { crc = mix(crc, x); }
+
+// Records the first failing assertion; main() returns the id instead of the CRC.
+def fail_assert(id: int) { if (failed == 0) failed = id; }
+
+//======================================================================
+// Program initialization order.
+//
+// `note()` is called only from field initializers, so INIT_LOG is written once
+// per process, before main() runs, and every section below only reads it.
+//======================================================================
+def INIT_LOG = Array<int>.new(32);
+var initN: int;
+def note(x: int) -> int { INIT_LOG[initN++] = x; return x; }
+
+def TOP_A: int = note(10);		// top-level globals of the program component
+var TOP_B: int = note(11);
+
+component Alpha {
+	def a1: int = note(20);
+	var a2: int = note(21);
+	def a3: Array<int> = [note(22), note(23)];
+	var calls: int;
+	def bump(n: int) -> int { calls++; return a1 + n; }
+	def reset() { a2 = 21; calls = 0; }
+}
+
+var TOP_C: int = note(12);
+
+component Beta {
+	// reads a field of a component declared earlier; sees its initialized value
+	def b1: int = note(Alpha.a1 + 10);
+	var b2: int = note(31);
+	var calls: int;
+	def scale(n: int) -> int { calls++; return b1 * n; }
+	def reset() { b2 = 31; calls = 0; }
+}
+
+component Gamma {
+	def g1: int = note(40);
+	var counter: int;
+	var hist = Array<int>.new(16);
+	def base: int = 100;
+	def next() -> int {
+		hist[counter % hist.length] = counter;
+		return base + counter++;
+	}
+	def reset() {
+		counter = 0;
+		hist = Array<int>.new(16);
+	}
+}
+
+var TOP_D: int = note(13);
+
+//======================================================================
+// Section 1: initialization order
+//======================================================================
+def initorder() {
+	var h = mix(0, initN);
+	for (i < initN) h = mix(h, INIT_LOG[i]);
+	h = mix(h, TOP_A);
+	h = mix(h, TOP_B);
+	h = mix(h, TOP_C);
+	h = mix(h, TOP_D);
+	h = mix(h, Alpha.a1);
+	h = mix(h, Beta.b1);
+	h = mix(h, Gamma.g1);
+	acci(h);
+
+	if (initN != 11) fail_assert(101);
+	// every initializer ran exactly once and stored its own marker
+	if (TOP_A != 10) fail_assert(102);
+	if (TOP_B != 11) fail_assert(103);
+	if (TOP_C != 12) fail_assert(104);
+	if (TOP_D != 13) fail_assert(105);
+	if (Alpha.a1 != 20) fail_assert(106);
+	if (Alpha.a3[0] != 22) fail_assert(107);
+	if (Alpha.a3[1] != 23) fail_assert(108);
+	if (Gamma.g1 != 40) fail_assert(109);
+	// a component's own initializers run in declaration order
+	if (!(idx(20) < idx(21))) fail_assert(110);
+	if (!(idx(21) < idx(22))) fail_assert(111);
+	if (!(idx(22) < idx(23))) fail_assert(112);
+	if (!(idx(31) < idx(40))) fail_assert(113);	// Beta before Gamma
+	if (!(idx(10) < idx(11))) fail_assert(114);
+	if (!(idx(11) < idx(12))) fail_assert(115);
+	if (!(idx(12) < idx(13))) fail_assert(116);
+	// Beta's initializer observed Alpha's already-initialized field
+	if (Beta.b1 != 30) fail_assert(117);
+	if (!(idx(20) < idx(30))) fail_assert(118);
+	// the array literal in Alpha is a real, distinct array
+	if (Alpha.a3.length != 2) fail_assert(119);
+}
+def idx(marker: int) -> int {
+	for (i < initN) if (INIT_LOG[i] == marker) return i;
+	return -1;
+}
+
+//======================================================================
+// Section 2: component var/def fields under mutation
+//======================================================================
+def DATA: Array<int> = [5, 3, 8, 1, 9, 2, 7, 4, 6, 0, 11, 13];
+def counters() {
+	Alpha.reset();
+	Beta.reset();
+	Gamma.reset();
+
+	var h = 0;
+	for (i < 100) h = mix(h, Gamma.next());
+	for (i < Gamma.hist.length) h = mix(h, Gamma.hist[i]);
+	h = mix(h, Gamma.counter);
+	acci(h);
+	if (Gamma.counter != 100) fail_assert(201);
+	if (Gamma.base != 100) fail_assert(202);
+	if (Gamma.hist[0] != 96) fail_assert(203);	// last write at counter 96
+	if (Gamma.hist[15] != 95) fail_assert(204);
+
+	var g = 0;
+	for (i < DATA.length) {
+		Alpha.a2 = DATA[i];
+		Beta.b2 = DATA[i] * 2;
+		g = mix(g, Alpha.a2);
+		g = mix(g, Beta.b2);
+		g = mix(g, Alpha.bump(DATA[i]));
+		g = mix(g, Beta.scale(DATA[i]));
+	}
+	g = mix(g, Alpha.calls);
+	g = mix(g, Beta.calls);
+	acci(g);
+	if (Alpha.calls != DATA.length) fail_assert(205);
+	if (Beta.calls != DATA.length) fail_assert(206);
+	if (Alpha.a2 != 13) fail_assert(207);
+	if (Beta.b2 != 26) fail_assert(208);
+	if (Alpha.bump(0) != 20) fail_assert(209);
+	if (Beta.scale(2) != 60) fail_assert(210);
+	if (Alpha.calls != DATA.length + 1) fail_assert(211);
+
+	// resetting really does restore the initial values
+	Alpha.reset();
+	Beta.reset();
+	Gamma.reset();
+	if (Alpha.a2 != 21) fail_assert(212);
+	if (Beta.b2 != 31) fail_assert(213);
+	if (Gamma.counter != 0) fail_assert(214);
+	if (Alpha.calls != 0) fail_assert(215);
+	if (Gamma.next() != 100) fail_assert(216);
+	Gamma.reset();
+}
+
+//======================================================================
+// Section 3: component methods as first-class values
+//======================================================================
+component Ops {
+	var applied: int;
+	def add(a: int, b: int) -> int { applied++; return a + b; }
+	def sub(a: int, b: int) -> int { applied++; return a - b; }
+	def mul(a: int, b: int) -> int { applied++; return a * b; }
+	def maxi(a: int, b: int) -> int { applied++; return if(a > b, a, b); }
+	def reset() { applied = 0; }
+}
+def fold(f: (int, int) -> int, init: int, a: Array<int>) -> int {
+	var acc = init;
+	for (i < a.length) acc = f(acc, a[i]);
+	return acc;
+}
+def methodvals() {
+	Ops.reset();
+	Gamma.reset();
+
+	def OPS: Array<(int, int) -> int> = [Ops.add, Ops.sub, Ops.mul, Ops.maxi];
+	var h = 0;
+	for (k < OPS.length) {
+		h = mix(h, fold(OPS[k], 1, DATA));
+		for (i < DATA.length) h = mix(h, OPS[k](DATA[i], 3));
+	}
+	h = mix(h, Ops.applied);
+	acci(h);
+
+	// partial application of a component method
+	var inc = Ops.add(1, _);
+	var dec = Ops.add(_, -1);
+	var neg = Ops.sub(0, _);
+	var g = 0;
+	for (i < DATA.length) {
+		g = mix(g, inc(DATA[i]));
+		g = mix(g, dec(DATA[i]));
+		g = mix(g, neg(DATA[i]));
+	}
+	acci(g);
+
+	// a zero-argument component method as a value, called repeatedly
+	var gen: void -> int = Gamma.next;
+	var k = 0;
+	for (i < 40) k = mix(k, gen());
+	k = mix(k, Gamma.counter);
+	acci(k);
+
+	if (fold(Ops.add, 0, DATA) != 69) fail_assert(301);	// DATA sums to 69
+	if (fold(Ops.maxi, -1, DATA) != 13) fail_assert(302);
+	if (fold(Ops.mul, 1, DATA) != 0) fail_assert(303);	// DATA contains 0
+	if (Ops.add(3, 4) != 7) fail_assert(304);
+	if (Ops.sub(3, 4) != -1) fail_assert(305);
+	if (inc(41) != 42) fail_assert(306);
+	if (dec(43) != 42) fail_assert(307);
+	if (neg(5) != -5) fail_assert(308);
+	if (Gamma.counter != 40) fail_assert(309);
+	if (gen() != 140) fail_assert(310);
+	// two references to the same component method are the same function
+	var f1: (int, int) -> int = Ops.add;
+	var f2: (int, int) -> int = Ops.add;
+	if (f1(2, 3) != f2(2, 3)) fail_assert(311);
+	Ops.reset();
+	Gamma.reset();
+}
+
+//======================================================================
+// Section 4: mutual references between components
+//======================================================================
+component Ping {
+	var hits: int;
+	var depth: int;
+	def go(n: int) -> int {
+		hits++;
+		if (n <= 0) return 0;
+		if (n > depth) depth = n;
+		return 1 + Pong.go(n - 1);
+	}
+	def reset() { hits = 0; depth = 0; }
+}
+component Pong {
+	var hits: int;
+	def go(n: int) -> int {
+		hits++;
+		if (n <= 0) return 0;
+		return 1 + Ping.go(n - 1);
+	}
+	def reset() { hits = 0; }
+}
+component Registry {
+	var slots = Array<int>.new(8);
+	var n: int;
+	def put(x: int) -> int { slots[n % slots.length] = x; return n++; }
+	def sum() -> int {
+		var s = 0;
+		for (i < slots.length) s += slots[i];
+		return s;
+	}
+	def reset() { slots = Array<int>.new(8); n = 0; }
+}
+component Feeder {
+	def feed(a: Array<int>) -> int {
+		var last = -1;
+		for (i < a.length) last = Registry.put(a[i]);
+		return last;
+	}
+}
+def mutual() {
+	Ping.reset();
+	Pong.reset();
+	Registry.reset();
+
+	var h = 0;
+	for (i < 40) h = mix(h, Ping.go(i));
+	h = mix(h, Ping.hits);
+	h = mix(h, Pong.hits);
+	h = mix(h, Ping.depth);
+	acci(h);
+	if (Ping.go(0) != 0) fail_assert(401);
+	if (Ping.depth != 39) fail_assert(402);
+	Ping.reset();
+	Pong.reset();
+	if (Ping.go(5) != 5) fail_assert(403);
+	if (Ping.hits != 3) fail_assert(404);		// n = 5, 3, 1
+	if (Pong.hits != 3) fail_assert(405);		// n = 4, 2, 0
+	if (Ping.go(4) != 4) fail_assert(406);
+	if (Ping.hits != 6) fail_assert(407);		// + n = 4, 2, 0
+	if (Pong.hits != 5) fail_assert(408);		// + n = 3, 1
+
+	var g = mix(0, Feeder.feed(DATA));
+	g = mix(g, Registry.n);
+	g = mix(g, Registry.sum());
+	for (i < Registry.slots.length) g = mix(g, Registry.slots[i]);
+	acci(g);
+	if (Registry.n != DATA.length) fail_assert(409);
+	if (Registry.slots[0] != 6) fail_assert(410);	// DATA[8] overwrote DATA[0]
+	if (Registry.slots[3] != 13) fail_assert(411);	// DATA[11]
+	if (Registry.sum() != 6 + 0 + 11 + 13 + 9 + 2 + 7 + 4) fail_assert(412);
+	Registry.reset();
+	if (Registry.sum() != 0) fail_assert(413);
+	Ping.reset();
+	Pong.reset();
+}
+
+//======================================================================
+// Section 5: top-level globals of many types
+//======================================================================
+class Obj {
+	def id: int;
+	var w: int;
+	new(id) { }
+	def score() -> int { return id * 10 + w; }
+}
+type Val {
+	case None;
+	case I(x: int);
+	case S(s: string);
+	case P(o: Obj, k: int);
+}
+def WORDS: Array<string> = ["one", "two", "three", "four", "five"];
+
+var gi: int;
+var gl: long;
+var gf: float;
+var gd: double;
+var gs: string;
+var gt: (int, string, float);
+var ga: Array<int>;
+var gaa: Array<Array<int>>;
+var go: Obj;
+var gv: Val;
+var gvs: Array<Val>;
+
+def valScore(v: Val) -> int {
+	match (v) {
+		None => return -1;
+		I(x) => return x;
+		S(s) => return if(s == null, -2, s.length);
+		P(o, k) => return if(o == null, -3, o.score() + k);
+	}
+}
+def globals() {
+	// reset every global this section touches
+	gi = 0;
+	gl = 0;
+	gf = 0f;
+	gd = 0d;
+	gs = null;
+	gt = (0, null, 0f);
+	ga = null;
+	gaa = null;
+	go = null;
+	gv = Val.None;
+	gvs = null;
+
+	var h = mix(0, gi);
+	h = mixl(h, gl);
+	h = mixf(h, gf);
+	h = mixd(h, gd);
+	h = mixs(h, gs);
+	h = mixb(h, ga == null);
+	h = mixb(h, go == null);
+	h = mix(h, valScore(gv));
+	acci(h);
+	if (gi != 0) fail_assert(501);
+	if (gl != 0) fail_assert(502);
+	if (gf != 0f) fail_assert(503);
+	if (gd != 0d) fail_assert(504);
+	if (gs != null) fail_assert(505);
+	if (ga != null) fail_assert(506);
+	if (go != null) fail_assert(507);
+	if (valScore(gv) != -1) fail_assert(508);
+
+	ga = Array<int>.new(DATA.length);
+	gaa = Array<Array<int>>.new(8);
+	gvs = Array<Val>.new(DATA.length);
+	for (i < gaa.length) {
+		gaa[i] = Array<int>.new(8);
+		for (j < 8) gaa[i][j] = i * 8 + j;
+	}
+	var g = 0;
+	for (i < DATA.length) {
+		gi = DATA[i];
+		gl = long.!(gi) * 1000000007L;
+		gf = float.roundi(gi) * 0.5f;
+		gd = double.roundi(gi) / 3d;
+		gs = WORDS[i % WORDS.length];
+		gt = (gi, gs, gf);
+		ga[i] = gi * gi;
+		go = Obj.new(gi);
+		go.w = i;
+		match (i % 4) {
+			0 => gv = Val.None;
+			1 => gv = Val.I(gi);
+			2 => gv = Val.S(gs);
+			_ => gv = Val.P(go, i);
+		}
+		gvs[i] = gv;
+		g = mix(g, gi);
+		g = mixl(g, gl);
+		g = mixf(g, gf);
+		g = mixd(g, gd);
+		g = mixs(g, gs);
+		g = mix(g, gt.0);
+		g = mixs(g, gt.1);
+		g = mixf(g, gt.2);
+		g = mix(g, ga[i]);
+		g = mix(g, go.score());
+		g = mix(g, valScore(gv));
+		g = mix(g, gv.tag);
+	}
+	acci(g);
+	var k = 0;
+	for (i < gaa.length) for (j < 8) k = mix(k, gaa[i][j]);
+	for (i < gvs.length) k = mix(k, valScore(gvs[i]));
+	acci(k);
+
+	if (gi != 13) fail_assert(509);
+	if (gl != 13000000091L) fail_assert(510);
+	if (gf != 6.5f) fail_assert(511);
+	if (gs.length != 3) fail_assert(512);		// WORDS[11 % 5] == "two"
+	if (gt.0 != 13) fail_assert(513);
+	if (ga[10] != 121) fail_assert(514);
+	if (go.id != 13) fail_assert(515);
+	if (go.score() != 141) fail_assert(516);	// 13*10 + 11
+	if (gaa[7][7] != 63) fail_assert(517);
+	if (valScore(Val.I(9)) != 9) fail_assert(518);
+	if (valScore(Val.S(WORDS[2])) != 5) fail_assert(519);
+	if (valScore(Val.P(null, 3)) != -3) fail_assert(520);
+	if (Val.None.tag != 0) fail_assert(521);
+	if (Val.P(null, 0).tag != 3) fail_assert(522);
+	if (gvs[0].tag != 0) fail_assert(523);
+	if (gvs[1].tag != 1) fail_assert(524);
+
+	// leave the globals in a known state
+	gi = 0;
+	gl = 0;
+	gf = 0f;
+	gd = 0d;
+	gs = null;
+	gt = (0, null, 0f);
+	ga = null;
+	gaa = null;
+	go = null;
+	gv = Val.None;
+	gvs = null;
+}
+
+//======================================================================
+// Section 6: component-held arrays and aliasing
+//======================================================================
+component Pool {
+	var buf = Array<int>.new(32);
+	var tags = Array<string>.new(32);
+	var objs = Array<Obj>.new(32);
+	var used: int;
+	def take(x: int, s: string) -> int {
+		var i = used % buf.length;
+		buf[i] = x;
+		tags[i] = s;
+		objs[i] = Obj.new(x);
+		used++;
+		return i;
+	}
+	def total() -> int {
+		var s = 0;
+		for (i < buf.length) s += buf[i];
+		return s;
+	}
+	def reset() {
+		buf = Array<int>.new(32);
+		tags = Array<string>.new(32);
+		objs = Array<Obj>.new(32);
+		used = 0;
+	}
+}
+def aliasing() {
+	Pool.reset();
+
+	var h = 0;
+	for (i < 100) h = mix(h, Pool.take(i * i, WORDS[i % WORDS.length]));
+	h = mix(h, Pool.used);
+	h = mix(h, Pool.total());
+	for (i < Pool.buf.length) {
+		h = mix(h, Pool.buf[i]);
+		h = mixs(h, Pool.tags[i]);
+		h = mix(h, Pool.objs[i].score());
+	}
+	acci(h);
+	if (Pool.used != 100) fail_assert(601);
+	if (Pool.buf[0] != 96 * 96) fail_assert(602);
+	if (Pool.buf[31] != 95 * 95) fail_assert(603);
+
+	// an alias of the component's array sees writes made through the component
+	var alias = Pool.buf;
+	Pool.buf[5] = -7;
+	if (alias[5] != -7) fail_assert(604);
+	alias[6] = -8;
+	if (Pool.buf[6] != -8) fail_assert(605);
+	// replacing the component's array breaks the alias
+	Pool.buf = Array<int>.new(32);
+	if (Pool.buf[5] == -7) fail_assert(606);
+	if (alias[5] != -7) fail_assert(607);
+	var g = 0;
+	for (i < alias.length) g = mix(g, alias[i]);
+	for (i < Pool.buf.length) g = mix(g, Pool.buf[i]);
+	acci(g);
+
+	// ranges over a component-held array alias it too
+	Pool.reset();
+	for (i < 32) void(Pool.take(i, WORDS[i % WORDS.length]));
+	var r: Range<int> = Pool.buf;
+	var mid = r[8 ... 24];
+	for (i < mid.length) mid[i] = mid[i] * -3;
+	var k = mix(0, mid.length);
+	for (i < Pool.buf.length) k = mix(k, Pool.buf[i]);
+	acci(k);
+	if (mid.length != 16) fail_assert(608);
+	if (Pool.buf[8] != -24) fail_assert(609);
+	if (Pool.buf[7] != 7) fail_assert(610);
+	if (Pool.buf[23] != -69) fail_assert(611);
+	if (Pool.buf[24] != 24) fail_assert(612);
+	Pool.reset();
+}
+
+//======================================================================
+// Section 7: bulk data-driven work through component state
+//======================================================================
+component Stats {
+	var n: int;
+	var sum: long;
+	var mini: int = 2147483647;
+	var maxi: int = -2147483648;
+	var buckets = Array<int>.new(16);
+	def add(x: int) -> this {
+		n++;
+		sum = sum + x;
+		if (x < mini) mini = x;
+		if (x > maxi) maxi = x;
+		buckets[(x & 0x7FFFFFFF) % buckets.length]++;
+	}
+	def reset() {
+		n = 0;
+		sum = 0;
+		mini = 2147483647;
+		maxi = -2147483648;
+		buckets = Array<int>.new(16);
+	}
+}
+var seed: int;
+def srand(s: int) { seed = s; }
+def rand() -> int {
+	seed = seed * 1664525 + 1013904223;
+	seed = seed ^ (seed >>> 16);
+	return seed;
+}
+def randn(n: int) -> int { return (rand() & 0x7FFFFFFF) % n; }
+def bulk() {
+	Stats.reset();
+	srand(0x5EED71);
+
+	for (i < 5000) Stats.add(randn(10000) - 5000);
+	var h = mix(0, Stats.n);
+	h = mixl(h, Stats.sum);
+	h = mix(h, Stats.mini);
+	h = mix(h, Stats.maxi);
+	for (i < Stats.buckets.length) h = mix(h, Stats.buckets[i]);
+	acci(h);
+	if (Stats.n != 5000) fail_assert(701);
+
+	Stats.reset();
+	if (Stats.n != 0) fail_assert(702);
+	if (Stats.sum != 0) fail_assert(703);
+	if (Stats.mini != 2147483647) fail_assert(704);
+	if (Stats.maxi != -2147483648) fail_assert(705);
+
+	for (i < DATA.length) Stats.add(DATA[i]);
+	if (Stats.n != DATA.length) fail_assert(706);
+	if (Stats.sum != 69) fail_assert(707);
+	if (Stats.mini != 0) fail_assert(708);
+	if (Stats.maxi != 13) fail_assert(709);
+	if (Stats.buckets[0] != 1) fail_assert(710);
+	if (Stats.buckets[13] != 1) fail_assert(711);	// only DATA[11] == 13
+	var g = mix(0, Stats.n);
+	g = mixl(g, Stats.sum);
+	for (i < Stats.buckets.length) g = mix(g, Stats.buckets[i]);
+	acci(g);
+
+	// method chaining on a component method returning `this`
+	Stats.reset();
+	Stats.add(1).add(2).add(3);
+	if (Stats.n != 3) fail_assert(712);
+	if (Stats.sum != 6) fail_assert(713);
+	Stats.reset();
+}
+
+//======================================================================
+// Section 8: allocation churn rooted in component state
+//======================================================================
+component Heap {
+	var live = Array<Obj>.new(24);
+	var vals = Array<Val>.new(24);
+	var n: int;
+	def keep(o: Obj, v: Val) {
+		live[n % live.length] = o;
+		vals[n % vals.length] = v;
+		n++;
+	}
+	def reset() {
+		live = Array<Obj>.new(24);
+		vals = Array<Val>.new(24);
+		n = 0;
+	}
+}
+def churn() {
+	Heap.reset();
+	srand(0x5EED81);
+
+	for (i < 6000) {
+		var o = Obj.new(randn(1000));
+		o.w = randn(100);
+		var v: Val;
+		match (i % 4) {
+			0 => v = Val.None;
+			1 => v = Val.I(o.id);
+			2 => v = Val.S(WORDS[i % WORDS.length]);
+			_ => v = Val.P(o, i);
+		}
+		if ((i % 211) == 0) Heap.keep(o, v);
+	}
+	var h = mix(0, Heap.n);
+	for (i < Heap.live.length) {
+		if (Heap.live[i] != null) h = mix(h, Heap.live[i].score());
+		h = mix(h, valScore(Heap.vals[i]));
+		h = mix(h, Heap.vals[i].tag);
+	}
+	acci(h);
+
+	// short-lived arrays churn while the component roots stay live
+	var g = 0;
+	for (i < 800) {
+		var junk = Array<Obj>.new(32);
+		for (j < 32) junk[j] = Obj.new(j + i);
+		if ((i % 97) == 0) g = mix(g, junk[31].score());
+	}
+	for (i < Heap.live.length) {
+		if (Heap.live[i] != null) g = mix(g, Heap.live[i].id);
+	}
+	g = mix(g, Heap.n);
+	acci(g);
+	Heap.reset();
+}
+
+//======================================================================
+def run(a: int) {
+	crc = a;
+	failed = 0;
+	if (a == 0 || a == 1) initorder();
+	if (a == 0 || a == 2) counters();
+	if (a == 0 || a == 3) methodvals();
+	if (a == 0 || a == 4) mutual();
+	if (a == 0 || a == 5) globals();
+	if (a == 0 || a == 6) aliasing();
+	if (a == 0 || a == 7) bulk();
+	if (a == 0 || a == 8) churn();
+}
+def main(a: int) -> int {
+	run(a);
+	if (failed != 0) return failed;
+	return crc;
+}

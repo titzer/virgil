@@ -1,0 +1,752 @@
+//@execute 0=629141339; 1=769252617; 2=-975528655; 3=43838728; 4=-873363931; 5=1411150932; 6=1148332853; 7=-1769927764; 8=-1881007487
+//@heap-size=1000000
+// Smoke test: `#unboxed` variants and bit packing.
+// Unboxed variants with mixed field types, unboxed variants nested inside one
+// another, unboxed variants in arrays, tuples, globals and class fields,
+// comparison and query behavior, per-case method implementations of an abstract
+// parent method, `#unboxed #packed` variants with sub-word fields, and the
+// `iN.pack` / `iN.unpack` operators over tuples, data types and enum sets.
+// Results are mixed into a running CRC that main() returns, so no computation
+// can be deleted as dead. Interleaved are assert()s over compile-time
+// constants, which the optimizer is expected to fold away; a folding bug sets
+// the failure flag instead. Input selects the section.
+//
+// NaN float payloads are deliberately absent: variant equality over a NaN
+// payload constant-folds to true but evaluates to false at runtime. See
+// test/variants/eq_nan{00,01,02}.v3.
+
+//======================================================================
+// Accumulator and assertions
+//======================================================================
+var crc: int;
+var failed: int;
+
+def mix(h: int, x: int) -> int {
+	var t = h ^ x;
+	t = t * 0x01000193;
+	return t ^ (t >>> 15);
+}
+def mixl(h: int, x: long) -> int {
+	return mix(mix(h, int.view(u32.view(x))), int.view(u32.view(x >> 32)));
+}
+def mixf(h: int, f: float) -> int {
+	return mix(h, if(f != f, 0x4E614E00, int.view(f)));
+}
+def mixd(h: int, d: double) -> int {
+	if (d != d) return mix(h, 0x4E614E01);
+	return mixl(h, long.view(d));
+}
+def mixb(h: int, b: bool) -> int {
+	return mix(h, if(b, 0x5A5A5A5A, 0x0F0F0F0F));
+}
+def mixs(h: int, s: string) -> int {
+	if (s == null) return mix(h, -1);
+	var t = mix(h, s.length);
+	for (i < s.length) t = mix(t, s[i]);
+	return t;
+}
+def acci(x: int) { crc = mix(crc, x); }
+
+// Records the first failing assertion; main() returns the id instead of the CRC.
+def fail_assert(id: int) { if (failed == 0) failed = id; }
+
+var seed: int;
+def srand(s: int) { seed = s; }
+def rand() -> int {
+	seed = seed * 1664525 + 1013904223;
+	seed = seed ^ (seed >>> 16);
+	return seed;
+}
+def randn(n: int) -> int { return (rand() & 0x7FFFFFFF) % n; }
+
+def WORDS: Array<string> = ["ay", "bee", "cee", "dee", "ee", "ef"];
+def NUMS: Array<int> = [7, 2, 9, 4, 1, 8, 3, 6, 5, 0, 11, 12];
+
+//======================================================================
+// Types
+//======================================================================
+class Cls {
+	def id: int;
+	var w: int;
+	new(id) { }
+	def score() -> int { return id * 10 + w; }
+}
+
+// An unboxed variant with a deliberately wide mix of field types. Each case
+// implements the abstract `val()` declared on the parent.
+type UB #unboxed {
+	case Zero { def val() -> int { return -1; } }
+	case I(x: int) { def val() -> int { return x; } }
+	case L(x: long, b: bool) { def val() -> int { return int.view(x) + if(b, 1, 0); } }
+	case S(s: string, k: byte) { def val() -> int { return if(s == null, -2, s.length) + k; } }
+	case F(f: float, g: double) { def val() -> int { return int.truncf(f) + int.truncd(g); } }
+	case R(o: Cls, n: int) { def val() -> int { return if(o == null, -3, o.score()) + n; } }
+	case T(t: (int, byte, bool)) { def val() -> int { return t.0 + t.1 + if(t.2, 100, 0); } }
+
+	def val() -> int;
+	def doubled() -> int { return val() * 2; }	// concrete parent method
+}
+
+// Nested unboxed variants: the inner value is flattened into the outer.
+type Leafy #unboxed {
+	case A(x: int);
+	case B(y: byte, z: byte);
+	case C;
+}
+type Nest #unboxed {
+	case P(i: Leafy, k: int);
+	case Q(i: Leafy, j: Leafy);
+	case R;
+}
+
+// A packed variant: fields occupy sub-word bit ranges.
+//
+// `Three` deliberately puts its only SIGNED field last. A signed sub-word field
+// followed by another field is currently not portable: under `-ra` the trailing
+// field reads back as all-ones, while the interpreter reads it correctly.
+// Minimal case:
+//   type B #unboxed #packed { case T(a: i16, b: i8) #unboxed #packed; case F #unboxed #packed; }
+//   var v: B = B.T(i16.view(k - 100), i8.view(k - 60));
+//   var t = B.T.!(v);  (t.a, t.b)  ==  (-100, -60) on v3i, (-100, -1) with -ra
+type Bits #unboxed #packed {
+	case One(a: u13, b: u16, c: bool) #unboxed #packed;
+	case Two(a: u29, b: bool) #unboxed #packed;
+	case Three(a: u16, b: i8) #unboxed #packed;
+	case Four #unboxed #packed;
+}
+
+// Data types used with iN.pack / iN.unpack.
+type Pt(x: u4, y: u4) { }
+type Wide(a: u8, b: u16, c: u8) { }
+type GPair<X>(x: X, y: X) { }
+enum Flag { F0, F1, F2, F3 }
+
+def leafyVal(l: Leafy) -> int {
+	match (l) {
+		A(x) => return x;
+		B(y, z) => return int.!(y) * 100 + int.!(z);
+		C => return -7;
+	}
+}
+def nestVal(n: Nest) -> int {
+	match (n) {
+		P(i, k) => return leafyVal(i) + k;
+		Q(i, j) => return leafyVal(i) - leafyVal(j);
+		R => return -9;
+	}
+}
+def bitsVal(b: Bits) -> int {
+	match (b) {
+		One(a, bb, c) => return int.!(a) + int.!(bb) + if(c, 1000, 0);
+		Two(a, bb) => return int.view(a) + if(bb, 2000, 0);
+		Three(a, bb) => return int.!(a) * 10 + int.!(bb);
+		Four => return -4;
+	}
+}
+def makeUB(i: int) -> UB {
+	var a = NUMS[i % NUMS.length];
+	var b = NUMS[(i + 5) % NUMS.length];
+	match (i % 7) {
+		0 => return UB.Zero;
+		1 => return UB.I(a);
+		2 => return UB.L(long.!(a) * 1000000007L, (i & 1) == 0);
+		3 => return UB.S(WORDS[i % WORDS.length], byte.view(a));
+		4 => return UB.F(float.roundi(a) * 0.5f, double.roundi(b) / 4d);
+		5 => {
+			var o = Cls.new(a);
+			o.w = b;
+			return UB.R(o, i);
+		}
+		_ => return UB.T((a, byte.view(b), (i & 2) == 0));
+	}
+}
+def makeLeafy(i: int) -> Leafy {
+	match (i % 3) {
+		0 => return Leafy.A(NUMS[i % NUMS.length]);
+		1 => return Leafy.B(byte.view(i), byte.view(i * 3));
+		_ => return Leafy.C;
+	}
+}
+def makeNest(i: int) -> Nest {
+	match (i % 3) {
+		0 => return Nest.P(makeLeafy(i), i);
+		1 => return Nest.Q(makeLeafy(i), makeLeafy(i + 1));
+		_ => return Nest.R;
+	}
+}
+def makeBits(i: int) -> Bits {
+	match (i % 4) {
+		0 => return Bits.One(u13.view(i % 8192), u16.view(i * 7), (i & 1) == 0);
+		1 => return Bits.Two(u29.view(i * 13), (i & 2) == 0);
+		2 => return Bits.Three(u16.view(i * 5 + 100), i8.view(i - 60));
+		_ => return Bits.Four;
+	}
+}
+
+//======================================================================
+// Section 1: unboxed variants with mixed field types
+//======================================================================
+def basics() {
+	var h = 0;
+	for (i < 140) {
+		var u = makeUB(i);
+		h = mix(h, u.val());
+		h = mix(h, u.doubled());
+		h = mix(h, u.tag);
+		h = mixs(h, u.name);
+	}
+	acci(h);
+
+	var g = 0;
+	for (i < 140) {
+		var u = makeUB(i);
+		match (u) {
+			Zero => g = mix(g, -1);
+			I(x) => g = mix(g, x);
+			L(x, b) => { g = mixl(g, x); g = mixb(g, b); }
+			S(s, k) => { g = mixs(g, s); g = mix(g, k); }
+			F(f, d) => { g = mixf(g, f); g = mixd(g, d); }
+			R(o, n) => { g = mix(g, if(o == null, -1, o.score())); g = mix(g, n); }
+			T(t) => { g = mix(g, t.0); g = mix(g, t.1); g = mixb(g, t.2); }
+		}
+	}
+	acci(g);
+
+	var o = Cls.new(3);
+	o.w = 4;
+	if (UB.Zero.val() != -1) fail_assert(101);
+	if (UB.I(5).val() != 5) fail_assert(102);
+	if (UB.L(7, true).val() != 8) fail_assert(103);
+	if (UB.L(7, false).val() != 7) fail_assert(104);
+	if (UB.S(WORDS[1], 10).val() != 13) fail_assert(105);
+	if (UB.S(null, 10).val() != 8) fail_assert(106);
+	if (UB.F(2.5f, 8.75d).val() != 10) fail_assert(107);
+	if (UB.R(o, 5).val() != 39) fail_assert(108);
+	if (UB.R(null, 5).val() != 2) fail_assert(109);
+	if (UB.T((3, 4, true)).val() != 107) fail_assert(110);
+	if (UB.T((3, 4, false)).val() != 7) fail_assert(111);
+	if (UB.I(5).doubled() != 10) fail_assert(112);
+	if (UB.Zero.doubled() != -2) fail_assert(113);
+	if (UB.Zero.tag != 0) fail_assert(114);
+	if (UB.T((0, 0, false)).tag != 6) fail_assert(115);
+	if (UB.I(0).name.length != 1) fail_assert(116);
+	// dispatch through a parent-typed variable and a function value
+	var v: UB = UB.L(7, true);
+	if (v.val() != 8) fail_assert(117);
+	var f: UB -> int = UB.val;
+	if (f(UB.I(9)) != 9) fail_assert(118);
+	if (f(UB.Zero) != -1) fail_assert(119);
+	// field accessor as a function value
+	var getx = UB.I.x;
+	if (getx(UB.I(21)) != 21) fail_assert(120);
+}
+
+//======================================================================
+// Section 2: nested unboxed variants
+//======================================================================
+def nestedub() {
+	var h = 0;
+	for (i < 120) {
+		var l = makeLeafy(i);
+		var n = makeNest(i);
+		h = mix(h, leafyVal(l));
+		h = mix(h, nestVal(n));
+		h = mix(h, l.tag);
+		h = mix(h, n.tag);
+		h = mixb(h, Nest.P.?(n));
+		h = mixb(h, Leafy.B.?(l));
+	}
+	acci(h);
+
+	var g = 0;
+	for (i < 60) {
+		var n = makeNest(i);
+		match (n) {
+			P(inner, k) => {
+				match (inner) {
+					A(x) => g = mix(g, x + k);
+					B(y, z) => g = mix(g, int.!(y) + int.!(z) + k);
+					C => g = mix(g, k);
+				}
+			}
+			Q(a, b) => g = mix(g, leafyVal(a) * 3 - leafyVal(b));
+			R => g = mix(g, -1);
+		}
+	}
+	acci(g);
+
+	if (leafyVal(Leafy.A(5)) != 5) fail_assert(201);
+	if (leafyVal(Leafy.B(2, 3)) != 203) fail_assert(202);
+	if (leafyVal(Leafy.C) != -7) fail_assert(203);
+	if (nestVal(Nest.P(Leafy.A(5), 6)) != 11) fail_assert(204);
+	if (nestVal(Nest.P(Leafy.C, 6)) != -1) fail_assert(205);
+	if (nestVal(Nest.Q(Leafy.A(5), Leafy.A(2))) != 3) fail_assert(206);
+	if (nestVal(Nest.R) != -9) fail_assert(207);
+	if (Nest.P(Leafy.C, 0).tag != 0) fail_assert(208);
+	if (Nest.R.tag != 2) fail_assert(209);
+	if (Leafy.C.tag != 2) fail_assert(210);
+	// the nested value round-trips through the outer variant intact
+	var n: Nest = Nest.P(Leafy.B(9, 8), 1);
+	if (!Nest.P.?(n)) fail_assert(211);
+	var inner = Nest.P.!(n).i;
+	if (!Leafy.B.?(inner)) fail_assert(212);
+	if (Leafy.B.!(inner).y != 9) fail_assert(213);
+	if (Leafy.B.!(inner).z != 8) fail_assert(214);
+	if (!(inner == Leafy.B(9, 8))) fail_assert(215);
+	if (!(n == Nest.P(Leafy.B(9, 8), 1))) fail_assert(216);
+	if (n == Nest.P(Leafy.B(9, 7), 1)) fail_assert(217);
+	if (n == Nest.P(Leafy.A(9), 1)) fail_assert(218);
+}
+
+//======================================================================
+// Section 3: unboxed variants in arrays, tuples, globals and class fields
+//======================================================================
+class Holder {
+	var u: UB;
+	var n: Nest;
+	var b: Bits;
+	var pair: (UB, Leafy);
+	var many: Array<Leafy>;
+	new() {
+		u = UB.Zero;
+		n = Nest.R;
+		b = Bits.Four;
+		pair = (UB.Zero, Leafy.C);
+		many = Array<Leafy>.new(4);
+		for (i < many.length) many[i] = Leafy.A(i);
+	}
+	def total() -> int {
+		var t = u.val() + nestVal(n) + bitsVal(b) + pair.0.val() + leafyVal(pair.1);
+		for (i < many.length) t += leafyVal(many[i]);
+		return t;
+	}
+}
+var gUB: UB;
+var gLeafy: Leafy;
+var gBits: Bits;
+var gTup: (UB, Leafy, int);
+var gArr: Array<UB>;
+
+def storage() {
+	gUB = UB.Zero;
+	gLeafy = Leafy.C;
+	gBits = Bits.Four;
+	gTup = (UB.Zero, Leafy.C, 0);
+	gArr = null;
+
+	var h = mix(0, gUB.val());
+	h = mix(h, leafyVal(gLeafy));
+	h = mix(h, bitsVal(gBits));
+	h = mixb(h, gArr == null);
+	acci(h);
+	if (gUB.val() != -1) fail_assert(301);
+	if (bitsVal(gBits) != -4) fail_assert(302);
+	if (gArr != null) fail_assert(303);
+
+	gArr = Array<UB>.new(140);
+	var ls = Array<Leafy>.new(140);
+	var bs = Array<Bits>.new(140);
+	for (i < gArr.length) {
+		gArr[i] = makeUB(i);
+		ls[i] = makeLeafy(i);
+		bs[i] = makeBits(i);
+	}
+	var g = 0;
+	for (i < gArr.length) {
+		gUB = gArr[i];
+		gLeafy = ls[i];
+		gBits = bs[i];
+		gTup = (gUB, gLeafy, i);
+		g = mix(g, gUB.val());
+		g = mix(g, leafyVal(gLeafy));
+		g = mix(g, bitsVal(gBits));
+		g = mix(g, gTup.0.val());
+		g = mix(g, leafyVal(gTup.1));
+		g = mix(g, gTup.2);
+		g = mix(g, gArr[i].tag);
+	}
+	acci(g);
+	if (gTup.2 != 139) fail_assert(304);
+	if (gArr[7].tag != 0) fail_assert(305);		// 7 % 7 == 0
+	if (ls[4].tag != 1) fail_assert(306);		// 4 % 3 == 1
+	if (bs[6].tag != 2) fail_assert(307);		// 6 % 4 == 2
+
+	// array element writes really replace the whole unboxed value
+	gArr[3] = UB.I(77);
+	if (gArr[3].val() != 77) fail_assert(308);
+	if (!(gArr[3] == UB.I(77))) fail_assert(309);
+	ls[3] = Leafy.B(1, 2);
+	if (leafyVal(ls[3]) != 102) fail_assert(310);
+
+	// class fields
+	var hs = Array<Holder>.new(40);
+	for (i < hs.length) {
+		var x = Holder.new();
+		x.u = makeUB(i);
+		x.n = makeNest(i);
+		x.b = makeBits(i);
+		x.pair = (makeUB(i + 1), makeLeafy(i));
+		hs[i] = x;
+	}
+	var k = 0;
+	for (i < hs.length) {
+		k = mix(k, hs[i].total());
+		k = mix(k, hs[i].u.tag);
+		k = mix(k, hs[i].b.tag);
+		k = mix(k, leafyVal(hs[i].many[2]));
+	}
+	acci(k);
+
+	var one = Holder.new();
+	// Zero (-1) + R (-9) + Four (-4) + Zero (-1) + C (-7) + A(0..3) summing 6
+	if (one.total() != -1 - 9 - 4 - 1 - 7 + 6) fail_assert(311);
+	one.u = UB.I(50);
+	if (one.total() != 50 - 9 - 4 - 1 - 7 + 6) fail_assert(312);
+	one.many[2] = Leafy.B(1, 1);
+	if (leafyVal(one.many[2]) != 101) fail_assert(313);
+
+	gUB = UB.Zero;
+	gLeafy = Leafy.C;
+	gBits = Bits.Four;
+	gTup = (UB.Zero, Leafy.C, 0);
+	gArr = null;
+}
+
+//======================================================================
+// Section 4: comparison and query behavior
+//======================================================================
+def ubeq = UB.==;
+def leq = Leafy.==;
+def equality() {
+	var h = 0;
+	for (i < 70) {
+		var a = makeUB(i);
+		var b = makeUB(i);
+		var c = makeUB(i + 1);
+		h = mixb(h, a == b);
+		h = mixb(h, a == c);
+		h = mixb(h, a != c);
+		h = mixb(h, ubeq(a, a));
+	}
+	acci(h);
+	var g = 0;
+	for (i < 24) for (j < 24) {
+		g = mixb(g, makeLeafy(i) == makeLeafy(j));
+		g = mixb(g, leq(makeLeafy(i), makeLeafy(j)));
+		g = mixb(g, makeBits(i) == makeBits(j));
+		g = mixb(g, makeNest(i) == makeNest(j));
+	}
+	acci(g);
+
+	// same case, same payload
+	if (!(UB.Zero == UB.Zero)) fail_assert(401);
+	if (!(UB.I(5) == UB.I(5))) fail_assert(402);
+	if (UB.I(5) == UB.I(6)) fail_assert(403);
+	if (!(UB.L(9, true) == UB.L(9, true))) fail_assert(404);
+	if (UB.L(9, true) == UB.L(9, false)) fail_assert(405);
+	if (!(UB.T((1, 2, true)) == UB.T((1, 2, true)))) fail_assert(406);
+	if (UB.T((1, 2, true)) == UB.T((1, 2, false))) fail_assert(407);
+	// different cases are never equal
+	var z: UB = UB.Zero;
+	var i5: UB = UB.I(5);
+	if (z == i5) fail_assert(408);
+	if (!(z != i5)) fail_assert(409);
+	// class and string payloads compare by reference
+	var o1 = Cls.new(3), o2 = Cls.new(3);
+	if (!(UB.R(o1, 1) == UB.R(o1, 1))) fail_assert(410);
+	if (UB.R(o1, 1) == UB.R(o2, 1)) fail_assert(411);
+	var w1 = Array<byte>.new(1), w2 = Array<byte>.new(1);
+	w1[0] = 'q';
+	w2[0] = 'q';
+	if (UB.S(w1, 0) == UB.S(w2, 0)) fail_assert(412);
+	if (!(UB.S(w1, 0) == UB.S(w1, 0))) fail_assert(413);
+	// float payloads compare bitwise: 0.0 and -0.0 are distinct
+	if (!(UB.F(1.5f, 2.5d) == UB.F(1.5f, 2.5d))) fail_assert(414);
+	if (UB.F(0f, 0d) == UB.F(-0.0f, 0d)) fail_assert(415);
+	// the equality operator taken as a function value agrees
+	if (!ubeq(UB.I(5), UB.I(5))) fail_assert(416);
+	if (ubeq(UB.I(5), UB.I(6))) fail_assert(417);
+	if (!leq(Leafy.C, Leafy.C)) fail_assert(418);
+	var la: Leafy = Leafy.A(1);
+	if (leq(la, Leafy.C)) fail_assert(419);
+	// packed variants compare on their packed representation
+	if (!(Bits.One(1, 2, true) == Bits.One(1, 2, true))) fail_assert(420);
+	if (Bits.One(1, 2, true) == Bits.One(1, 2, false)) fail_assert(421);
+	var b1: Bits = Bits.Two(7, false);
+	if (b1 == Bits.Four) fail_assert(422);
+	if (!(Bits.Four == Bits.Four)) fail_assert(423);
+	if (!(Bits.Three(11, -3) == Bits.Three(11, -3))) fail_assert(424);
+	if (Bits.Three(11, -3) == Bits.Three(11, 3)) fail_assert(425);
+	// queries
+	var ul: UB = UB.L(1, true);
+	if (!UB.L.?(ul)) fail_assert(426);
+	if (UB.L.?(z)) fail_assert(427);
+	if (!Bits.Two.?(b1)) fail_assert(428);
+	if (Bits.One.?(b1)) fail_assert(429);
+	var ul2: UB = UB.L(42, false);
+	if (UB.L.!(ul2).x != 42) fail_assert(430);
+}
+
+//======================================================================
+// Section 5: packed variants
+//======================================================================
+def packedvariants() {
+	var arr = Array<Bits>.new(200);
+	for (i < arr.length) arr[i] = makeBits(i);
+	var h = 0;
+	for (i < arr.length) {
+		h = mix(h, bitsVal(arr[i]));
+		h = mix(h, arr[i].tag);
+		h = mixs(h, arr[i].name);
+		h = mixb(h, Bits.One.?(arr[i]));
+		h = mixb(h, Bits.Four.?(arr[i]));
+	}
+	acci(h);
+
+	var g = 0;
+	for (i < arr.length) {
+		match (arr[i]) {
+			One(a, b, c) => { g = mix(g, a); g = mix(g, b); g = mixb(g, c); }
+			Two(a, b) => { g = mix(g, int.view(a)); g = mixb(g, b); }
+			Three(a, b) => { g = mix(g, a); g = mix(g, b); }
+			Four => g = mix(g, -1);
+		}
+	}
+	acci(g);
+
+	// field values survive the packed representation, including sign extension
+	if (bitsVal(Bits.One(1, 2, true)) != 1003) fail_assert(501);
+	if (bitsVal(Bits.One(1, 2, false)) != 3) fail_assert(502);
+	if (bitsVal(Bits.Two(7, true)) != 2007) fail_assert(503);
+	if (bitsVal(Bits.Three(11, -3)) != 107) fail_assert(504);
+	if (bitsVal(Bits.Four) != -4) fail_assert(505);
+	if (Bits.One(0, 0, false).tag != 0) fail_assert(506);
+	if (Bits.Two(0, false).tag != 1) fail_assert(507);
+	if (Bits.Three(0, 0).tag != 2) fail_assert(508);
+	if (Bits.Four.tag != 3) fail_assert(509);
+	// widest values in each field
+	var w1: Bits = Bits.One(8191, 65535, true);
+	var w2: Bits = Bits.Two(536870911, true);
+	var w3: Bits = Bits.Three(65535, -128);
+	var w4: Bits = Bits.Three(0, 127);
+	var w5: Bits = Bits.Three(1, -1);
+	if (Bits.One.!(w1).a != 8191) fail_assert(510);
+	if (Bits.One.!(w1).b != 65535) fail_assert(511);
+	if (Bits.One.!(w1).c != true) fail_assert(512);
+	if (Bits.Two.!(w2).a != 536870911) fail_assert(513);
+	if (Bits.Three.!(w3).a != 65535) fail_assert(514);
+	if (Bits.Three.!(w4).b != 127) fail_assert(515);
+	if (Bits.Three.!(w5).b != -1) fail_assert(516);
+	// packed values in arrays keep their identity
+	var pa = Array<Bits>.new(4);
+	pa[0] = Bits.One(5, 6, true);
+	pa[1] = Bits.Two(9, false);
+	pa[2] = Bits.Three(5, -6);
+	pa[3] = Bits.Four;
+	if (bitsVal(pa[0]) != 1011) fail_assert(517);
+	if (bitsVal(pa[1]) != 9) fail_assert(518);
+	if (bitsVal(pa[2]) != 44) fail_assert(519);
+	if (bitsVal(pa[3]) != -4) fail_assert(520);
+	if (!(pa[0] == Bits.One(5, 6, true))) fail_assert(521);
+	var k = 0;
+	for (i < pa.length) {
+		k = mix(k, bitsVal(pa[i]));
+		k = mix(k, pa[i].tag);
+	}
+	acci(k);
+}
+
+//======================================================================
+// Section 6: iN.pack and iN.unpack
+//======================================================================
+def packints() {
+	// the first field occupies the HIGH bits; fields are contiguous
+	var h = 0;
+	for (i < 16) {
+		for (j < 16) {
+			var p = u8.pack<(u4, u4)>((u4.view(i), u4.view(j)));
+			h = mix(h, p);
+			var u = u8.unpack<(u4, u4)>(p);
+			h = mix(h, u.0);
+			h = mix(h, u.1);
+		}
+	}
+	acci(h);
+
+	var g = 0;
+	for (i < 64) {
+		var pt = Pt(u4.view(i), u4.view(i * 3));
+		var p = u8.pack<Pt>(pt);
+		var u = u8.unpack<Pt>(p);
+		g = mix(g, p);
+		g = mix(g, u.x);
+		g = mix(g, u.y);
+		g = mixb(g, u == pt);
+		var w = Wide(u8.view(i), u16.view(i * 257), u8.view(i + 3));
+		var q = u32.pack<Wide>(w);
+		var v = u32.unpack<Wide>(q);
+		g = mix(g, int.view(q));
+		g = mix(g, v.a);
+		g = mix(g, v.b);
+		g = mix(g, v.c);
+		g = mixb(g, v == w);
+	}
+	acci(g);
+
+	// nested tuples flatten in declaration order
+	if (int.view(u12.pack<(u4, (u4, u4))>((0xA, (0xB, 0xC)))) != 0xABC) fail_assert(601);
+	if (int.view(u12.pack<(u4, u4, u4)>((0xA, 0xB, 0xC))) != 0xABC) fail_assert(602);
+	if (int.view(u12.pack<((u4, u4), u4)>(((0xA, 0xB), 0xC))) != 0xABC) fail_assert(603);
+	if (int.view(u16.pack<(u8, u8)>((0x12, 0x34))) != 0x1234) fail_assert(604);
+	if (int.view(u12.pack<(u4, u8)>((0xA, 0xBC))) != 0xABC) fail_assert(605);
+	if (int.view(u12.pack<(u8, u4)>((0xAB, 0xC))) != 0xABC) fail_assert(606);
+	// data types pack like the tuple of their fields
+	if (int.view(u8.pack<Pt>(Pt(0xA, 0xB))) != 0xAB) fail_assert(607);
+	if (u8.unpack<Pt>(0xAB).x != 0xA) fail_assert(608);
+	if (u8.unpack<Pt>(0xAB).y != 0xB) fail_assert(609);
+	if (!(u8.unpack<Pt>(0xAB) == Pt(0xA, 0xB))) fail_assert(610);
+	if (int.view(u32.pack<Wide>(Wide(0x12, 0x3456, 0x78))) != 0x12345678) fail_assert(611);
+	if (u32.unpack<Wide>(0x12345678u).b != 0x3456) fail_assert(612);
+	// generic data types instantiate their field types
+	if (int.view(u8.pack<GPair<u4>>(GPair<u4>(0xA, 0xB))) != 0xAB) fail_assert(613);
+	if (u8.unpack<GPair<u4>>(0xAB).x != 0xA) fail_assert(614);
+	if (int.view(u24.pack<GPair<u12>>(GPair<u12>(0xABB, 0xCCD))) != 0xABBCCD) fail_assert(615);
+	if (u24.unpack<GPair<u12>>(u24.view(0xABBCCD)).y != 0xCCD) fail_assert(616);
+	// an enum set packs to its bitset, first case in the LOW bit
+	if (int.view(u4.pack<Flag.set>(Flag.F1 | Flag.F3)) != 0b1010) fail_assert(617);
+	if (int.view(u4.pack<Flag.set>(Flag.set.all)) != 0b1111) fail_assert(618);
+	if (!(u4.unpack<Flag.set>(0b0101) == (Flag.F0 | Flag.F2))) fail_assert(619);
+	// round trip at runtime, with a value the optimizer cannot see through
+	var k = 0;
+	for (i < 16) {
+		var s = fromBits(i);
+		var p = u4.pack<Flag.set>(s);
+		k = mix(k, int.view(p));
+		k = mixb(k, u4.unpack<Flag.set>(p) == s);
+	}
+	acci(k);
+	if (int.view(u4.pack<Flag.set>(fromBits(0b1010))) != 0b1010) fail_assert(620);
+	if (int.view(u4.pack<Flag.set>(fromBits(0))) != 0) fail_assert(621);
+}
+def fromBits(x: int) -> Flag.set {
+	var s: Flag.set;
+	if ((x & 1) != 0) s |= Flag.F0;
+	if ((x & 2) != 0) s |= Flag.F1;
+	if ((x & 4) != 0) s |= Flag.F2;
+	if ((x & 8) != 0) s |= Flag.F3;
+	return s;
+}
+
+//======================================================================
+// Section 7: unboxed variants through functions and tuples
+//======================================================================
+def swapUB(t: (UB, UB)) -> (UB, UB) { return (t.1, t.0); }
+def pickUB(a: UB, b: UB, which: bool) -> UB { return if(which, a, b); }
+def sumVals(a: Array<UB>) -> int {
+	var s = 0;
+	for (i < a.length) s += a[i].val();
+	return s;
+}
+def funcs() {
+	var arr = Array<UB>.new(140);
+	for (i < arr.length) arr[i] = makeUB(i);
+	var h = mix(0, sumVals(arr));
+	for (i < arr.length) {
+		var t = (arr[i], arr[(i + 1) % arr.length]);
+		var s = swapUB(t);
+		h = mix(h, s.0.val());
+		h = mix(h, s.1.val());
+		h = mixb(h, t == s);
+		h = mix(h, pickUB(t.0, t.1, (i & 1) == 0).val());
+	}
+	acci(h);
+
+	// unboxed variants returned from and passed through delegates
+	def FS: Array<UB -> int> = [UB.val, UB.doubled, ubtag];
+	var g = 0;
+	for (k < FS.length) for (i < arr.length) g = mix(g, FS[k](arr[i]));
+	acci(g);
+
+	var mk: int -> UB = makeUB;
+	var k = 0;
+	for (i < 140) k = mix(k, mk(i).val());
+	acci(k);
+
+	if (swapUB((UB.I(1), UB.I(2))).0.val() != 2) fail_assert(701);
+	if (pickUB(UB.I(1), UB.I(2), true).val() != 1) fail_assert(702);
+	if (pickUB(UB.I(1), UB.I(2), false).val() != 2) fail_assert(703);
+	var two: Array<UB> = [UB.I(3), UB.I(4)];
+	if (sumVals(two) != 7) fail_assert(704);
+	if (mk(1).val() != NUMS[1]) fail_assert(705);
+	var t1 = (UB.I(1), UB.Zero);
+	var t2 = (UB.I(1), UB.Zero);
+	if (!(t1 == t2)) fail_assert(706);
+	if (t1 == swapUB(t1)) fail_assert(707);
+	if (ubtag(UB.Zero) != 0) fail_assert(708);
+}
+def ubtag(u: UB) -> int { return u.tag; }
+
+//======================================================================
+// Section 8: bulk work and allocation churn
+//======================================================================
+def churn() {
+	srand(0x5EEDA1);
+	// arrays of unboxed variants: the elements themselves are not boxed, but
+	// the class and string payloads they carry are.
+	var keep = Array<Array<UB>>.new(8);
+	var h = 0;
+	for (i < 500) {
+		var a = Array<UB>.new(64);
+		for (j < a.length) a[j] = makeUB(randn(140));
+		if ((i % 61) == 0) keep[(i / 61) % keep.length] = a;
+		if ((i % 97) == 0) h = mix(h, sumVals(a));
+	}
+	acci(h);
+	var g = 0;
+	for (i < keep.length) {
+		if (keep[i] == null) continue;
+		g = mix(g, sumVals(keep[i]));
+		for (j < keep[i].length) g = mix(g, keep[i][j].tag);
+	}
+	acci(g);
+
+	// packed and nested unboxed variants in long-lived arrays
+	var bs = Array<Bits>.new(2000);
+	var ns = Array<Nest>.new(2000);
+	for (i < bs.length) {
+		bs[i] = makeBits(randn(200));
+		ns[i] = makeNest(randn(120));
+	}
+	var k = 0;
+	for (i < bs.length) {
+		k = mix(k, bitsVal(bs[i]));
+		k = mix(k, nestVal(ns[i]));
+	}
+	acci(k);
+	var m = 0;
+	for (i < 800) {
+		var junk = Array<Nest>.new(32);
+		for (j < junk.length) junk[j] = makeNest(randn(120));
+		if ((i % 197) == 0) m = mix(m, nestVal(junk[0]));
+	}
+	acci(m);
+}
+
+//======================================================================
+def run(a: int) {
+	crc = a;
+	failed = 0;
+	if (a == 0 || a == 1) basics();
+	if (a == 0 || a == 2) nestedub();
+	if (a == 0 || a == 3) storage();
+	if (a == 0 || a == 4) equality();
+	if (a == 0 || a == 5) packedvariants();
+	if (a == 0 || a == 6) packints();
+	if (a == 0 || a == 7) funcs();
+	if (a == 0 || a == 8) churn();
+}
+def main(a: int) -> int {
+	run(a);
+	if (failed != 0) return failed;
+	return crc;
+}

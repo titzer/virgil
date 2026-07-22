@@ -1,0 +1,747 @@
+//@execute 0=0
+//@heap-size=5000000
+// Smoke test: graph algorithms over an object graph.
+// Nodes are heap objects with growable adjacency arrays; the traversals use
+// arrays as explicit stacks and queues plus integer visit stamps, so the whole
+// file is pointer chasing over a large, mutating object graph -- exactly the
+// shape that finds GC and register-allocation bugs. Breadth-first search,
+// depth-first search (recursive and iterative, which must agree), topological
+// sort with cycle detection, connected components and a longest-path DP each
+// run over small hand-checked graphs and over larger generated ones whose
+// results feed the CRC that main() returns.
+// Interleaved are assert()s over compile-time constants and hand-derived
+// answers; a folding or codegen bug shows up as the assertion id instead.
+// Input selects the section; input 0 runs every section in one method body.
+
+//======================================================================
+// Accumulator and assertions
+//======================================================================
+var crc: int;
+var failed: int;
+
+def mix(h: int, x: int) -> int {
+	var t = h ^ x;
+	t = t * 0x01000193;
+	return t ^ (t >>> 15);
+}
+def mixb(h: int, b: bool) -> int {
+	return mix(h, if(b, 0x5A5A5A5A, 0x0F0F0F0F));
+}
+def acci(x: int) { crc = mix(crc, x); }
+
+// Records the first failing assertion; main() returns the id instead of the CRC.
+def fail_assert(id: int) { if (failed == 0) failed = id; }
+
+var seed: int;
+def srand(s: int) { seed = s; }
+def rand() -> int {
+	seed = seed * 1664525 + 1013904223;
+	seed = seed ^ (seed >>> 16);
+	return seed;
+}
+def randn(n: int) -> int { return (rand() & 0x7FFFFFFF) % n; }
+
+//======================================================================
+// The graph
+//======================================================================
+class Node {
+	def id: int;
+	var succ: Array<Node>;
+	var nsucc: int;
+	var pred: Array<Node>;
+	var npred: int;
+	var mark: int;			// visit stamp
+	var dist: int;
+	var order: int;
+	var comp: int;
+	var value: int;
+	new(id) {
+		succ = Array<Node>.new(2);
+		pred = Array<Node>.new(2);
+		value = id * 3 + 1;
+	}
+	def addSucc(n: Node) {
+		if (nsucc == succ.length) {
+			var bigger = Array<Node>.new(succ.length * 2);
+			for (i < nsucc) bigger[i] = succ[i];
+			succ = bigger;
+		}
+		succ[nsucc] = n;
+		nsucc++;
+	}
+	def addPred(n: Node) {
+		if (npred == pred.length) {
+			var bigger = Array<Node>.new(pred.length * 2);
+			for (i < npred) bigger[i] = pred[i];
+			pred = bigger;
+		}
+		pred[npred] = n;
+		npred++;
+	}
+	def fp() -> int {
+		var h = mix(id, value);
+		h = mix(h, nsucc);
+		for (i < nsucc) h = mix(h, succ[i].id);
+		return h;
+	}
+}
+class Graph {
+	var nodes: Array<Node>;
+	var edges: int;
+	var stamp: int;
+	new(n: int) {
+		nodes = Array<Node>.new(n);
+		for (i < n) nodes[i] = Node.new(i);
+	}
+	def addEdge(a: int, b: int) {
+		nodes[a].addSucc(nodes[b]);
+		nodes[b].addPred(nodes[a]);
+		edges++;
+	}
+	def nextStamp() -> int { stamp++; return stamp; }
+	def fold() -> int {
+		var h = mix(0, nodes.length);
+		h = mix(h, edges);
+		for (i < nodes.length) h = mix(h, nodes[i].fp());
+		return h;
+	}
+}
+
+// 0 -> 1, 0 -> 2, 1 -> 3, 2 -> 3, 3 -> 4;  5 is isolated
+def smallGraph() -> Graph {
+	var g = Graph.new(6);
+	g.addEdge(0, 1);
+	g.addEdge(0, 2);
+	g.addEdge(1, 3);
+	g.addEdge(2, 3);
+	g.addEdge(3, 4);
+	return g;
+}
+// a directed cycle 0 -> 1 -> 2 -> 0 plus a tail 2 -> 3
+def cycleGraph() -> Graph {
+	var g = Graph.new(4);
+	g.addEdge(0, 1);
+	g.addEdge(1, 2);
+	g.addEdge(2, 0);
+	g.addEdge(2, 3);
+	return g;
+}
+// a layered DAG: `layers` layers of `width` nodes, every node pointing at a
+// deterministic subset of the next layer
+def layeredDag(layers: int, width: int) -> Graph {
+	var g = Graph.new(layers * width);
+	for (l < layers - 1) {
+		for (i < width) {
+			var from = l * width + i;
+			g.addEdge(from, (l + 1) * width + i);
+			g.addEdge(from, (l + 1) * width + ((i + 1) % width));
+		}
+	}
+	return g;
+}
+// a random DAG: edges always point from a lower index to a higher one
+def randomDag(n: int, density: int) -> Graph {
+	var g = Graph.new(n);
+	for (i < n) {
+		var outs = randn(density);
+		for (k < outs) {
+			var j = i + 1 + randn(8);
+			if (j < n) g.addEdge(i, j);
+		}
+	}
+	return g;
+}
+
+//======================================================================
+// Section 1: construction and shape
+//======================================================================
+def build() {
+	var g = smallGraph();
+	if (g.nodes.length != 6) fail_assert(101);
+	if (g.edges != 5) fail_assert(102);
+	if (g.nodes[0].nsucc != 2) fail_assert(103);
+	if (g.nodes[0].npred != 0) fail_assert(104);
+	if (g.nodes[3].npred != 2) fail_assert(105);
+	if (g.nodes[3].nsucc != 1) fail_assert(106);
+	if (g.nodes[5].nsucc != 0) fail_assert(107);
+	if (g.nodes[5].npred != 0) fail_assert(108);
+	if (g.nodes[0].succ[0].id != 1) fail_assert(109);
+	if (g.nodes[0].succ[1].id != 2) fail_assert(110);
+	if (g.nodes[3].pred[0].id != 1) fail_assert(111);
+	if (g.nodes[4].value != 13) fail_assert(112);		// 4*3+1
+	// growing an adjacency array past its initial capacity
+	var big = Graph.new(3);
+	for (i < 25) big.addEdge(0, 1 + (i % 2));
+	if (big.edges != 25) fail_assert(113);
+	if (big.nodes[0].nsucc != 25) fail_assert(114);
+	if (big.nodes[0].succ.length < 25) fail_assert(115);
+	if (big.nodes[1].npred != 13) fail_assert(116);		// i even: 13 of 25
+	if (big.nodes[2].npred != 12) fail_assert(117);
+	var bad = 0;
+	for (i < 25) if (big.nodes[0].succ[i].id != 1 + (i % 2)) bad++;
+	if (bad != 0) fail_assert(118);
+	acci(g.fold());
+	acci(big.fold());
+
+	var lg = layeredDag(10, 8);
+	if (lg.nodes.length != 80) fail_assert(119);
+	if (lg.edges != 9 * 8 * 2) fail_assert(120);		// 144
+	if (lg.nodes[0].nsucc != 2) fail_assert(121);
+	if (lg.nodes[79].nsucc != 0) fail_assert(122);
+	if (lg.nodes[72].npred != 2) fail_assert(123);
+	acci(lg.fold());
+	// folding is stable across rebuilds
+	if (layeredDag(10, 8).fold() != lg.fold()) fail_assert(124);
+	if (smallGraph().fold() != g.fold()) fail_assert(125);
+}
+
+//======================================================================
+// Breadth-first search, using an array as a queue
+//======================================================================
+def bfs(g: Graph, start: int) -> int {
+	var s = g.nextStamp();
+	var queue = Array<Node>.new(g.nodes.length);
+	var head = 0, tail = 0;
+	var n0 = g.nodes[start];
+	n0.mark = s;
+	n0.dist = 0;
+	queue[tail] = n0;
+	tail++;
+	var reached = 0;
+	while (head < tail) {
+		var n = queue[head];
+		head++;
+		reached++;
+		for (i < n.nsucc) {
+			var m = n.succ[i];
+			if (m.mark != s) {
+				m.mark = s;
+				m.dist = n.dist + 1;
+				queue[tail] = m;
+				tail++;
+			}
+		}
+	}
+	// unreached nodes get -1
+	for (i < g.nodes.length) if (g.nodes[i].mark != s) g.nodes[i].dist = -1;
+	return reached;
+}
+
+//======================================================================
+// Section 2: breadth-first search
+//======================================================================
+def breadth() {
+	var g = smallGraph();
+	var reached = bfs(g, 0);
+	if (reached != 5) fail_assert(201);
+	if (g.nodes[0].dist != 0) fail_assert(202);
+	if (g.nodes[1].dist != 1) fail_assert(203);
+	if (g.nodes[2].dist != 1) fail_assert(204);
+	if (g.nodes[3].dist != 2) fail_assert(205);
+	if (g.nodes[4].dist != 3) fail_assert(206);
+	if (g.nodes[5].dist != -1) fail_assert(207);
+	// from an isolated node only itself is reachable
+	if (bfs(g, 5) != 1) fail_assert(208);
+	if (g.nodes[5].dist != 0) fail_assert(209);
+	if (g.nodes[0].dist != -1) fail_assert(210);
+	// from 3, only 3 and 4
+	if (bfs(g, 3) != 2) fail_assert(211);
+	if (g.nodes[4].dist != 1) fail_assert(212);
+	if (g.nodes[1].dist != -1) fail_assert(213);
+
+	// on a layered DAG every node of layer l is at distance l from node 0
+	var lg = layeredDag(12, 6);
+	if (bfs(lg, 0) != 57) fail_assert(214);		// 1+2+3+4+5+6 then 6 per layer
+	var h = 0;
+	var bad = 0;
+	for (i < lg.nodes.length) {
+		var n = lg.nodes[i];
+		if (n.dist >= 0) {
+			var layer = i / 6;
+			if (n.dist != layer) bad++;
+		}
+		h = mix(h, n.dist);
+	}
+	acci(h);
+	if (bad != 0) fail_assert(215);
+	// the BFS invariant: for every edge u -> v with u reached, dist(v) <= dist(u)+1
+	srand(0x9002);
+	var rg = randomDag(600, 4);
+	var got = bfs(rg, 0);
+	var viol = 0;
+	var g2 = 0;
+	for (i < rg.nodes.length) {
+		var u = rg.nodes[i];
+		if (u.dist < 0) continue;
+		for (k < u.nsucc) {
+			var v = u.succ[k];
+			if (v.dist < 0 || v.dist > u.dist + 1) viol++;
+		}
+		g2 = mix(g2, u.dist);
+	}
+	acci(g2);
+	acci(mix(0, got));
+	if (viol != 0) fail_assert(216);
+	if (got < 1) fail_assert(217);
+	if (got > 600) fail_assert(218);
+}
+
+//======================================================================
+// Depth-first search: recursive and iterative
+//======================================================================
+def dfsRec(n: Node, s: int, out: Array<int>, np: Array<int>) {
+	n.mark = s;
+	out[np[0]] = n.id;
+	np[0]++;
+	for (i < n.nsucc) {
+		var m = n.succ[i];
+		if (m.mark != s) dfsRec(m, s, out, np);
+	}
+}
+// the iterative version pushes successors in reverse, so it visits them in the
+// same order the recursive version does
+def dfsIter(g: Graph, start: int, out: Array<int>) -> int {
+	var s = g.nextStamp();
+	var stack = Array<Node>.new(g.nodes.length * 4);
+	var sp = 0;
+	var np = 0;
+	stack[sp] = g.nodes[start];
+	sp++;
+	while (sp > 0) {
+		sp--;
+		var n = stack[sp];
+		if (n.mark == s) continue;
+		n.mark = s;
+		out[np] = n.id;
+		np++;
+		for (i = n.nsucc - 1; i >= 0; i--) {
+			var m = n.succ[i];
+			if (m.mark != s) {
+				stack[sp] = m;
+				sp++;
+			}
+		}
+	}
+	return np;
+}
+
+//======================================================================
+// Section 3: depth-first search
+//======================================================================
+def depth() {
+	var g = smallGraph();
+	var out = Array<int>.new(6);
+	var np = Array<int>.new(1);
+	dfsRec(g.nodes[0], g.nextStamp(), out, np);
+	// 0, then 1, then 3, then 4, then back up to 2
+	if (np[0] != 5) fail_assert(301);
+	if (out[0] != 0) fail_assert(302);
+	if (out[1] != 1) fail_assert(303);
+	if (out[2] != 3) fail_assert(304);
+	if (out[3] != 4) fail_assert(305);
+	if (out[4] != 2) fail_assert(306);
+
+	var out2 = Array<int>.new(6);
+	var n2 = dfsIter(g, 0, out2);
+	if (n2 != 5) fail_assert(307);
+	for (i < 5) if (out2[i] != out[i]) fail_assert(308);
+
+	// a cyclic graph must still terminate and visit each node once
+	var cg = cycleGraph();
+	var o3 = Array<int>.new(4);
+	var n3 = dfsIter(cg, 0, o3);
+	if (n3 != 4) fail_assert(309);
+	if (o3[0] != 0) fail_assert(310);
+	if (o3[1] != 1) fail_assert(311);
+	if (o3[2] != 2) fail_assert(312);
+	if (o3[3] != 3) fail_assert(313);
+	var seen = Array<int>.new(4);
+	for (i < n3) seen[o3[i]]++;
+	for (i < 4) if (seen[i] != 1) fail_assert(314);
+
+	// on generated graphs the two traversals must agree exactly
+	srand(0x9003);
+	var h = 0;
+	for (round < 12) {
+		var rg = randomDag(200 + randn(100), 3);
+		var a = Array<int>.new(rg.nodes.length);
+		var pa = Array<int>.new(1);
+		dfsRec(rg.nodes[0], rg.nextStamp(), a, pa);
+		var b = Array<int>.new(rg.nodes.length);
+		var nb = dfsIter(rg, 0, b);
+		if (nb != pa[0]) fail_assert(315);
+		for (i < nb) if (a[i] != b[i]) fail_assert(316);
+		// DFS and BFS reach exactly the same set
+		var reached = bfs(rg, 0);
+		if (reached != nb) fail_assert(317);
+		var t = mix(0, nb);
+		for (i < nb) t = mix(t, a[i]);
+		h = mix(h, t);
+	}
+	acci(h);
+}
+
+//======================================================================
+// Topological sort (Kahn's algorithm) with cycle detection
+//======================================================================
+// returns the number of nodes ordered; less than nodes.length means a cycle
+def toposort(g: Graph, order: Array<int>) -> int {
+	var n = g.nodes.length;
+	var indeg = Array<int>.new(n);
+	for (i < n) indeg[i] = g.nodes[i].npred;
+	var queue = Array<Node>.new(n);
+	var head = 0, tail = 0;
+	for (i < n) if (indeg[i] == 0) { queue[tail] = g.nodes[i]; tail++; }
+	var np = 0;
+	while (head < tail) {
+		var u = queue[head];
+		head++;
+		order[np] = u.id;
+		u.order = np;
+		np++;
+		for (k < u.nsucc) {
+			var v = u.succ[k];
+			indeg[v.id]--;
+			if (indeg[v.id] == 0) { queue[tail] = v; tail++; }
+		}
+	}
+	return np;
+}
+
+//======================================================================
+// Section 4: topological sort
+//======================================================================
+def topo() {
+	var g = smallGraph();
+	var order = Array<int>.new(6);
+	var np = toposort(g, order);
+	if (np != 6) fail_assert(401);
+	// 0 and 5 are the only sources, in index order
+	if (order[0] != 0) fail_assert(402);
+	if (order[1] != 5) fail_assert(403);
+	if (order[2] != 1) fail_assert(404);
+	if (order[3] != 2) fail_assert(405);
+	if (order[4] != 3) fail_assert(406);
+	if (order[5] != 4) fail_assert(407);
+	// every edge points forward in the order
+	var viol = 0;
+	for (i < g.nodes.length) {
+		var u = g.nodes[i];
+		for (k < u.nsucc) if (u.order >= u.succ[k].order) viol++;
+	}
+	if (viol != 0) fail_assert(408);
+
+	// a cycle is detected by a short order
+	var cg = cycleGraph();
+	var o2 = Array<int>.new(4);
+	if (toposort(cg, o2) != 0) fail_assert(409);		// no source at all
+	// adding a source in front leaves the cycle unordered
+	var cg2 = Graph.new(5);
+	cg2.addEdge(4, 0);
+	cg2.addEdge(0, 1);
+	cg2.addEdge(1, 2);
+	cg2.addEdge(2, 0);
+	var o3 = Array<int>.new(5);
+	// nodes 3 (isolated) and 4 (the source) order; the 0-1-2 cycle does not
+	if (toposort(cg2, o3) != 2) fail_assert(410);
+	if (o3[0] != 3) fail_assert(411);
+	if (o3[1] != 4) fail_assert(412);
+
+	// layered DAGs sort layer by layer
+	var lg = layeredDag(10, 5);
+	var o4 = Array<int>.new(50);
+	if (toposort(lg, o4) != 50) fail_assert(416);
+	var bad = 0;
+	for (i < 50) if (o4[i] / 5 != i / 5) bad++;		// layer l occupies slots 5l..5l+4
+	if (bad != 0) fail_assert(413);
+	var h = 0;
+	for (i < 50) h = mix(h, o4[i]);
+	acci(h);
+
+	// generated DAGs: the order must respect every edge
+	srand(0x9004);
+	var g2 = 0;
+	for (round < 10) {
+		var rg = randomDag(300 + randn(200), 4);
+		var o = Array<int>.new(rg.nodes.length);
+		var got = toposort(rg, o);
+		if (got != rg.nodes.length) fail_assert(414);	// a DAG always sorts fully
+		var v2 = 0;
+		for (i < rg.nodes.length) {
+			var u = rg.nodes[i];
+			for (k < u.nsucc) if (u.order >= u.succ[k].order) v2++;
+		}
+		if (v2 != 0) fail_assert(415);
+		var t = mix(0, got);
+		for (i < got) t = mix(t, o[i]);
+		g2 = mix(g2, t);
+	}
+	acci(g2);
+}
+
+//======================================================================
+// Connected components over the undirected view of the graph
+//======================================================================
+def components(g: Graph) -> int {
+	var n = g.nodes.length;
+	for (i < n) g.nodes[i].comp = -1;
+	var stack = Array<Node>.new(n);
+	var ncomp = 0;
+	for (i < n) {
+		if (g.nodes[i].comp >= 0) continue;
+		var sp = 0;
+		stack[sp] = g.nodes[i];
+		sp++;
+		g.nodes[i].comp = ncomp;
+		while (sp > 0) {
+			sp--;
+			var u = stack[sp];
+			for (k < u.nsucc) {
+				var v = u.succ[k];
+				if (v.comp < 0) { v.comp = ncomp; stack[sp] = v; sp++; }
+			}
+			for (k < u.npred) {
+				var v = u.pred[k];
+				if (v.comp < 0) { v.comp = ncomp; stack[sp] = v; sp++; }
+			}
+		}
+		ncomp++;
+	}
+	return ncomp;
+}
+
+//======================================================================
+// Section 5: connected components
+//======================================================================
+def connected() {
+	var g = smallGraph();
+	// {0,1,2,3,4} and {5}
+	if (components(g) != 2) fail_assert(501);
+	if (g.nodes[0].comp != 0) fail_assert(502);
+	if (g.nodes[4].comp != 0) fail_assert(503);
+	if (g.nodes[5].comp != 1) fail_assert(504);
+	var sizes = Array<int>.new(2);
+	for (i < 6) sizes[g.nodes[i].comp]++;
+	if (sizes[0] != 5) fail_assert(505);
+	if (sizes[1] != 1) fail_assert(506);
+
+	// a graph with no edges has one component per node
+	var iso = Graph.new(20);
+	if (components(iso) != 20) fail_assert(507);
+	if (iso.nodes[19].comp != 19) fail_assert(508);
+	// a single chain is one component
+	var chain = Graph.new(50);
+	for (i < 49) chain.addEdge(i, i + 1);
+	if (components(chain) != 1) fail_assert(509);
+	// k disjoint chains give k components
+	var k = 7;
+	var many = Graph.new(k * 6);
+	for (c < k) for (i < 5) many.addEdge(c * 6 + i, c * 6 + i + 1);
+	if (components(many) != k) fail_assert(510);
+	var counts = Array<int>.new(k);
+	for (i < many.nodes.length) counts[many.nodes[i].comp]++;
+	for (c < k) if (counts[c] != 6) fail_assert(511);
+	var h = 0;
+	for (i < many.nodes.length) h = mix(h, many.nodes[i].comp);
+	acci(h);
+
+	// merging two components with one edge drops the count by one
+	var before = components(many);
+	many.addEdge(0, 6);
+	var after = components(many);
+	if (after != before - 1) fail_assert(512);
+	acci(mix(mix(0, before), after));
+
+	// generated graphs: every edge must join nodes of the same component
+	srand(0x9005);
+	var g2 = 0;
+	for (round < 10) {
+		var rg = randomDag(400, 3);
+		var nc = components(rg);
+		if (nc < 1) fail_assert(513);
+		if (nc > 400) fail_assert(514);
+		var viol = 0;
+		for (i < rg.nodes.length) {
+			var u = rg.nodes[i];
+			for (j < u.nsucc) if (u.succ[j].comp != u.comp) viol++;
+		}
+		if (viol != 0) fail_assert(515);
+		var t = mix(0, nc);
+		for (i < rg.nodes.length) t = mix(t, rg.nodes[i].comp);
+		g2 = mix(g2, t);
+	}
+	acci(g2);
+}
+
+//======================================================================
+// Section 6: longest path over a DAG, in topological order
+//======================================================================
+def longestPath(g: Graph) -> int {
+	var n = g.nodes.length;
+	var order = Array<int>.new(n);
+	var got = toposort(g, order);
+	if (got != n) return -1;
+	for (i < n) g.nodes[i].value = 0;
+	var best = 0;
+	for (p < n) {
+		var u = g.nodes[order[p]];
+		for (k < u.nsucc) {
+			var v = u.succ[k];
+			if (v.value < u.value + 1) v.value = u.value + 1;
+		}
+		if (u.value > best) best = u.value;
+	}
+	return best;
+}
+def longest() {
+	var g = smallGraph();
+	// 0 -> 1 -> 3 -> 4 has three edges
+	if (longestPath(g) != 3) fail_assert(601);
+	if (g.nodes[4].value != 3) fail_assert(602);
+	if (g.nodes[5].value != 0) fail_assert(603);
+	if (g.nodes[0].value != 0) fail_assert(604);
+	var chain = Graph.new(40);
+	for (i < 39) chain.addEdge(i, i + 1);
+	if (longestPath(chain) != 39) fail_assert(605);
+	var iso = Graph.new(10);
+	if (longestPath(iso) != 0) fail_assert(606);
+	// a cycle has no topological order at all
+	if (longestPath(cycleGraph()) != -1) fail_assert(607);
+	// a layered DAG's longest path is one less than the number of layers
+	var lg = layeredDag(15, 4);
+	if (longestPath(lg) != 14) fail_assert(608);
+	var h = 0;
+	for (i < lg.nodes.length) h = mix(h, lg.nodes[i].value);
+	acci(h);
+	// a diamond: 0->1, 0->2, 1->3, 2->3 gives 2
+	var d = Graph.new(4);
+	d.addEdge(0, 1);
+	d.addEdge(0, 2);
+	d.addEdge(1, 3);
+	d.addEdge(2, 3);
+	if (longestPath(d) != 2) fail_assert(609);
+	acci(d.fold());
+
+	srand(0x9006);
+	var g2 = 0;
+	for (round < 8) {
+		var rg = randomDag(300, 4);
+		var lp = longestPath(rg);
+		if (lp < 0) fail_assert(610);
+		if (lp >= 300) fail_assert(611);
+		// the DP result must dominate every edge
+		var viol = 0;
+		for (i < rg.nodes.length) {
+			var u = rg.nodes[i];
+			for (k < u.nsucc) if (u.succ[k].value < u.value + 1) viol++;
+		}
+		if (viol != 0) fail_assert(612);
+		var t = mix(0, lp);
+		for (i < rg.nodes.length) t = mix(t, rg.nodes[i].value);
+		g2 = mix(g2, t);
+	}
+	acci(g2);
+}
+
+//======================================================================
+// Section 7: a large graph, mutated between traversals
+//======================================================================
+def churnGraph() {
+	srand(0x9007);
+	var g = Graph.new(1500);
+	// a spanning chain, so the graph is connected from the start
+	for (i < 1499) g.addEdge(i, i + 1);
+	var h = 0;
+	for (round < 20) {
+		// add random forward edges, allocating adjacency arrays as they grow
+		for (k < 200) {
+			var a = randn(1400);
+			var b = a + 1 + randn(99);
+			if (b < 1500) g.addEdge(a, b);
+		}
+		var reached = bfs(g, 0);
+		if (reached != 1500) fail_assert(701);		// the chain reaches everything
+		var order = Array<int>.new(1500);
+		var got = toposort(g, order);
+		if (got != 1500) fail_assert(702);		// edges only ever point forward
+		if (order[0] != 0) fail_assert(703);
+		var nc = components(g);
+		if (nc != 1) fail_assert(704);
+		h = mix(h, reached);
+		h = mix(h, got);
+		h = mix(h, nc);
+		h = mix(h, g.nodes[1499].dist);
+	}
+	acci(h);
+	acci(mix(0, g.edges));
+	if (g.edges < 1499) fail_assert(705);
+	// the node objects survived all the churn intact
+	var bad = 0;
+	for (i < g.nodes.length) {
+		var n = g.nodes[i];
+		if (n.id != i) bad++;
+		for (k < n.nsucc) if (n.succ[k].id <= i) bad++;	// every edge points forward
+	}
+	if (bad != 0) fail_assert(706);
+	acci(g.fold());
+}
+
+//======================================================================
+// Section 8: many small graphs, built and dropped
+//======================================================================
+def manyGraphs() {
+	srand(0x9008);
+	var keep = Array<Graph>.new(10);
+	var h = 0;
+	for (round < 150) {
+		var n = 20 + randn(60);
+		var g = Graph.new(n);
+		for (i < n - 1) g.addEdge(i, i + 1);
+		for (k < n / 2) {
+			var a = randn(n - 1);
+			var b = a + 1 + randn(5);
+			if (b < n) g.addEdge(a, b);
+		}
+		if (components(g) != 1) fail_assert(801);
+		if (bfs(g, 0) != n) fail_assert(802);
+		var order = Array<int>.new(n);
+		if (toposort(g, order) != n) fail_assert(803);
+		var lp = longestPath(g);
+		if (lp < 1) fail_assert(804);
+		if (lp > n - 1) fail_assert(805);
+		h = mix(h, n);
+		h = mix(h, lp);
+		h = mix(h, g.edges);
+		if ((round % 15) == 0) keep[round / 15] = g;
+	}
+	acci(h);
+	// the retained graphs are still traversable after all the churn
+	var g2 = 0;
+	for (i < keep.length) {
+		var g = keep[i];
+		if (g == null) fail_assert(806);
+		if (components(g) != 1) fail_assert(807);
+		if (bfs(g, 0) != g.nodes.length) fail_assert(808);
+		g2 = mix(g2, g.fold());
+	}
+	acci(g2);
+}
+
+//======================================================================
+def run(a: int) {
+	crc = a;
+	failed = 0;
+	if (a == 0 || a == 1) build();
+	if (a == 0 || a == 2) breadth();
+	if (a == 0 || a == 3) depth();
+	if (a == 0 || a == 4) topo();
+	if (a == 0 || a == 5) connected();
+	if (a == 0 || a == 6) longest();
+	if (a == 0 || a == 7) churnGraph();
+	if (a == 0 || a == 8) manyGraphs();
+}
+def main(a: int) -> int {
+	run(a);
+	if (failed != 0) return failed;
+	return crc;
+}
