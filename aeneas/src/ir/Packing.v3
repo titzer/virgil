@@ -149,24 +149,7 @@ class SsaUnpacker(builder: SsaBuilder, ft: IntType) {
 			x: EnumType => {
 				def tagType: IntType = x.enumDecl.tagType;
 				def unpackedTag: SsaInstr = builder.opIntViewI0(ft, tagType, shiftedInput);
-				def numCases = x.enumDecl.cases.length;
-				def cond: SsaInstr = builder.addApply(builder.source, tagType.opLt(), [unpackedTag, builder.graph.intConst(numCases)]);
-				// Valid tag case
-				def trueBlock = SsaBlock.new();
-				def subsumeOrigTag = SsaApplyOp.new(builder.source, V3Op.newTypeSubsume(tagType, x), [unpackedTag]);
-				trueBlock.append(subsumeOrigTag);
-				// Invalid tag -> map to 0th enum value 
-				def falseBlock = SsaBlock.new();
-				def subsumeZero = SsaApplyOp.new(builder.source, V3Op.newTypeSubsume(tagType, x), [builder.graph.intConst(0)]);
-				falseBlock.append(subsumeZero);
-				builder.addIf(cond, trueBlock, falseBlock);
-				// Set builder to process on joinBlock
-				def joinBlock = SsaBlock.new();
-				trueBlock.append(SsaGoto.new(joinBlock));
-				falseBlock.append(SsaGoto.new(joinBlock));
-				builder.set(joinBlock);
-				def enumInstr = builder.addPhi(x, [subsumeOrigTag, subsumeZero]);
-
+				def enumInstr = builder.pure1(V3Op.newEnumViewI(tagType, x), unpackedTag);
 				unpackedBuffer.push(enumInstr);
 				pos += tagType.width;
 			}
@@ -191,20 +174,24 @@ class SsaUnpacker(builder: SsaBuilder, ft: IntType) {
 			}	
 			x: ClassType => {
 				var ic = builder.context.prog.ir.makeIrClass(x); // XXX: makeIrClass seems wrong after normalization
-				var fs = ic.fields; 
-				for (i=fs.length-1; i >= 0; i--) {	
-					def field = fs[i];
-					unpack0(field.fieldType);
+				var fs = ic.fields;
+				// Field types must be instantiated with the class type's type arguments, as
+				// SsaPacker does. For a generic data type {P<X>(x: X)}, the declared field
+				// type is the type parameter {X}, which cannot be unpacked on its own.
+				def irFieldTypes = Array<Type>.new(fs.length);
+				for (i < fs.length) irFieldTypes[i] = IrSpec.new(x, TypeUtil.NO_TYPES, fs[i]).getFieldType();
+				for (i = fs.length - 1; i >= 0; i--) {
+					unpack0(irFieldTypes[i]);
 				}
 				def fieldInstr = Array<SsaInstr>.new(fs.length);
 				for (i < fs.length) {
-					if (unpackedBuffer.empty()) { 
+					if (unpackedBuffer.empty()) {
 						builder.context.fail(Strings.format2("Error unpacking %q. Missing %q", x.render, fs[i].render));
+						return;
 					}
 					fieldInstr[i] = unpackedBuffer.pop();
 				}
 
-				def irFieldTypes = Arrays.map(fs, IrField.fieldType);
 				def variantAlloc = builder.pure(V3Op.newVariantAlloc(x, irFieldTypes), fieldInstr);
 				unpackedBuffer.push(variantAlloc);
 			}
@@ -216,15 +203,26 @@ class SsaUnpacker(builder: SsaBuilder, ft: IntType) {
 
 
 component PackingUtils {
-	// Given a type, computes the width of the type. 
+	// Given a type, computes the width of the type.
 	// Returns a tuple containing the size and status string
-	def packingWidth(t: Type, seen: List<Type>) -> (int, string) { // XXX: another ad-hoc type recursion check
+	def packingWidth(t: Type, seen: List<Type>) -> (int, string) {
+		return widthOf(t, seen, false);
+	}
+	// Like {packingWidth}, but additionally requires that any variant denote
+	// exactly one case, so that no bits are needed for a case tag. {iN.pack} and
+	// {iN.unpack} reserve no such bits, so they can represent a data type like
+	// {type P(x: u4, y: u4) { }} or a specific case type like {T.A}, but not a
+	// variant declared with cases, like {T} itself.
+	def flatPackingWidth(t: Type, seen: List<Type>) -> (int, string) {
+		return widthOf(t, seen, true);
+	}
+	private def widthOf(t: Type, seen: List<Type>, flat: bool) -> (int, string) { // XXX: another ad-hoc type recursion check
 		match (t) {
 			x: PrimType => return (x.width, null);
 			x: TupleType => {
 				var width = 0;
 				for (l = x.nested; l != null; l = l.tail) {
-					var t = packingWidth(l.head, seen);
+					var t = widthOf(l.head, seen, flat);
 					if (t.1 != null) return (int.max, t.1);
 					width += t.0;
 				}
@@ -236,14 +234,34 @@ component PackingUtils {
 					if (l.head == x) return (int.max, Strings.format1("because %q is recursive", x.render));
 				}
 				seen = List.new(x, seen);
-				var cs = x.classDecl.cases;
-				var width: int = 0; 
+				var decl = x.classDecl;
+				var params: VstList<ParamDecl>;
+				if (flat) {
+					// {decl.variantCase} is set both for a data type, whose single case is
+					// the declaration itself, and for a case type like {T.A}. Either denotes
+					// exactly one case, so its fields can be packed without a tag.
+					if (decl.variantCase == null) {
+						var cs = decl.cases;
+						if (cs == null || cs.length == 0) { // no cases at all, e.g. {type P { }}
+							return (int.max, Strings.format1("because %q has no cases", x.render));
+						}
+						return (int.max, Strings.format1("because %q is a variant with cases", x.render));
+					}
+					params = decl.params;
+				} else {
+					var cs = decl.cases;
+					if (cs == null || cs.length == 0) { // a case type has no cases of its own
+						return (int.max, Strings.format1("because %q is a variant case type", x.render));
+					}
+					params = cs[0].decl.params;
+				}
+				var width: int = 0;
 				var typeArgs = x.getTypeArgs();
-				if (cs[0].decl.params == null) return (width, null);
-				for (l = cs[0].decl.params.list; l != null; l = l.tail) {
+				if (params == null) return (width, null);
+				for (l = params.list; l != null; l = l.tail) {
 					var ft = l.head.vtype;
 					if (typeArgs != null) ft = ft.substitute(typeArgs);
-					var t = packingWidth(ft, seen);
+					var t = widthOf(ft, seen, flat);
 					if (t.1 != null) return (int.max, t.1);
 					width += t.0;
 				}
