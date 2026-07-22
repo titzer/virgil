@@ -71,8 +71,6 @@ cd test/asm/x86-64 && ./test.bash
 ./test/diagnose.bash
 ```
 
-**Test suites** (from `test/all.bash`): `unit asm/x86 asm/x86-64 redef core regalloc cast variants enums wasmgc fsi32 fsi64 float range layout funexpr readonly large pointer vmaddr darwin linux rt stacktrace gc system link lib wizeng apps bench`
-
 **Key environment variables for testing:**
 - `TEST_HOST` — override assumed host platform
 - `TEST_TARGETS` — override set of targets (e.g., `"v3i x86-64-linux"`)
@@ -117,16 +115,11 @@ Source flows through these phases in order:
 
 ### Runtime System (`rt/`)
 
-The runtime is compiled together with user programs (no separate runtime linking). Key parts:
-- `rt/gc/` — garbage collector (written entirely in Virgil)
-- `rt/native/` — native startup and system interface code
-- `rt/posix/` — POSIX-specific implementations
-- `rt/x86-64-linux/`, `rt/x86-64-darwin/`, etc. — platform-specific runtime variants
-- `rt/wasm-*/` — WebAssembly runtime support
+The runtime is compiled together with user programs (no separate runtime linking).
 
 ### Standard Libraries (`lib/`)
 
-Optional utility libraries (not part of the language core): `lib/util/`, `lib/asm/`, `lib/file/`, `lib/net/`, `lib/math/`, `lib/test/`, `lib/wasm/`. Programs must explicitly include these files at compilation.
+Optional utility libraries, not part of the language core. Programs must explicitly include these files at compilation.
 
 ### Compiler Binaries (`bin/`)
 
