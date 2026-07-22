@@ -88,6 +88,19 @@ function gdb_can_run() {
 }
 
 function run_gdb_tiers() {
+    # The goldens record where each variable lives and which methods exist,
+    # both of which are properties of a particular pipeline configuration: at
+    # -O3 a method the golden names gets inlined away, and at -O0 a local lands
+    # in a different stack slot. Compare them only at the default optimization
+    # level. The compile and run tiers above still run under whatever flags the
+    # ambient V3C_OPTS carries, so debug info is exercised across them.
+    case " $V3C_OPTS " in
+	*" -O"*)
+	    print_status Gdb "$target"
+	    echo "${YELLOW}skipped${NORM} (goldens are for the default optimization level)"
+	    return 0
+	    ;;
+    esac
     GDB=$(echo $CONFIG/gdb-$target*)
     if [ "$GDB" = "$CONFIG/gdb-$target*" ] || [ ! -x "$GDB" ]; then
 	print_status Gdb $target

@@ -1,6 +1,6 @@
 # Class fields and array elements must be reachable through the references, and
 # a string must be readable as the byte array it is.
-break objects.v3:32
+break objects.v3:35
 run
 if p->x == 3 && p->y == 4
   printf "ok: p == (3, 4)\n"
