@@ -26,7 +26,7 @@ else
   TESTS=*.v3
 fi
 
-LIB_FILES="$VIRGIL_LOC/lib/util/*.v3 $VIRGIL_LOC/lib/math/*.v3 $VIRGIL_LOC/lib/file/csv/*.v3 $VIRGIL_LOC/lib/file/json/*.v3"
+LIB_FILES="$VIRGIL_LOC/lib/util/*.v3 $VIRGIL_LOC/lib/math/*.v3 $VIRGIL_LOC/lib/file/csv/*.v3 $VIRGIL_LOC/lib/file/json/*.v3 $VIRGIL_LOC/lib/hash/*.v3"
 
 function do_v3i() {
     P=$OUT/run.out
