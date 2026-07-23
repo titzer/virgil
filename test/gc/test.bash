@@ -34,11 +34,36 @@ function compile_gc_tests() {
     local target=$1
     shift
 
-    local i=1
+    # The 4k shadow stack is sized for the micro tests indexed by the other .gc
+    # files. The test/smoke tests are medium-sized by design and recurse deeper,
+    # so they are compiled in a separate shard with more shadow stack; the
+    # per-test //@heap-size directive overrides -heap-size for both shards.
+    local micro="" smoke=""
+    for t in "$@"; do
+	case "$t" in
+	    ../smoke/*) smoke="$smoke $t" ;;
+	    *)          micro="$micro $t" ;;
+	esac
+    done
+
     RT_OPT="-rt.files=$(echo $RT_FILES)"
+    compile_gc_shard "$target" 4k $micro
+    compile_gc_shard "$target" 256k $smoke
+}
+
+function compile_gc_shard() {
+    local SHARDING=80
+    local target=$1
+    local sstack=$2
+    shift 2
+    if [ $# = 0 ]; then
+	return 0
+    fi
+
+    local i=1
     while [ $i -le $# ]; do
 	local args=${@:$i:$SHARDING}
-	run_v3c "" -symbols -output=$T -target=$target-test -tr -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=4k -heap-size=10k "$RT_OPT" -multiple $args
+	run_v3c "" -symbols -output=$T -target=$target-test -tr -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=$sstack -heap-size=10k "$RT_OPT" -multiple $args
 	i=$(($i + $SHARDING))
     done
 }
