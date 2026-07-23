@@ -21,20 +21,23 @@ class Dwarf {
 	def info = DwarfInfoSection.new(abbrev);
 	def loclists = DwarfLocListsSection.new();
 	def line = DwarfLineSection.new(dirFile);
+	def frame = DwarfFrameSection.new();
 	def normTupleMap = TypeUtil.newTypeMap<TypeNorm>();
+	var codeStart: long;	// virtual address of the start of the text section
 
 	new(elf, sections, prog, mach) {
 		codePointerSize = if(elf.is64(), CODE_POINTER_SIZE64, CODE_POINTER_SIZE32);
+		info.mach = mach;
 	}
 
 	def emit(w: DataWriter) {
+		codeStart = sections.text.sh_addr;
 		// .debug_str
 		var sectionStart = w.pos;
 		var buf = StringBuilder.new();
 		// Iterate methods for name and prepare subprogram information
 		for (i < prog.ir.methods.length) {
 			var m = prog.ir.methods[i];
-//			Terminal.put1("Emitting DWARF for: %q\n", m.renderLong);
 			if (m.source == null) continue;
 			var addr = mach.methodMap[m];
 			if (addr == null || addr.absolute < 0) continue;
@@ -53,11 +56,14 @@ class Dwarf {
 				entry.decl_line = u32.!(fileRange.beginLine);
 			}
 			entry.abbrev = abbrev.getSubprogramAbbrev(hasFile, hasRet);
-			// Fill the end of loclist to method end
-			for (j < entry.loclistMap.length) {
-				var index = entry.loclistMap[j] - 1;
+			// Fill the end of loclist to method end. Location list bounds are
+			// offsets from the compilation unit's base address (= {codeStart}),
+			// not absolute addresses.
+			var methodEnd = u32.!(entry.low_pc - codeStart) + entry.high_pc;
+			for (j < entry.locLists.length) {
+				var index = entry.locLists[j] - 1;
 				if (index < 0) continue;
-				if (loclists.locLists[index].end == 0) loclists.locLists[index].end = u32.!(entry.low_pc) + entry.high_pc;
+				if (loclists.locLists[index].end == 0) loclists.locLists[index].end = methodEnd;
 			}
 			// Populate method name
 			buf.reset();
@@ -67,14 +73,22 @@ class Dwarf {
 		}
 		setSectionInfo(DebugSection.str.tag, sectionStart, w);
 
-		// .debug_loclists
+		// .debug_line_str. This must precede .debug_info, which refers to strings
+		// in this section by offset (DW_AT_name and DW_AT_comp_dir of the CU).
+		line.w = w;
+		sectionStart = w.pos;
+		line.emitLineStr();
+		setSectionInfo(DebugSection.line_str.tag, sectionStart, w);
+
+		// .debug_loclists. Must precede .debug_info, which refers to location
+		// lists in this section by offset.
 		sectionStart = w.pos;
 		loclists.emit(w);
 		setSectionInfo(DebugSection.loclists.tag, sectionStart, w);
 
 		// .debug_info
 		sectionStart = w.pos;
-		info.emit(dirFile, w, sections.text.sh_addr, sections.text.sh_size, prog.ir.classes);
+		info.emit(dirFile, w, codeStart, sections.text.sh_size);
 		setSectionInfo(DebugSection.info.tag, sectionStart, w);
 
 		// .debug_abbrev
@@ -82,18 +96,17 @@ class Dwarf {
 		abbrev.emit(w);
 		setSectionInfo(DebugSection.abbrev.tag, sectionStart, w);
 
-		// .debug_line_str
-		line.w = w;
-		sectionStart = w.pos;
-		line.emitLineStr();
-		setSectionInfo(DebugSection.line_str.tag, sectionStart, w);
-
 		// .debug_line
 		sectionStart = w.pos;
-		line.codeStart = sections.text.sh_addr;
+		line.codeStart = codeStart;
 		line.codeSize = sections.text.sh_size;
 		line.emit();
 		setSectionInfo(DebugSection.line.tag, sectionStart, w);
+
+		// .debug_frame
+		sectionStart = w.pos;
+		frame.emit(w, info.subprograms, codeStart);
+		setSectionInfo(DebugSection.frame.tag, sectionStart, w);
 	}
 	def setSectionInfo(tag: int, start: int, w: DataWriter) {
 		debugs[tag].sh_offset = start;
@@ -105,17 +118,19 @@ class Dwarf {
 		if (locs.length == 0) {
 			// do nothing.
 		} else if (locs.length == 1) {
+			var sub = context.method.subprogram;
 			var v = DwarfVariable.new(newvar.0, newvar.1, pos);
-			if (index != -1) { // Non-ssa var
-				var i = loclists.addLocList(v);
-				loclists.locLists[i-1].addLoc(u32.!(pos), locs[0]);
-				// Set loclist index for non-tuple var or the first element of tuple.
-				context.method.subprogram.loclistMap.set(index, i);
-				v.setLocList(i);
-			} else {
-				v.setSingleLoc(locs[0]);
-			}
-			context.method.subprogram.children.put(v);
+			// Always describe the variable with a location list, so that its
+			// location only takes effect from its definition onwards. A single
+			// location would otherwise claim, for instance, a register that
+			// holds an unrelated value earlier in the method.
+			var i = loclists.addLocList(v);
+			loclists.locLists[i-1].addLoc(u32.!(pos), locs[0]);
+			sub.locLists.put(i);
+			// Set loclist index for non-tuple var or the first element of tuple.
+			if (index != -1) sub.loclistMap.set(index, i);
+			v.setLocList(i);
+			sub.children.put(v);
 			info.putType(newvar.1);
 		} else { // Tuple
 			var len = Tuple.length(newvar.1);
@@ -173,6 +188,26 @@ class Dwarf {
 			}
 			children.put(v);
 		}
+	}
+	// Add a line table row at the entry point of the method currently being
+	// generated. Without it, the method's prologue would be attributed to the
+	// last line of the preceding method in the text section.
+	def addFuncEntry(pos: int) {
+		if (context == null || context.method == null) return;
+		var m = context.method.source;
+		if (m == null || m.func.body == null) return;
+		var r = m.func.body.range();
+		var label = Label.new();
+		label.pos = pos;
+		line.addLineEntryAt(r.fileName, r.beginLine, r.beginColumn, label, false);
+	}
+	// Record a call-frame-information instruction for the method currently being
+	// generated. {pos} is the offset in the text section at which the new
+	// unwind state takes effect.
+	def addCfi(pos: int, op: DwarfCfi) {
+		if (context == null || context.method == null) return;
+		if (context.method.subprogram == null) context.method.subprogram = DwarfSubprogram.new();
+		context.method.subprogram.cfi.put(pos, op);
 	}
 	def normTuple(t: Type) -> TypeNorm {
 //		Terminal.put2("normTuple %q in %q\n", t.render, context.method.render);
@@ -269,13 +304,15 @@ def putUnitLength(w: DataWriter, start: int) {
 class DwarfInfoSection(abbrev: DwarfAbbrevSection) {
 	def subprograms = Vector<DwarfSubprogram>.new();
 	def typeRef = TypeUtil.newTypeMap<int>();
+	def pending = Vector<Type>.new();	// types registered but not yet emitted
 	def labels = Vector<(Type, int)>.new();
 	def buf = StringBuilder.new();
 	var info_start: int;
 	var codeStart: long;
 	var w: DataWriter;
+	var mach: MachProgram;			// for object layout information
 
-	def emit(dirFile: DwarfDirFile, w: DataWriter, codeStart: long, codeSize: long, classes: Vector<IrClass>) {
+	def emit(dirFile: DwarfDirFile, w: DataWriter, codeStart: long, codeSize: long) {
 		info_start = w.pos;
 		w.skipN(DWARF_LENGTH_SIZE); // unit_length
 		w.put_b16(DWARF_VERSION); // version
@@ -283,82 +320,125 @@ class DwarfInfoSection(abbrev: DwarfAbbrevSection) {
 		w.putb(codePointerSize); // address_size
 		w.put_b32(0); // debug_abbrev_offset
 		// DW_TAG_compile_unit DIE abbrev (1)
-		w.put_uleb32(1u);
-		w.put_b32(dirFile.rootFile.offset);
-		w.put_b32(dirFile.compilationDir.offset);
-		w.put_b64(codeStart);
-		w.put_b64(codeSize);
-		w.put_b32(0); // DW_AT_stmt_list
-		w.put_b32(12); // DW_AT_loclists_base
-		// DW_TAG_base_type
+		w.put_uleb32(DwarfCompileUnitTag);
+		w.put_b32(dirFile.rootFile.offset);	// DW_AT_name
+		w.put_b32(dirFile.compilationDir.offset); // DW_AT_comp_dir
+		w.puta("Aeneas ").puta(Version.version).putb(0); // DW_AT_producer
+		// There is no DWARF language code for Virgil. Claim C99, whose expression
+		// syntax is close enough that gdb's expression parser is usable.
+		w.put_b16(int.!(DW.DW_LANG_C99));	// DW_AT_language
+		w.put_b64(codeStart);			// DW_AT_low_pc
+		w.put_b64(codeSize);			// DW_AT_high_pc
+		w.put_b32(0);				// DW_AT_stmt_list
+		w.put_b32(12);				// DW_AT_loclists_base
 		this.w = w;
 		this.codeStart = codeStart;
-		typeRef.apply(emitType);
+		// Emit all types. Emitting a type may discover new types (e.g. field
+		// types), which are appended to {pending} and emitted by this same loop.
+		for (i = 0; i < pending.length; i++) emitType(pending[i]);
 		// DW_TAG_subprogram DIE abbrev
 		for (i < subprograms.length) {
 			subprograms[i].emit(w, getTypeRef, codeStart);
 		}
+		w.putb(0); // terminate the children of the compile unit DIE
 		patchTypeRef();
 		putUnitLength(w, info_start);
 	}
-	def emitType(t: Type, v: int) {
-		typeRef[t] = w.pos - info_start;
-		var byteSize: int, encoding: int;
+	def emitType(t: Type) {
 		match (t) {
-			x: VoidType => ; // do nothing
-			x: ComponentType => ; // do nothing
 			x: BoolType => emitBaseType(t, 1, DW.DW_ATE_boolean);
-			x: FloatType => {
-				byteSize = x.byteSize;
-				encoding = DW.DW_ATE_float;
-				emitBaseType(t, byteSize, encoding);
-			}
-			x: IntType => {
-				byteSize = x.byteSize;
-				encoding = if (V3.isSigned(x), DW.DW_ATE_signed, DW.DW_ATE_unsigned);
-				emitBaseType(t, byteSize, encoding);
-			}
-			x: ClassType => emitClassType(x);
+			x: FloatType => emitBaseType(t, x.byteSize, DW.DW_ATE_float);
+			x: IntType => emitBaseType(t, x.byteSize, if(V3.isSigned(x), DW.DW_ATE_signed, DW.DW_ATE_unsigned));
 			x: EnumType => emitEnumType(x);
+			x: ClassType => emitClassType(x);
 			x: ArrayType => emitArrayType(x);
 			_ => emitUnspecifiedType(t);
 		}
 	}
 	def emitBaseType(t: Type, byteSize: int, encoding: int) {
-		w.put_uleb32(2); // DW_TAG_base_type (2)
+		typeRef[t] = w.pos - info_start;
+		w.put_uleb32(DwarfBaseTypeTag);
 		w.putb(byteSize); // DW_AT_byte_size
 		w.putb(encoding); // DW_AT_encoding
-		buf.reset();
-		t.render(buf); // DW_AT_name
-		buf.send(w.putr);
-		w.putb(0);
+		putName(t);
 	}
+	// A Virgil class reference is a pointer to a heap object. Model it in DWARF
+	// as DW_TAG_pointer_type -> DW_TAG_structure_type, so that gdb can both
+	// print the reference and dereference fields with {obj.field}.
 	def emitClassType(t: ClassType) {
-		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.ClassType));
-		buf.reset();
-		t.render(buf);
-		buf.send(w.putr);
-		w.putb(0);
-		Lists.apply(t.classDecl.members, emitField);
-		w.putb(0);
-	}
-	def emitField(t: VstMember) {
-		match (t) {
-			x: VstField => {
-				w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.Member));
-				w.puta(x.name());
-				w.putb(0);
-				w.put_b32(getTypeRef(x.vtype, w.pos));
-			}
-			_ => ;
+		var ic = if(mach != null, mach.prog.ir.getIrClass(t));
+		if (ic == null || ic.machSize < 0 || ic.boxing == Boxing.UNBOXED) return emitUnspecifiedType(t);
+		var patchPos = emitPointerTo(t);
+		// the pointee structure
+		var structOff = w.pos - info_start;
+		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.StructType));
+		putName(t);
+		w.put_uleb32(u32.!(ic.machSize)); // DW_AT_byte_size
+		for (f in ic.fields) {
+			buf.reset();
+			f.render(buf);
+			emitMember(buf.extract(), f.fieldType, f.machOffset);
 		}
+		w.putb(0); // terminate members
+		patchRef(patchPos, structOff);
+	}
+	// A Virgil array reference is a pointer to a heap object with a length field
+	// and inline element storage. Model the object as a structure with a
+	// {length} member and an {elems} member whose count is that length.
+	def emitArrayType(t: ArrayType) {
+		var et = t.elementType();
+		if (mach == null || Void.TYPE == et) return emitUnspecifiedType(t);
+		var lengthOffset = mach.getArrayLengthOffset(t);
+		var elemOffset = mach.getArrayElemOffset(t, 0);
+		var patchPos = emitPointerTo(t);
+		var structOff = w.pos - info_start;
+		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.StructType));
+		putName(t);
+		w.put_uleb32(u32.!(elemOffset)); // DW_AT_byte_size (header only)
+		var lengthDie = w.pos - info_start;
+		emitMember("length", Int.TYPE, lengthOffset);
+		// the {elems} member, whose type is an array with a dynamic count
+		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.Member));
+		w.puta("elems").putb(0);
+		var elemsTypePatch = w.pos;
+		w.put_b32(0);
+		w.put_uleb32(u32.!(elemOffset));
+		w.putb(0); // terminate members
+		// the array type of {elems}
+		patchRef(elemsTypePatch, w.pos - info_start);
+		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.ArrayType));
+		w.put_b32(getTypeRef(et, w.pos));
+		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.SubrangeType));
+		w.put_b32(lengthDie); // DW_AT_count refers to the length member
+		w.putb(0); // terminate subranges
+		patchRef(patchPos, structOff);
+	}
+	def emitMember(name: string, vtype: Type, offset: int) {
+		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.Member));
+		w.puta(name);
+		w.putb(0);
+		w.put_b32(getTypeRef(vtype, w.pos));
+		w.put_uleb32(u32.!(offset)); // DW_AT_data_member_location
+	}
+	// Emit a DW_TAG_pointer_type DIE for {t} and return the position of its
+	// DW_AT_type attribute, to be patched with the pointee's offset.
+	def emitPointerTo(t: Type) -> int {
+		typeRef[t] = w.pos - info_start;
+		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.PointerType));
+		w.putb(codePointerSize); // DW_AT_byte_size
+		var patchPos = w.pos;
+		w.put_b32(0);
+		return patchPos;
+	}
+	def patchRef(pos: int, target: int) {
+		w.at(pos);
+		w.put_b32(target);
+		w.atEnd();
 	}
 	def emitEnumType(t: EnumType) {
+		typeRef[t] = w.pos - info_start;
 		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.EnumurationType));
-		buf.reset();
-		t.render(buf);
-		buf.send(w.putr);
-		w.putb(0);
+		putName(t);
 		w.putb(t.byteSize);
 		for (c in t.enumDecl.cases) {
 			w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.Enumurator));
@@ -370,30 +450,30 @@ class DwarfInfoSection(abbrev: DwarfAbbrevSection) {
 		}
 		w.putb(0);
 	}
-	def emitArrayType(t: ArrayType) {
-		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.ArrayType));
-		w.put_b32(getTypeRef(t.elementType(), w.pos));
-		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.SubrangeType));
-		w.put_b32(getTypeRef(Int.getType(true, 32), w.pos));
-		w.put_uleb32(4); // expr length
-		w.putb(DW.DW_OP_lit4);
-		w.putb(DW.DW_OP_push_object_address);
-		w.putb(DW.DW_OP_minus);
-		w.putb(DW.DW_OP_deref);
-		w.putb(0);
-	}
 	def emitUnspecifiedType(t: Type) {
+		typeRef[t] = w.pos - info_start;
 		w.put_uleb32(abbrev.getAbbrev(DwarfAbbrevTag.UnspecifiedType));
+		putName(t);
+	}
+	def putName(t: Type) {
 		buf.reset();
 		t.render(buf);
 		buf.send(w.putr);
 		w.putb(0);
 	}
+	// Register {t} to be emitted as a type DIE.
 	def putType(t: Type) {
+		if (t == null || VoidType.?(t)) return;
+		if (typeRef.has(t)) return;
 		typeRef[t] = 0;
+		pending.put(t);
 	}
+	// Return the offset of the type DIE for {t}, registering it for emission if
+	// it has not been seen. A zero is written now and patched by {patchTypeRef}.
 	def getTypeRef(t: Type, pos: int) -> int {
-		if (typeRef[t] > 0) return typeRef[t];
+		putType(t);
+		var r = typeRef[t];
+		if (r > 0) return r;
 		// Type hasn't been emitted yet. Create a label and patch later.
 		labels.put((t, pos));
 		return 0;
@@ -427,6 +507,8 @@ class DwarfSubprogram extends DwarfDie {
 	var rettype: Type;
 	def children = Vector<DwarfDie>.new();
 	def loclistMap = Vector<int>.new(); // Map to the index in loclist, start from 1.
+	def locLists = Vector<int>.new();   // every loclist created for this method
+	def cfi = Vector<(int, DwarfCfi)>.new(); // call frame instructions, by text offset
 
 	def emit(w: DataWriter, getTypeRef: (Type, int) -> int, codeStart: long) {
 		w.put_uleb32(abbrev);
@@ -438,9 +520,12 @@ class DwarfSubprogram extends DwarfDie {
 		if (!VoidType.?(rettype)) w.put_b32(getTypeRef(rettype, w.pos));
 		w.put_b64(low_pc);
 		w.put_uleb32(high_pc);
-		var exprLen = 1u;
-		w.put_uleb32(exprLen);
-		w.putb(DW.DW_OP_reg7);
+		// DW_AT_frame_base. Frame-relative variable locations (DW_OP_fbreg) are
+		// emitted relative to the stack pointer after the prologue, so the frame
+		// base is simply the value of the stack pointer.
+		w.put_uleb32(2);
+		w.putb(DW.DW_OP_breg7);
+		w.putb(0);
 
 		emitChildren(w, getTypeRef, codeStart, children);
 	}
@@ -471,41 +556,10 @@ class DwarfVariable extends DwarfDie {
 		w.putb(0);
 		w.put_b32(getTypeRef(vtype, w.pos));
 		match (abbrev) {
-			DwarfVariableExprTag => { // ssa variable
-				if (reg != null) { // register
-					w.put_uleb32(1); // exprloc length
-					w.putb(DW.DWRegMap(reg));
-				} else { // stack location
-					var l = if (V3.isArray(vtype), 4u, 1u);
-					w.put_uleb32(sleb32_len(location) + l); // exprloc length
-					w.putb(DW.DW_OP_fbreg);
-					w.put_sleb32(location);
-					if (V3.isArray(vtype)) {
-						// Add 8 byte to skip array header
-						w.putb(DW.DW_OP_deref);
-						w.putb(DW.DW_OP_lit8);
-						w.putb(DW.DW_OP_plus);
-					}
-				}
-			}
+			DwarfVariableExprTag => putLoc(w, reg, location); // ssa variable
 			// Non-ssa variable
 			DwarfVariableLocListTag => w.put_b32(loclistOffset);
 		}
-	}
-	def sleb32_len(data: int) -> u32 {
-		var r = 1u;
-		if (data >= 0) {
-			while (data >= 0x40) {
-				r += 1;
-				data = data >> 7;
-			}
-		} else {
-			while ((data >> 6) != -1) {
-				r += 1;
-				data = data >> 7;
-			}
-		}
-		return r;
 	}
 }
 
@@ -534,19 +588,20 @@ var Abbrev_code: u32 = 5; // next unique code for abbrev tag
 
 enum DwarfAbbrevTag {
 	LexicalBlock,
-	ClassType,
+	StructType,
 	Member,
 	EnumurationType,
 	Enumurator,
 	ArrayType,
 	SubrangeType,
 	UnspecifiedType,
+	PointerType,
 }
 
 class DwarfAbbrevSection {
 	def abbrev = Vector<DwarfAbbrev>.new();
 	def subprogram: Array<int> = [-1, -1, -1, -1]; // four types of subprogram
-	def tags = Array<u32>.new(8); // size of DwarfAbbrevTag
+	def tags = Array<u32>.new(9); // size of DwarfAbbrevTag
 
 	def emit(w: DataWriter) {
 		// DW_TAG_compile_unit DIE abbrev (1)
@@ -555,6 +610,8 @@ class DwarfAbbrevSection {
 		w.putb(DW.DW_children_yes);
 		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_line_strp);
 		emitAbbrev(w, DW.DW_AT_comp_dir, DW.DW_FORM_line_strp);
+		emitAbbrev(w, DW.DW_AT_producer, DW.DW_FORM_string);
+		emitAbbrev(w, DW.DW_AT_language, DW.DW_FORM_data2);
 		emitAbbrev(w, DW.DW_AT_low_pc, DW.DW_FORM_addr);
 		emitAbbrev(w, DW.DW_AT_high_pc, DW.DW_FORM_data8);
 		emitAbbrev(w, DW.DW_AT_stmt_list, DW.DW_FORM_sec_offset);
@@ -610,13 +667,14 @@ class DwarfAbbrevSection {
 			var t: DwarfAbbrev;
 			match (a) {
 				LexicalBlock => t = DwarfLexicalBlockAbbrev.new();
-				ClassType => t = DwarfClassTypeAbbrev.new();
+				StructType => t = DwarfStructTypeAbbrev.new();
 				Member => t = DwarfMemberAbbrev.new();
 				EnumurationType => t = DwarfEnumutationTypeAbbrev.new();
 				Enumurator => t = DwarfEnumuratorAbbrev.new();
 				ArrayType => t = DwarfArrayTypeAbbrev.new();
 				SubrangeType => t = DwarfSubrangeTypeAbbrev.new();
 				UnspecifiedType => t = DwarfUnspecifiedTypeAbbrev.new();
+				PointerType => t = DwarfPointerTypeAbbrev.new();
 			}
 			abbrev.put(t);
 			tags[a.tag] = t.code;
@@ -662,12 +720,23 @@ class DwarfLexicalBlockAbbrev extends DwarfAbbrev {
 		emitAbbrev(w, 0, 0);
 	}
 }
-class DwarfClassTypeAbbrev extends DwarfAbbrev {
+class DwarfStructTypeAbbrev extends DwarfAbbrev {
 	def emit(w: DataWriter) {
 		w.put_uleb32(code);
-		w.put_uleb32(DW.DW_TAG_class_type);
+		w.put_uleb32(DW.DW_TAG_structure_type);
 		w.putb(DW.DW_children_yes);
 		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_string);
+		emitAbbrev(w, DW.DW_AT_byte_size, DW.DW_FORM_udata);
+		emitAbbrev(w, 0, 0);
+	}
+}
+class DwarfPointerTypeAbbrev extends DwarfAbbrev {
+	def emit(w: DataWriter) {
+		w.put_uleb32(code);
+		w.put_uleb32(DW.DW_TAG_pointer_type);
+		w.putb(DW.DW_children_no);
+		emitAbbrev(w, DW.DW_AT_byte_size, DW.DW_FORM_data1);
+		emitAbbrev(w, DW.DW_AT_type, DW.DW_FORM_ref4);
 		emitAbbrev(w, 0, 0);
 	}
 }
@@ -678,6 +747,7 @@ class DwarfMemberAbbrev extends DwarfAbbrev {
 		w.putb(DW.DW_children_no);
 		emitAbbrev(w, DW.DW_AT_name, DW.DW_FORM_string);
 		emitAbbrev(w, DW.DW_AT_type, DW.DW_FORM_ref4);
+		emitAbbrev(w, DW.DW_AT_data_member_location, DW.DW_FORM_udata);
 		emitAbbrev(w, 0, 0);
 	}
 }
@@ -715,8 +785,9 @@ class DwarfSubrangeTypeAbbrev extends DwarfAbbrev {
 		w.put_uleb32(code);
 		w.put_uleb32(DW.DW_TAG_subrange_type);
 		w.putb(DW.DW_children_no);
-		emitAbbrev(w, DW.DW_AT_type, DW.DW_FORM_ref4);
-		emitAbbrev(w, DW.DW_AT_upper_bound, DW.DW_FORM_exprloc);
+		// The element count is the value of the {length} member of the enclosing
+		// array object, which DWARF 5 allows to be a reference to that member.
+		emitAbbrev(w, DW.DW_AT_count, DW.DW_FORM_ref4);
 		emitAbbrev(w, 0, 0);
 	}
 }
@@ -760,20 +831,14 @@ class DwarfLocList(v: DwarfVariable) {
 	var end: u32;
 	def emit(w: DataWriter) {
 		for (i < entries.length) {
-			w.putb(DW.DW_LLE_offset_pair);
-			// Start of this entry
-			w.put_uleb32(entries[i].start);
 			// End of this entry: next entry start or the end of this variable
-			var end = if (i + 1 < entries.length, entries[i+1].start, end);
+			var e = entries[i], last = i + 1 == entries.length;
+			var end = if (last, this.end, entries[i+1].start);
+			if (end <= e.start) continue; // empty or inverted range; gdb rejects these
+			w.putb(DW.DW_LLE_offset_pair);
+			w.put_uleb32(e.start);
 			w.put_uleb32(end);
-			if (entries[i].reg != null) { // stack location
-				w.put_uleb32(1); // exprloc length
-				w.putb(DW.DWRegMap(entries[i].reg));
-			} else { // register
-				w.put_uleb32(2);
-				w.putb(DW.DW_OP_fbreg);
-				w.putb(entries[i].location);
-			}
+			putLoc(w, e.reg, e.location);
 		}
 		w.putb(DW.DW_LLE_end_of_list);
 	}
@@ -783,6 +848,160 @@ class DwarfLocList(v: DwarfVariable) {
 			if (last.reg == loc.0 && last.location == loc.1) return;
 		}
 		entries.put(DwarfLocListEntry(pos, loc.0, loc.1));
+	}
+}
+// Emit a DWARF expression (prefixed by its length) locating a value that lives
+// either in register {reg} or at offset {location} from the frame base.
+def putLoc(w: DataWriter, reg: X86_64Reg, location: int) {
+	if (reg != null) {
+		var n = DW.DWRegNum(reg);
+		if (n < 0) { // unknown register; emit an empty (unavailable) location
+			w.put_uleb32(0);
+		} else if (n <= 31) {
+			w.put_uleb32(1);
+			w.putb(DW.DW_OP_reg0 + n);
+		} else {
+			w.put_uleb32(1u + uleb32_len(u32.!(n)));
+			w.putb(DW.DW_OP_regx);
+			w.put_uleb32(u32.!(n));
+		}
+	} else {
+		w.put_uleb32(1u + sleb32_len(location));
+		w.putb(DW.DW_OP_fbreg);
+		w.put_sleb32(location);
+	}
+}
+def sleb32_len(data: int) -> u32 {
+	var r = 1u;
+	if (data >= 0) {
+		while (data >= 0x40) {
+			r += 1;
+			data = data >> 7;
+		}
+	} else {
+		while ((data >> 6) != -1) {
+			r += 1;
+			data = data >> 7;
+		}
+	}
+	return r;
+}
+def uleb32_len(data: u32) -> u32 {
+	var r = 1u;
+	while (data >= 0x80) {
+		r += 1;
+		data = data >> 7;
+	}
+	return r;
+}
+
+/* .debug_frame */
+// A single call frame instruction, recorded by the code generator at a given
+// text offset and replayed into an FDE in the .debug_frame section.
+type DwarfCfi {
+	case DefCfaOffset(offset: int);			// CFA = <cfa register> + offset
+	case DefCfaRegister(reg: int);			// CFA = reg + <cfa offset>
+	case SaveReg(reg: int, cfaOffset: int);		// reg is saved at CFA + cfaOffset
+	case RestoreReg(reg: int);			// reg has its initial rule again
+	case RememberState;
+	case RestoreState;
+}
+
+// Emits the .debug_frame section: one CIE describing the common unwind rules
+// at function entry, plus one FDE per method that has recorded CFI.
+class DwarfFrameSection {
+	// x86-64 System V: at function entry the CFA is %rsp+8 and the return
+	// address has been pushed at CFA-8.
+	var cfaRegister = DW.DW_X86_64_RSP;
+	var cfaOffset = 8;
+	var returnAddressReg = DW.DW_X86_64_RA;
+	var dataAlignmentFactor = -8;
+	var cieOffset: int;
+
+	def emit(w: DataWriter, subprograms: Vector<DwarfSubprogram>, codeStart: long) {
+		cieOffset = 0;
+		emitCie(w);
+		for (i < subprograms.length) {
+			var s = subprograms[i];
+			if (s.cfi.length == 0) continue;
+			emitFde(w, s, codeStart);
+		}
+	}
+	private def emitCie(w: DataWriter) {
+		var start = w.pos;
+		w.skipN(DWARF_LENGTH_SIZE);	// length
+		w.put_b32(-1);			// CIE_id (0xffffffff in the 32-bit format)
+		w.putb(4);			// version
+		w.putb(0);			// augmentation: empty string
+		w.putb(codePointerSize);	// address_size
+		w.putb(0);			// segment_selector_size
+		w.put_uleb32(1);		// code_alignment_factor
+		w.put_sleb32(dataAlignmentFactor);
+		w.put_uleb32(u32.!(returnAddressReg));
+		// initial instructions: CFA = cfaRegister + cfaOffset; RA saved at CFA-8
+		w.putb(DW.DW_CFA_def_cfa);
+		w.put_uleb32(u32.!(cfaRegister));
+		w.put_uleb32(u32.!(cfaOffset));
+		w.putb(DW.DW_CFA_offset | returnAddressReg);
+		w.put_uleb32(u32.!(cfaOffset / -dataAlignmentFactor));
+		align(w, start);
+		putUnitLength(w, start);
+	}
+	private def emitFde(w: DataWriter, s: DwarfSubprogram, codeStart: long) {
+		var start = w.pos;
+		w.skipN(DWARF_LENGTH_SIZE);	// length
+		w.put_b32(cieOffset);		// CIE_pointer
+		w.put_b64(s.low_pc);		// initial_location
+		w.put_b64(s.high_pc);		// address_range
+		var funcStart = int.!(s.low_pc - codeStart), loc = 0;
+		for (i < s.cfi.length) {
+			var e = s.cfi[i], delta = (e.0 - funcStart) - loc;
+			if (delta < 0) continue;	// out-of-order entry; skip defensively
+			putAdvanceLoc(w, u32.!(delta));
+			loc += delta;
+			putCfi(w, e.1);
+		}
+		align(w, start);
+		putUnitLength(w, start);
+	}
+	private def putCfi(w: DataWriter, cfi: DwarfCfi) {
+		match (cfi) {
+			DefCfaOffset(offset) => {
+				w.putb(DW.DW_CFA_def_cfa_offset);
+				w.put_uleb32(u32.!(offset));
+			}
+			DefCfaRegister(reg) => {
+				w.putb(DW.DW_CFA_def_cfa_register);
+				w.put_uleb32(u32.!(reg));
+			}
+			SaveReg(reg, cfaOffset) => {
+				w.putb(DW.DW_CFA_offset | reg);
+				w.put_uleb32(u32.!(cfaOffset / dataAlignmentFactor));
+			}
+			RestoreReg(reg) => w.putb(DW.DW_CFA_restore | reg);
+			RememberState => w.putb(DW.DW_CFA_remember_state);
+			RestoreState => w.putb(DW.DW_CFA_restore_state);
+		}
+	}
+	private def putAdvanceLoc(w: DataWriter, delta: u32) {
+		if (delta == 0) return;
+		if (delta < 0x40) {
+			w.putb(DW.DW_CFA_advance_loc | int.!(delta));
+		} else if (delta < 0x100) {
+			w.putb(DW.DW_CFA_advance_loc1);
+			w.putb(int.!(delta));
+		} else if (delta < 0x10000) {
+			w.putb(DW.DW_CFA_advance_loc2);
+			w.put_b16(int.!(delta));
+		} else {
+			w.putb(DW.DW_CFA_advance_loc4);
+			w.put_b32(int.!(delta));
+		}
+	}
+	// Pad the entry with DW_CFA_nop so that its total length is a multiple of
+	// the address size, as required for .debug_frame entries.
+	private def align(w: DataWriter, start: int) {
+		while (((w.pos - start) & (codePointerSize - 1)) != 0) w.putb(DW.DW_CFA_nop);
 	}
 }
 
@@ -808,8 +1027,12 @@ class DwarfLineSection(dirFile: DwarfDirFile) {
 	def maxSpecialAddrDelta: u32 = (255u - DWARFLineOpcodeBase) / DWARFLineRange;
 	
 	def addLineEntry(src: Source, label: Label, prologue_end: bool) {
-		var fileNum = dirFile.files[src.mdecl.token.fileName].index;
-		var lineEntry = DwarfLineEntry.new(fileNum, src.line, u32.!(src.column), label);
+		addLineEntryAt(src.mdecl.token.fileName, src.line, src.column, label, prologue_end);
+	}
+	def addLineEntryAt(fileName: string, line: int, column: int, label: Label, prologue_end: bool) {
+		var file = dirFile.files[fileName];
+		if (file == null) return; // unknown file; cannot describe this location
+		var lineEntry = DwarfLineEntry.new(file.index, line, u32.!(column), label);
 		if (prologue_end) lineEntry.flags |= DWARF_FLAG_PROLOGUE_END;
 		lineEntries.put(lineEntry);
 	}
