@@ -73,6 +73,16 @@ backends (`WasmTarget.v3`, `WasmGcTarget.v3`) to size the module's linear-memory
 heap; the default is only 1024 bytes, so any allocating test needs a realistic
 value. The v3i interpreter ignores it.
 
+Note that `-target=wasm-test` links **no garbage collector**: the allocator is a
+bare bump pointer that traps `unreachable` once it passes the end of the heap.
+Allocation is therefore monotonic, and the wrapper runs every input in a single
+instance, so the heap must be large enough to hold the allocation of an *entire
+run* — not merely the peak live set. A test that fits comfortably on v3i, wasm-gc
+and the native targets (all of which do collect) can still exhaust the heap here,
+and the symptom is a `RuntimeError: unreachable` trap rather than a wrong value.
+The same directive is reused by `test/gc`, which does run a real collector, so
+raising it trades a little GC stress there for a green wasm build.
+
 ## Adding a test
 
 1. Write the sections. Keep values flowing from arrays/globals rather than
@@ -88,6 +98,24 @@ value. The v3i interpreter ignores it.
 
 If a construct turns out not to be portable across backends, leave a comment
 saying so at the site rather than silently deleting the check.
+
+## Currently disabled tests
+
+These carry a `.v3.fail` extension, so the `*.v3` glob in `test.bash` skips them
+and they are also left out of `test/gc/smoke.gc`:
+
+- `gc01`, `gc03`, `work01`, `work03`, `work04`
+
+They were committed with a placeholder `//@execute 0=0` and never blessed. Their
+values do agree across v3i, wasm-gc and a GC-free wasm-linear run
+(`gc01=-1315312563`, `gc03=1729852229`, `work01=-1465536795`,
+`work03=1541062172`, `work04=-648465453`), but that is only three execution
+models that share the property of *not* using a shadow stack for GC roots; the
+native x86 targets that CI actually runs were not verified. Since these are
+allocation-churn tests aimed squarely at GC root tracking, blessing them from
+the interpreter alone risks encoding a wrong answer. Re-enabling them means
+following the blessing procedure above against a native target, and treating any
+disagreement as a compiler bug to report rather than a value to record.
 
 ## Known non-portable constructs (deliberately avoided here)
 

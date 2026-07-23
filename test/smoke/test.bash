@@ -18,11 +18,14 @@ function flags_of() {
 	fi
 }
 
-GROUPS=$OUT/flag-groups.txt
+# NOTE: do not name this variable GROUPS; that is a reserved bash variable
+# holding the current user's group ids, and assigning to it silently has no
+# effect, which would send this list to a file named after a group id instead.
+FLAG_GROUPS=$OUT/flag-groups.txt
 for t in $ALL; do
 	flags_of "$t"
 	echo
-done | sort -u > $GROUPS
+done | sort -u > $FLAG_GROUPS
 
 BASE_OPTS="$V3C_OPTS"
 while IFS= read -r g; do
@@ -42,6 +45,6 @@ while IFS= read -r g; do
 	V3C_OPTS="$BASE_OPTS $g"
 	execute_tests
 	V3C_OPTS="$BASE_OPTS"
-done < $GROUPS
+done < $FLAG_GROUPS
 
 exit $?
