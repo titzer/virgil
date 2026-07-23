@@ -29,6 +29,8 @@ function normalize() {
 	-e '/^warning: /d' \
 	-e '/^Reading symbols/d' \
 	-e '/^\[Inferior /d' \
+	-e '/^qemu-x86_64:/d' \
+	-e '/QEMU: Terminated via GDBstub/d' \
 	-e '/^\[New /d' \
 	-e '/^During startup/d' \
 	-e '/^Breakpoint [0-9]* at /d' \
