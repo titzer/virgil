@@ -333,18 +333,27 @@ class X86CodeGen extends OldCodeGen {
 		return false;
 	}
 	def genWideIntCastF(i: SsaApplyOp, orig: Operator, v: VReg, isDouble: bool) -> bool {
-		var name: string, m: (X86MacroAssembler, X86Rm, X86Rm, SSERm, bool) -> void;
 		var signed = IntType.!(orig.sig.returnType()).signed;
-		if (isDouble) {
-			name = if(signed, "cvt_d2l", "cvt_d2ul");
-			m = if(signed, X86MacroAssembler.cvt_fp2l, X86MacroAssembler.cvt_fp2ul);
-		} else {
-			name = if(signed, "cvt_f2l", "cvt_f2ul");
-			m = if(signed, X86MacroAssembler.cvt_fp2l, X86MacroAssembler.cvt_fp2ul);
+		if (signed) {
+			// fisttp writes its result to memory: define the two result words in a
+			// frame slot and let it write there directly.
+			var spill = frame.allocSpill(RegClass.I64) & ~(frame.IS_64);
+			gen(if(isDouble, "cvt_d2l", "cvt_f2l"), asm_sse_fp2l, (
+				dfnAt(vars[v.varNum], spill),
+				dfnAt(vars[v.varNum + 1], spill + 1),
+				use(i.input0()),
+				isDouble));
+			return false;
 		}
-		gen(name, asm_sse_f2l, (m,
-			dfn(vars[v.varNum]),
-			dfn(vars[v.varNum + 1]),
+		// the unsigned case goes through a fixup stub, which takes and returns its
+		// value on the stack, so the result has to be popped into registers. They
+		// are pinned rather than merely constrained to the GPR class, because two
+		// class-constrained defs of one instruction can be assigned the same
+		// register, and the second pop would then discard the first.
+		gen(if(isDouble, "cvt_d2ul", "cvt_f2ul"), asm_sse_f2l, (
+			X86MacroAssembler.cvt_fp2ul,
+			dfnAt(vars[v.varNum], Regs.EAX),
+			dfnAt(vars[v.varNum + 1], Regs.EDX),
 			use(i.input0()),
 			isDouble));
 		return false;
@@ -359,7 +368,7 @@ class X86CodeGen extends OldCodeGen {
 		return false;
 	}
 	def genWideIntTruncF(i: SsaApplyOp, orig: Operator, v: VReg, isDouble: bool) -> bool {
-		var name: string, m: (X86MacroAssembler, X86Rm, X86Rm, SSERm, bool) -> void;
+		var name: string, m: (X86MacroAssembler, X86Reg, X86Reg, SSERm, bool) -> void;
 		var signed = IntType.!(orig.sig.returnType()).signed;
 		if (isDouble) {
 			name = if(signed, "long_truncd", "ulong_truncd");
@@ -368,15 +377,17 @@ class X86CodeGen extends OldCodeGen {
 			name = if(signed, "long_truncf", "ulong_truncf");
 			m = if(signed, X86MacroAssembler.long_truncfp, X86MacroAssembler.ulong_truncfp);
 		}
+		// the fixup stub returns its value on the stack, so the result has to be
+		// popped into registers; pinned, see genWideIntCastF.
 		gen(name, asm_sse_f2l, (m,
-			dfn(vars[v.varNum]),
-			dfn(vars[v.varNum + 1]),
+			dfnAt(vars[v.varNum], Regs.EAX),
+			dfnAt(vars[v.varNum + 1], Regs.EDX),
 			use(i.input0()),
 			isDouble));
 		return false;
 	}
 	def genWideFloatRoundI(i: SsaApplyOp, orig: Operator, v: VReg, isDouble: bool) -> bool {
-		var name: string, m: (X86MacroAssembler, SSEReg, X86Rm, X86Rm, bool) -> void;
+		var name: string, m: (X86MacroAssembler, SSEReg, X86Rm, X86Rm, SSEAddr, bool) -> void;
 		var signed = IntType.!(orig.typeArgs[0]).signed;
 		if (isDouble) {
 			name = if(signed, "round_l2d", "round_ul2d");
@@ -385,10 +396,16 @@ class X86CodeGen extends OldCodeGen {
 			name = if(signed, "round_l2f", "round_ul2f");
 			m = if(signed, X86MacroAssembler.cvt_l2fp, X86MacroAssembler.cvt_ul2fp);
 		}
+		// fild reads from memory, not from the top of the stack. Hand the value
+		// over in a dedicated frame slot, which the result then travels back in;
+		// it must not be an operand's own slot, since the operand may still be
+		// live afterwards.
+		var spill = frame.allocSpill(RegClass.I64) & ~(frame.IS_64);
 		gen(name, asm_sse_l2f, (
-			m, dfn(v),
+			m, dfnsse(v),
 			use(i.input0()),
 			use(i.input1()),
+			spill,
 			isDouble));
 		return false;
 	}
@@ -1082,13 +1099,21 @@ class X86CodeGen extends OldCodeGen {
 		dest = loc(dest); a = loc(a);
 		m(asm, loc_s(dest), loc_rm(a));
 	}
-	def asm_sse_f2l(m: (X86MacroAssembler, X86Rm, X86Rm, SSERm, bool) -> void, il: int, ih: int, a: int, isDouble: bool) {
+	def asm_sse_f2l(m: (X86MacroAssembler, X86Reg, X86Reg, SSERm, bool) -> void, il: int, ih: int, a: int, isDouble: bool) {
 		il = loc(il); ih = loc(ih); a = loc(a);
-		m(asm, loc_rm(il), loc_rm(ih), loc_sm(a), isDouble);
+		m(asm, loc_r(il), loc_r(ih), loc_sm(a), isDouble);
 	}
-	def asm_sse_l2f(m: (X86MacroAssembler, SSEReg, X86Rm, X86Rm, bool) -> void, dest: int, a: int, b: int, isDouble: bool) {
+	// {il} names an 8-byte frame slot that receives the result; {ih} is its high
+	// half and only fixes the location of the second result word.
+	def asm_sse_fp2l(il: int, ih: int, a: int, isDouble: bool) {
+		il = loc(il); a = loc(a);
+		asm.cvt_fp2l(SSEAddr.!(loc_sm(il)), loc_sm(a), isDouble);
+	}
+	// {slot} is a raw frame location, not an operand index, so it is not loc()'d.
+	def asm_sse_l2f(m: (X86MacroAssembler, SSEReg, X86Rm, X86Rm, SSEAddr, bool) -> void,
+			dest: int, a: int, b: int, slot: int, isDouble: bool) {
 		dest = loc(dest); a = loc(a); b = loc(b);
-		m(asm, loc_s(dest), loc_rm(a), loc_rm(b), isDouble);
+		m(asm, loc_s(dest), loc_rm(a), loc_rm(b), SSEAddr.!(loc_sm(slot)), isDouble);
 	}
 	def asm_sse_cvt(m: (X86Assembler, SSEReg, SSERm) -> void, dest: int, a: int) {
 		dest = loc(dest); a = loc(a);
