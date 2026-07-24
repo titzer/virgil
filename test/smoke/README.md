@@ -101,21 +101,24 @@ saying so at the site rather than silently deleting the check.
 
 ## Currently disabled tests
 
-These carry a `.v3.fail` extension, so the `*.v3` glob in `test.bash` skips them
-and they are also left out of `test/gc/smoke.gc`:
+`float02.v3.fail` carries a `.v3.fail` extension, so the `*.v3` glob in
+`test.bash` skips it and it is also left out of `test/gc/smoke.gc`.
 
-- `gc01`, `gc03`, `work01`, `work03`, `work04`
+It fails only on **x86-linux**, only on input 8 (`dispatch()`): eight double
+accumulators live across a virtual call is more than that backend has XMM
+registers, and one of them (`s4`) comes back wrong. Every other target agrees on
+all eleven inputs. The failure is distilled into
+`test/regalloc/float_dispatch00.v3.fail`; re-enable `float02` when that passes.
 
-They were committed with a placeholder `//@execute 0=0` and never blessed. Their
-values do agree across v3i, wasm-gc and a GC-free wasm-linear run
-(`gc01=-1315312563`, `gc03=1729852229`, `work01=-1465536795`,
-`work03=1541062172`, `work04=-648465453`), but that is only three execution
-models that share the property of *not* using a shadow stack for GC roots; the
-native x86 targets that CI actually runs were not verified. Since these are
-allocation-churn tests aimed squarely at GC root tracking, blessing them from
-the interpreter alone risks encoding a wrong answer. Re-enabling them means
-following the blessing procedure above against a native target, and treating any
-disagreement as a compiler bug to report rather than a value to record.
+The five allocation-churn tests `gc01`, `gc03`, `work01`, `work04` are enabled
+here but deliberately **not** listed in `test/gc/smoke.gc`: under `-rt.test-gc`
+they run long enough to be within a factor of two of the native tester's hard
+5-second per-run timeout, which would make that suite flaky. They still run on
+every target from this suite.
+
+Raising a `//@heap-size` to satisfy the GC-free wasm-linear target trades away GC
+stress in `test/gc`; `gc01`, `work03` and `work04` needed that, which is a second
+reason they are not in `smoke.gc`.
 
 ## Known non-portable constructs (deliberately avoided here)
 
@@ -128,13 +131,18 @@ its feature without running it.
   normalization/codegen, so folded and runtime answers differ. NaN and signed
   zero show the two opposite symptoms. See `test/variants/eq_nan{00,01,02}.v3.fail`
   and `test/core/tuple_eq_zero00.v3.fail`.
-- **Reading a `double #big-endian` layout field.** Not byte-swapped on compiled
-  backends; the write side is correct. See `test/layout/read_double_be00.v3.fail`.
+- **Reading a `double #big-endian` layout field.** Not byte-swapped on the JVM
+  backend; the write side is correct, and the native and wasm backends read it
+  correctly. See `test/layout/read_double_be00.v3.fail`.
 
 Other bugs these tests surfaced, which do not constrain how tests are written:
-`test/core/match_span00.v3.fail` (compiler crash when a `match` spans more than
-`int.max`), `test/core/neg_zero_lit00.v3.fail` (`-0` lexes as a double with the
-wrong value), `test/range/query00.v3.fail` (`Range<T>.?` contradicts `Range<T>.!`).
+`test/core/neg_zero_lit00.v3.fail` (`-0` lexes as a double with the wrong value)
+and `test/range/query00.v3.fail` (`Range<T>.?` contradicts `Range<T>.!`).
+
+Fixed since: `test/core/match_span00.v3` (compiler crash when a `match` spans
+more than `int.max`) and `test/variants/sign_pack_multi00.v3` (a signed
+sub-word field of a `#packed` variant corrupted the fields above it) now pass and
+are enabled, as are `double02`, `fsi02`, `fsi03`, `func02` and `layout01` here.
 
 ## Notes on Virgil that these tests ran into
 
