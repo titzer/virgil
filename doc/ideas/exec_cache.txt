@@ -1,0 +1,124 @@
+Idea: Execution cache to accelerate compiler testing
+
+## Background
+
+Virgil compilation is very deterministic, as the compiler itself is a portable Virgil program that shouldn't depend on host configuration, architecture, OS, etc.
+Optimization decisions made by the compiler are driven solely by compiler flags and analysis of the program being compiled.
+Similarly, test programs in the suite are often very small and exercise only a small part of the compiler each.
+Most programs have a limited number of optimization opportunities and the compiler will often produce the same results at different optimization levels.
+
+## Compiler should stream compilation artifacts to a pipe
+
+The compiler usually produces a single output binary, but for some targets it produces multiple files, such as the JVM, where it produces multiple .class files.
+Currently, the testing harnesses redirect the compiler to dump its outputs in /tmp and then runners pick up executables one by one.
+Instead, to improve efficiency by avoiding thousands of small files and unnecessary disk traffic to launch and test programs, the compiler should have a streaming mode where it outputs the name of each file it would write, plus the contents to a pipe.
+On the other end of the pipe, a test harness inspects compiler outputs and consults an execution cache.
+If the compiler produced the same binary for the same test as a previous run which passed, there's no need to execute the test again.
+The test harness can be most efficient if the test cache is in RAM.
+For reproducing failures, the test harness on the end of the pipe can also tee the compiler outputs to a file in /tmp that contains the exact bytes for all compilations in the batch.
+This is more efficient than opening, writing, and closing multiple files per test.
+Only when the execution cache misses should the test harness write individual results to disk and then attempt to execute them.
+
+## Cache the execution results by (strong) hash
+
+As stated, most tests have stable compiler output.
+Similarly, most tests have a fixed set of inputs; it's rare to change execution tests, and much more comment to add new tests.
+Execution of a test with inputs is also very deterministic.
+Therefore, it makes sense to cache the results of running each binary on its inputs.
+A full test suite run for one target might produce 15,000 binaries, each several kilobytes in size.
+A cache will eventually accumulate all the compiled binaries ever produced during testing.
+Even if this is gigabytes in size, we consider this fine for now.
+However, for quick checking, we can improve performance by using hashing.
+
+Given a binary B, compute hash(B).
+Store the results of executing a binary on a particular runner, e.g. test-arm64-linux, as:
+
+hash(B) -> test-arm64-linux(_, 1, 2, 3, 4) = (res1, res2, res3, res4)
+
+Which means the results of running test-arm64-linux on the binary B, with different inputs 1, 2, 3, 4 yields results res1, res2, res3, res4.
+Importantly, the inputs and the results aren't interpreted as correct or incorrect, just stored in the cache.
+Thus we can store negative results so that during a debugging session, we don't need to constantly rerun binaries that are still broken because a fix didn't change the compiler output.
+It's up to the test harness that queries the execution cache to interpret whether the results are right.
+If nothing is in the cache for a given invocation, then a new execution on an actual runner will be created, and when finished, the results stored in the cache.
+The runner interprets the input arguments, starts execution, and when done, provides the output results back to the cache.
+Since the test suite supports testing targets via emulation and remotely, some executions will be slow; we can execute them asynchronously and in parallel, populating the cache when their results are known.
+After the execution is done, the cache is updated.
+Importantly, the test harness always inspects results via the cache mechanism, even if the cache is disabled.
+
+The operation is easy to see for execution tests that only produce a single binary and take command-line inputs and write their result to stdout, like the vast majority of the Virgil test suite.
+
+## More complicated runs
+
+Other runners could take more complicated inputs, e.g. to test I/O.
+
+hash(B) -> run-arm64-linux(_, stdin={S}) = (stdout={O})
+
+Where {S} and {O} mean references to other files that are used for setting up the test.
+The notation stdin= and stdout= remember how runner the runner set the test up for execution and what to record from execution; in this case, piping in the contents of {S} to stdin and recorded the output of stdout, which was {B}.
+Again, the test harness that uses the cache entry decides whether or not that was an acceptable run; the cache just stores the facts.
+
+It's up to the runner to decide how to map the inputs and outputs.
+For example, we could specify filenames to set up as inputs for the test, and filenames that should be created by the test.
+
+hash(B) -> run-riscv64(_, filename={F} args="filename") = (stdout={O}, outfile={F})
+
+Here, filename= implies the runner would create a file named "filename" and put the contents of {F} into the file.
+Here also, args="filename" implies the runner passes command-line arguments "filename" to the execution.
+Lastly, the stdout= and outfile= parts record that this execution produced the given results in stdout and the named file "outfile".
+
+We can have multiple input files to a runner, e.g. the JVM runner needs multiple class files.
+
+hash(B) -> run-jvm(MyClass1.class={B1}, MyClass2.class={B2}) = (stdout={O})
+
+The JVM runner then put the contents {B1} and {B2} into the given files and record the stdout.
+
+## The cache is a key-value store
+
+The data model for the execution cache is intentionally a type of key-value store.
+For a test harness, typically it wants to query the cache by binary {B}, by test runner, {test-runner}, and perhaps by other inputs.
+An effective index would be to make searching for (hash(B), test-runner) very efficient; e.g. since there are relatively few test-runners (perhaps a few dozen), each could have its own B-tree for hash(B).
+Since test-runners are also typically target-specific, then they could be further grouped by target.
+
+## Flakiness, Validation and Invalidation
+
+A thorny problem in test suites is flaky tests, which fail intermittently, e.g. due to resource exhaustion.
+In the execution cache system proposed here, ideally a test would be run just once, then its result added to the cache.
+That would bake-in the result of the first attempt.
+If the test passes the first time, then success gets recorded, and no matter how many further retries are attempted, the cache supplies the same answer.
+That gives false confidence; the test being flaky might be indicative of a real bug that is masked by caching.
+The opposite is also problematic.
+If a test fails the first time, the cache will mean every attempt to rerun it will also fail.
+The test may not be indicative of a bug, yet no amount of rerunning will indicate that.
+
+For this reason, the execution cache should support invalidation of entries and/or marking them as flaky.
+Invalidating an entry simply means that it will get reexecuted the next time it comes up.
+
+## Environment variables
+
+Similarly, sometimes tests aren't flaky but depend on state in the environment in addition to the binary and inputs being tested.
+For example, a system-wide configuration parameter (e.g. amount of physical RAM) might make some tests fail.
+For any relevant environment variable, we can add them as inputs to a cache entry:
+
+hash(B) -> run-rpi5(RAM_SIZE=1GB, _, 1, 2) = (44, 55)
+hash(B) -> run-rpi5(RAM_SIZE=128KB, _, 1, 2) = (!HeapOverflowException, 55)
+
+## Rerunning tests
+
+The cache entries themselves reference binaries and all their inputs.
+Therefore they represent a complete record of everything needed to run, or re-run, a test.
+This makes it possible to re-run cache entries on test-runners just by fetching the resources and setting the test up again.
+If the results differ, then there are either hidden environment variables that differ between runs, the test itself is flaky, or the runner itself is flaky (e.g. faulty RAM on a test board).
+For robustness, it makes sense to periodically revisit cache entries and rerun the tests to see if they hold.
+Note however, that this is decoupled from testing a particular change; it can be done asynchronously, in the background.
+
+## Cache entries are tests for runners
+
+Some test runners target virtual machines like the JVM or Wasm.
+Those software systems also have bugs, versions, revisions, etc.
+The test cache stores all the inputs of all the tests ever run on these runners, which forms a natural split between *two* systems under test--the system producing input binaries and the runner running the binaries.
+That makes it a natural fit for also creating a regression suite *for the target*.
+For example, given a new V8 or Wasmtime version to run Wasm programs, we can immediately run it on all the Virgil wasm binaries that have ever been put through the execution cache mechanism, even including ones that had Virgil compiler miscompiles.
+This allows differential testing and debugging of the underlying runners; we have a record of all the executions performed on them.
+That's also great for adding new hardware test devices.
+For example, suppose that a target like arm64-linux has only been tested on an emulator, and we now add a new hardware device that can run these binaries natively.
+We can run all the tests on the hardware without even having the Virgil compiler--we just need the binaries from the execution cache.
