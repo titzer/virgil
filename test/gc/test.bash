@@ -74,7 +74,8 @@ function do_int_test() {
     ALL=$T/compile.all.out
     rm -f $ALL
 
-    if [[ "$target" =~ "x86-64" ]]; then
+    # TODO: factor out helper function for is64 into common.bash
+    if [[ "$target" =~ "x86-64" || "$target" =~ "arm64" ]]; then
         HEAP='-heap-size=65m' # 64-bit needs more heap
     else
         HEAP='-heap-size=32m'

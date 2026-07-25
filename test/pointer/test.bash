@@ -36,6 +36,8 @@ for target in $TEST_TARGETS; do
 	TESTS=$(ls $TESTS | grep -v _32.v3)
     elif [ "$target" = x86-64-darwin ]; then
 	TESTS=$(ls $TESTS | grep -v _32.v3)
+    elif [ "$target" = arm64-linux ]; then
+	TESTS=$(ls $TESTS | grep -v _32.v3)
     else
 	continue;
     fi
