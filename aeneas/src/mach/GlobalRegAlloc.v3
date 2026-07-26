@@ -182,6 +182,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		// Build interference graph using local liveness.
 		if (verbose) Terminal.put1("Round %d: building interference graph\n", spillRound);
 		codegen.iterateInstructionsBackward(addInterferenceForInstr);
+		graph.finish();
 		if (verbose) {
 			printGraph();
 			Terminal.put1("Round %d: coloring graph\n", spillRound);
@@ -396,35 +397,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			movesWorklist.put((dst.varNum, src.varNum, curWeight));
 		}
 	}
+	// Add the edges out of {index} to every other variable live in {currentRow}. Since this
+	// is called for every variable in the row, only the outgoing direction is added here;
+	// the reverse edge is added when the other endpoint of the edge is visited.
 	def addInterferenceEdgesByIndex(index: int, currentRow: int) {
-		var vreg = vars[index];
-		var node = graph.nodes[index];
-		addInterferenceEdges(currentRow, vreg, node);
-	}
-	def addInterferenceEdges(currentRow: int, vreg: VReg, node: Node) {
-		var vec = node.interfere;
-		var old = vec.extract();
-		var i = 0, j = 0;
-		while (i < old.length && old[i] < 0) {
-			vec.put(old[i]);
-			i++;
-		}
-		while (i < old.length && j < vars.length) {
-			if (old[i] == j) {
-				vec.put(old[i]);
-				i++;
-			} else if (liveness[currentRow, j] && j != vreg.varNum) {
-				vec.put(j);
-				graph.nodes[j].addInterfere(vreg.varNum);
-			}
-			j++;
-		}
-		for (j = j; j < vars.length; j++) {
-			if (liveness[currentRow, j] && j != vreg.varNum) {
-				vec.put(j);
-				graph.nodes[j].addInterfere(vreg.varNum);
-			}
-		}
+		liveness.apply(currentRow, graph.addEdgeFrom, index);
 	}
 	// Process constraint in two cases:
 	// 1. If constraint is a single register, add a move for this constraint.
@@ -436,19 +413,18 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			liveness.apply(currentRow, addInterferencesReg, (vreg, constraint));
 			if (vreg != null && graph.addMove(vreg.varNum, -constraint)) movesWorklist.put((-constraint, vreg.varNum, curWeight));
 		} else {
-			// Membership is tested through the register set matrix, since neither the
-			// constraint set nor the register class is required to be sorted.
+			// Test membership with set matrix, since constraint set and the register class are not necessarily sorted.
 			var set = regSet.regClasses[vreg.regClass.tag];
 			var rset = regSet.regSets[set];
 			for (i < rset.length - COLOR_RESERVE) {
 				var reg = rset[i];
-				if (!regSet.isInRegSet(reg, constraint)) graph.nodes[vreg.varNum].addInterfere(-reg);
+				if (!regSet.isInRegSet(reg, constraint)) graph.addEdge(vreg.varNum, -reg);
 			}
 		}
 	}
 	def addInterferencesReg(index: int, t: (VReg, int)) {
 		var vreg = t.0, constraint = t.1;
-		if (vreg == null || vreg.varNum != index) graph.nodes[index].addInterfere(-constraint);
+		if (vreg == null || vreg.varNum != index) graph.addEdge(index, -constraint);
 	}
 	def addInterferencesRegSet(index: int, rset: Array<byte>) {
 		for (reg in rset) addInterferencesReg(index, (null, reg)); // XXX: more efficient bulk-add of interferences.
@@ -988,15 +964,82 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 
 class InterferenceGraph(varsCnt: int, regSet: MachRegSet) {
 	def nodes = Array<Node>.new(varsCnt);
+	// Scratch state used by {dedup} and {sortEdges}.
+	private def markOffset = regSet.physRegs + 1;	// negative ids denote physical registers
+	private def mark = Array<int>.new(varsCnt + regSet.physRegs + 1);
+	private var stamp: int;
+	private var sortTmp = Array<int>.new(0);
 
 	new() {
 		for (i < nodes.length) nodes[i] = Node.new(i);
 	}
 
+	// Append an edge from {x} to {y} without checking for a duplicate. Deduplicates {x} once
+	// its edge list has grown to twice its degree, which bounds storage to 2x the degree.
+	def addEdge(x: int, y: int) {
+		var node = nodes[x];
+		node.interfere.put(y);
+		if (node.interfere.length >= node.dedupLimit) dedup(node);
+	}
+	// Append an edge from {nid} to {neighbor}.
+	def addEdgeFrom(neighbor: int, nid: int) {
+		if (neighbor != nid) addEdge(nid, neighbor);
+	}
+	// Finish construction, leaving every node's edge list free of duplicates and sorted.
+	def finish() {
+		for (i < nodes.length) {
+			var node = nodes[i];
+			dedup(node);
+			sortEdges(node);
+		}
+	}
+	// Remove duplicate edges from {node}, preserving the order of the remaining edges.
+	private def dedup(node: Node) {
+		var v = node.interfere, s = ++stamp, write = 0;
+		for (i < v.length) {
+			var e = v[i], k = e + markOffset;
+			if (mark[k] != s) {
+				mark[k] = s;
+				v[write++] = e;
+			}
+		}
+		v.length = write;
+		node.interfereCnt = write;
+		node.dedupLimit = if(write < 8, 16, write * 2);
+	}
+	// Sort {node}'s edges in ascending order. Avoid {Arrays.sort} for now since it allocates
+	// a new array at every level of its recursion. XXX: use Ranges.quicksort
+	private def sortEdges(node: Node) {
+		var v = node.interfere, n = v.length;
+		if (n < 2) return;
+		var a = v.array, sorted = true;
+		for (i = 1; i < n; i++) if (a[i] < a[i - 1]) { sorted = false; break; }
+		if (sorted) return;
+		if (sortTmp.length < n) sortTmp = Array<int>.new(n);
+		var src = a, dst = sortTmp;
+		for (width = 1; width < n; width = width * 2) {
+			for (lo = 0; lo < n; lo = lo + width + width) {
+				var mid = lo + width, hi = mid + width;
+				if (mid > n) mid = n;
+				if (hi > n) hi = n;
+				var i = lo, j = mid, k = lo;
+				while (i < mid && j < hi) {
+					if (src[j] < src[i]) dst[k++] = src[j++];
+					else dst[k++] = src[i++];
+				}
+				while (i < mid) dst[k++] = src[i++];
+				while (j < hi) dst[k++] = src[j++];
+			}
+			var t = src;
+			src = dst;
+			dst = t;
+		}
+		if (src != a) for (i < n) a[i] = src[i];
+	}
 	def addInterference(x_: int, y_: int) {
 		if (x_ == y_) return;
-		nodes[x_].addInterfere(y_);
-		nodes[y_].addInterfere(x_);
+		addEdge(x_, y_);
+		addEdge(y_, x_);
 	}
 	def addMove(x_: int, y: int) -> bool {
 		if (!COALESCE) return false;
@@ -1071,8 +1114,9 @@ class InterferenceGraph(varsCnt: int, regSet: MachRegSet) {
 
 class Node(var alias: int) {
 	var defBlock: SsaBlock;
-	var interfere = Vector<int>.new(); // sorted
+	var interfere = Vector<int>.new(); // unsorted, with duplicates, until {InterferenceGraph.finish}
 	var interfereCnt: int = 0;
+	var dedupLimit = 16;               // length at which duplicate edges are removed
 	var moves = Vector<int>.new();
 	var movesCnt: int = 0;
 	var spillCost = 0;
