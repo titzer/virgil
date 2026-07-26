@@ -1,0 +1,441 @@
+Idea: An adversarial register allocator fuzzer
+
+## Background
+
+Aeneas has four register allocators:
+
+  GlobalRegAlloc		graph coloring with spilling, splitting, coalescing (x86-64, arm64)
+  LocalRegAlloc			block-local allocation (x86-64, arm64, -O1 and up)
+  SimpleRegAlloc		the fallback when the others are off
+  LinearScanRegAlloc		used by the older 32-bit x86 backend via OldCodeGen
+
+A register allocator is one of the worst things in a compiler to test, for four reasons.
+
+First, it is almost entirely invisible in the output of a test.
+A program that computes the right answer with the wrong register assignment is indistinguishable from one that computes the right answer with the right assignment, unless the wrong assignment happens to clobber a value that is read again on the path the test takes.
+Most small test programs do not take that path.
+
+Second, its behavior is a step function of register pressure.
+Nearly every interesting bug in a graph-coloring allocator fires only when some node's degree sits exactly at the number of available colors.
+That number is a property of the target: it is 12 on x86-64 (16 GPRs minus COLOR_RESERVE minus reserved ones) and roughly 29 on arm64.
+A test tuned to provoke the boundary on one target is trivially colorable on the other, so a test corpus written against x86-64 provides almost no coverage of the same code paths on arm64.
+
+Third, the interesting state is internal and transient.
+When GlobalRegAlloc's coalescing was fixed, the actual defect was that a node could be pushed onto a worklist twice, so its neighbors' degrees were decremented twice, so the maintained degree drifted below the real degree.
+The symptom appeared hundreds of steps later as "no colors available for v14", in a different phase, with no surviving evidence of the cause.
+The defect was located by adding eight lines that recomputed the degree from scratch at each simplify step and compared.
+Nothing in the test suite could have narrowed it further, because nothing in the test suite can see a degree.
+
+Fourth, the allocator's inputs are hard to reach from the source language.
+To exercise a spill you must first build enough register pressure that the allocator decides to spill; to exercise a precolored interference you must arrange a calling convention that happens to pin the value you care about.
+Both require large, indirect programs, which are then large and indirect to debug.
+
+The purpose of this document is to describe a set of compiler-side mechanisms that make the allocator's inputs directly addressable and its outputs directly checkable, and then to describe how to build a fuzzer on top of them whose job is to break register allocators.
+
+## Design principle: make the fuzzer's job easy, not the allocator's
+
+Every mechanism below exists to move some part of the allocator's behavior from "emergent, provoked indirectly by program shape" to "requested directly by the test".
+The fuzzer should be able to say "spill this value", "put this value in this register", "make these two values interfere", "pretend there are only five registers" -- and then check invariants directly rather than inferring them from a wrong answer.
+
+A secondary principle: prefer oracles that fire on *internal inconsistency* over oracles that fire on *wrong output*.
+A wrong answer requires the generated program to be sensitive to the bug; an invariant violation does not.
+
+
+# Part 1: Compiler-side mechanisms
+
+## 1.1 CiTest intrinsics
+
+CiTest already exists (aeneas/src/v3/CiTest.v3).
+It is a Member_TypeCon installed into the program's type environment by CiTestModule.install(), which resolves names under the CiTest namespace to operators.
+Today it exposes exactly one:
+
+  CiTest.killRegisters()	-> Opcode.KillRegisters -> V3Op.opKillRegisters
+
+which lowers in SsaX86_64Gen to kill(Regs.ALL) plus an I_KILL_REGS pseudo-instruction, is a nop in the interpreter (Eval.v3) and on the JVM, and forces every live value out of registers.
+This one intrinsic is responsible for most of the deliberate spill coverage in test/regalloc.
+The pattern generalizes well; the following are the intrinsics worth adding, roughly in order of value.
+
+### killRegisters(set)
+
+The current form kills everything, which is an all-or-nothing hammer.
+A parameterized form that kills a named subset leaves the allocator with a small number of usable registers at a specific program point, which is a much finer instrument: it creates *graduated* pressure rather than total pressure.
+The machinery is already present -- Operand.Kill(constraint) takes a register set index and MachRegSet.regSets[] already indexes named subsets -- so this is close to free.
+
+Useful spellings, in decreasing order of portability:
+
+  CiTest.killRegisters()			kill all (today)
+  CiTest.killAllBut(n)				leave n registers of each class free
+  CiTest.killRegisters_gpr()			kill one class only
+  CiTest.killRegisters_$name()			kill a named target-specific set
+
+killAllBut(n) is the important one for fuzzing, because it is portable: it means the same thing on x86-64 and arm64, and it lets a six-variable program create the same pressure that would otherwise require forty.
+
+### forceSpill(x) -> x
+
+An identity operator on a value that marks its VReg as must-spill.
+
+This is the single most valuable addition, because the spill machinery is currently unreachable except through pressure.
+In GlobalRegAlloc, computeLivenessAndInsertSpills, insertRestoreBeforeUse and dupVReg only run for a VReg whose spillRound equals the current round, i.e. only after the allocator has already decided to spill it.
+Getting there today requires 15 to 40 simultaneously live values, which makes every such test large, slow, and target-sensitive.
+With forceSpill it is six lines.
+
+It also gives direct access to a failure mode that is otherwise very hard to reach.
+selectSpill() refuses to spill any VReg whose spillRound is nonzero, and insertRestoreBeforeUse creates its restore VRegs with spillRound = 1, so a restore can never itself be spilled.
+Whether that is correct is exactly the kind of question a fuzzer should be able to ask directly: forceSpill a value, then forceSpill its restore, and see what happens.
+
+Implementation notes:
+- The signature must be an identity on the value (sig_x_x), not void->void like killRegisters, so that the operator sits on the value's def and the optimizer cannot drift it away from what it is marking.
+- It must survive SSA optimization; treat it like a barrier for the value.
+- In the interpreter and on JVM/Wasm it is the identity.
+- In the mach backend it sets a flag on the VReg that the allocator honors before round 1. ShadowStackSpiller already pre-spills values live across calls, so there is an existing hook to imitate.
+
+### forceSpillHere(x) -> x
+
+The same, but spilling only at that program point rather than for the whole live range.
+
+This is worth calling out separately because it is precisely the primitive that live range splitting needs.
+Building it as a test intrinsic first gives the fuzzer a way to construct split live ranges by hand, which means the splitting heuristics can be developed against a corpus of hand-built splits before they are inferred automatically.
+
+### forceReg_$name(x) -> x
+
+An identity operator that constrains a value to a named physical register.
+
+Today the only sources of precolored interference are calling conventions and Kill operands, both of which are coarse and both of which come with a lot of other structure attached.
+The code that handles precolored nodes -- George's coalescing heuristic, the biased-coloring move that addInterferencesFromConstraints adds when a use is constrained to one register, MoveResolver's cycle breaking -- is therefore reachable only in aggregate.
+When GlobalRegAlloc's coalescing was fixed, the George heuristic was passing a positive register number where a negative one was expected, so it was searching a neighbor list for a *variable* whose id happened to equal the register number; that bug was found by differential fuzzing, not by any directed test, because no directed test could be written.
+
+Two design wrinkles:
+- Resolving a register name requires the target's MachRegSet at type-check time, but CiTestModule.install() runs in Aeneas.v3 before the backend is chosen. This is workable since the target is known from CLOptions, but it makes such tests target-specific; they belong under test/asm/<arch> or need per-target expectations.
+- A role-based spelling avoids the problem entirely and is portable:
+
+    CiTest.forceReg_arg0(x)		first argument register
+    CiTest.forceReg_ret0(x)		first return register
+    CiTest.forceReg_scratch(x)	the target's scratch register
+    CiTest.forceReg_callee0(x)	first callee-saved register
+
+  Every backend can map those, the tests run everywhere, and they cover the cases that actually matter (argument/return/scratch conflicts).
+
+Keep the physical-name form too, for arch-specific regression tests, but make the role-based form the one the fuzzer uses by default.
+
+### forceSameReg(a, b) and forceDiffReg(a, b)
+
+The most expressive primitives of the whole set, and the least obvious.
+
+forceSameReg(a, b) inserts a coalescible move between two values.
+forceDiffReg(a, b) inserts an interference edge between two values.
+
+Together they let a test *construct an interference graph directly* rather than coaxing one out of dataflow.
+"A clique of size K-1, plus one move between two of its members, plus one node of degree K-1 adjacent to both" is a sentence that describes a coloring corner case exactly, and with these two primitives it is about eight lines of Virgil.
+Without them it is a guessing game about how many local variables produce that shape after instruction selection, and the answer differs per target.
+
+This is also what makes the fuzzer's generator tractable.
+A generator that emits random *programs* has to work very hard to hit interesting graphs.
+A generator that emits random *graphs* and then renders them as programs using forceSameReg/forceDiffReg hits them by construction.
+
+Implementation: forceDiffReg needs to reach the allocator as a synthetic interference edge; the simplest route is a two-input operator that the mach backend recognizes and turns into an edge in addInterferenceForInstr, with both values kept live across it.
+forceSameReg similarly becomes a move candidate in tryCoalescing.
+Both are identities at runtime, so the interpreter ignores them.
+
+### keepAlive(x, ...) / clobber()
+
+Two small ones worth having:
+
+  CiTest.keepAlive(x)		extends a value's live range to that point without using it
+  CiTest.clobber()		a barrier that neither kills registers nor is removable
+
+keepAlive lets the generator control live ranges precisely -- which is most of what determines the interference graph -- without inventing artificial uses that change the program's value and therefore its expected output.
+This matters more than it sounds: today, to keep a value live you must consume it, which perturbs the result the test is checking.
+
+## 1.2 Allocator knobs
+
+These are command-line options, not intrinsics.
+The existing -ra option name is taken (reachability), so prefer a -regalloc- prefix.
+
+### -regalloc-max-regs=N
+
+Restrict the allocator to the first N registers of each class.
+
+This is the highest-leverage single knob in the whole document, because it multiplies the value of every test that already exists rather than requiring new ones.
+GlobalRegAlloc computes availableColor from regSet.regSets[...].length - COLOR_RESERVE and AssignColors iterates the same prefix; one knob adjusts both.
+
+What it buys:
+- The 195 tests in test/regalloc become a threshold-stress corpus at every value of N, at essentially zero authoring cost.
+- Tests stop being target-tuned. A six-variable test at -regalloc-max-regs=4 provokes the same boundary on x86-64 and arm64.
+- It exercises the spill and reload paths continuously rather than only in the handful of tests that build enough pressure.
+- It makes the fuzzer's generated programs small. Small programs shrink well and read well.
+
+The constraint is that N must stay above whatever the ABI and the scratch registers require; COLOR_RESERVE already models part of this, so the knob should be expressed as "reserve more" rather than "use fewer" if that is simpler to keep safe.
+
+### -regalloc=<algo>
+
+Select the allocator explicitly: global, local, simple, linearscan.
+
+Four allocators over the same IR is an unusually good position to be in, because it makes a *cheap* oracle available that needs no interpreter: compile the same program with two allocators and compare the results.
+Any disagreement is a bug in one of them, and the pair narrows it.
+This should be a first-class flag rather than a combination of -global-regalloc, LocalRegAlloc and optimization level.
+
+### -regalloc-coalesce=true|false
+
+Whether the global allocator coalesces move-related variables should be selectable per compilation rather than fixed when the compiler is built.
+As a flag it lets CI run the corpus both ways, lets a bisect A/B it, and makes the -print-regalloc statistics comparable between runs.
+The general rule: every internal boolean that changes allocator behavior should be reachable from the command line, because the fuzzer's most productive oracle is the same program compiled two ways.
+COLOR_RESERVE in GlobalRegAlloc is a constant of the same kind, and is what -regalloc-max-regs above would replace.
+
+### -regalloc-seed=N
+
+Randomize the allocator's tie-breaks: which node simplify() pops from the worklist, the order of worklistMoves, the choice among equally good spill candidates, the order registers are tried in AssignColors.
+
+This is the mechanism most likely to actually find the next bug, and it is worth explaining why.
+Threshold bugs in a graph-coloring allocator do not depend on the program so much as on the *order* in which nodes cross the threshold.
+The allocator is deterministic, so for a given program there is exactly one order, and a test either hits the bug or does not.
+Randomizing the order turns each of the 195 existing tests into an unbounded family of tests.
+Empirically this is how the coalescing worklist bug would have been found fastest: many programs produce a node that crosses K twice, but only some orderings then re-simplify it before anything else changes.
+
+Deterministic replay from a seed is essential; the seed goes in the bug report and reproduces exactly.
+
+### -regalloc-first/-regalloc-last
+
+A decision counter for allocator decisions, mirroring the existing -first-enabled / -last-enabled / -first-disabled / -last-disabled mechanism in Compiler.v3 that bisects optimization decisions.
+
+Number every coalesce, every spill choice, every split, and allow a range to be suppressed.
+Given a failing program, bisecting on this counter identifies the single decision that breaks it, which is usually enough to name the bug.
+This is the debugging counterpart to -regalloc-seed: the seed finds the failure, the counter localizes it.
+
+## 1.3 Observability
+
+### -regalloc-verify
+
+An internal invariant checker, run after each phase when enabled.
+This is the oracle that catches silent miscompiles, which is the class that execution tests structurally cannot catch.
+
+Checks worth having, cheapest first:
+
+  During coloring:
+  - Every node is on at most one worklist, and its recorded position in that worklist is correct.
+  - No node appears twice on a worklist.
+  - At simplify time, the maintained degree equals |{t in adj(n) : t is precolored or not yet removed}|.
+    (This is literally the check that located the coalescing bug.)
+  - alias chains are acyclic and terminate at a node or a physical register.
+
+  After coloring:
+  - For every interference edge (a,b), coloring[getAlias(a)] != coloring[getAlias(b)].
+  - For every precolored edge (a,-r), coloring[a] != r.
+  - Every VReg that is live somewhere has a color or a spill slot, and never neither.
+  - Every color assigned to a VReg belongs to that VReg's register class.
+
+  After finalization:
+  - Every operand's assigned location satisfies its constraint.
+  - Every parallel move is a permutation: no two moves write the same destination.
+    (MoveResolver already fails on this, which is how one family of coalescing bugs surfaced;
+     making it a verifier check rather than an assertion inside the resolver reports it earlier.)
+  - Every use reads a location that is written on all paths to it.
+    This last one is the real prize and the most work: it is a dataflow check over the final
+    machine code, and it is what actually catches "the allocator lost a value".
+
+The first two groups are cheap enough to enable in the whole test suite, not just under the fuzzer.
+
+### Machine-readable statistics
+
+RegAllocStatistic already tracks iterations, stores, reloads, coalesces and moves, printed under -print-regalloc.
+Emit one machine-readable line per method, so that:
+- tests can assert on it (see 3.5), and
+- the fuzzer can use it as a coverage signal (see Part 5).
+
+Suggested: one line per method with a stable key=value format, including at minimum
+method, vregs, rounds, spills, reloads, moves, coalesced, maxDegree, worklistTransitions.
+
+
+# Part 2: The generator
+
+## 2.1 Two generators, not one
+
+Generate *graphs* and generate *programs*, separately.
+
+The graph generator is the adversarial one.
+It emits an interference graph directly -- pick a clique size relative to the current -regalloc-max-regs, add move edges, add a few high-degree nodes, add precolored constraints -- and renders it into Virgil using forceDiffReg, forceSameReg, forceReg_*, forceSpill and keepAlive.
+Its advantage is that it can aim: "produce a node whose degree crosses K exactly twice" is a property of the graph, and the graph generator can construct it on purpose.
+
+The program generator is the realistic one.
+It emits ordinary Virgil -- loops, phis, calls, casts, matches, tuples, arrays -- and lets instruction selection produce whatever graph it produces.
+Its advantage is that it finds bugs in the parts of the pipeline *around* the allocator: how MachLowering shapes the operands, how ShadowStackSpiller pre-spills, how the GC reference map interacts with spill slots.
+
+Both are necessary. The graph generator finds coloring bugs; the program generator finds integration bugs.
+
+## 2.2 What the program generator should emit
+
+The shapes that matter are the ones that produce moves and interference.
+Ranked by observed yield when a corpus of ~290 generated programs was used to find coalescing bugs (36 discriminating cases survived):
+
+  loop headers with many carried values		highest yield; the phis form long move chains
+  loops that rotate values across the back edge	move cycles, which stress MoveResolver
+  if-expression merges over N values		phi parallel moves
+  merges where several phis share a source	repeated sources in one parallel move
+  self-assigning phis, v = if(c, v, w)		the pattern coalescing exists to remove
+  N-argument / N-result calls			precolored argument and result registers
+  chained calls				a result must be coalesced onto the next argument
+  values held live across killRegisters()	forces coalesced ranges to spill
+  reference values through phis			interacts with the GC reference map
+  tuples, sub-register (byte) values, longs, floats  different register classes and widths
+
+Sweep the width of each shape across a range that brackets the number of available colors.
+With -regalloc-max-regs available, sweep the register count instead and keep the programs small; that is strictly better, because it produces the same coverage with programs that a human can read.
+
+## 2.3 Programs must be self-checking and deterministic
+
+Each generated program must compute a value that depends on every live value it creates, so that a lost or clobbered value changes the answer.
+A generator that produces values it never reads is generating tests that cannot fail.
+
+Avoid undefined or target-dependent behavior: no uninitialized reads, no reliance on evaluation order where the language does not fix it, no floating-point operations whose result depends on excess precision, no dependence on allocation addresses or hash iteration order.
+
+Ground truth comes from running the same program in the interpreter (v3i / Aeneas -test), which performs no register allocation at all and is therefore an independent oracle.
+The workflow that produced the coalescing regression tests was exactly this: generate with placeholder expectations, run the interpreter, read the actual values out of the failure message, write them back as //@execute expectations.
+That loop should be part of the fuzzer, not a manual step.
+
+
+# Part 3: Oracles
+
+Ordered by how much they narrow a failure, best first.
+
+## 3.1 Internal verifier
+
+-regalloc-verify (1.3).
+Fires at the point of corruption rather than at the point of symptom.
+This is the only oracle that catches a wrong-but-consistent register assignment that the generated program happens not to be sensitive to.
+
+## 3.2 Differential: allocator against allocator
+
+Compile the same program with -regalloc=global and -regalloc=simple and compare results.
+No interpreter required, and disagreement immediately names one of two suspects.
+Extend to all four allocators; a 4-way vote localizes further.
+
+## 3.3 Differential: interpreter against native
+
+The interpreter does no register allocation, so it is an independent oracle for the whole backend.
+Slower, but catches bugs in phases the allocator-vs-allocator comparison shares.
+
+## 3.4 Differential: same allocator, different knobs
+
+The same program at -regalloc-max-regs=4, 6, 8, 12 must produce the same answer.
+The same program at -regalloc-seed=1..100 must produce the same answer.
+The same program with and without -regalloc-coalesce must produce the same answer.
+
+This is a metamorphic oracle and it is very productive, because it needs no expected value at all: any *disagreement* between two runs of the same program is a bug, regardless of which one is right.
+It also scales to programs whose expected value is expensive to compute.
+
+## 3.5 Metamorphic: injected intrinsics must not change results
+
+Inserting CiTest.forceSpill(x), CiTest.killRegisters(), CiTest.keepAlive(x) or CiTest.forceReg_*(x) into a working program must never change what it computes.
+This turns every existing test in the suite into a family of tests: take a passing program, inject an intrinsic at a random point, and the answer must not move.
+
+This is cheap to implement and applies to the entire existing corpus, which is thousands of programs.
+
+## 3.6 Assertions on allocator output
+
+The oracles above check that the allocator is *correct*.
+Nothing checks that it is *doing anything*.
+
+The 36 coalescing regression tests added to test/regalloc all pass with coalescing disabled; the entire optimization could silently regress to a no-op and the suite would stay green.
+The same is true of spilling quality, of live range splitting, and of the coalescing rate.
+
+Add a test header checked against the machine-readable statistics:
+
+  //@regalloc main: moves=0 spills=0 coalesced>=10
+
+so that a test can assert the optimization happened, not merely that the program survived it.
+A weaker but even cheaper variant is a golden code-size file for a small corpus, which catches quality regressions in aggregate -- enabling coalescing, for instance, makes test/large/bigframe05 about 3% larger because merging live ranges raises register pressure, and nothing in the suite currently notices.
+
+## 3.7 Crash and internal error
+
+The cheapest oracle: any InternalError, assertion failure, or non-termination is a bug.
+In practice this is what most allocator bugs look like once the invariants are tight enough, which is an argument for tightening them.
+
+
+# Part 4: Shrinking
+
+A fuzzer without a shrinker produces findings nobody acts on.
+For this domain the reduction steps are unusually well-structured, because the generators are parameterized:
+
+  1. Reduce the width parameter (number of live values) until the failure disappears; keep the smallest failing width.
+  2. Reduce -regalloc-max-regs; a failure at 4 registers is far more readable than the same failure at 12.
+  3. Delete injected intrinsics one at a time.
+  4. Delete statements, then delete variables, re-deriving the expected value from the interpreter after each step.
+  5. Bisect with -regalloc-first/-regalloc-last to name the single decision responsible.
+  6. Re-derive expected values and emit the test with its //@execute header.
+
+Steps 1 and 2 do most of the work and are trivial to implement, because they are just re-running the generator with smaller parameters rather than transforming source.
+This is a strong argument for generating from parameters rather than mutating text.
+
+The output of the shrinker should be a file that drops straight into test/regalloc, with a header comment naming the mechanism it stresses and the seed it came from.
+
+
+# Part 5: Driving the search adversarially
+
+A fuzzer that samples uniformly will spend most of its time on graphs that are trivially colorable.
+Feed the statistics from 1.3 back into the generator as a coverage signal, and reward inputs that:
+
+  - produce a node whose degree crosses the threshold more than once
+    (this is exactly the condition of the coalescing worklist bug)
+  - require more than one spill round
+  - produce a parallel move with a cycle longer than 2
+  - produce a coalesce that is later undone by a spill
+  - produce a spill of a value that was itself introduced by a reload
+  - produce a live range that spans a kill and a call and a loop back edge
+  - maximize the ratio of moves to instructions
+  - maximize maximum degree relative to the available register count
+
+Each of these is a one-line predicate over the statistics line, and each names a region of the state space where allocators are known to be fragile.
+Prefer mutating inputs that scored well on any of them, in the usual coverage-guided way.
+
+A second, cruder adversarial signal: reward inputs where two allocators, or two seeds, produce *different code* even though they produce the same answer.
+Those are the inputs where the allocation is under-determined, which is where a wrong choice is most likely to go unnoticed.
+
+
+# Part 6: Suggested order of implementation
+
+Each step is independently useful; do not wait for the whole thing.
+
+  1. -regalloc-max-regs=N.
+     Multiplies the value of the entire existing corpus at once, with no new tests.
+     Run test/regalloc at several values in CI.
+
+  2. -regalloc-verify, worklist and degree checks only.
+     Cheap, and it is the check that located the last serious bug.
+     Enable it across the whole suite, not just the fuzzer.
+
+  3. -regalloc=<algo> and -regalloc-coalesce=<bool>.
+     Turns internal constants into oracles.
+
+  4. CiTest.forceSpill(x) and CiTest.keepAlive(x).
+     The first two intrinsics that make small directed tests possible.
+
+  5. The metamorphic harness of 3.5, applied to the existing suite.
+     Thousands of new test cases from code that already exists.
+
+  6. -regalloc-verify, post-coloring checks.
+     The silent-miscompile oracle.
+
+  7. -regalloc-seed=N.
+     Turns every test into a family.
+
+  8. The program generator and the interpreter-based expectation loop.
+
+  9. CiTest.forceSameReg / forceDiffReg / forceReg_$role, and the graph generator on top.
+
+ 10. Statistics-guided search, //@regalloc assertions, -regalloc-first/-last bisection.
+
+
+## Closing note
+
+The three bug classes worth keeping in mind while building this, because each defeated a different existing defense:
+
+  - A degree counter that drifted from the truth. Defeated execution tests, because the
+    resulting code was usually still correct; caught only by recomputing the invariant.
+  - A heuristic that read a register id with the wrong sign. Defeated directed tests,
+    because no directed test could construct the required precolored neighborhood;
+    caught only by differential fuzzing.
+  - A worklist that was a multiset where the algorithm assumed a set. Defeated code review
+    twice, because the code matches the published pseudocode line for line -- the published
+    pseudocode just says "set".
+
+Mechanisms that would have caught each, respectively: -regalloc-verify, forceReg_*, and
+-regalloc-seed with the worklist membership check.
