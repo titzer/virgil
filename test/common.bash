@@ -386,7 +386,7 @@ function execute_target_tests() {
 	    fi
 	done
 
-	if [ "RAN" = 0 ]; then
+	if [ "$RAN" = 0 ]; then
 	    print_status "  skipped" ""
 	    count=$(echo $(echo $TORUN | wc -w))
 	    printf "$count ${YELLOW}no runners found${NORM}\n"
