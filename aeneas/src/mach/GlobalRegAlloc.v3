@@ -1,13 +1,34 @@
 // Copyright 2023 Virgil Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-def COALESCE = false;
 def COLOR_RESERVE = 2;
+
+// Which worklist a node is currently on. Appel's worklists are sets, so a node must never
+// appear on one twice; a node's degree can rise again while coalescing merges nodes, so it
+// can reach the "trivially colorable" threshold more than once.
+component WL {
+	def NONE: byte = 0;
+	def SIMPLIFY: byte = 1;
+	def FREEZE: byte = 2;
+	def SPILL: byte = 3;
+}
+
+// The state of a move that is a candidate for coalescing. Follows the {worklistMoves},
+// {activeMoves}, {frozenMoves}, {constrainedMoves} and {coalescedMoves} sets of Appel's
+// "Iterated Register Coalescing"; a move is in exactly one of these states at all times.
+component MoveState {
+	def WORKLIST: byte = 0;		// candidate for coalescing in this round
+	def ACTIVE: byte = 1;		// not a candidate now, but may be re-enabled
+	def FROZEN: byte = 2;		// given up on, will not be coalesced
+	def CONSTRAINED: byte = 3;	// endpoints interfere, cannot be coalesced
+	def COALESCED: byte = 4;	// endpoints have been merged
+}
 
 // Implements global register allocation via graph coloring, including spilling, splitting,
 // and coalescing.
 class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def statistic = RegAllocStatistic.new();
+	def doCoalesce = codegen.context.compiler.RegAllocCoalesce;
 	def vars = codegen.vars;
 	var liveness = BitMatrix.new(0, 0);
 	def constRow = 0;
@@ -23,7 +44,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def freezeWorklist = Vector<int>.new();
 	def spillWorklist = Vector<int>.new();
 	def selectStack = Vector<int>.new();
-	var movesWorklist = Vector<(int,int,int)>.new(); // var, var, weight
+	def worklistMoves = Vector<int>.new();	// ids of moves in state {MoveState.WORKLIST}
 	var actualSpill: bool;
 	var spillChange: bool;
 	var spillRound = 1;
@@ -41,7 +62,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def allocate() {
 		// Reset internal state.
 		verbose = CLOptions.PRINT_REGALLOC.val && codegen.context.shouldPrintMach();
-		statistic.reset(vars.length);
+		statistic.reset(vars.length, doCoalesce);
 		regState.clear();
 		stackMoves = false;
 		for (i < regUsage.length) regUsage[i] = 0;
@@ -169,7 +190,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	def buildAndColorGraph() {
 		curWeight = 0;
 		spillChange = false;
-		movesWorklist.resize(0);
+		worklistMoves.resize(0);
 		// Compute liveness for each block and insert spills from this round.
 		liveness.reset(codegen.blocks.order.length + 1, vars.length, false);
 		if (verbose) Terminal.put2("Round %d: computing liveness %s\n", spillRound, if(spillRound > 1, "and inserting spills", ""));
@@ -178,7 +199,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			if (spillChange) codegen.print(Strings.format1("after inserting spills in round %d", spillRound));
 			printLiveness();
 		}
-		graph = InterferenceGraph.new(vars.length, regSet);
+		graph = InterferenceGraph.new(vars.length, regSet, doCoalesce);
 		// Build interference graph using local liveness.
 		if (verbose) Terminal.put1("Round %d: building interference graph\n", spillRound);
 		codegen.iterateInstructionsBackward(addInterferenceForInstr);
@@ -351,7 +372,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		// 5. Process constraint interferences for uses.
 		for (i < operands.length) match (operands[i]) {
 			Overwrite(vreg, use, constraint) => {
-				if (COALESCE) tryCoalescing(vreg, 0, use, constraint);
+				if (doCoalesce) tryCoalescing(vreg, 0, use, constraint);
 				addInterferencesFromConstraints(currentRow, use, constraint);
 			}
 			Use(vreg, constraint) => {
@@ -361,7 +382,7 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		}
 
 		// 6. If coalescing is turned on, remember possible coalescing opportunities.
-		if (COALESCE && opcode == ArchInstrs.ARCH_PARMOVE) {
+		if (doCoalesce && opcode == ArchInstrs.ARCH_PARMOVE) {
 			var half = operands.length >> 1;
 			for (i < half) {
 				match (operands[i]) {
@@ -391,11 +412,19 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			liveness.apply(currentRow, graph.addInterference, vreg.varNum);
 		}
 	}
+	// Record a move between {dst} and {src} as a candidate for coalescing.
+	// XXX: also consider !live[src] && !live[dst]
 	def tryCoalescing(dst: VReg, dconstraint: int, src: VReg, sconstraint: int) {
-		// XXX: also consider !live[src] && !live[dst]
-		if (dconstraint == 0 && sconstraint == 0 && dst != src && graph.addMove(dst.varNum, src.varNum)) {
-			movesWorklist.put((dst.varNum, src.varNum, curWeight));
-		}
+		if (dst == null || src == null || dst == src) return;
+		if (dst.regClass != src.regClass) return;
+		if (!isUnconstrained(dst, dconstraint) || !isUnconstrained(src, sconstraint)) return;
+		graph.addMove(dst.varNum, src.varNum, curWeight);
+	}
+	// Check whether {constraint} restricts {vreg} to fewer registers than its class allows.
+	// A constraint that is exactly the variable's register class does not constrain the
+	// coalescing decision, since both endpoints of the move are in the same class.
+	def isUnconstrained(vreg: VReg, constraint: int) -> bool {
+		return constraint == 0 || constraint == regSet.regClasses[vreg.regClass.tag];
 	}
 	// Add the edges out of {index} to every other variable live in {currentRow}. Since this
 	// is called for every variable in the row, only the outgoing direction is added here;
@@ -411,7 +440,8 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		if (regSet.isReg(constraint)) {
 			// All live variables interfere with this register now.
 			liveness.apply(currentRow, addInterferencesReg, (vreg, constraint));
-			if (vreg != null && graph.addMove(vreg.varNum, -constraint)) movesWorklist.put((-constraint, vreg.varNum, curWeight));
+			// Bias the coloring of {vreg} toward the register it is constrained to here.
+			if (doCoalesce && vreg != null) graph.addMove(-constraint, vreg.varNum, curWeight);
 		} else {
 			// Test membership with set matrix, since constraint set and the register class are not necessarily sorted.
 			var set = regSet.regClasses[vreg.regClass.tag];
@@ -440,33 +470,37 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 		freezeWorklist.resize(0);
 		spillWorklist.resize(0);
 		selectStack.resize(0);
+		worklistMoves.resize(0);
 
 		for (i = vars.length - 1; i >= 0; i--) {
 			if (vars[i] == null) continue;
 			var node = graph.nodes[i];
 			node.interfereCnt = node.interfere.length;
 			if (node.interfereCnt >= availableColor) {
-				spillWorklist.put(i);
-			} else if (node.movesCnt > 0) {
-				if (!COALESCE) codegen.context.fail("coalesce should be turned off");
-				freezeWorklist.put(i);
+				putOnWorklist(WL.SPILL, i);
+			} else if (graph.isMoveRelated(i)) {
+				if (!doCoalesce) codegen.context.fail("coalesce should be turned off");
+				putOnWorklist(WL.FREEZE, i);
 			} else {
-				simplifyWorklist.put(i);
+				putOnWorklist(WL.SIMPLIFY, i);
 			}
 		}
-		if (COALESCE) {
-			Ranges.quicksort(movesWorklist.array[0 ... movesWorklist.length], movesWorklistCmp);
-			statistic.move = movesWorklist.length;
+		if (doCoalesce) {
+			// Consider the heaviest moves first; moves are popped off the back.
+			for (i < graph.moveCount()) worklistMoves.put(i);
+			// Note: a mergesort, not {Ranges.quicksort}, whose last-element pivot degrades to
+			// O(n^2) on the long runs of equal weights that block weights produce.
+			worklistMoves.array = Arrays.sort(worklistMoves.array, 0, worklistMoves.length, moveWeightCmp);
+			statistic.move = worklistMoves.length;
 		}
 		// Simplify, coalesce, and freeze.
-		while (simplifyWorklist.length > 0 || freezeWorklist.length > 0 || spillWorklist.length > 0) {
+		while (simplifyWorklist.length > 0 || worklistMoves.length > 0
+			|| freezeWorklist.length > 0 || spillWorklist.length > 0) {
 			if (verbose) Terminal.put3(" simplify: %d, freeze: %d, spill: %d\n", simplifyWorklist.length, freezeWorklist.length, spillWorklist.length);
-			if (simplifyWorklist.length > 0) {
-				simplify();
-			} else if (!coalesce()) {
-				if (freezeWorklist.length > 0) freeze();
-				else selectSpill();
-			}
+			if (simplifyWorklist.length > 0) simplify();
+			else if (worklistMoves.length > 0) coalesce();
+			else if (freezeWorklist.length > 0) freeze();
+			else selectSpill();
 		}
 		// Assign coloring by popping from the select stack.
 		coloring = Array<byte>.new(vars.length);
@@ -479,15 +513,11 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			node.removed = false;
 			for (i < regSet.physRegs) allocatedColor[i] = false;
 			for (i < node.interfere.length) {
-				var neighbor = node.interfere[i];
-				// Mark neighbors' color as allocated
-				if (neighbor < 0) {
-					allocatedColor[-neighbor] = true;
-				} else {
-					if (!graph.nodes[neighbor].removed) {
-						allocatedColor[coloring[neighbor]] = true;
-					}
-				}
+				// Mark the color of each neighbor that has been colored already. A neighbor
+				// that was coalesced away takes the color of the node it was merged into.
+				var neighbor = getAlias(node.interfere[i]);
+				if (neighbor < 0) allocatedColor[-neighbor] = true;
+				else if (!graph.nodes[neighbor].removed) allocatedColor[coloring[neighbor]] = true;
 			}
 			var vreg = vars[nid];
 			if (vreg.hint != 0 && !allocatedColor[vreg.hint]) { // try hint first
@@ -514,177 +544,229 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			codegen.allocSpill(vreg);
 			if (verbose) Terminal.put2(" spill v%d = %d\n", vreg.varNum, vreg.spill);
 		}
-		// Finalize colorings for nodes.
+		// Finalize colorings for nodes that were coalesced away.
 		for (i = vars.length - 1; i >= 0; i--) {
 			if (vars[i] == null || coloring[i] > 0) continue;
 			var a = getAlias(i);
-			coloring[i] = if(a > 0, coloring[a], byte.!(-a));
+			if (a == i) continue;
+			coloring[i] = if(a >= 0, coloring[a], byte.!(-a));
 		}
 	}
-	// Sort movesWorklist against the weight in descending order
-	def movesWorklistCmp(x: (int, int, int), y: (int, int, int)) -> bool {
-		return x.2 > y.2;
+	// Order moves by ascending weight, so that popping off the back of {worklistMoves}
+	// considers the heaviest moves first.
+	def moveWeightCmp(x: int, y: int) -> bool {
+		return graph.moveWeight[x] < graph.moveWeight[y];
 	}
-	def removeFromWorklist(worklist: Vector<int>, nid: int) -> bool {
-		for (i < worklist.length) {
-			if (worklist[i] == nid) {
-				var a = worklist[--worklist.length];
-				if (worklist.length > 0) worklist[i] = a;
-				return true;
-			}
+	def worklist(wl: byte) -> Vector<int> {
+		match (wl) {
+			WL.SIMPLIFY => return simplifyWorklist;
+			WL.FREEZE => return freezeWorklist;
+			_ => return spillWorklist;
 		}
-		return false;
 	}
+	// Move {nid} onto worklist {wl}, removing it from whichever worklist it is on now.
+	// Idempotent, so that a node can never appear on a worklist twice.
+	def putOnWorklist(wl: byte, nid: int) {
+		var node = graph.nodes[nid];
+		if (node.wl == wl) return;
+		if (node.wl != WL.NONE) removeFromWorklist(nid);
+		var v = worklist(wl);
+		node.wl = wl;
+		node.wlIndex = v.length;
+		v.put(nid);
+	}
+	// Remove {nid} from whichever worklist it is on, if any.
+	def removeFromWorklist(nid: int) {
+		var node = graph.nodes[nid];
+		if (node.wl == WL.NONE) return;
+		var v = worklist(node.wl), i = node.wlIndex, last = --v.length;
+		if (i < last) {
+			var moved = v[last];
+			v[i] = moved;
+			graph.nodes[moved].wlIndex = i;
+		}
+		node.wl = WL.NONE;
+	}
+	// Remove and return the last node on worklist {wl}.
+	def popWorklist(wl: byte) -> int {
+		var v = worklist(wl), nid = v[--v.length];
+		graph.nodes[nid].wl = WL.NONE;
+		return nid;
+	}
+	// Follow the chain of coalescing aliases to the node that {nid} was merged into.
+	// A negative result denotes a physical register that {nid} was coalesced onto.
 	def getAlias(nid: int) -> int {
-		var alias: int;
-		while (nid > 0 && (alias = graph.nodes[nid].alias) != nid) {
+		while (nid >= 0) {
+			var alias = graph.nodes[nid].alias;
+			if (alias == nid) break;
 			nid = alias;
 		}
 		return nid;
 	}
 	// Simplify the last node in the worklist.
 	def simplify() {
-		var nid = simplifyWorklist[--simplifyWorklist.length];
+		var nid = popWorklist(WL.SIMPLIFY);
 		if (verbose) Terminal.put1("  simplify v%d\n", nid);
 		var node = graph.nodes[nid];
 		node.removed = true;
 		selectStack.put(nid);
 		var interfere = node.interfere;
 		for (i < interfere.length) {
-			decrementDegree(interfere[i]);
+			var t = interfere[i];
+			if (t >= 0 && !graph.nodes[t].removed) decrementDegree(t);
 		}
 	}
-	// Decrements the degree of node {n} and moves the node to the right worklist.
+	// Decrement the degree of node {nid} and move it to the right worklist if its degree
+	// just dropped below the number of available colors.
 	def decrementDegree(nid: int) {
-		if (nid < 0) return;
 		var node = graph.nodes[nid];
-		// When a degree transit from availableColor, move the node to simplifyWorklist.
-		if (!node.removed && node.interfereCnt == availableColor) {
-			removeFromWorklist(spillWorklist, nid);
-			if (node.movesCnt > 0) freezeWorklist.put(nid);
-			else simplifyWorklist.put(nid);
-		}
-		node.interfereCnt--;
+		var d = node.interfereCnt;
+		node.interfereCnt = d - 1;
+		if (d != availableColor || node.wl != WL.SPILL) return;
+		// The node just became trivially colorable; re-enable its moves and requeue it.
+		enableMoves(nid);
+		putOnWorklist(if(graph.isMoveRelated(nid), WL.FREEZE, WL.SIMPLIFY), nid);
 	}
-	// Coalesces all possible moves in the movelist.
-	def coalesce() -> bool {
-		if (verbose) Terminal.put(" coalesce\n");
-		var any = false; // if any nodes were coalesced
-		var tmpMovesWorklist = Vector<(int, int, int)>.new();
-		while (movesWorklist.length > 0) {
-			var m = movesWorklist[--movesWorklist.length];
-			var u = getAlias(m.0), v = getAlias(m.1);
-			var x = if(v < 0, v, u), y = if(v < 0, u, v);
-			if (y < 0) {
-				// both vars are precolored
-			} else if (x == y) {
-				any = true;
-				graph.nodes[x].movesCnt--;
-				addWorklist(x);
-			} else if (!graph.interfere(x, y) && tryCoalesce(x, y)) {
-				any = true;
-			} else { // cannot coalesce
-				tmpMovesWorklist.put(m);
-			}
-		}
-		movesWorklist = tmpMovesWorklist;
-		if (verbose) Terminal.put1(" coalesced: %z\n", any);
-		return any;
-	}
-	def addWorklist(nid: int) {
-		if (nid <= 0) return;
-		var node = graph.nodes[nid];
-		if (node.movesCnt == 0 && node.interfereCnt < availableColor) {
-			removeFromWorklist(freezeWorklist, nid);
-			simplifyWorklist.put(nid);
+	// Make the moves of {nid} and of its neighbors candidates for coalescing again, since
+	// the degree of {nid} just dropped and a previously conservative test may now succeed.
+	def enableMoves(nid: int) {
+		enableMovesOf(nid);
+		var interfere = graph.nodes[nid].interfere;
+		for (i < interfere.length) {
+			var t = interfere[i];
+			if (t >= 0 && !graph.nodes[t].removed) enableMovesOf(t);
 		}
 	}
-	// Try to coalesce, and if success, merge node y into node x.
-	def tryCoalesce(x_: int, y_: int) -> bool {
-		var coalesce = false;
-		var y = graph.nodes[y_];
-		if (x_ < 0) {
-			if (precoloredCoalesceCheck(-x_, y)) {
-				coalesce = true;
-			}
-		} else {
-			var x = graph.nodes[x_];
-			var combine = graph.combineInterfere(x_, y_);
-			var cnt = 0, tmpInterfereCnt = 0;
-			for (i < combine.length) {
-				if (combine[i] < 0) { cnt++; tmpInterfereCnt++; continue; }
-				if (graph.nodes[combine[i]].interfereCnt >= availableColor) cnt++;
-				if (!graph.nodes[combine[i]].removed) tmpInterfereCnt++;
-			}
-			if (cnt < availableColor) {
-				// Briggs conservative coalescing heuristic.
-				coalesce = true;
-				x.movesCnt--;
-				graph.mergeMoves(x_, y_);
-				if (tmpInterfereCnt >= availableColor && x.interfereCnt < availableColor) {
-					removeFromWorklist(freezeWorklist, x_);
-					spillWorklist.put(x_);
-				} else if (tmpInterfereCnt < availableColor && x.movesCnt == 0) {
-					removeFromWorklist(freezeWorklist, x_);
-					simplifyWorklist.put(x_);
-				}
-				x.interfere = combine;
-				x.interfereCnt = tmpInterfereCnt;
-			}
+	def enableMovesOf(nid: int) {
+		var moveList = graph.nodes[nid].moveList;
+		for (i < moveList.length) {
+			var m = moveList[i];
+			if (graph.moveState[m] != MoveState.ACTIVE) continue;
+			graph.moveState[m] = MoveState.WORKLIST;
+			worklistMoves.put(m);
 		}
-		if (coalesce) {
-			// Remove y and updates its neighbors.
+	}
+	// Consider the last move in the worklist for coalescing.
+	def coalesce() {
+		var m = worklistMoves[--worklistMoves.length];
+		if (graph.moveState[m] != MoveState.WORKLIST) return; // stale worklist entry
+		var x = getAlias(graph.moveX[m]), y = getAlias(graph.moveY[m]);
+		var u = x, v = y;
+		if (y < 0) { u = y; v = x; } // a precolored node is always {u}
+		if (u == v) {
+			// Both ends already have the same color; the move will disappear.
+			graph.moveState[m] = MoveState.COALESCED;
+			addWorklist(u);
+		} else if (v < 0 || graph.interfere(u, v)) {
+			// Both ends are precolored, or they interfere; the move can never be removed.
+			graph.moveState[m] = MoveState.CONSTRAINED;
+			addWorklist(u);
+			addWorklist(v);
+		} else if (if(u < 0, georgeCheck(u, v), briggsCheck(u, v))) {
+			graph.moveState[m] = MoveState.COALESCED;
 			statistic.coalesce++;
-			y.removed = true;
-			if (y.interfereCnt < availableColor) removeFromWorklist(freezeWorklist, y_);
-			else removeFromWorklist(spillWorklist, y_);
-			for (i < y.interfere.length) {
-				if (y.interfere[i] < 0) continue;
-				if (graph.nodes[y.interfere[i]].addInterfere(x_)) graph.nodes[y.interfere[i]].interfereCnt--;
-				else decrementDegree(y.interfere[i]);
-			}
-			y.alias = x_;
+			combine(u, v);
+			addWorklist(u);
+		} else {
+			// Coalescing is not conservatively safe yet; retry if a degree drops later.
+			graph.moveState[m] = MoveState.ACTIVE;
 		}
-		return coalesce;
 	}
-	// Heuristic used for coalescing a precolored register:
-	// For any t in y's neighbor, t is precolored || degree[t] < K || (t, r) interfere
-	def precoloredCoalesceCheck(precolored: int, y: Node) -> bool{
-		for (i < y.interfere.length) {
-			if (y.interfere[i] < 0) continue;
-			var t = y.interfere[i], tnode = graph.nodes[t];
-			if (tnode.removed || tnode.interfereCnt < availableColor || graph.interfere(t, precolored)) continue;
+	// Move {nid} from the freeze worklist to the simplify worklist if it is no longer
+	// move-related and is trivially colorable.
+	def addWorklist(nid: int) {
+		if (nid < 0) return; // precolored nodes are never on a worklist
+		var node = graph.nodes[nid];
+		if (node.removed || node.interfereCnt >= availableColor) return;
+		if (graph.isMoveRelated(nid)) return;
+		if (node.wl == WL.FREEZE) putOnWorklist(WL.SIMPLIFY, nid);
+	}
+	// George's heuristic for coalescing {v} onto the precolored register {u}: every neighbor
+	// of {v} is either precolored, trivially colorable, or already interferes with {u}.
+	def georgeCheck(u: int, v: int) -> bool {
+		var interfere = graph.nodes[v].interfere;
+		for (i < interfere.length) {
+			var t = interfere[i];
+			if (t < 0) continue; // precolored
+			var tnode = graph.nodes[t];
+			if (tnode.removed) continue; // not adjacent anymore
+			if (tnode.interfereCnt < availableColor) continue;
+			if (graph.interfere(t, u)) continue;
 			return false;
 		}
 		return true;
 	}
-	// Freeze the last node in the worklist.
-	def freeze() {
-		var node = freezeWorklist[--freezeWorklist.length];
-		simplifyWorklist.put(node);
-		freezeMoves(node);
+	// Briggs' heuristic: the merged node has fewer than {availableColor} neighbors of
+	// significant degree, and is therefore no harder to color than {u} and {v} were.
+	def briggsCheck(u: int, v: int) -> bool {
+		var stamp = graph.newStamp();
+		var cnt = countSignificantNeighbors(u, stamp, 0);
+		if (cnt >= availableColor) return false;
+		cnt = countSignificantNeighbors(v, stamp, cnt);
+		return cnt < availableColor;
 	}
-	def freezeMoves(n: int) {
-		var moves = graph.nodes[n].moves;
-		for (i < moves.length) {
-			var v = getAlias(moves[i]);
-			if (v > 0 && v != n) {
-				graph.nodes[v].movesCnt--;
-				if (!graph.nodes[v].removed && graph.nodes[v].movesCnt == 0
-					&& graph.nodes[v].interfereCnt < availableColor) {
-					simplifyWorklist.put(v);
-					removeFromWorklist(freezeWorklist, v);
-				}
+	def countSignificantNeighbors(nid: int, stamp: int, cnt: int) -> int {
+		var interfere = graph.nodes[nid].interfere;
+		for (i < interfere.length) {
+			if (cnt >= availableColor) break; // the test has already failed
+			var t = interfere[i];
+			if (t >= 0 && graph.nodes[t].removed) continue; // not adjacent anymore
+			if (!graph.markOnce(t, stamp)) continue;        // already counted
+			// A precolored neighbor always has significant degree.
+			if (t < 0 || graph.nodes[t].interfereCnt >= availableColor) cnt++;
+		}
+		return cnt;
+	}
+	// Merge node {v} into {u}, which may be a precolored register.
+	def combine(u: int, v: int) {
+		if (verbose) Terminal.put2("  coalesce v%d into %d\n", v, u);
+		var vnode = graph.nodes[v];
+		removeFromWorklist(v);
+		vnode.removed = true;
+		vnode.alias = u;
+		if (u >= 0) graph.mergeMoveList(u, v);
+		enableMoves(v);
+		// Every neighbor of {v} now interferes with {u} instead. Adding the edge bumps the
+		// neighbor's degree, so the following decrement leaves it unchanged when the edge is
+		// new and drops it by one when {u} was already a neighbor.
+		var interfere = vnode.interfere;
+		for (i < interfere.length) {
+			var t = interfere[i];
+			if (t < 0) {
+				if (u >= 0) graph.nodes[u].addInterfere(t); // {u} inherits register conflicts
+				continue;
 			}
-			// Remove from movesWorklist
-			for (j < movesWorklist.length) {
-				var x = getAlias(movesWorklist[j].0), y = getAlias(movesWorklist[j].1);
-				if ((x == n && y == v) || (x == v && y == n)) {
-					var a = movesWorklist[--movesWorklist.length];
-					if (movesWorklist.length > 0) movesWorklist[j] = a;
-					break;
-				}
-			}
+			if (graph.nodes[t].removed) continue;
+			if (u >= 0) graph.nodes[u].addInterfere(t);
+			graph.nodes[t].addInterfere(u);
+			decrementDegree(t);
+		}
+		if (u >= 0 && graph.nodes[u].interfereCnt >= availableColor && graph.nodes[u].wl == WL.FREEZE) {
+			putOnWorklist(WL.SPILL, u);
+		}
+	}
+	// Freeze the last node in the worklist, giving up on coalescing any of its moves.
+	def freeze() {
+		var nid = popWorklist(WL.FREEZE);
+		if (verbose) Terminal.put1("  freeze v%d\n", nid);
+		putOnWorklist(WL.SIMPLIFY, nid);
+		freezeMoves(nid);
+	}
+	// Give up on all moves involving {nid}, requeueing the other end of each move if it is
+	// no longer move-related and is trivially colorable.
+	def freezeMoves(nid: int) {
+		var moveList = graph.nodes[nid].moveList;
+		for (i < moveList.length) {
+			var m = moveList[i], state = graph.moveState[m];
+			if (state != MoveState.WORKLIST && state != MoveState.ACTIVE) continue;
+			graph.moveState[m] = MoveState.FROZEN;
+			var x = getAlias(graph.moveX[m]), y = getAlias(graph.moveY[m]);
+			var other = if(y == getAlias(nid), x, y);
+			if (other < 0) continue;
+			var node = graph.nodes[other];
+			if (node.removed || node.interfereCnt >= availableColor) continue;
+			if (graph.isMoveRelated(other)) continue;
+			if (node.wl == WL.FREEZE) putOnWorklist(WL.SIMPLIFY, other);
 		}
 	}
 	// Select a node in spillWorklist with minimum cost and push it to simplifyWorklist.
@@ -709,15 +791,13 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 			}
 		}
 		if (idx == -1) {
-			spillWorklist.resize(0);
+			while (spillWorklist.length > 0) removeFromWorklist(spillWorklist[0]);
 			return codegen.context.fail("nothing available to spill");
 		}
 		var nid = spillWorklist[idx];
 		if (verbose) Terminal.put1("  spill v%d\n", nid);
 		graph.nodes[nid].spill = true;
-		simplifyWorklist.put(nid);
-		var a = spillWorklist[--spillWorklist.length];
-		if (spillWorklist.length > 0) spillWorklist[idx] = a;
+		putOnWorklist(WL.SIMPLIFY, nid);
 		freezeMoves(nid);
 	}
 	// Finalize assignment of registers in uses and defs after coloring.
@@ -962,13 +1042,19 @@ class GlobalRegAlloc(regSet: MachRegSet, codegen: SsaMachGen) {
 	}
 }
 
-class InterferenceGraph(varsCnt: int, regSet: MachRegSet) {
+class InterferenceGraph(varsCnt: int, regSet: MachRegSet, coalesce: bool) {
 	def nodes = Array<Node>.new(varsCnt);
 	// Scratch state used by {dedup} and {sortEdges}.
 	private def markOffset = regSet.physRegs + 1;	// negative ids denote physical registers
 	private def mark = Array<int>.new(varsCnt + regSet.physRegs + 1);
 	private var stamp: int;
 	private var sortTmp = Array<int>.new(0);
+	// Moves considered for coalescing, indexed by move id. Both ends are node ids, where a
+	// negative id denotes a physical register.
+	def moveX = Vector<int>.new();
+	def moveY = Vector<int>.new();
+	def moveWeight = Vector<int>.new();
+	def moveState = Vector<byte>.new();
 
 	new() {
 		for (i < nodes.length) nodes[i] = Node.new(i);
@@ -1041,24 +1127,65 @@ class InterferenceGraph(varsCnt: int, regSet: MachRegSet) {
 		addEdge(x_, y_);
 		addEdge(y_, x_);
 	}
-	def addMove(x_: int, y: int) -> bool {
-		if (!COALESCE) return false;
-		var x = nodes[x_];
-		for (i < x.moves.length) {
-			if (x.moves[i] == y) return false;
+	// Record a move between {x} and {y} as a candidate for coalescing. Either end may be a
+	// physical register (a negative id), but not both.
+	def addMove(x: int, y: int, weight: int) {
+		if (!coalesce) return;
+		if (x == y || (x < 0 && y < 0)) return;
+		var owner = if(x >= 0, x, y);
+		var moveList = nodes[owner].moveList;
+		for (i < moveList.length) { // avoid recording the same move twice
+			var m = moveList[i];
+			if ((moveX[m] == x && moveY[m] == y) || (moveX[m] == y && moveY[m] == x)) return;
 		}
-		x.moves.put(y);
-		x.movesCnt++;
-		if (y > 0) {
-			nodes[y].moves.put(x_);
-			nodes[y].movesCnt++;
-		}
-		return true;
+		var id = moveX.length;
+		moveX.put(x);
+		moveY.put(y);
+		moveWeight.put(weight);
+		moveState.put(MoveState.WORKLIST);
+		if (x >= 0) nodes[x].moveList.put(id);
+		if (y >= 0) nodes[y].moveList.put(id);
 	}
-	def mergeMoves(dst: int, src: int) {
-		if (dst < 0) return;
-		nodes[dst].moves.putv(nodes[src].moves);
-		nodes[dst].movesCnt += nodes[src].movesCnt;
+	def moveCount() -> int {
+		return moveX.length;
+	}
+	// Check whether any move involving {nid} is still a candidate for coalescing.
+	def isMoveRelated(nid: int) -> bool {
+		var moveList = nodes[nid].moveList;
+		for (i < moveList.length) {
+			if (isMoveCandidate(moveList[i])) return true;
+		}
+		return false;
+	}
+	def isMoveCandidate(m: int) -> bool {
+		var state = moveState[m];
+		return state == MoveState.WORKLIST || state == MoveState.ACTIVE;
+	}
+	// Merge {v}'s move list into {u}'s. Moves that are no longer candidates are dropped, so
+	// that repeatedly merging into the same node does not grow its move list quadratically.
+	def mergeMoveList(u: int, v: int) {
+		var dst = nodes[u].moveList, src = nodes[v].moveList;
+		var write = 0;
+		for (i < dst.length) {
+			var m = dst[i];
+			if (isMoveCandidate(m)) dst[write++] = m;
+		}
+		dst.length = write;
+		for (i < src.length) {
+			var m = src[i];
+			if (isMoveCandidate(m)) dst.put(m);
+		}
+	}
+	// Allocate a fresh stamp for use with {markOnce}, which implements a set of node ids.
+	def newStamp() -> int {
+		return ++stamp;
+	}
+	// Add {nid} to the set denoted by {stamp}, returning {true} if it was not present.
+	def markOnce(nid: int, stamp: int) -> bool {
+		var k = nid + markOffset;
+		if (mark[k] == stamp) return false;
+		mark[k] = stamp;
+		return true;
 	}
 	def interfere(x: int, y: int) -> bool {
 		if (x < 0 && y < 0) return true;
@@ -1073,32 +1200,6 @@ class InterferenceGraph(varsCnt: int, regSet: MachRegSet) {
 			else high = mid - 1;
 		}
 		return false;
-	}
-	def combineInterfere(x_: int, y_: int) -> Vector<int> {
-		var x = nodes[x_], y = nodes[y_];
-		var combine = Vector<int>.new();
-		var i = 0, j = 0;
-		while (i < x.interfere.length && j < y.interfere.length) {
-			if (x.interfere[i] == y.interfere[j]) {
-				combine.put(x.interfere[i]);
-				i++; j++;
-			} else if (x.interfere[i] < y.interfere[j]) {
-				combine.put(x.interfere[i]);
-				i++;
-			} else {
-				combine.put(y.interfere[j]);
-				j++;
-			}
-		}
-		while (i < x.interfere.length) {
-			combine.put(x.interfere[i]);
-			i++;
-		}
-		while (j < y.interfere.length) {
-			combine.put(y.interfere[j]);
-			j++;
-		}
-		return combine;
 	}
 	def print() {
 		for (i < nodes.length) {
@@ -1115,15 +1216,19 @@ class InterferenceGraph(varsCnt: int, regSet: MachRegSet) {
 class Node(var alias: int) {
 	var defBlock: SsaBlock;
 	var interfere = Vector<int>.new(); // unsorted, with duplicates, until {InterferenceGraph.finish}
-	var interfereCnt: int = 0;
+	var interfereCnt: int = 0;         // degree, i.e. the number of neighbors not yet removed
 	var dedupLimit = 16;               // length at which duplicate edges are removed
-	var moves = Vector<int>.new();
-	var movesCnt: int = 0;
+	var wl = WL.NONE;                  // worklist this node is currently on
+	var wlIndex: int;                  // position of this node within that worklist
+	def moveList = Vector<int>.new();  // ids of moves with this node as an endpoint
 	var spillCost = 0;
 	var removed: bool = false;
 	var spill: bool = false;
 	var use: bool = false;
 
+	// Insert {n} while keeping {interfere} sorted, incrementing the degree and returning
+	// {true} if the edge was not already present. Only valid after the graph is finished,
+	// i.e. during coalescing; the graph is built with {InterferenceGraph.addEdge} instead.
 	def addInterfere(n: int) -> bool {
 		var stop = interfere.length;
 		for (i < interfere.length) { // XXX: binary search
@@ -1139,7 +1244,7 @@ class Node(var alias: int) {
 			interfere[i] = interfere[i-1];
 		}
 		interfere[stop] = n;
-		interfereCnt = interfere.length;
+		interfereCnt++;
 		return true;
 	}
 }
@@ -1151,16 +1256,20 @@ class RegAllocStatistic {
 	var reload: int;
 	var coalesce: int;
 	var move: int;
+	var coalescing: bool;	// whether coalescing was enabled for this allocation
 
-	def reset(len: int) {
+	def reset(len: int, coalescing: bool) {
 		varslen = len;
 		iterate = 0;
 		store = 0;
 		reload = 0;
+		coalesce = 0;
+		move = 0;
+		this.coalescing = coalescing;
 	}
 	def print() {
 		Terminal.put1("Statistic: iterate=%d\n", iterate);
 		Terminal.put3("           varslen=%d, store=%d, reload=%d\n", varslen, store, reload);
-		if (COALESCE) Terminal.put2("           coalesce=%d/%d\n", coalesce, move);
+		if (coalescing) Terminal.put2("           coalesce=%d/%d\n", coalesce, move);
 	}
 }
