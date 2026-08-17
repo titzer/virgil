@@ -1,0 +1,464 @@
+// Copyright 2024 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Emits a corpus of x86-64 instructions together with this disassembler's rendering
+// of each one, so that an external disassembler (objdump, ndisasm) can be run over
+// the same bytes and the two compared. See disasm-diff.py.
+//
+// Each instruction occupies a fixed-size slot padded with 0x90 (nop) so that an
+// external tool which disagrees about an instruction's length still resynchronizes
+// at the next slot. Output format, one line per instruction:
+//
+//   <slot-offset-hex> <length> <slot-bytes-hex> <disassembly>
+
+def SLOT = 16;
+
+def w = DataWriter.new();
+def asm = X86_64Assemblers.create64(w);
+
+def buf = StringBuilder.new();
+def printer = X86_64DisassemblyPrinter.new(buf);
+def dis = X86_64Disassembler.new(printer);
+
+// Registers chosen to cover the low 8, the REX-extended 8, and the encodings that
+// need special treatment in ModRM/SIB (rsp, rbp, r12, r13).
+def GPRS = [
+	X86_64Regs.RAX, X86_64Regs.RCX, X86_64Regs.RSP, X86_64Regs.RBP,
+	X86_64Regs.RSI, X86_64Regs.R8, X86_64Regs.R12, X86_64Regs.R13, X86_64Regs.R15
+];
+def XMMS = [X86_64Regs.XMM0, X86_64Regs.XMM3, X86_64Regs.XMM8, X86_64Regs.XMM15];
+
+def ADDRS = [
+	X86_64Regs.RAX.indirect(),
+	X86_64Regs.RSP.indirect(),			// requires a SIB byte
+	X86_64Regs.RBP.indirect(),			// requires a disp8 of 0
+	X86_64Regs.R12.indirect(),			// requires a SIB byte
+	X86_64Regs.R13.indirect(),			// requires a disp8 of 0
+	X86_64Regs.RCX.plus(0x10),
+	X86_64Regs.RDI.plus(-1),
+	X86_64Regs.RBX.plus(0x12345),
+	X86_64Regs.RCX.plusR(X86_64Regs.RDX, 4, 0x20),
+	X86_64Regs.RBP.plusR(X86_64Regs.R13, 8, -0x100),
+	X86_64Regs.R12.plusR(X86_64Regs.R15, 2, 0),
+	X86_64Addr.new(null, null, 1, 0x4000)		// absolute
+];
+
+def IMMS = [0, 1, -1, 127, -128, 128, -129, 0x1234, -0x12345678, 0x7FFFFFFF];
+
+//========================================================================================
+// Corpus construction
+//========================================================================================
+
+var slotOffset = 0;
+
+// Closes the slot holding the instruction just written, padding it with nops,
+// then disassembles and prints it. The buffer is reused for the next
+// instruction so that memory use stays constant over a large corpus.
+def close() {
+	if (w.pos > SLOT) System.error("CorpusError", "instruction longer than slot");
+	while (w.pos < SLOT) w.putb(0x90);
+
+	dis.reset(w.data[0 ... SLOT]);
+	buf.reset();
+	printer.ok = false;
+	dis.disassemble();
+	var len = dis.r.pos;
+	var text = buf.toString();
+
+	buf.reset();
+	buf.putx_32(u32.view(slotOffset)).sp();
+	buf.putd(len).sp();
+	for (j < SLOT) putHexByte(w.data[j]);
+	buf.sp().puts(text).ln();
+	System.puts(buf.toString());
+
+	slotOffset += SLOT;
+	w.at(0);
+}
+// Closes a slot after an assembler call. The argument is only there to force the
+// assembler call to be evaluated first; its value is discarded.
+def one<R>(x: R) {
+	close();
+}
+def scratch = Array<byte>.new(SLOT);
+
+// Emits one instruction given directly as bytes, followed by filler so that any
+// ModRM, displacement or immediate bytes the opcode requires are present.
+//
+// Only the bytes this disassembler actually consumes are kept; the rest of the
+// slot is padded with one-byte nops. That keeps an external disassembler
+// sweeping the blob linearly from ever running past a slot boundary, so it
+// always restarts each instruction at the offset we expect.
+def raw(prefix: Range<byte>, op: Range<byte>, tail: Range<byte>) {
+	var n = 0;
+	for (b in prefix) if (n < SLOT) { scratch[n] = b; n++; }
+	for (b in op) if (n < SLOT) { scratch[n] = b; n++; }
+	for (b in tail) if (n < SLOT) { scratch[n] = b; n++; }
+	while (n < SLOT) { scratch[n] = 0x90; n++; }
+
+	dis.reset(scratch);
+	buf.reset();
+	dis.disassemble();
+	var len = dis.r.pos;
+	if (len < 1) len = 1;
+	if (len > SLOT) len = SLOT;
+	for (i < len) w.putb(scratch[i]);
+	close();
+}
+
+// Prefix combinations worth exercising: none, REX.W, all REX bits, operand-size
+// override, the two mandatory SSE prefixes, and lock.
+def PREFIXES: Array<Array<byte>> = [
+	[],
+	[0x48],			// REX.W
+	[0x41],			// REX.B
+	[0x4F],			// REX.WRXB
+	[0x66],
+	[0xF2],
+	[0xF3],
+	[0x66, 0x48]		// operand-size override then REX.W
+];
+
+// ModRM (plus SIB and displacement) patterns covering every addressing form.
+def MODRMS: Array<Array<byte>> = [
+	[0xC0],			// mod=11 reg=0 rm=0
+	[0xFF],			// mod=11 reg=7 rm=7
+	[0xD1],			// mod=11 reg=2 rm=1
+	[0x00],			// [rax]
+	[0x08],			// [rax], reg=1
+	[0x04, 0x00],		// SIB: [rax+rax]
+	[0x04, 0x25, 0x00, 0x40, 0x00, 0x00],	// SIB: absolute [0x4000]
+	[0x05, 0x00, 0x10, 0x00, 0x00],		// RIP-relative
+	[0x45, 0x08],		// [rbp+8]
+	[0x94, 0xCD, 0x00, 0xFF, 0xFF, 0xFF],	// [rbp+rcx*8-0x100]
+	[0x9C, 0x24, 0x00, 0x01, 0x00, 0x00]	// [rsp+0x100]
+];
+
+// Filler for immediates. Chosen so that a truncated read is unlikely to be mistaken
+// for a plausible encoding, and so signed/unsigned rendering differences show up.
+def TAIL: Array<byte> = [0x78, 0x56, 0x34, 0x12, 0xEF, 0xCD, 0xAB, 0x89, 0x11, 0x22, 0x33, 0x44];
+
+def enumerate() {
+	for (p in PREFIXES) {
+		for (m in MODRMS) {
+			var tail = Arrays.concat(m, TAIL);
+			for (i < 256) {
+				var op: Array<byte> = [byte.view(i)];
+				raw(p, op, tail);
+				var op2: Array<byte> = [0x0F, byte.view(i)];
+				raw(p, op2, tail);
+			}
+			for (i < 0x50) {	// the populated part of the 0F 38 map
+				var op: Array<byte> = [0x0F, 0x38, byte.view(i)];
+				raw(p, op, tail);
+			}
+			for (i < 0x50) {	// the populated part of the 0F 3A map
+				var op: Array<byte> = [0x0F, 0x3A, byte.view(i)];
+				raw(p, op, tail);
+			}
+		}
+	}
+}
+
+// Drives the assembler over a broad selection of its instructions, so that every
+// encoding the assembler can produce is checked against an external disassembler.
+def assembled() {
+	asm.shorten = false;
+	def d = asm.d, q = asm.q;
+	for (a in GPRS) {
+		one(q.pushq_r(a));
+		one(q.popq_r(a));
+		one(q.bswap_r(a));
+		one(d.bswap_r(a));
+		one(q.inc_r(a));
+		one(d.dec_r(a));
+		one(q.neg_r(a));
+		one(d.not_r(a));
+		one(q.mul_r(a));
+		one(d.imul_r(a));
+		one(q.div_r(a));
+		one(d.idiv_r(a));
+		one(q.ijmp_r(a));
+		one(q.icall_r(a));
+		one(q.rdfsbase(a));
+		one(q.wrgsbase(a));
+		one(q.shl_r_cl(a));
+		one(d.sar_r_cl(a));
+		one(q.rol_r_i(a, 3));
+		one(d.shr_r_i(a, 1));
+		one(q.btr_r_i(a, 9));
+		one(q.movq_r_l(a, 0x1122334455667788));
+		for (b in GPRS) {
+			one(q.add_r_r(a, b));
+			one(d.sub_r_r(a, b));
+			one(q.cmp_r_r(a, b));
+			one(q.movq_r_r(a, b));
+			one(d.movd_r_r(a, b));
+			one(q.movb_r_r(a, b));
+			one(q.movw_r_r(a, b));
+			one(q.test_r_r(a, b));
+			one(q.xchg_r_r(a, b));
+			one(q.xadd_r_r(a, b));
+			one(q.imul_r_r(a, b));
+			one(q.bsf_r_r(a, b));
+			one(d.bsr_r_r(a, b));
+			one(q.popcnt_r_r(a, b));
+			one(q.movbsx_r_r(a, b));
+			one(q.movwzx_r_r(a, b));
+			one(q.cmpxchg_r_r(a, b));
+			one(q.cmpb_r_r(a, b));
+		}
+		for (m in ADDRS) {
+			one(q.add_r_m(a, m));
+			one(d.or_m_r(m, a));
+			one(q.movq_r_m(a, m));
+			one(q.movq_m_r(m, a));
+			one(d.movd_r_m(a, m));
+			one(q.movb_m_r(m, a));
+			one(q.movw_r_m(a, m));
+			one(q.lea(a, m));
+			one(d.lea(a, m));
+			one(q.imul_r_m(a, m));
+			one(q.movbzx_r_m(a, m));
+			one(q.xchg_m_r(m, a));
+			one(q.xadd_m_r(m, a));
+			one(q.cmpxchg_m_r(m, a));
+		}
+		for (i in IMMS) {
+			one(q.add_r_i(a, i));
+			one(d.and_r_i(a, i));
+			one(q.cmp_r_i(a, i));
+			one(q.test_r_i(a, i));
+			one(q.imul_r_i(a, i));
+			one(q.movq_r_i(a, i));
+			one(d.movd_r_i(a, i));
+			one(q.movb_r_i(a, i & 0xFF));
+			one(q.movw_r_i(a, i & 0xFFFF));
+		}
+		for (c in X86_64Conds.all) {
+			one(q.set_r(c, a));
+			for (b in GPRS) one(q.cmov_r(c, a, b));
+		}
+	}
+	for (m in ADDRS) {
+		one(q.inc_m(m));
+		one(d.dec_m(m));
+		one(q.neg_m(m));
+		one(q.negb_m(m));
+		one(q.negw_m(m));
+		one(q.not_m(m));
+		one(q.mul_m(m));
+		one(q.idiv_m(m));
+		one(q.ijmp_m(m));
+		one(q.icall_m(m));
+		one(q.pushq_m(m));
+		one(q.popq_m(m));
+		one(q.ldmxcsr_m(m));
+		one(q.stmxcsr_m(m));
+		one(q.shl_m_cl(m));
+		one(q.sar_m_i(m, 5));
+		one(q.btr_m_i(m, 33));
+		one(q.faddd(m));
+		one(q.fldd(m));
+		one(q.fldq(m));
+		one(q.fildq(m));
+		one(q.fstpd(m));
+		one(q.fstpq(m));
+		one(q.fisttpq(m));
+		for (i in IMMS) {
+			one(q.add_m_i(m, i));
+			one(d.xor_m_i(m, i));
+			one(q.movq_m_i(m, i));
+			one(d.movd_m_i(m, i));
+			one(q.movb_m_i(m, i & 0xFF));
+			one(q.movw_m_i(m, i & 0xFFFF));
+		}
+		for (c in X86_64Conds.all) one(q.set_m(c, m));
+	}
+	for (a in XMMS) {
+		for (b in XMMS) {
+			one(q.movaps_s_s(a, b));
+			one(q.movss_s_s(a, b));
+			one(q.movsd_s_s(a, b));
+			one(q.movhlps_s_s(a, b));
+			one(q.movlhps_s_s(a, b));
+			one(q.movddup_s_s(a, b));
+			one(q.movshdup_s_s(a, b));
+			one(q.addss_s_s(a, b));
+			one(q.addsd_s_s(a, b));
+			one(q.addps_s_s(a, b));
+			one(q.addpd_s_s(a, b));
+			one(q.subss_s_s(a, b));
+			one(q.mulsd_s_s(a, b));
+			one(q.divps_s_s(a, b));
+			one(q.minsd_s_s(a, b));
+			one(q.maxps_s_s(a, b));
+			one(q.sqrtsd_s_s(a, b));
+			one(q.andps_s_s(a, b));
+			one(q.andnpd_s_s(a, b));
+			one(q.orps_s_s(a, b));
+			one(q.xorpd_s_s(a, b));
+			one(q.pand_s_s(a, b));
+			one(q.pandn_s_s(a, b));
+			one(q.pxor_s_s(a, b));
+			one(q.paddb_s_s(a, b));
+			one(q.paddw_s_s(a, b));
+			one(q.paddd_s_s(a, b));
+			one(q.paddq_s_s(a, b));
+			one(q.psubsb_s_s(a, b));
+			one(q.psubusw_s_s(a, b));
+			one(q.pmullw_s_s(a, b));
+			one(q.pmulhuw_s_s(a, b));
+			one(q.pmuludq_s_s(a, b));
+			one(q.pmuldq_s_s(a, b));
+			one(q.pmulld_s_s(a, b));
+			one(q.pmaddwd_s_s(a, b));
+			one(q.pmaddubsw_s_s(a, b));
+			one(q.pmulhrsw_s_s(a, b));
+			one(q.pcmpeqb_s_s(a, b));
+			one(q.pcmpeqq_s_s(a, b));
+			one(q.pcmpgtd_s_s(a, b));
+			one(q.pcmpgtq_s_s(a, b));
+			one(q.pminsb_s_s(a, b));
+			one(q.pminuw_s_s(a, b));
+			one(q.pmaxsd_s_s(a, b));
+			one(q.pmaxub_s_s(a, b));
+			one(q.pavgb_s_s(a, b));
+			one(q.pabsd_s_s(a, b));
+			one(q.packuswb_s_s(a, b));
+			one(q.packssdw_s_s(a, b));
+			one(q.packusdw_s_s(a, b));
+			one(q.punpcklbw_s_s(a, b));
+			one(q.punpckhwd_s_s(a, b));
+			one(q.punpcklqdq_s_s(a, b));
+			one(q.pshufb_s_s(a, b));
+			one(q.unpcklps_s_s(a, b));
+			one(q.ptest_s_s(a, b));
+			one(q.ucomisd_s_s(a, b));
+			one(q.ucomiss_s_s(a, b));
+			one(q.cvtss2sd_s_s(a, b));
+			one(q.cvtsd2ss_s_s(a, b));
+			one(q.cvtdq2ps_s_s(a, b));
+			one(q.cvtdq2pd_s_s(a, b));
+			one(q.cvtps2pd_s_s(a, b));
+			one(q.cvtpd2ps_s_s(a, b));
+			one(q.cvttps2dq_s_s(a, b));
+			one(q.cvttpd2dq_s_s(a, b));
+			one(q.pmovsxbw_s_s(a, b));
+			one(q.pmovzxdq_s_s(a, b));
+			one(q.shufps_s_s_i(a, b, 0x1B));
+			one(q.pshufd_s_s_i(a, b, 0xE4));
+			one(q.pshuflw_s_s_i(a, b, 0x27));
+			one(q.pblendw_s_s_i(a, b, 0x5A));
+			one(q.pclmulqdq_s_s_imm(a, b, 0x11));
+			one(q.insertps_s_s_i(a, b, 0x10));
+			one(q.roundsd_s_s(a, b, X86_64Rounding.TO_ZERO));
+			one(q.roundps_s_s(a, b, X86_64Rounding.TO_NEG_INF));
+			one(q.cmpss_s_s(SSECmps.LT, a, b));
+			one(q.cmppd_s_s(SSECmps.ORD, a, b));
+			one(q.psllw_s_s(a, b));
+			one(q.psrad_s_s(a, b));
+			one(q.psrlq_s_s(a, b));
+		}
+		one(q.psllw_i(a, 3));
+		one(q.pslld_i(a, 5));
+		one(q.psllq_i(a, 7));
+		one(q.psrlw_i(a, 2));
+		one(q.psrld_i(a, 4));
+		one(q.psrlq_i(a, 6));
+		one(q.psraw_i(a, 8));
+		one(q.psrad_i(a, 9));
+		for (m in ADDRS) {
+			one(q.movdqu_s_m(a, m));
+			one(q.movdqu_m_s(m, a));
+			one(q.movaps_s_m(a, m));
+			one(q.movss_s_m(a, m));
+			one(q.movss_m_s(m, a));
+			one(q.movsd_s_m(a, m));
+			one(q.movsd_m_s(m, a));
+			one(q.addsd_s_m(a, m));
+			one(q.mulss_s_m(a, m));
+			one(q.pminsb_s_m(a, m));
+			one(q.pcmpeqw_s_m(a, m));
+			one(q.pabsb_s_m(a, m));
+			one(q.xorps_s_m(a, m));
+			one(q.ucomisd_s_m(a, m));
+			one(q.cvtdq2ps_s_m(a, m));
+			one(q.pmovsxbw_s_m(a, m));
+			one(q.roundsd_s_m(a, m, X86_64Rounding.TO_POS_INF));
+			one(q.cmpsd_s_m(SSECmps.NEQ, a, m));
+			one(q.pinsrq_s_m_i(a, m, 1));
+			one(q.pextrq_m_s_i(m, a, 1));
+		}
+		for (b in GPRS) {
+			one(q.movd_s_r(a, b));
+			one(q.movd_r_s(b, a));
+			one(q.movq_s_r(a, b));
+			one(q.movq_r_s(b, a));
+			one(q.movmskps_r_s(b, a));
+			one(q.movmskpd_r_s(b, a));
+			one(q.pmovmskb_r_s(b, a));
+			one(q.cvtsd2si_r_s(b, a));
+			one(q.cvtss2si_r_s(b, a));
+			one(q.cvttsd2si_r_s(b, a));
+			one(q.cvtsi2sd_s_r(a, b));
+			one(q.cvtsi2ss_s_r(a, b));
+			one(q.pinsrb_s_r_i(a, b, 2));
+			one(q.pinsrw_s_r_i(a, b, 3));
+			one(q.pinsrd_s_r_i(a, b, 1));
+			one(q.pinsrq_s_r_i(a, b, 0));
+			one(q.pextrb_r_s_i(b, a, 4));
+			one(q.pextrw_r_s_i(b, a, 5));
+			one(q.pextrd_r_s_i(b, a, 2));
+			one(q.pextrq_r_s_i(b, a, 1));
+		}
+		for (m in ADDRS) one(q.cvtsi2sd_s_m(a, m));
+	}
+	one(asm.nop1());
+	one(asm.nop2());
+	one(asm.nop3());
+	one(asm.nop4());
+	one(asm.ret());
+	one(asm.iret());
+	one(asm.cdq());
+	one(asm.cqo());
+	one(asm.pushfq());
+	one(asm.scasb());
+	one(asm.movsb());
+	one(asm.syscall());
+	one(asm.sysenter());
+	one(asm.sysexit());
+	one(asm.rdtsc());
+	one(asm.mfence());
+	one(asm.invalid());
+	one(asm.lock());
+	for (i < 256) one(asm.intK(i));
+	for (i in IMMS) {
+		one(asm.pushq_i(i));
+		one(asm.callr(i));
+		one(asm.jmp_rel_raw(i));
+		for (c in X86_64Conds.all) one(asm.jc_rel(c, i));
+	}
+}
+
+//========================================================================================
+// Output
+//========================================================================================
+
+def HEX = "0123456789abcdef";
+
+def putHexByte(b: byte) {
+	buf.putc(HEX[b >> 4]).putc(HEX[b & 0xF]);
+}
+
+def main(args: Array<string>) -> int {
+	var doAsm = true, doEnum = true;
+	for (a in args) {
+		if (Strings.equal(a, "-asm")) doEnum = false;
+		else if (Strings.equal(a, "-enum")) doAsm = false;
+	}
+	if (doAsm) assembled();
+	if (doEnum) enumerate();
+
+	return 0;
+}
