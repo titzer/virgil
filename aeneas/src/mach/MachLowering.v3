@@ -42,6 +42,7 @@ class MachLoweringConfig {
 	var FloatPromoteU64 = true;
 	var IntCastFTraps = false;	// IntCastF machine instruction traps
 	var NativeCmpSwp = true;	// target platform supports native compare+swap
+	var ExEntrySize: int = 6;	// exception entry size (8 for ARM64 due to 4-byte insn alignment)
 
 	def getArithWidth(tt: IntType) -> ArithWidth {
 		// XXX: speed up this routine with a lookup table
@@ -965,12 +966,19 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var signed = ft.signed && !i_old.inputs[0].dest.facts.V_NON_NEGATIVE;
 				var extend = extendBigEnd(inputs[fbig], ft, signed);
 				var vals = ftn.growToN(inputs, ttn.size, extend);
+				// the extension filled whole words; truncate the target's big end
+				// only if it is actually narrower than a word. A full-word big end
+				// is already correctly extended, and re-viewing it would materialize
+				// a spurious instruction from the {extend} value.
+				var tbig = ttn.bigEndIndex(), tbt = IntType.!(ttn.sub[tbig]);
+				if (tbt.width < mach.intNorm.width) vals[tbig] = curBlock.opIntViewI0(mach.intNorm.word, tbt, vals[tbig]);
 				return mapN(i_old, vals);
 			}
 			// M >= N, so select N values from inputs.
 			var vals = ftn.getLowestN(inputs, ttn.size);
 			// truncate the big end if necessary.
-			var fbt = ftn.sub[fbig], tbig = ftn.bigEndIndex(), tbt = ttn.sub[tbig];
+			var tbig = ttn.bigEndIndex(), tbt = ttn.sub[tbig];
+			var fbt = if(tbig == fbig, ftn.sub[fbig], mach.intNorm.word);
 			if (fbt != tbt) vals[tbig] = curBlock.opIntViewI0(fbt, tbt, vals[tbig]);
 			return mapN(i_old, vals);
 		}
@@ -1624,8 +1632,16 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			}
 		}
 		if (tn != null && tn.newType != fieldType) {
-			var op = getAccessViewOp(fieldType, tn.newType);
-			if (op != null) ai_results = [wideInputs(op, if(tn.size > 1, tn), ai_results, Fact.O_PURE)];
+			if (IntType.?(fieldType) && tn.size > 1) {
+				viewBigEndWord(IntNorm.!(tn), mach.intNorm.makeType(IntType.!(fieldType)), ai_results);
+			} else {
+				var op = getAccessViewOp(fieldType, tn.newType);
+				if (op != null) ai_results = [wideInputs(op, if(tn.size > 1, tn), ai_results, Fact.O_PURE)];
+			}
+		}
+		if (BoolType.?(fieldType)) {
+			// a bool field's truth value is the lowest bit of its byte
+			ai_results[0] = curBlock.pure(Byte.TYPE.opAnd(), [ai_results[0], context.graph.intConst(1)]);
 		}
 		return mapN(i_old, ai_results);
 	}
@@ -1643,9 +1659,13 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 
 		var ai_results = Array<SsaInstr>.new(accesses.length);
 		if (tn != null && tn.newType != fieldType) {
-			var op = getAccessViewOp(tn.oldType, fieldType);
-			var atn = if(tn.size > 1, tn);
-			if (op != null) vals = wideOutputs(op, atn, vals, Fact.O_PURE);
+			if (IntType.?(fieldType) && tn.size > 1) {
+				viewBigEndWord(mach.intNorm.makeType(IntType.!(fieldType)), IntNorm.!(tn), vals);
+			} else {
+				var op = getAccessViewOp(tn.oldType, fieldType);
+				var atn = if(tn.size > 1, tn);
+				if (op != null) vals = wideOutputs(op, atn, vals, Fact.O_PURE);
+			}
 		}
 		for (i < accesses.length) {
 			var a = accesses[i], i_val = vals[i];
@@ -1668,9 +1688,17 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		i_old.kill();
 		i_old.remove();
 	}
+	// For an int field decomposed into multiple machine words, only the big-end
+	// word's type can differ from the access word type; view just that word.
+	def viewBigEndWord(from: IntNorm, to: IntNorm, vals: Array<SsaInstr>) {
+		var big = from.bigEndIndex();
+		var fbt = IntType.!(from.sub[big]), tbt = IntType.!(to.sub[big]);
+		if (fbt != tbt) vals[big] = opIntViewINorm(fbt, tbt, vals[big]);
+	}
 	def getAccessViewOp(fieldType: Type, wordType: Type) -> Operator {
 		if (fieldType == wordType) return null;
 		match (fieldType) {
+			x: BoolType => return null; // bool loads are masked to bit 0 in genByteArrayGetField
 			x: IntType => match (wordType) {
 				y: IntType => return V3Op.newIntViewI(wordType, x);
 				y: FloatType => return if(y.is64, V3Op.opIntViewF64, V3Op.opIntViewF32);
@@ -2206,7 +2234,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def isNonTrivialStore(init: bool, v: SsaInstr) -> bool {
 		if (init) {
-			if (SsaConst.?(v)) return !Values.equal(SsaConst.!(v).val, null);
+			if (SsaConst.?(v)) return !Values.identical(SsaConst.!(v).val, null);
 		}
 		return true;
 	}

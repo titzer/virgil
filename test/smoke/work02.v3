@@ -1,0 +1,695 @@
+//@execute 0=-2109543050; 1=-1805303184; 2=-478517072; 3=76507896; 4=1903483673; 5=-7515937; 6=902974780; 7=426712339
+//@heap-size=4000000
+// Smoke test: a small expression interpreter.
+// A byte-string expression language is tokenized into a variant array, parsed by
+// recursive descent into an ADT tree, evaluated against an environment, and
+// pretty-printed back into a growable byte buffer. A table of hand-derived
+// input/result pairs drives the assertions; randomly generated trees are printed
+// and re-parsed to check that print and parse are inverses, and everything is
+// mixed into a running CRC that main() returns.
+// Interleaved are assert()s over compile-time constants and hand-computed table
+// entries; a folding or codegen bug shows up as the assertion id instead.
+// Input selects the section; input 0 runs every section in one method body.
+
+//======================================================================
+// Accumulator and assertions
+//======================================================================
+var crc: int;
+var failed: int;
+
+def mix(h: int, x: int) -> int {
+	var t = h ^ x;
+	t = t * 0x01000193;
+	return t ^ (t >>> 15);
+}
+def mixb(h: int, b: bool) -> int {
+	return mix(h, if(b, 0x5A5A5A5A, 0x0F0F0F0F));
+}
+def mixs(h: int, s: string) -> int {
+	if (s == null) return mix(h, -1);
+	var t = mix(h, s.length);
+	for (i < s.length) t = mix(t, s[i]);
+	return t;
+}
+def acci(x: int) { crc = mix(crc, x); }
+
+// Records the first failing assertion; main() returns the id instead of the CRC.
+def fail_assert(id: int) { if (failed == 0) failed = id; }
+
+var seed: int;
+def srand(s: int) { seed = s; }
+def rand() -> int {
+	seed = seed * 1664525 + 1013904223;
+	seed = seed ^ (seed >>> 16);
+	return seed;
+}
+def randn(n: int) -> int { return (rand() & 0x7FFFFFFF) % n; }
+
+def streq(a: string, b: string) -> bool {
+	if (a == b) return true;
+	if (a == null || b == null) return false;
+	if (a.length != b.length) return false;
+	for (i < a.length) if (a[i] != b[i]) return false;
+	return true;
+}
+
+//======================================================================
+// A growable byte buffer
+//======================================================================
+class Buf {
+	var buf = Array<byte>.new(16);
+	var len: int;
+	def putc(c: byte) -> this {
+		if (len == buf.length) grow();
+		buf[len] = c;
+		len++;
+	}
+	def puts(s: string) -> this {
+		for (i < s.length) putc(s[i]);
+	}
+	def putd(v: int) -> this {
+		if (v < 0) {
+			putc('-');
+			// negate carefully: int.min has no positive counterpart
+			if (v == -2147483648) { puts("2147483648"); return; }
+			putd(0 - v);
+			return;
+		}
+		if (v >= 10) putd(v / 10);
+		putc(byte.view('0' + (v % 10)));
+	}
+	def grow() {
+		var n = Array<byte>.new(buf.length * 2);
+		for (i < len) n[i] = buf[i];
+		buf = n;
+	}
+	def extract() -> string {
+		var s = Array<byte>.new(len);
+		for (i < len) s[i] = buf[i];
+		return s;
+	}
+	def reset() -> this { len = 0; }
+}
+
+//======================================================================
+// Tokens and the tokenizer
+//======================================================================
+type Tok {
+	case Num(v: int);
+	case Ident(s: string);
+	case Op(c: byte);
+	case Bad(c: byte);
+	case End;
+}
+def isDigit(c: byte) -> bool { return c >= '0' && c <= '9'; }
+def isAlpha(c: byte) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+def isSpace(c: byte) -> bool { return c == ' ' || c == '\t'; }
+def isOp(c: byte) -> bool {
+	return c == '+' || c == '-' || c == '*' || c == '/' || c == '%' ||
+		c == '(' || c == ')';
+}
+def tokenize(s: string) -> Array<Tok> {
+	var toks = Array<Tok>.new(8);
+	var n = 0;
+	var i = 0;
+	while (i < s.length) {
+		var c = s[i];
+		var t: Tok;
+		if (isSpace(c)) { i++; continue; }
+		if (isDigit(c)) {
+			var v = 0;
+			while (i < s.length && isDigit(s[i])) {
+				v = v * 10 + (int.!(s[i]) - '0');
+				i++;
+			}
+			t = Tok.Num(v);
+		} else if (isAlpha(c)) {
+			var start = i;
+			while (i < s.length && (isAlpha(s[i]) || isDigit(s[i]))) i++;
+			var name = Array<byte>.new(i - start);
+			for (k < name.length) name[k] = s[start + k];
+			t = Tok.Ident(name);
+		} else if (isOp(c)) {
+			t = Tok.Op(c);
+			i++;
+		} else {
+			t = Tok.Bad(c);
+			i++;
+		}
+		if (n == toks.length) {
+			var bigger = Array<Tok>.new(toks.length * 2);
+			for (k < n) bigger[k] = toks[k];
+			toks = bigger;
+		}
+		toks[n] = t;
+		n++;
+	}
+	var out = Array<Tok>.new(n + 1);
+	for (k < n) out[k] = toks[k];
+	out[n] = Tok.End;
+	return out;
+}
+
+//======================================================================
+// The syntax tree
+//======================================================================
+type Expr {
+	case Num(v: int);
+	case Var(s: string);
+	case Neg(e: Expr);
+	case Bin(op: byte, l: Expr, r: Expr);
+	case Err(code: int);
+}
+
+class Parser {
+	def toks: Array<Tok>;
+	var pos: int;
+	var errors: int;
+	new(toks) { }
+	def peek() -> Tok { return toks[pos]; }
+	def eatOp(c: byte) -> bool {
+		match (toks[pos]) {
+			Op(o) => if (o == c) { pos++; return true; }
+			_ => ;
+		}
+		return false;
+	}
+	// expr := term (('+' | '-') term)*
+	def parseExpr() -> Expr {
+		var l = parseTerm();
+		while (true) {
+			if (eatOp('+')) l = Expr.Bin('+', l, parseTerm());
+			else if (eatOp('-')) l = Expr.Bin('-', l, parseTerm());
+			else break;
+		}
+		return l;
+	}
+	// term := unary (('*' | '/' | '%') unary)*
+	def parseTerm() -> Expr {
+		var l = parseUnary();
+		while (true) {
+			if (eatOp('*')) l = Expr.Bin('*', l, parseUnary());
+			else if (eatOp('/')) l = Expr.Bin('/', l, parseUnary());
+			else if (eatOp('%')) l = Expr.Bin('%', l, parseUnary());
+			else break;
+		}
+		return l;
+	}
+	// unary := '-' unary | atom
+	def parseUnary() -> Expr {
+		if (eatOp('-')) return Expr.Neg(parseUnary());
+		return parseAtom();
+	}
+	// atom := number | identifier | '(' expr ')'
+	def parseAtom() -> Expr {
+		match (toks[pos]) {
+			Num(v) => { pos++; return Expr.Num(v); }
+			Ident(s) => { pos++; return Expr.Var(s); }
+			Op(c) => {
+				if (c == '(') {
+					pos++;
+					var e = parseExpr();
+					if (!eatOp(')')) { errors++; return Expr.Err(2); }
+					return e;
+				}
+			}
+			_ => ;
+		}
+		errors++;
+		return Expr.Err(1);
+	}
+}
+def parse(s: string) -> Expr {
+	var p = Parser.new(tokenize(s));
+	var e = p.parseExpr();
+	// trailing junk is an error
+	match (p.peek()) {
+		End => ;
+		_ => { p.errors++; return Expr.Err(3); }
+	}
+	return e;
+}
+
+//======================================================================
+// Environment and evaluation
+//======================================================================
+class Env {
+	def names: Array<string>;
+	def vals: Array<int>;
+	var misses: int;
+	new(names, vals) { }
+	def lookup(s: string) -> int {
+		for (i < names.length) if (streq(names[i], s)) return vals[i];
+		misses++;
+		return 0;
+	}
+}
+def eval(e: Expr, env: Env) -> int {
+	match (e) {
+		Num(v) => return v;
+		Var(s) => return env.lookup(s);
+		Neg(x) => return 0 - eval(x, env);
+		Bin(op, l, r) => {
+			var a = eval(l, env), b = eval(r, env);
+			if (op == '+') return a + b;
+			if (op == '-') return a - b;
+			if (op == '*') return a * b;
+			// division is guarded so that no input can trap
+			if (op == '/') {
+				if (b == 0) return 0;
+				if (b == -1) return 0 - a;
+				return a / b;
+			}
+			if (op == '%') {
+				if (b == 0) return 0;
+				if (b == -1) return 0;
+				return a % b;
+			}
+			return 0;
+		}
+		Err(code) => return -1000 - code;
+	}
+}
+def size(e: Expr) -> int {
+	match (e) {
+		Num(v) => return 1;
+		Var(s) => return 1;
+		Neg(x) => return 1 + size(x);
+		Bin(op, l, r) => return 1 + size(l) + size(r);
+		Err(code) => return 1;
+	}
+}
+def hasErr(e: Expr) -> bool {
+	match (e) {
+		Neg(x) => return hasErr(x);
+		Bin(op, l, r) => return hasErr(l) || hasErr(r);
+		Err(code) => return true;
+		_ => return false;
+	}
+}
+def depth(e: Expr) -> int {
+	match (e) {
+		Neg(x) => return 1 + depth(x);
+		Bin(op, l, r) => {
+			var a = depth(l), b = depth(r);
+			return 1 + if(a > b, a, b);
+		}
+		_ => return 1;
+	}
+}
+// fully parenthesized printing, so the result always reparses to the same tree
+def print(e: Expr, b: Buf) {
+	match (e) {
+		Num(v) => b.putd(v);
+		Var(s) => b.puts(s);
+		Neg(x) => { b.puts("-("); print(x, b); b.putc(')'); }
+		Bin(op, l, r) => {
+			b.putc('(');
+			print(l, b);
+			b.putc(op);
+			print(r, b);
+			b.putc(')');
+		}
+		Err(code) => b.puts("?");
+	}
+}
+def show(e: Expr) -> string {
+	var b = Buf.new();
+	print(e, b);
+	return b.extract();
+}
+
+//======================================================================
+// The table of test expressions, with hand-computed values.
+// The environment below is x=7, y=5, z=4, n=100, m=3.
+//======================================================================
+def EXPRS: Array<string> = [
+	"1+2",			// 3
+	"2*3+4",		// 10
+	"4+2*3",		// 10
+	"(1+2)*3",		// 9
+	"-5+3",			// -2
+	"-(2+3)*4",		// -20
+	"10/3",			// 3
+	"10%3",			// 1
+	"2*3*4",		// 24
+	"100-10-5",		// 85, left associative
+	"100-(10-5)",		// 95
+	"x+y",			// 12
+	"x*y-z",		// 31
+	"--3",			// 3
+	"-x",			// -7
+	"(((42)))",		// 42
+	"1+2*3-4/2",		// 1+6-2 = 5
+	"2*(3+4)*(5-1)",	// 2*7*4 = 56
+	"x/y",			// 1
+	"x%y",			// 2
+	"0-x",			// -7
+	"(x+y)*(x-y)",		// 12*2 = 24
+	"n*n",			// 10000
+	"n/m",			// 33
+	"n%m",			// 1
+	" 1 + 2 * 3 ",		// 7, whitespace is skipped
+	"1000000*1000",		// 1000000000
+	"2147483647+1"		// wraps to -2147483648
+];
+def VALUES: Array<int> = [
+	3, 10, 10, 9, -2, -20, 3, 1, 24, 85, 95, 12, 31, 3, -7, 42,
+	5, 56, 1, 2, -7, 24, 10000, 33, 1, 7, 1000000000, -2147483648
+];
+def NAMES: Array<string> = ["x", "y", "z", "n", "m"];
+def VARVALS: Array<int> = [7, 5, 4, 100, 3];
+def newEnv() -> Env { return Env.new(NAMES, VARVALS); }
+
+//======================================================================
+// Section 1: the tokenizer
+//======================================================================
+def tokens() {
+	var t = tokenize("12+ab*(3)");
+	// Num(12) Op(+) Ident(ab) Op(*) Op(() Num(3) Op()) End
+	if (t.length != 8) fail_assert(101);
+	if (t[0].tag != 0) fail_assert(102);
+	if (t[1].tag != 2) fail_assert(103);
+	if (t[2].tag != 1) fail_assert(104);
+	if (t[7].tag != 4) fail_assert(105);
+	match (t[0]) { Num(v) => if (v != 12) fail_assert(106); _ => fail_assert(107); }
+	match (t[2]) {
+		Ident(s) => {
+			if (s.length != 2) fail_assert(108);
+			if (s[0] != 'a') fail_assert(109);
+			if (s[1] != 'b') fail_assert(110);
+		}
+		_ => fail_assert(111);
+	}
+	match (t[4]) { Op(c) => if (c != '(') fail_assert(112); _ => fail_assert(113); }
+	if (tokenize("").length != 1) fail_assert(114);
+	if (tokenize("   ").length != 1) fail_assert(115);
+	if (tokenize("1 2 3").length != 4) fail_assert(116);
+	// bad characters become Bad tokens rather than being dropped
+	var bad = tokenize("1$2");
+	if (bad.length != 4) fail_assert(117);
+	if (bad[1].tag != 3) fail_assert(118);
+	// large literals and multi-digit parsing
+	var big = tokenize("123456");
+	match (big[0]) { Num(v) => if (v != 123456) fail_assert(119); _ => fail_assert(120); }
+
+	var h = 0;
+	for (i < EXPRS.length) {
+		var ts = tokenize(EXPRS[i]);
+		h = mix(h, ts.length);
+		for (k < ts.length) {
+			h = mix(h, ts[k].tag);
+			match (ts[k]) {
+				Num(v) => h = mix(h, v);
+				Ident(s) => h = mixs(h, s);
+				Op(c) => h = mix(h, c);
+				Bad(c) => h = mix(h, 1000 + c);
+				End => h = mix(h, -1);
+			}
+		}
+	}
+	acci(h);
+	if (isDigit('0') != true) fail_assert(121);
+	if (isDigit('a') != false) fail_assert(122);
+	if (isAlpha('Z') != true) fail_assert(123);
+	if (isOp('%') != true) fail_assert(124);
+	if (isOp('$') != false) fail_assert(125);
+}
+
+//======================================================================
+// Section 2: parse tree shape
+//======================================================================
+def trees() {
+	var e1 = parse("1+2");
+	if (e1.tag != 3) fail_assert(201);		// Bin
+	if (size(e1) != 3) fail_assert(202);
+	if (depth(e1) != 2) fail_assert(203);
+	var e2 = parse("1+2*3");
+	if (size(e2) != 5) fail_assert(204);
+	if (depth(e2) != 3) fail_assert(205);
+	match (e2) {
+		Bin(op, l, r) => {
+			if (op != '+') fail_assert(206);
+			if (l.tag != 0) fail_assert(207);	// Num on the left
+			if (r.tag != 3) fail_assert(208);	// the product on the right
+		}
+		_ => fail_assert(209);
+	}
+	// left associativity of '-'
+	var e3 = parse("1-2-3");
+	match (e3) {
+		Bin(op, l, r) => {
+			if (l.tag != 3) fail_assert(210);	// (1-2) is itself a Bin
+			if (r.tag != 0) fail_assert(211);
+		}
+		_ => fail_assert(212);
+	}
+	if (size(parse("-x")) != 2) fail_assert(213);
+	if (depth(parse("---1")) != 4) fail_assert(214);
+	if (size(parse("(((42)))")) != 1) fail_assert(215);
+	if (parse("(((42)))").tag != 0) fail_assert(216);
+	// errors
+	if (parse("(1+2").tag != 4) fail_assert(217);
+	if (!hasErr(parse("1+"))) fail_assert(218);		// Bin(+, 1, Err)
+	if (parse("").tag != 4) fail_assert(219);
+	if (parse("1 2").tag != 4) fail_assert(220);
+	if (!hasErr(parse("*3"))) fail_assert(221);		// Bin(*, Err, 3)
+
+	var h = 0;
+	for (i < EXPRS.length) {
+		var e = parse(EXPRS[i]);
+		h = mix(h, e.tag);
+		h = mix(h, size(e));
+		h = mix(h, depth(e));
+	}
+	acci(h);
+}
+
+//======================================================================
+// Section 3: evaluation against the table
+//======================================================================
+def evaluation() {
+	if (EXPRS.length != VALUES.length) fail_assert(301);
+	var env = newEnv();
+	var h = 0;
+	for (i < EXPRS.length) {
+		var e = parse(EXPRS[i]);
+		if (e.tag == 4) fail_assert(302);
+		var v = eval(e, env);
+		if (v != VALUES[i]) fail_assert(330 + i);	// ids 330.. name the row
+		h = mix(h, v);
+	}
+	acci(h);
+	if (env.misses != 0) fail_assert(303);
+	// division and modulo are guarded, never trapping
+	if (eval(parse("1/0"), env) != 0) fail_assert(304);
+	if (eval(parse("1%0"), env) != 0) fail_assert(305);
+	if (eval(parse("7/-1"), env) != -7) fail_assert(306);
+	if (eval(parse("7%-1"), env) != 0) fail_assert(307);
+	// unknown variables read as zero and are counted
+	var before = env.misses;
+	if (eval(parse("q+1"), env) != 1) fail_assert(308);
+	if (env.misses != before + 1) fail_assert(309);
+	// errors evaluate to a distinguished negative value
+	if (eval(parse("(1"), env) != -1002) fail_assert(310);
+	if (eval(parse("1 2"), env) != -1003) fail_assert(311);
+	if (eval(parse(""), env) != -1001) fail_assert(312);
+	// a fresh environment starts with no misses
+	if (newEnv().misses != 0) fail_assert(313);
+	if (newEnv().lookup("z") != 4) fail_assert(314);
+	if (newEnv().lookup("zz") != 0) fail_assert(315);
+}
+
+//======================================================================
+// Section 4: pretty printing
+//======================================================================
+def printing() {
+	if (!streq(show(parse("1+2")), "(1+2)")) fail_assert(401);
+	if (!streq(show(parse("1+2*3")), "(1+(2*3))")) fail_assert(402);
+	if (!streq(show(parse("(1+2)*3")), "((1+2)*3)")) fail_assert(403);
+	if (!streq(show(parse("-5+3")), "(-(5)+3)")) fail_assert(404);
+	if (!streq(show(parse("x")), "x")) fail_assert(405);
+	if (!streq(show(parse("42")), "42")) fail_assert(406);
+	if (!streq(show(parse("100-10-5")), "((100-10)-5)")) fail_assert(407);
+	if (!streq(show(parse("--3")), "-(-(3))")) fail_assert(408);
+	if (!streq(show(parse("(1")), "?")) fail_assert(409);
+	// the buffer's own number formatting
+	var b = Buf.new();
+	b.putd(0);
+	if (!streq(b.extract(), "0")) fail_assert(410);
+	b.reset().putd(-7);
+	if (!streq(b.extract(), "-7")) fail_assert(411);
+	b.reset().putd(2147483647);
+	if (!streq(b.extract(), "2147483647")) fail_assert(412);
+	b.reset().putd(-2147483648);
+	if (!streq(b.extract(), "-2147483648")) fail_assert(413);
+	b.reset().puts("ab").putc('c').putd(12);
+	if (!streq(b.extract(), "abc12")) fail_assert(414);
+	if (b.len != 5) fail_assert(415);
+	b.reset();
+	if (b.len != 0) fail_assert(416);
+	// a long string forces the buffer to grow several times
+	for (i < 500) b.putc(byte.view('a' + (i % 26)));
+	if (b.len != 500) fail_assert(417);
+	if (b.extract().length != 500) fail_assert(418);
+	if (b.extract()[499] != byte.view('a' + (499 % 26))) fail_assert(419);
+
+	var h = 0;
+	for (i < EXPRS.length) h = mixs(h, show(parse(EXPRS[i])));
+	acci(h);
+}
+
+//======================================================================
+// Section 6: print / parse round trips over the table
+//======================================================================
+def roundTrip() {
+	var env = newEnv();
+	var h = 0;
+	for (i < EXPRS.length) {
+		var e = parse(EXPRS[i]);
+		if (e.tag == 4) continue;
+		var s = show(e);
+		var e2 = parse(s);
+		if (e2.tag == 4) fail_assert(501);
+		var s2 = show(e2);
+		if (!streq(s, s2)) fail_assert(502);		// printing is idempotent
+		if (eval(e2, env) != VALUES[i]) fail_assert(503);
+		if (size(e2) != size(e)) fail_assert(504);
+		if (depth(e2) != depth(e)) fail_assert(505);
+		h = mixs(h, s2);
+		h = mix(h, size(e2));
+	}
+	acci(h);
+	// a deep left-leaning expression built by repeated printing
+	var acc = parse("1");
+	for (i < 60) acc = Expr.Bin('+', acc, Expr.Num(i));
+	var text = show(acc);
+	var back = parse(text);
+	if (back.tag != 3) fail_assert(506);
+	if (size(back) != size(acc)) fail_assert(507);
+	if (depth(back) != 61) fail_assert(508);
+	// 1 + sum of 0..59 = 1 + 1770
+	if (eval(back, env) != 1771) fail_assert(509);
+	if (!streq(show(back), text)) fail_assert(510);
+	acci(mixs(0, text));
+}
+
+//======================================================================
+// Section 7: random trees, printed and re-parsed
+//======================================================================
+def randomTree(d: int) -> Expr {
+	if (d <= 0) {
+		if ((rand() & 3) == 0) return Expr.Var(NAMES[randn(NAMES.length)]);
+		return Expr.Num(randn(50));
+	}
+	match (randn(6)) {
+		0 => return Expr.Neg(randomTree(d - 1));
+		1 => return Expr.Bin('+', randomTree(d - 1), randomTree(d - 1));
+		2 => return Expr.Bin('-', randomTree(d - 1), randomTree(d - 1));
+		3 => return Expr.Bin('*', randomTree(d - 1), randomTree(d - 1));
+		4 => return Expr.Bin('/', randomTree(d - 1), randomTree(d - 1));
+		_ => return Expr.Bin('%', randomTree(d - 1), randomTree(d - 1));
+	}
+}
+def fuzz() {
+	srand(0x2E77);
+	var env = newEnv();
+	var h = 0;
+	var nodes = 0;
+	for (round < 400) {
+		var e = randomTree(1 + randn(5));
+		var s = show(e);
+		var e2 = parse(s);
+		if (e2.tag == 4) fail_assert(601);
+		if (size(e2) != size(e)) fail_assert(602);
+		if (depth(e2) != depth(e)) fail_assert(603);
+		var v1 = eval(e, env);
+		var v2 = eval(e2, env);
+		if (v1 != v2) fail_assert(604);			// print/parse preserves value
+		if (!streq(show(e2), s)) fail_assert(605);
+		nodes = nodes + size(e);
+		h = mix(h, v1);
+		h = mixs(h, s);
+	}
+	acci(h);
+	acci(mix(0, nodes));
+	if (nodes < 400) fail_assert(606);
+	// evaluation is deterministic: the same tree twice gives the same value
+	srand(0x2E77);
+	var g = 0;
+	for (round < 200) {
+		var e = randomTree(1 + randn(4));
+		var a = eval(e, env);
+		var b = eval(e, env);
+		if (a != b) fail_assert(607);
+		g = mix(g, a);
+	}
+	acci(g);
+}
+
+//======================================================================
+// Section 8: a large generated program text
+//======================================================================
+def bigText() {
+	srand(0x2E88);
+	var env = newEnv();
+	// build one long sum-of-products expression as text, then parse it
+	var b = Buf.new();
+	var expect = 0;
+	for (i < 300) {
+		if (i > 0) b.putc('+');
+		var x = randn(20) + 1, y = randn(20) + 1;
+		b.putd(x).putc('*').putd(y);
+		expect = expect + x * y;
+	}
+	var text = b.extract();
+	var e = parse(text);
+	if (e.tag == 4) fail_assert(701);
+	if (size(e) != 1199) fail_assert(702);		// 300*3 product nodes + 299 sums
+	if (depth(e) != 301) fail_assert(703);		// left-leaning chain of adds
+	if (eval(e, env) != expect) fail_assert(704);
+	acci(mix(0, eval(e, env)));
+	acci(mixs(0, text));
+
+	// a deeply nested parenthesized expression
+	var p = Buf.new();
+	for (i < 200) p.putc('(');
+	p.putd(9);
+	for (i < 200) p.putc(')');
+	var deep = parse(p.extract());
+	if (deep.tag != 0) fail_assert(705);
+	if (size(deep) != 1) fail_assert(706);
+	if (eval(deep, env) != 9) fail_assert(707);
+	acci(mix(0, eval(deep, env)));
+
+	// a chain of unary minus: 201 of them applied to 5 gives -5
+	var u = Buf.new();
+	for (i < 201) u.putc('-');
+	u.putd(5);
+	var un = parse(u.extract());
+	if (depth(un) != 202) fail_assert(708);
+	if (eval(un, env) != -5) fail_assert(709);
+	var u2 = Buf.new();
+	for (i < 200) u2.putc('-');
+	u2.putd(5);
+	if (eval(parse(u2.extract()), env) != 5) fail_assert(710);
+	acci(mix(0, size(un)));
+}
+
+//======================================================================
+def run(a: int) {
+	crc = a;
+	failed = 0;
+	if (a == 0 || a == 1) tokens();
+	if (a == 0 || a == 2) trees();
+	if (a == 0 || a == 3) evaluation();
+	if (a == 0 || a == 4) printing();
+	if (a == 0 || a == 5) roundTrip();
+	if (a == 0 || a == 6) fuzz();
+	if (a == 0 || a == 7) bigText();
+}
+def main(a: int) -> int {
+	run(a);
+	if (failed != 0) return failed;
+	return crc;
+}

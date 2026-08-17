@@ -192,7 +192,16 @@ class MachCallConv {
 	def returnTypes: Array<Type>;	// return types
 	def retLocs: Array<int>;	// locations of return value(s)
 	def overflow: int;		// number of overflow stack arguments
+
 	new(regSet, paramTypes, paramLocs, returnTypes, retLocs, overflow) { }
+
+	// Returns true if any return value is in a slot in the caller's frame.
+	def anyCallerStackRet() -> bool {
+		for (j < retLocs.length) {
+			if (regSet.isStack(callerRet(j) & ~regSet.IS_64)) return true;
+		}
+		return false;
+	}
 	def callerParam(i: int) -> int {
 		return adjust(paramLocs[i], regSet.callerStart);
 	}
@@ -1019,11 +1028,18 @@ class SsaMachGen(context: SsaContext, mach: MachProgram, regSet: MachRegSet, w: 
 			else {
 				var vreg = getVReg(p), loc = frame.conv.callerParam(i);
 				dfnFixed(p, loc);
-				if (regSet.isStack(loc)) vreg.spill = loc;
+				// Reuse the caller's spill slot if this function wouldn't overwrite it with a return value.
+				if (regSet.isStack(loc) && !isReturnLoc(loc)) vreg.spill = loc;
 			}
 		}
 		emitN(ArchInstrs.ARCH_ENTRY);
 		advanceCursor();
+	}
+	// Returns true if {loc} is one of the locations this method returns a value in.
+	private def isReturnLoc(loc: int) -> bool {
+		var conv = frame.conv;
+		for (j < conv.returnTypes.length) if (conv.callerRet(j) == loc) return true;
+		return false;
 	}
 	def visitReturn(block: SsaBlock, i: SsaReturn) {
 		for (j < i.inputs.length) useFixed(i.inputs[j].dest, frame.conv.callerRet(j));
@@ -1331,7 +1347,7 @@ class ArchInstrBuffer(codegen: SsaMachGen, prog: Program, regSet: MachRegSet) ex
 // Generates machine code for all aspects of the program, including the main
 // stub, fatal stubs, and SSA methods.
 class MachBackend(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter) {
-	def alwaysGc: bool = CLOptions.RT_TEST_GC.get();
+	var alwaysGc: bool = CLOptions.RT_TEST_GC.get();
 	var ri_gc: IrMethod;
 	var ri_signal: IrMethod;
 	def context = SsaContext.new(compiler, prog);
@@ -1339,8 +1355,10 @@ class MachBackend(compiler: Compiler, prog: Program, mach: MachProgram, w: MachD
 		if (CLOptions.RT_GC.get()) {
 			mach.allocStub = Addr.new(mach.codeRegion, null, 0);
 			ri_gc = mach.runtime.getRiGc();
+			// the {CiTest.forceGc()} stub is only possible with a runtime GC method
+			if (ri_gc != null) mach.gcStub = Addr.new(mach.codeRegion, null, 0);
 		}
-		if (ri_gc == null && alwaysGc) return prog.ERROR.fail("RiRuntime.gc method needed for gc test mode");
+		if (alwaysGc && ri_gc == null) alwaysGc = false;
 		ri_signal = mach.runtime.getRiSignal();
 		if (ri_signal != null) mach.signalStub = Addr.new(mach.codeRegion, null, 0);
 	}
@@ -1358,8 +1376,18 @@ class MachBackend(compiler: Compiler, prog: Program, mach: MachProgram, w: MachD
 			genAllocStub();
 			w.bindSize(mach.allocStub);
 		}
+		// Generate the forced-GC stub, used by {CiTest.forceGc()}
+		if (mach.gcStub != null) {
+			w.atEnd().align(mach.code.addrAlign.size);
+			w.bind(mach.gcStub);
+			genGcStub();
+			w.bindSize(mach.gcStub);
+		}
 
 		// Generate code for SSA methods
+		var releaseSsa = CLOptions.RELEASE_SSA.val && !compiler.DebugSymbol;
+		var mainSpec = prog.getMain();
+		var mainMeth = if(mainSpec != null, mainSpec.asMethod());
 		var methods = prog.ir.methods;
 		var code = mach.code;
 		for (i < methods.length) {
@@ -1370,6 +1398,8 @@ class MachBackend(compiler: Compiler, prog: Program, mach: MachProgram, w: MachD
 			if (CLOptions.PRINT_CODEGEN_TIME.val) context.time("codegen", genCodeFromSsa, ());
 			else genCodeFromSsa();
 			w.atEnd().bindSize(addr);
+			// the stubs generated below still need these three graphs
+			if (releaseSsa && m != ri_gc && m != ri_signal && m != mainMeth) m.ssa = null;
 			if (CLOptions.PRINT_BIN.get()) {
 				Terminal.put2("%q: %d bytes\n", m.renderLong, addr.size);
 				w.render(start, addr.size, Terminal.buf);
@@ -1407,6 +1437,7 @@ class MachBackend(compiler: Compiler, prog: Program, mach: MachProgram, w: MachD
 	//=={ Architecture-specific routines }===================================
 	def genEntryStub();
 	def genAllocStub();
+	def genGcStub();
 	def genCodeFromSsa();
 	def genSignalHandlerStub();
 	def genFatalStub(ex: string, addr: Addr);

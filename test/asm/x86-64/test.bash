@@ -2,6 +2,11 @@
 
 . ../../common.bash x86-64-asm
 
+if [ "$TEST_ASM" = 0 ]; then
+    echo "x86-64 assembler tests skipped."
+    exit 0
+fi
+
 S=${OUT}/test.s
 L=${OUT}/test.list
 
@@ -44,3 +49,34 @@ fi
 
 printf "  Testing disassembler..."
 run_v3c "" -run ./X86_64DisassemblerTest.v3 $LIB_UTIL $LIB_ASM $LIB_TEST | tee $OUT/disass.out | $PROGRESS
+
+# Differential test: disassemble a corpus with this disassembler and with two
+# independent ones (GNU binutils and NASM), and compare. Baselines record the
+# known dialect differences so that only new disagreements fail the run.
+DIFF=./disasm-diff.py
+if [ ! -x "$(command -v python3)" ]; then
+    echo "  python3 not installed, skipping differential disassembler tests."
+    exit 0
+fi
+if [ ! -x "$(command -v objdump)" ] && [ ! -x "$(command -v ndisasm)" ]; then
+    echo "  neither objdump nor ndisasm installed, skipping differential disassembler tests."
+    exit 0
+fi
+
+for CORPUS in asm enum; do
+    printf "  Diffing disassembler (%s)..." $CORPUS
+    D=${OUT}/disasm-${CORPUS}.txt
+    run_v3c "" -run ./X86_64DisassemblerDump.v3 $LIB_UTIL $LIB_ASM -- -${CORPUS} > $D
+    if [ "$?" != 0 ]; then
+        printf "\n"
+        head -n 10 $D
+        exit 1
+    fi
+    python3 $DIFF $D --max 20 --baseline ./disasm-diff-${CORPUS}.baseline \
+        --blob ${OUT}/disasm-${CORPUS}.bin > ${OUT}/disasm-${CORPUS}.diff
+    X=$?
+    check $X
+    if [ $X != 0 ]; then
+        tail -n 20 ${OUT}/disasm-${CORPUS}.diff
+    fi
+done

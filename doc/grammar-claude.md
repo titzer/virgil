@@ -2,6 +2,10 @@
 
 Extracted from `aeneas/src/vst/Parser.v3`. Written in EBNF; `,*` means comma-separated list, `?` means optional, `*` means zero or more.
 
+A `,*` list may carry a single trailing comma before its closing delimiter
+(e.g. `[1, 2, 3,]`, `f(a, b,)`, `enum E { A, B, }`). This does not apply to
+declarator lists such as `var x = 1, y = 2;`, which still require a `;`.
+
 ---
 
 ## Top Level

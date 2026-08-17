@@ -1,0 +1,556 @@
+//@execute 0=0
+//@heap-size=4000000
+// Smoke test: allocation churn patterns.
+// Short-lived garbage in tight loops, medium-lived objects that survive a few
+// collections, a long-lived population that must survive all of them, and
+// objects of many different sizes and shapes (small classes, wide classes,
+// tiny arrays, huge arrays, arrays of references vs. arrays of primitives),
+// finally all interleaved under a PRNG. Every surviving object carries a
+// fingerprint that is recomputed after the churn, so a lost, duplicated or
+// mis-forwarded reference shows up as a wrong CRC rather than a crash.
+// Interleaved are assert()s over compile-time constants, which the optimizer is
+// expected to fold away; a folding bug sets the failure flag instead.
+// Input selects the section; input 0 runs every section in one method body.
+
+//======================================================================
+// Accumulator and assertions
+//======================================================================
+var crc: int;
+var failed: int;
+
+def mix(h: int, x: int) -> int {
+	var t = h ^ x;
+	t = t * 0x01000193;
+	return t ^ (t >>> 15);
+}
+def mixl(h: int, x: long) -> int {
+	return mix(mix(h, int.view(u32.view(x))), int.view(u32.view(x >> 32)));
+}
+def mixb(h: int, b: bool) -> int {
+	return mix(h, if(b, 0x5A5A5A5A, 0x0F0F0F0F));
+}
+def acci(x: int) { crc = mix(crc, x); }
+
+// Records the first failing assertion; main() returns the id instead of the CRC.
+def fail_assert(id: int) { if (failed == 0) failed = id; }
+
+var seed: int;
+def srand(s: int) { seed = s; }
+def rand() -> int {
+	seed = seed * 1664525 + 1013904223;
+	seed = seed ^ (seed >>> 16);
+	return seed;
+}
+def randn(n: int) -> int { return (rand() & 0x7FFFFFFF) % n; }
+
+//======================================================================
+// Shapes. Each carries a fingerprint derived only from its id.
+//======================================================================
+class Small {
+	def id: int;
+	var v: int;
+	new(id) { v = id * 7 + 3; }
+	def fp() -> int { return (id * 31) ^ v; }
+}
+class Medium {
+	def id: int;
+	var a: int;
+	var b: int;
+	var c: long;
+	var next: Medium;
+	new(id) {
+		a = id + 1;
+		b = id * id;
+		c = long.!(id) * 1000003L;
+	}
+	def fp() -> int {
+		return id ^ a ^ b ^ int.view(u32.view(c)) ^ int.view(u32.view(c >> 32));
+	}
+}
+// A wide object: many primitive fields and several reference fields, so the
+// object's field map is long and mixed.
+class Big {
+	def id: int;
+	var i0: int; var i1: int; var i2: int; var i3: int;
+	var i4: int; var i5: int; var i6: int; var i7: int;
+	var l0: long; var l1: long;
+	var f0: byte; var f1: bool;
+	var r0: Small;
+	var r1: Medium;
+	var r2: Array<int>;
+	var r3: Array<Small>;
+	new(id) {
+		i0 = id; i1 = id + 1; i2 = id + 2; i3 = id + 3;
+		i4 = id * 2; i5 = id * 3; i6 = id * 5; i7 = id * 7;
+		l0 = long.!(id) * 0x1_0000_0001L;
+		l1 = long.!(id) ^ 0x7FFF_FFFF_FFFFL;
+		f0 = byte.view(id);
+		f1 = (id & 1) == 0;
+		r0 = Small.new(id + 1);
+		r1 = Medium.new(id + 2);
+		r2 = Array<int>.new(3);
+		for (i < r2.length) r2[i] = id * 10 + i;
+		r3 = Array<Small>.new(2);
+		for (i < r3.length) r3[i] = Small.new(id * 100 + i);
+	}
+	def fp() -> int {
+		var s = i0 ^ i1 ^ i2 ^ i3 ^ i4 ^ i5 ^ i6 ^ i7;
+		s = s ^ int.view(u32.view(l0)) ^ int.view(u32.view(l0 >> 32));
+		s = s ^ int.view(u32.view(l1)) ^ int.view(u32.view(l1 >> 32));
+		s = s ^ int.!(f0) ^ (if(f1, 0x1111, 0x2222));
+		s = s ^ r0.fp() ^ r1.fp();
+		for (i < r2.length) s = s ^ (r2[i] * (i + 1));
+		for (i < r3.length) s = s ^ r3[i].fp();
+		return s;
+	}
+}
+
+def SIZES: Array<int> = [0, 1, 2, 3, 5, 8, 13, 21, 64, 255, 1024];
+def COUNTS: Array<int> = [1000, 2000, 4000];
+
+//======================================================================
+// Section 1: short-lived garbage in tight loops
+//======================================================================
+def shortLived() {
+	var n = COUNTS[1];			// 2000, from a global so nothing folds
+	var acc = 0;
+	for (i < n) {
+		var s = Small.new(i);
+		acc = acc + s.v;
+	}
+	// sum of (7i+3) for i in [0,2000) = 7*1999*1000 + 6000 = 13999000
+	if (acc != 13999000) fail_assert(101);
+	acci(mix(0, acc));
+
+	// garbage arrays of every listed size, none retained
+	var h = 0;
+	var total = 0;
+	for (r < 40) {
+		for (k < SIZES.length) {
+			var a = Array<int>.new(SIZES[k]);
+			for (i < a.length) a[i] = i + r;
+			total = total + a.length;
+			if (a.length > 0) h = mix(h, a[a.length - 1]);
+		}
+	}
+	acci(h);
+	// 40 * (0+1+2+3+5+8+13+21+64+255+1024) = 40 * 1396 = 55840
+	if (total != 55840) fail_assert(102);
+
+	// garbage objects allocated and immediately dropped inside a call chain
+	var g = 0;
+	for (i < 1500) g = g ^ makeAndDrop(i);
+	acci(g);
+
+	// pure compile-time facts about the shapes
+	if (Small.new(5).v != 38) fail_assert(103);
+	if (Small.new(5).fp() != 189) fail_assert(104);	// (5*31)=155 ^ 38 = 189
+	if (Small.new(0).v != 3) fail_assert(105);
+	if (Medium.new(4).a != 5) fail_assert(106);
+	if (Medium.new(4).b != 16) fail_assert(107);
+	if (Medium.new(4).c != 4000012L) fail_assert(108);
+	if (Medium.new(4).next != null) fail_assert(109);
+	if (Big.new(3).i7 != 21) fail_assert(110);
+	if (Big.new(3).r2.length != 3) fail_assert(111);
+	if (Big.new(3).r2[2] != 32) fail_assert(112);
+	if (Big.new(3).r3[1].id != 301) fail_assert(113);
+	if (Big.new(3).f1 != false) fail_assert(114);
+	if (Big.new(4).f1 != true) fail_assert(115);
+}
+def makeAndDrop(i: int) -> int {
+	var m = Medium.new(i);
+	var s0 = Small.new(i), s1 = Small.new(i + 1);
+	var a = Array<Small>.new(4);
+	for (k < a.length) a[k] = Small.new(i + k);
+	m.next = Medium.new(i + 1);
+	return m.fp() ^ s0.fp() ^ s1.fp() ^ a[3].fp() ^ m.next.fp();
+}
+
+//======================================================================
+// Section 2: medium-lived objects, replaced round after round
+//======================================================================
+def mediumLived() {
+	var slots = Array<Medium>.new(128);
+	for (i < slots.length) slots[i] = Medium.new(i);
+	var h = 0;
+	var replaced = 0;
+	for (round < 4096) {
+		var k = round % slots.length;
+		// the old occupant becomes garbage right here
+		slots[k] = Medium.new(round + 5000);
+		replaced++;
+		if ((round % 64) == 0) {
+			var t = 0;
+			for (i < slots.length) t = t ^ slots[i].fp();
+			h = mix(h, t);
+		}
+		// extra garbage between replacements
+		var junk = Array<Small>.new(8);
+		for (i < junk.length) junk[i] = Small.new(round + i);
+		h = mix(h, junk[round % 8].v);
+	}
+	acci(h);
+	if (replaced != 4096) fail_assert(201);
+
+	// 4096 rounds over 128 slots is exactly 32 full passes; the last pass wrote
+	// rounds 3968..4095, so slot k holds Medium(3968 + k + 5000)
+	var g = 0;
+	for (i < slots.length) {
+		var want = 3968 + i + 5000;
+		if (slots[i].id != want) fail_assert(202);
+		if (slots[i].a != want + 1) fail_assert(203);
+		g = g ^ slots[i].fp();
+	}
+	acci(g);
+	// chain the survivors together, then churn again and re-verify
+	for (i = 1; i < slots.length; i++) slots[i - 1].next = slots[i];
+	var burnt = 0;
+	for (r < 20) burnt = burnt ^ makeAndDrop(r);
+	acci(burnt);
+	var p = slots[0];
+	var n = 0;
+	var w = 0;
+	while (p != null) { w = mix(w, p.fp()); p = p.next; n++; }
+	acci(w);
+	if (n != 128) fail_assert(204);
+	if (slots[127].next != null) fail_assert(205);
+}
+
+//======================================================================
+// Section 3: a long-lived, generational-style population
+//======================================================================
+def oldGeneration() {
+	var oldSize = 600;
+	var old = Array<Big>.new(oldSize);
+	for (i < oldSize) old[i] = Big.new(i);
+	var prints = Array<int>.new(oldSize);
+	for (i < oldSize) prints[i] = old[i].fp();
+
+	var h = 0;
+	for (gen < 8) {
+		// a nursery that dies completely every generation
+		var nursery = Array<Medium>.new(400);
+		for (i < nursery.length) nursery[i] = Medium.new(gen * 1000 + i);
+		var t = 0;
+		for (i < nursery.length) t = t ^ nursery[i].fp();
+		h = mix(h, t);
+		// the old generation must be untouched by the nursery's death
+		for (i < oldSize) {
+			if (old[i].fp() != prints[i]) fail_assert(301);
+		}
+	}
+	acci(h);
+
+	// promote a slice of the nursery pattern into the old set
+	for (i < oldSize) {
+		if ((i % 5) == 0) old[i].r1 = Medium.new(i + 90000);
+	}
+	var burn = 0;
+	for (r < 30) burn = burn ^ makeAndDrop(r * 3);
+	acci(burn);
+	var g = 0;
+	var promoted = 0;
+	for (i < oldSize) {
+		if ((i % 5) == 0) {
+			if (old[i].r1.id != i + 90000) fail_assert(302);
+			promoted++;
+		} else {
+			if (old[i].fp() != prints[i]) fail_assert(303);
+		}
+		g = mix(g, old[i].fp());
+	}
+	acci(g);
+	if (promoted != 120) fail_assert(304);
+	if (oldSize != 600) fail_assert(305);
+	if (old[0].id != 0) fail_assert(306);
+	if (old[599].id != 599) fail_assert(307);
+}
+
+//======================================================================
+// Section 4: many sizes and shapes, allocated side by side
+//======================================================================
+def shapes() {
+	var keep = Array<Big>.new(SIZES.length);
+	var h = 0;
+	for (k < SIZES.length) {
+		var sz = SIZES[k];
+		var ints = Array<int>.new(sz);
+		var longs = Array<long>.new(sz);
+		var bytes = Array<byte>.new(sz);
+		var smalls = Array<Small>.new(sz);
+		for (i < sz) {
+			ints[i] = i * 3 + k;
+			longs[i] = long.!(i) * 0x1_0000_0007L + long.!(k);
+			bytes[i] = byte.view(i + k);
+			smalls[i] = Small.new(i + k * 10);
+		}
+		var t = mix(0, sz);
+		for (i < sz) {
+			t = mix(t, ints[i]);
+			t = mixl(t, longs[i]);
+			t = mix(t, int.!(bytes[i]));
+			t = mix(t, smalls[i].fp());
+		}
+		h = mix(h, t);
+		keep[k] = Big.new(sz);
+		if (ints.length != sz) fail_assert(401);
+		if (smalls.length != sz) fail_assert(402);
+	}
+	acci(h);
+	var g = 0;
+	for (k < keep.length) g = mix(g, keep[k].fp());
+	acci(g);
+	// zero-length arrays are still real objects with distinct identity
+	var z0 = Array<int>.new(0), z1 = Array<int>.new(0);
+	if (z0.length != 0) fail_assert(403);
+	if (z0 == null) fail_assert(404);
+	if (z0 == z1) fail_assert(405);
+	if (SIZES[SIZES.length - 1] != 1024) fail_assert(406);
+	if (keep[0].id != 0) fail_assert(407);
+	if (keep[SIZES.length - 1].id != 1024) fail_assert(408);
+	if (Big.new(1024).i7 != 7168) fail_assert(409);
+}
+
+//======================================================================
+// Section 5: arrays of primitives vs. arrays of references
+//======================================================================
+def bulkArrays() {
+	var n = 4000;
+	var prim = Array<int>.new(n);
+	var lprim = Array<long>.new(n);
+	var refs = Array<Small>.new(n);
+	for (i < n) {
+		prim[i] = i * 5 - 7;
+		lprim[i] = long.!(i) * 0x100000001L;
+		refs[i] = Small.new(i);
+	}
+	var s = 0;
+	for (i < n) s = s + prim[i];
+	// sum of (5i-7) for i in [0,4000) = 5*3999*2000 - 28000 = 39990000 - 28000
+	if (s != 39962000) fail_assert(501);
+
+	var h = 0;
+	for (i < n) h = mix(h, prim[i]);
+	acci(h);
+	var hl = 0;
+	for (i < n) hl = mixl(hl, lprim[i]);
+	acci(hl);
+	var hr = 0;
+	for (i < n) hr = mix(hr, refs[i].fp());
+	acci(hr);
+
+	// churn a lot of garbage while the three big arrays stay live
+	var junk = 0;
+	for (r < 25) junk = junk ^ makeAndDrop(r * 7);
+	acci(junk);
+
+	// re-verify contents after the churn
+	var bad = 0;
+	for (i < n) {
+		if (prim[i] != i * 5 - 7) bad++;
+		if (refs[i].id != i) bad++;
+	}
+	if (bad != 0) fail_assert(502);
+	if (prim.length != 4000) fail_assert(503);
+	if (refs[3999].v != 3999 * 7 + 3) fail_assert(504);
+
+	// an array of arrays of references: three levels of scanning
+	var nest = Array<Array<Small>>.new(40);
+	for (i < nest.length) {
+		nest[i] = Array<Small>.new(1 + (i % 9));
+		for (j < nest[i].length) nest[i][j] = Small.new(i * 20 + j);
+	}
+	for (r < 15) junk = junk ^ makeAndDrop(r);
+	var hn = 0;
+	var cells = 0;
+	for (i < nest.length) for (j < nest[i].length) {
+		hn = mix(hn, nest[i][j].fp());
+		cells++;
+	}
+	acci(hn);
+	// lengths 1..9 repeated: 40 rows, sum over i of (1 + i%9)
+	// i%9 cycles 0..8 four times (i=0..35) plus 0,1,2,3 (i=36..39)
+	// = 4*(9 + 36) + (1+2+3+4) = 180 + 10 = 190
+	if (cells != 190) fail_assert(505);
+}
+
+//======================================================================
+// Section 6: all shapes interleaved under a PRNG, with a retention set
+//======================================================================
+def interleaved() {
+	srand(0x1CE01);
+	var kept = Array<Big>.new(64);
+	var keptS = Array<Small>.new(64);
+	var keptA = Array<Array<int>>.new(64);
+	for (i < kept.length) {
+		kept[i] = Big.new(i + 7);
+		keptS[i] = Small.new(i + 13);
+		keptA[i] = Array<int>.new(4);
+		for (j < 4) keptA[i][j] = i * 4 + j;
+	}
+	var h = 0;
+	var allocs = 0;
+	for (round < 6000) {
+		var pick = randn(6);
+		match (pick) {
+			0 => { var s = Small.new(round); h = h ^ s.v; }
+			1 => { var m = Medium.new(round); m.next = Medium.new(round + 1); h = h ^ m.fp(); }
+			2 => { var b = Big.new(round & 1023); h = h ^ b.i0; }
+			3 => {
+				var a = Array<int>.new(SIZES[randn(SIZES.length)]);
+				for (i < a.length) a[i] = i;
+				h = h ^ a.length;
+			}
+			4 => {
+				var a = Array<Small>.new(1 + randn(16));
+				for (i < a.length) a[i] = Small.new(i);
+				h = h ^ a[a.length - 1].v;
+			}
+			_ => {
+				// occasionally replace something in the retention set
+				var k = randn(kept.length);
+				kept[k] = Big.new(k + 7);
+				keptS[k] = Small.new(k + 13);
+			}
+		}
+		allocs++;
+		if ((round % 500) == 0) {
+			var t = 0;
+			for (i < kept.length) t = t ^ kept[i].fp() ^ keptS[i].fp();
+			h = mix(h, t);
+		}
+	}
+	acci(h);
+	if (allocs != 6000) fail_assert(601);
+	// the retention set is rebuilt from the same ids, so fingerprints are stable
+	var bad = 0;
+	for (i < kept.length) {
+		if (kept[i].id != i + 7) bad++;
+		if (keptS[i].id != i + 13) bad++;
+		if (kept[i].fp() != Big.new(i + 7).fp()) bad++;
+		if (keptA[i][3] != i * 4 + 3) bad++;
+	}
+	if (bad != 0) fail_assert(602);
+	var g = 0;
+	for (i < kept.length) g = mix(g, kept[i].fp());
+	for (i < kept.length) g = mix(g, keptS[i].fp());
+	for (i < kept.length) for (j < 4) g = mix(g, keptA[i][j]);
+	acci(g);
+}
+
+//======================================================================
+// Section 7: linked structures built and dropped repeatedly
+//======================================================================
+def chains() {
+	srand(0x1CE07);
+	var longest: Medium;
+	var longestLen = 0;
+	var h = 0;
+	for (round < 200) {
+		var len = 1 + randn(64);
+		var head: Medium;
+		for (i < len) {
+			var m = Medium.new(round * 100 + i);
+			m.next = head;
+			head = m;
+		}
+		// walk the chain we just built
+		var p = head;
+		var n = 0;
+		var t = 0;
+		while (p != null) { t = t ^ p.fp(); p = p.next; n++; }
+		if (n != len) fail_assert(701);
+		h = mix(h, t);
+		if (len > longestLen) { longestLen = len; longest = head; }
+		// everything but `longest` becomes garbage on the next iteration
+	}
+	acci(h);
+	var p = longest;
+	var n = 0;
+	var g = 0;
+	while (p != null) { g = mix(g, p.fp()); p = p.next; n++; }
+	acci(g);
+	if (n != longestLen) fail_assert(702);
+	if (longestLen < 1) fail_assert(703);
+	if (longestLen > 64) fail_assert(704);
+	if (longest == null) fail_assert(705);
+	// a hand-built 3-node chain has fully determined contents
+	var c2 = Medium.new(2), c1 = Medium.new(1), c0 = Medium.new(0);
+	c0.next = c1; c1.next = c2;
+	if (c0.next.next.id != 2) fail_assert(706);
+	if (c0.next.next.next != null) fail_assert(707);
+	if (c0.next.b != 1) fail_assert(708);
+	if (c1.next.b != 4) fail_assert(709);
+}
+
+//======================================================================
+// Section 8: a size sweep, allocating every length in turn
+//======================================================================
+def sizeSweep() {
+	var h = 0;
+	var totalCells = 0;
+	for (len < 300) {
+		var a = Array<int>.new(len);
+		var b = Array<Small>.new(len);
+		for (i < len) {
+			a[i] = len * 1000 + i;
+			b[i] = Small.new(len ^ i);
+		}
+		totalCells = totalCells + len;
+		var t = mix(0, len);
+		if (len > 0) {
+			t = mix(t, a[0]);
+			t = mix(t, a[len - 1]);
+			t = mix(t, b[0].fp());
+			t = mix(t, b[len - 1].fp());
+		}
+		if ((len % 25) == 0) h = mix(h, t);
+		if (a.length != len) fail_assert(801);
+		if (b.length != len) fail_assert(802);
+	}
+	acci(h);
+	// sum of 0..299 = 299*300/2 = 44850
+	if (totalCells != 44850) fail_assert(803);
+
+	// the same sweep, but every array is retained
+	var all = Array<Array<int>>.new(150);
+	for (len < all.length) {
+		all[len] = Array<int>.new(len);
+		for (i < len) all[len][i] = len - i;
+	}
+	var burn = 0;
+	for (r < 20) burn = burn ^ makeAndDrop(r);
+	acci(burn);
+	var g = 0;
+	var cells = 0;
+	for (len < all.length) {
+		if (all[len].length != len) fail_assert(804);
+		for (i < len) {
+			if (all[len][i] != len - i) fail_assert(805);
+			cells++;
+		}
+		g = mix(g, len);
+	}
+	acci(g);
+	// sum of 0..149 = 149*150/2 = 11175
+	if (cells != 11175) fail_assert(806);
+}
+
+//======================================================================
+def run(a: int) {
+	crc = a;
+	failed = 0;
+	if (a == 0 || a == 1) shortLived();
+	if (a == 0 || a == 2) mediumLived();
+	if (a == 0 || a == 3) oldGeneration();
+	if (a == 0 || a == 4) shapes();
+	if (a == 0 || a == 5) bulkArrays();
+	if (a == 0 || a == 6) interleaved();
+	if (a == 0 || a == 7) chains();
+	if (a == 0 || a == 8) sizeSweep();
+}
+def main(a: int) -> int {
+	run(a);
+	if (failed != 0) return failed;
+	return crc;
+}

@@ -1,44 +1,147 @@
 // Copyright 2024 Virgil authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// A disassembler for 64-bit x86 instructions.
+//
+// Coverage: the one-byte opcode map, the 0x0F two-byte map, the 0x0F 0x38 and
+// 0x0F 0x3A three-byte maps, the x87 escapes 0xD8-0xDF, MMX, SSE through SSE4.2,
+// AES, MPX, and 3DNow!. Instructions are decoded into an {X86_64AddrMode}, which
+// names the operands and their widths, and reported to an {X86_64DisVisitor}.
+//
+// VEX- and EVEX-prefixed encodings (AVX, AVX2, AVX-512) are not yet handled; they
+// are reported through {X86_64DisVisitor.unsupported} rather than silently
+// mis-decoded. A segment override is reported in the prefix set rather than
+// inside the memory operand, which does not model one.
+//
+// Testing. Two independent checks are run by test/asm/x86-64/test.bash:
+//   - X86_64DisassemblerTest.v3 assembles instructions with X86_64Assembler and
+//     checks that decoding them recovers the same mnemonic and operands, so the
+//     two agree on the binary format.
+//   - disasm-diff.py disassembles a large corpus with this disassembler and with
+//     GNU binutils objdump and NASM ndisasm, and reports every disagreement about
+//     an instruction's length or meaning.
+//
+// Where the two external disassemblers disagree with each other, the Intel SDM
+// decides. Two such cases are worth recording, because they look like bugs:
+//   - 0x66 on a near branch. binutils reads a rel16 displacement; NASM reads
+//     rel32. The SDM lists the rel16 forms of JMP, CALL and Jcc as "N.S." in
+//     64-bit mode and fixes the operation size at 64 bits, so this disassembler
+//     always reads rel32, as NASM does.
+//   - 0x48 0x90. binutils prints "rex.W nop"; NASM prints "xchg rax,rax". The
+//     SDM defines 0x90 as an alias of XCHG rAX, rAX, so this disassembler prints
+//     the exchange whenever a prefix makes it observable.
+
+// The size of an operand. Sizes are used both to select the textual name of a
+// general-purpose register (e.g. {al} vs {rax}) and to disambiguate memory
+// operands, which have no register from which to infer a width.
+enum X86_64Size(bits: byte, nasm: string) {
+	BYTE(8, "byte"),
+	WORD(16, "word"),
+	DWORD(32, "dword"),
+	QWORD(64, "qword"),
+	FWORD(48, "fword"),
+	TWORD(80, "tword"),
+	OWORD(128, "oword")
+}
+
 // Addressing modes describe the possible combinations of operands to instructions.
+// Modes that mention a general-purpose register or a memory location carry the
+// operand size, since neither can be inferred from the mnemonic alone.
+//   {r} = general-purpose register, {m} = memory, {s} = SSE register,
+//   {i} = immediate, {t} = x87 stack register, {cl} = implicit %cl
 type X86_64AddrMode {
 	case none;
-	case imm_b(i: byte);
-	case r(a: X86_64Gpr);
-	case r_r(a: X86_64Gpr, b: X86_64Gpr);
-	case r_m(a: X86_64Gpr, b: X86_64Addr);
-	case m_r(a: X86_64Addr, b: X86_64Gpr);
-	case r_b(a: X86_64Gpr, i: byte);
-	case m_b(a: X86_64Addr, i: byte);
-	case r_i(a: X86_64Gpr, i: int);
-	case m_i(a: X86_64Addr, i: int);
-	case r_l(a: X86_64Gpr, i: long);
-	case r_s(a: X86_64Gpr, b: X86_64Xmmr);
-	case s_s(a: X86_64Xmmr, b: X86_64Xmmr);
-	case s_m(a: X86_64Xmmr, b: X86_64Addr);
-	case m_s(a: X86_64Addr, b: X86_64Xmmr);
-	case s_r(a: X86_64Xmmr, b: X86_64Gpr);
+	case imm_b(i: byte);					// int 3
+	case imm_i(i: int);					// push 0x1234
+	case rel(i: int);					// jmp/call, relative to next insn
+	case imm_2(a: int, b: int);				// enter 0x10, 0
 
-	def render(buf: StringBuilder) -> StringBuilder { // TODO: pass operand size
+	case r(sz: X86_64Size, a: X86_64Gpr);
+	case m(sz: X86_64Size, a: X86_64Addr);
+	case r_r(sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr);
+	case r_m(sz: X86_64Size, a: X86_64Gpr, b: X86_64Addr);
+	case m_r(sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr);
+	case r_i(sz: X86_64Size, a: X86_64Gpr, i: int);
+	case m_i(sz: X86_64Size, a: X86_64Addr, i: int);
+	case r_l(sz: X86_64Size, a: X86_64Gpr, i: long);	// movabs
+	case r_off(sz: X86_64Size, a: X86_64Gpr, off: long);	// mov al, [0x1122334455667788]
+	case off_r(sz: X86_64Size, off: long, a: X86_64Gpr);	// mov [0x1122334455667788], al
+	case r_cl(sz: X86_64Size, a: X86_64Gpr);
+	case m_cl(sz: X86_64Size, a: X86_64Addr);
+	case r_r_i(sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr, i: int);
+	case r_m_i(sz: X86_64Size, a: X86_64Gpr, b: X86_64Addr, i: int);
+	case m_r_i(sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr, i: int);
+	case r_r_cl(sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr);
+	case m_r_cl(sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr);
+	case i_r(i: int, sz: X86_64Size, a: X86_64Gpr);		// out 0x70, al
+
+	// Mixed-width moves, e.g. movsx/movzx, where the two operands differ in size.
+	case r_r2(sz: X86_64Size, a: X86_64Gpr, sz2: X86_64Size, b: X86_64Gpr);
+	case r_m2(sz: X86_64Size, a: X86_64Gpr, sz2: X86_64Size, b: X86_64Addr);
+
+	case s_s(a: X86_64Xmmr, b: X86_64Xmmr);
+	case s_m(sz: X86_64Size, a: X86_64Xmmr, b: X86_64Addr);
+	case m_s(sz: X86_64Size, a: X86_64Addr, b: X86_64Xmmr);
+	case r_s(sz: X86_64Size, a: X86_64Gpr, b: X86_64Xmmr);
+	case s_r(sz: X86_64Size, a: X86_64Xmmr, b: X86_64Gpr);
+	case s_i(a: X86_64Xmmr, i: byte);
+	case s_s_i(a: X86_64Xmmr, b: X86_64Xmmr, i: byte);
+	case s_m_i(sz: X86_64Size, a: X86_64Xmmr, b: X86_64Addr, i: byte);
+	case m_s_i(sz: X86_64Size, a: X86_64Addr, b: X86_64Xmmr, i: byte);
+	case r_s_i(sz: X86_64Size, a: X86_64Gpr, b: X86_64Xmmr, i: byte);
+	case s_r_i(sz: X86_64Size, a: X86_64Xmmr, b: X86_64Gpr, i: byte);
+
+	case t(a: byte);					// fld st3
+	case t_t(a: byte, b: byte);				// fadd st0, st3
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		return renderWith(buf, false);
+	}
+	// Renders with the address size selected by a 0x67 prefix: when {addr32} is set,
+	// the base and index registers of memory operands are 32 bits wide.
+	def renderWith(buf: StringBuilder, addr32: bool) -> StringBuilder {
+		X86_64Disassemblers.addr32 = addr32;
 		match (this) {
-			none => 	;
-			imm_b(i) =>	buf.putd(i);
-			r(a) =>		buf.puts(a.name64);
-			r_r(a, b) =>	buf.puts(a.name64).csp().puts(b.name64);
-			r_m(a, b) =>	buf.puts(a.name64).csp().putq(b.render);
-			m_r(a, b) =>	buf.putq(a.render).csp().puts(b.name64);
-			r_b(a, i) =>	buf.puts(a.name64).csp().putx(i);
-			m_b(a, i) =>	buf.putq(a.render).csp().putx(i);
-			r_i(a, i) =>	buf.puts(a.name64).csp().putx(i);
-			m_i(a, i) =>	buf.putq(a.render).csp().putx(i);
-			r_l(a, i) =>	buf.puts(a.name64).csp().putx(i);
-			r_s(a, b) => buf.puts(a.name64).csp().puts(b.name);
-			s_s(a, b) => buf.puts(a.name).csp().puts(b.name);
-			s_m(a, b) => buf.puts(a.name).csp().putq(b.render);
-			m_s(a, b) => buf.putq(a.render).csp().puts(b.name);
-			s_r(a, b) => buf.puts(a.name).csp().puts(b.name64);
+			none =>			;
+			imm_b(i) =>		X86_64Disassemblers.putImm(buf, i);
+			imm_i(i) =>		X86_64Disassemblers.putImm(buf, i);
+			rel(i) =>		buf.puts("$").putd(i);
+			imm_2(a, b) =>		buf.putd(a).csp().putd(b);
+			r(sz, a) =>		buf.puts(X86_64Disassemblers.regName(a, sz));
+			m(sz, a) =>		X86_64Disassemblers.putMem(buf, sz, a);
+			r_r(sz, a, b) =>	buf.puts(X86_64Disassemblers.regName(a, sz)).csp().puts(X86_64Disassemblers.regName(b, sz));
+			r_m(sz, a, b) =>	X86_64Disassemblers.putMem(buf.puts(X86_64Disassemblers.regName(a, sz)).csp(), sz, b);
+			m_r(sz, a, b) =>	X86_64Disassemblers.putMem(buf, sz, a).csp().puts(X86_64Disassemblers.regName(b, sz));
+			r_i(sz, a, i) =>	X86_64Disassemblers.putImm(buf.puts(X86_64Disassemblers.regName(a, sz)).csp(), i);
+			m_i(sz, a, i) =>	X86_64Disassemblers.putImm(X86_64Disassemblers.putMem(buf, sz, a).csp(), i);
+			r_l(sz, a, i) =>	X86_64Disassemblers.putImm(buf.puts(X86_64Disassemblers.regName(a, sz)).csp(), i);
+			r_off(sz, a, off) =>	buf.puts(X86_64Disassemblers.regName(a, sz)).csp().puts(sz.nasm).puts(" [0x").putx(off).puts("]");
+			off_r(sz, off, a) =>	buf.puts(sz.nasm).puts(" [0x").putx(off).puts("], ").puts(X86_64Disassemblers.regName(a, sz));
+			r_cl(sz, a) =>		buf.puts(X86_64Disassemblers.regName(a, sz)).csp().puts("cl");
+			m_cl(sz, a) =>		X86_64Disassemblers.putMem(buf, sz, a).csp().puts("cl");
+			r_r_i(sz, a, b, i) =>	X86_64Disassemblers.putImm(buf.puts(X86_64Disassemblers.regName(a, sz)).csp().puts(X86_64Disassemblers.regName(b, sz)).csp(), i);
+			r_m_i(sz, a, b, i) =>	X86_64Disassemblers.putImm(X86_64Disassemblers.putMem(buf.puts(X86_64Disassemblers.regName(a, sz)).csp(), sz, b).csp(), i);
+			m_r_i(sz, a, b, i) =>	X86_64Disassemblers.putImm(X86_64Disassemblers.putMem(buf, sz, a).csp().puts(X86_64Disassemblers.regName(b, sz)).csp(), i);
+			r_r_cl(sz, a, b) =>	buf.puts(X86_64Disassemblers.regName(a, sz)).csp().puts(X86_64Disassemblers.regName(b, sz)).puts(", cl");
+			m_r_cl(sz, a, b) =>	X86_64Disassemblers.putMem(buf, sz, a).csp().puts(X86_64Disassemblers.regName(b, sz)).puts(", cl");
+			i_r(i, sz, a) =>	X86_64Disassemblers.putImm(buf, i).csp().puts(X86_64Disassemblers.regName(a, sz));
+			r_r2(sz, a, sz2, b) =>	buf.puts(X86_64Disassemblers.regName(a, sz)).csp().puts(X86_64Disassemblers.regName(b, sz2));
+			r_m2(sz, a, sz2, b) =>	X86_64Disassemblers.putMem(buf.puts(X86_64Disassemblers.regName(a, sz)).csp(), sz2, b);
+			s_s(a, b) =>		buf.puts(a.name).csp().puts(b.name);
+			s_m(sz, a, b) =>	X86_64Disassemblers.putMem(buf.puts(a.name).csp(), sz, b);
+			m_s(sz, a, b) =>	X86_64Disassemblers.putMem(buf, sz, a).csp().puts(b.name);
+			r_s(sz, a, b) =>	buf.puts(X86_64Disassemblers.regName(a, sz)).csp().puts(b.name);
+			s_r(sz, a, b) =>	buf.puts(a.name).csp().puts(X86_64Disassemblers.regName(b, sz));
+			s_i(a, i) =>		X86_64Disassemblers.putImm(buf.puts(a.name).csp(), i);
+			s_s_i(a, b, i) =>	X86_64Disassemblers.putImm(buf.puts(a.name).csp().puts(b.name).csp(), i);
+			s_m_i(sz, a, b, i) =>	X86_64Disassemblers.putImm(X86_64Disassemblers.putMem(buf.puts(a.name).csp(), sz, b).csp(), i);
+			m_s_i(sz, a, b, i) =>	X86_64Disassemblers.putImm(X86_64Disassemblers.putMem(buf, sz, a).csp().puts(b.name).csp(), i);
+			r_s_i(sz, a, b, i) =>	X86_64Disassemblers.putImm(buf.puts(X86_64Disassemblers.regName(a, sz)).csp().puts(b.name).csp(), i);
+			s_r_i(sz, a, b, i) =>	X86_64Disassemblers.putImm(buf.puts(a.name).csp().puts(X86_64Disassemblers.regName(b, sz)).csp(), i);
+			t(a) =>			buf.puts("st").putd(a);
+			t_t(a, b) =>		buf.puts("st").putd(a).csp().puts("st").putd(b);
 		}
+		X86_64Disassemblers.addr32 = false;
 		return buf;
 	}
 }
@@ -49,22 +152,48 @@ class X86_64DisVisitor {
 	// Generic visit routine for any addressing mode.
 	def visit(prefixes: X86_64Prefix.set, name: string, mode: X86_64AddrMode) { }
 
-	def visit_none(prefixes: X86_64Prefix.set, name: string) { visit(prefixes, name, X86_64AddrMode.none); }
-	def visit_imm_b(prefixes: X86_64Prefix.set, name: string, i: byte) { visit(prefixes, name, X86_64AddrMode.imm_b(i)); }
-	def visit_r(prefixes: X86_64Prefix.set, name: string, a: X86_64Gpr) { visit(prefixes, name, X86_64AddrMode.r(a)); }
-	def visit_r_r(prefixes: X86_64Prefix.set, name: string, a: X86_64Gpr, b: X86_64Gpr) { visit(prefixes, name, X86_64AddrMode.r_r(a, b)); }
-	def visit_r_m(prefixes: X86_64Prefix.set, name: string, a: X86_64Gpr, b: X86_64Addr) { visit(prefixes, name, X86_64AddrMode.r_m(a, b)); }
-	def visit_m_r(prefixes: X86_64Prefix.set, name: string, a: X86_64Addr, b: X86_64Gpr) { visit(prefixes, name, X86_64AddrMode.m_r(a, b)); }
-	def visit_r_b(prefixes: X86_64Prefix.set, name: string, a: X86_64Gpr, i: byte)  { visit(prefixes, name, X86_64AddrMode.r_b(a, i)); }
-	def visit_m_b(prefixes: X86_64Prefix.set, name: string, a: X86_64Addr, i: byte)  { visit(prefixes, name, X86_64AddrMode.m_b(a, i)); }
-	def visit_r_i(prefixes: X86_64Prefix.set, name: string, a: X86_64Gpr, i: int)  { visit(prefixes, name, X86_64AddrMode.r_i(a, i)); }
-	def visit_m_i(prefixes: X86_64Prefix.set, name: string, a: X86_64Addr, i: int)  { visit(prefixes, name, X86_64AddrMode.m_i(a, i)); }
-	def visit_r_l(prefixes: X86_64Prefix.set, name: string, a: X86_64Gpr, i: long)  { visit(prefixes, name, X86_64AddrMode.r_l(a, i)); }
-	def visit_r_s(prefixes: X86_64Prefix.set, name: string, a: X86_64Gpr, b: X86_64Xmmr) { visit(prefixes, name, X86_64AddrMode.r_s(a, b)); }
-	def visit_s_s(prefixes: X86_64Prefix.set, name: string, a: X86_64Xmmr, b: X86_64Xmmr) { visit(prefixes, name, X86_64AddrMode.s_s(a, b)); }
-	def visit_s_m(prefixes: X86_64Prefix.set, name: string, a: X86_64Xmmr, b: X86_64Addr) { visit(prefixes, name, X86_64AddrMode.s_m(a, b)); }
-	def visit_m_s(prefixes: X86_64Prefix.set, name: string, a: X86_64Addr, b: X86_64Xmmr) { visit(prefixes, name, X86_64AddrMode.m_s(a, b)); }
-	def visit_s_r(prefixes: X86_64Prefix.set, name: string, a: X86_64Xmmr, b: X86_64Gpr) { visit(prefixes, name, X86_64AddrMode.s_r(a, b)); }
+	def visit_none(p: X86_64Prefix.set, name: string) { visit(p, name, X86_64AddrMode.none); }
+	def visit_imm_b(p: X86_64Prefix.set, name: string, i: byte) { visit(p, name, X86_64AddrMode.imm_b(i)); }
+	def visit_imm_i(p: X86_64Prefix.set, name: string, i: int) { visit(p, name, X86_64AddrMode.imm_i(i)); }
+	def visit_rel(p: X86_64Prefix.set, name: string, i: int) { visit(p, name, X86_64AddrMode.rel(i)); }
+	def visit_imm_2(p: X86_64Prefix.set, name: string, a: int, b: int) { visit(p, name, X86_64AddrMode.imm_2(a, b)); }
+
+	def visit_r(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr) { visit(p, name, X86_64AddrMode.r(sz, a)); }
+	def visit_m(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Addr) { visit(p, name, X86_64AddrMode.m(sz, a)); }
+	def visit_r_r(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr) { visit(p, name, X86_64AddrMode.r_r(sz, a, b)); }
+	def visit_r_m(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Addr) { visit(p, name, X86_64AddrMode.r_m(sz, a, b)); }
+	def visit_m_r(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr) { visit(p, name, X86_64AddrMode.m_r(sz, a, b)); }
+	def visit_r_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, i: int) { visit(p, name, X86_64AddrMode.r_i(sz, a, i)); }
+	def visit_m_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Addr, i: int) { visit(p, name, X86_64AddrMode.m_i(sz, a, i)); }
+	def visit_r_l(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, i: long) { visit(p, name, X86_64AddrMode.r_l(sz, a, i)); }
+	def visit_r_off(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, off: long) { visit(p, name, X86_64AddrMode.r_off(sz, a, off)); }
+	def visit_off_r(p: X86_64Prefix.set, name: string, sz: X86_64Size, off: long, a: X86_64Gpr) { visit(p, name, X86_64AddrMode.off_r(sz, off, a)); }
+	def visit_r_cl(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr) { visit(p, name, X86_64AddrMode.r_cl(sz, a)); }
+	def visit_m_cl(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Addr) { visit(p, name, X86_64AddrMode.m_cl(sz, a)); }
+	def visit_r_r_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr, i: int) { visit(p, name, X86_64AddrMode.r_r_i(sz, a, b, i)); }
+	def visit_r_m_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Addr, i: int) { visit(p, name, X86_64AddrMode.r_m_i(sz, a, b, i)); }
+	def visit_m_r_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr, i: int) { visit(p, name, X86_64AddrMode.m_r_i(sz, a, b, i)); }
+	def visit_r_r_cl(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr) { visit(p, name, X86_64AddrMode.r_r_cl(sz, a, b)); }
+	def visit_m_r_cl(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr) { visit(p, name, X86_64AddrMode.m_r_cl(sz, a, b)); }
+	def visit_i_r(p: X86_64Prefix.set, name: string, i: int, sz: X86_64Size, a: X86_64Gpr) { visit(p, name, X86_64AddrMode.i_r(i, sz, a)); }
+	def visit_r_r2(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, sz2: X86_64Size, b: X86_64Gpr) { visit(p, name, X86_64AddrMode.r_r2(sz, a, sz2, b)); }
+	def visit_r_m2(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, sz2: X86_64Size, b: X86_64Addr) { visit(p, name, X86_64AddrMode.r_m2(sz, a, sz2, b)); }
+
+	def visit_s_s(p: X86_64Prefix.set, name: string, a: X86_64Xmmr, b: X86_64Xmmr) { visit(p, name, X86_64AddrMode.s_s(a, b)); }
+	def visit_s_m(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Xmmr, b: X86_64Addr) { visit(p, name, X86_64AddrMode.s_m(sz, a, b)); }
+	def visit_m_s(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Xmmr) { visit(p, name, X86_64AddrMode.m_s(sz, a, b)); }
+	def visit_r_s(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Xmmr) { visit(p, name, X86_64AddrMode.r_s(sz, a, b)); }
+	def visit_s_r(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Xmmr, b: X86_64Gpr) { visit(p, name, X86_64AddrMode.s_r(sz, a, b)); }
+	def visit_s_i(p: X86_64Prefix.set, name: string, a: X86_64Xmmr, i: byte) { visit(p, name, X86_64AddrMode.s_i(a, i)); }
+	def visit_s_s_i(p: X86_64Prefix.set, name: string, a: X86_64Xmmr, b: X86_64Xmmr, i: byte) { visit(p, name, X86_64AddrMode.s_s_i(a, b, i)); }
+	def visit_s_m_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Xmmr, b: X86_64Addr, i: byte) { visit(p, name, X86_64AddrMode.s_m_i(sz, a, b, i)); }
+	def visit_m_s_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Xmmr, i: byte) { visit(p, name, X86_64AddrMode.m_s_i(sz, a, b, i)); }
+	def visit_r_s_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Xmmr, i: byte) { visit(p, name, X86_64AddrMode.r_s_i(sz, a, b, i)); }
+	def visit_s_r_i(p: X86_64Prefix.set, name: string, sz: X86_64Size, a: X86_64Xmmr, b: X86_64Gpr, i: byte) { visit(p, name, X86_64AddrMode.s_r_i(sz, a, b, i)); }
+
+	def visit_t(p: X86_64Prefix.set, name: string, a: byte) { visit(p, name, X86_64AddrMode.t(a)); }
+	def visit_t_t(p: X86_64Prefix.set, name: string, a: byte, b: byte) { visit(p, name, X86_64AddrMode.t_t(a, b)); }
+
 	// Handle unsupported opcodes.
 	def unsupported(msg: string) { }
 	// Handle illegal opcodes.
@@ -73,15 +202,112 @@ class X86_64DisVisitor {
 
 // Prefixes that can be applied to an instruction.
 enum X86_64Prefix {
-	REP, REX, REX_B, REX_X, REX_R, REX_W, LOCK, FS_OVERRIDE,
-	OPERAND_SIZE_OVERRIDE, ADDRESS_SIZE_OVERRIDE, GROUP1_2
+	REP, REPNE, REX, REX_B, REX_X, REX_R, REX_W, LOCK,
+	CS_OVERRIDE, SS_OVERRIDE, DS_OVERRIDE, ES_OVERRIDE, FS_OVERRIDE, GS_OVERRIDE,
+	OPERAND_SIZE_OVERRIDE, ADDRESS_SIZE_OVERRIDE
 }
 
-// Disassembler for X86-64 instructions.
+// Registers and helpers that only the disassembler needs.
+component X86_64Disassemblers {
+	// The instruction pointer, used as the base of RIP-relative addresses. Its
+	// {regnum} is deliberately out of the 0-15 range so that it cannot be confused
+	// with a general-purpose register; it is for display and analysis only.
+	def RIP = X86_64Gpr.new("rip", "rip", "rip", "rip", 16);
+
+	// The legacy high-byte registers, addressable as ModRM.rm/reg 4-7 only when no
+	// REX prefix is present. With any REX prefix those encodings mean spl/bpl/sil/dil.
+	def AH = X86_64Gpr.new("ah", "ah", "ah", "ah", 4);
+	def CH = X86_64Gpr.new("ch", "ch", "ch", "ch", 5);
+	def DH = X86_64Gpr.new("dh", "dh", "dh", "dh", 6);
+	def BH = X86_64Gpr.new("bh", "bh", "bh", "bh", 7);
+	def HIGH_BYTE_GPRs = [AH, CH, DH, BH];
+
+	// Control, debug, segment and bound registers. They are modelled as
+	// {X86_64Gpr} so that they can appear in the ordinary register operand shapes;
+	// every width spells the same name, and their {regnum} is the encoding number.
+	def CRs = named("cr", 16);
+	def DRs = named("dr", 16);
+	def BNDs = named("bnd", 4);
+	def SEGs = [
+		one("es", 0), one("cs", 1), one("ss", 2), one("ds", 3),
+		one("fs", 4), one("gs", 5), one("seg6", 6), one("seg7", 7)
+	];
+	private def one(name: string, num: int) -> X86_64Gpr {
+		return X86_64Gpr.new(name, name, name, name, byte.view(num));
+	}
+	private def named(prefix: string, count: int) -> Array<X86_64Gpr> {
+		var buf = StringBuilder.new(), result = Array<X86_64Gpr>.new(count);
+		for (i < count) {
+			var name = buf.reset().puts(prefix).putd(i).toString();
+			result[i] = one(name, i);
+		}
+		return result;
+	}
+
+	// Set while rendering an instruction that carries a 0x67 address-size override.
+	var addr32: bool;
+
+	// The name of a register at a given operand size. Sizes that no general-purpose
+	// register has (48, 80 and 128 bits) fall back to the 64-bit name, which is what
+	// the synthetic control, debug, segment and bound registers always use.
+	def regName(a: X86_64Gpr, sz: X86_64Size) -> string {
+		var n = a.name(sz.bits);
+		return if(n == null, a.name64, n);
+	}
+	// Renders an immediate in signed decimal followed by its hexadecimal form.
+	def putImm<T>(buf: StringBuilder, i: T) -> StringBuilder {
+		return buf.putd(i);
+	}
+	// Renders a memory operand with an explicit size, e.g. {qword [rax+8]}.
+	def putMem(buf: StringBuilder, sz: X86_64Size, a: X86_64Addr) -> StringBuilder {
+		buf.puts(sz.nasm).sp();
+		return putAddr(buf, a);
+	}
+	// Renders the address part of a memory operand, e.g. {[rax+rbx*4+8]}.
+	def putAddr(buf: StringBuilder, a: X86_64Addr) -> StringBuilder {
+		var bits = if(addr32, 32, 64);
+		buf.putc('[');
+		var has_base = a.base != null, has_index = a.index != null;
+		if (has_base) buf.puts(if(a.base == RIP, "rip", a.base.name(bits)));
+		if (has_index) {
+			if (has_base) buf.putc('+');
+			buf.puts(a.index.name(bits));
+			// always show the scale when there is no base, to distinguish [rax] from [rax*1]
+			if (a.scale != 1 || !has_base) buf.putc('*').putd(a.scale);
+		}
+		if (has_base || has_index) {
+			if (a.disp < 0) buf.putd(a.disp);
+			if (a.disp > 0) buf.putc('+').putd(a.disp);
+		} else {
+			buf.puts("0x").putx(a.disp);
+		}
+		return buf.putc(']');
+	}
+}
+
+// Disassembler for X86-64 instructions. Decoding is driven by {disassemble()}, which
+// consumes exactly one instruction from the underlying reader and reports it to the
+// visitor {v}.
 class X86_64Disassembler(v: X86_64DisVisitor) {
 	def r = DataReader.new(null);	// reader used to access data
-	def var pos: int;		// current position offset within {r}
+	def var pos: int;		// start offset of the current instruction within {r}
+
 	private var prefixes: X86_64Prefix.set;
+	private var rex: byte;		// REX bits (REX_W|REX_R|REX_X|REX_B), 0 if absent
+	private var hasRex: bool;	// a REX prefix was present (affects byte register names)
+	private var opsize16: bool;	// 0x66 operand size override
+	private var addrsize32: bool;	// 0x67 address size override
+	private var group1: byte;	// the last of 0xF2/0xF3 seen, which selects the encoding
+	private var sawF2: bool;	// a 0xF2 prefix byte was present
+	private var sawF3: bool;	// a 0xF3 prefix byte was present
+	private var sseUsed: bool;	// {group1} was consumed as a mandatory SSE prefix
+
+	// ModRM decoding results.
+	private var mod: int;
+	private var regf: int;		// ModRM.reg, extended by REX.R
+	private var rmf: int;		// ModRM.rm, extended by REX.B (register case only)
+	private var rmIsReg: bool;
+	private var rmAddr: X86_64Addr;
 
 	// Reset this disassembler to use the given data.
 	def reset(data: Range<byte>) -> this {
@@ -91,71 +317,426 @@ class X86_64Disassembler(v: X86_64DisVisitor) {
 	def more() -> bool {
 		return r.more();
 	}
+
 	// Disassembles a single instruction, returning {false} for an illegal or unknown
 	// instruction, or if no instructions remain.
 	def disassemble() -> bool {
-		// Remember the start of the current instruction.
 		pos = r.pos;
 		if (r.pos >= r.limit) return false;
 
 		//--------------------------------------------------------------------------------
-		// Decode prefixes.
+		// Decode prefixes. A REX prefix must immediately precede the opcode; any legacy
+		// prefix appearing after one cancels it.
 		//--------------------------------------------------------------------------------
 		var none: X86_64Prefix.set;
 		prefixes = none;
-		var group1_prefix = 0;
+		rex = 0;
+		hasRex = false;
+		opsize16 = false;
+		addrsize32 = false;
+		group1 = 0;
+		sawF2 = false;
+		sawF3 = false;
+		sseUsed = false;
+		bank = X86_64Regs.XMMs;
+
 		var current: byte;
 		while (r.ok) {
 			current = r.read1();
-
-			if (current == OPERAND_SIZE_OVERRIDE_PREFIX) {  // Group 3 prefix.
-				prefixes |= X86_64Prefix.OPERAND_SIZE_OVERRIDE;
-			} else if ((current & 0xF0) == 0x40) {  // REX prefix.
-				prefixes |= X86_64Prefix.REX;
-				if ((current & 0x1) != 0) prefixes |= X86_64Prefix.REX_B;
-				if ((current & 0x2) != 0) prefixes |= X86_64Prefix.REX_X;
-				if ((current & 0x4) != 0) prefixes |= X86_64Prefix.REX_R;
-				if ((current & 0x8) != 0) prefixes |= X86_64Prefix.REX_W;
-			} else if ((current & 0xFE) == 0xF2) {  // Group 1 prefix (0xF2 or 0xF3).
-				group1_prefix = current;
-			} else if (current == LOCK_PREFIX) {
-				prefixes |= X86_64Prefix.LOCK;
-			} else if (current == VEX3_PREFIX) {
-				return unsupported("VEX3 prefix");
-			} else if (current == VEX2_PREFIX) {
-				return unsupported("VEX2 prefix");
-			} else if (current == SEGMENT_FS_OVERRIDE_PREFIX) {
-				prefixes |= X86_64Prefix.FS_OVERRIDE;
-			} else if (current == ADDRESS_SIZE_OVERRIDE_PREFIX) {
-				prefixes |= X86_64Prefix.ADDRESS_SIZE_OVERRIDE;
-			} else {  // Not a prefix - an opcode.
-			  	break;
+			if ((current & 0xF0) == 0x40) {  // REX prefix
+				rex = byte.view(current & 0x0F);
+				hasRex = true;
+				continue;
+			}
+			// any non-REX prefix cancels a preceding REX
+			match (current) {
+				0x66 => { opsize16 = true; rex = 0; hasRex = false; }
+				0x67 => { addrsize32 = true; rex = 0; hasRex = false; }
+				0xF0 => { prefixes |= X86_64Prefix.LOCK; rex = 0; hasRex = false; }
+				0xF2 => { group1 = 0xF2; sawF2 = true; rex = 0; hasRex = false; }
+				0xF3 => { group1 = 0xF3; sawF3 = true; rex = 0; hasRex = false; }
+				0x2E => { prefixes |= X86_64Prefix.CS_OVERRIDE; rex = 0; hasRex = false; }
+				0x36 => { prefixes |= X86_64Prefix.SS_OVERRIDE; rex = 0; hasRex = false; }
+				0x3E => { prefixes |= X86_64Prefix.DS_OVERRIDE; rex = 0; hasRex = false; }
+				0x26 => { prefixes |= X86_64Prefix.ES_OVERRIDE; rex = 0; hasRex = false; }
+				0x64 => { prefixes |= X86_64Prefix.FS_OVERRIDE; rex = 0; hasRex = false; }
+				0x65 => { prefixes |= X86_64Prefix.GS_OVERRIDE; rex = 0; hasRex = false; }
+				_ => break;
 			}
 		}
-
-		//--------------------------------------------------------------------------------
-		// Decode main instructions.
-		//--------------------------------------------------------------------------------
-		match (current) {
-			0x90 => return do_none("nop");
-			0x99 => return do_none("cdq");
-			0x9C => return do_none("pushfq");
-			0xAE => return do_none("scasb");
-			0xC3 => return do_none("ret");
-			0xCC => return do_imm_b("int", 3);
-			0xCD => return do_imm_b("int", r.read1());
-			0xCF => return do_none("iret");
-		}
-		return do_illegal();
-	}
-	def do_none(name: string) -> bool {
 		if (!r.ok) return do_illegal();
-		v.visit_none(prefixes, name);
+
+		if (opsize16) prefixes |= X86_64Prefix.OPERAND_SIZE_OVERRIDE;
+		if (addrsize32) prefixes |= X86_64Prefix.ADDRESS_SIZE_OVERRIDE;
+		if (sawF2) prefixes |= X86_64Prefix.REPNE;
+		if (sawF3) prefixes |= X86_64Prefix.REP;
+		if (hasRex) {
+			prefixes |= X86_64Prefix.REX;
+			if ((rex & REX_B_BIT) != 0) prefixes |= X86_64Prefix.REX_B;
+			if ((rex & REX_X_BIT) != 0) prefixes |= X86_64Prefix.REX_X;
+			if ((rex & REX_R_BIT) != 0) prefixes |= X86_64Prefix.REX_R;
+			if ((rex & REX_W_BIT) != 0) prefixes |= X86_64Prefix.REX_W;
+		}
+
+		match (current) {
+			0xC4 => return unsupported("VEX3 prefix");
+			0xC5 => return unsupported("VEX2 prefix");
+			0x62 => return unsupported("EVEX prefix");
+			0x0F => return decode_0F();
+		}
+		return decode_1(current);
+	}
+
+	//========================================================================================
+	// Operand size and register selection
+	//========================================================================================
+
+	// The default operand size: 64 bits with REX.W, 16 bits with 0x66, otherwise 32 bits.
+	private def opsize() -> X86_64Size {
+		if ((rex & REX_W_BIT) != 0) return X86_64Size.QWORD;
+		if (opsize16) return X86_64Size.WORD;
+		return X86_64Size.DWORD;
+	}
+	// The operand size of instructions that default to 64 bits in long mode
+	// (near call/jmp/push/pop), which cannot be encoded as 32 bits.
+	private def stacksize() -> X86_64Size {
+		if ((rex & REX_W_BIT) != 0) return X86_64Size.QWORD;
+		if (opsize16) return X86_64Size.WORD;
+		return X86_64Size.QWORD;
+	}
+	// The operand size of an SSE instruction's general-purpose register operand.
+	// A 0x66 byte on these encodings is a mandatory prefix, not an operand-size
+	// override, so only REX.W widens the register.
+	private def sseGprSize() -> X86_64Size {
+		if ((rex & REX_W_BIT) != 0) return X86_64Size.QWORD;
+		return X86_64Size.DWORD;
+	}
+	// The size of an immediate that is encoded as 32 bits unless the operand size is 16.
+	private def immsize() -> X86_64Size {
+		if (opsize() == X86_64Size.WORD) return X86_64Size.WORD;
+		return X86_64Size.DWORD;
+	}
+	private def gpr(sz: X86_64Size, num: int) -> X86_64Gpr {
+		if (sz == X86_64Size.BYTE && !hasRex && num >= 4 && num < 8) {
+			return X86_64Disassemblers.HIGH_BYTE_GPRs[num - 4];
+		}
+		return X86_64Regs.GPRs[num];
+	}
+	// The SSE opcodes share encodings with MMX; {bank} selects which register file
+	// the current instruction names. MMX has only eight registers and ignores REX.
+	private var bank = X86_64Regs.XMMs;
+	private def xmm(num: int) -> X86_64Xmmr {
+		if (bank != X86_64Regs.XMMs) return bank[num & 7];
+		return bank[num];
+	}
+	// The mandatory prefix that selects among SSE encodings of the same opcode.
+	// 0xF2/0xF3 take precedence over 0x66.
+	private def sse() -> byte {
+		if (group1 != 0) {
+			sseUsed = true;	// 0xF2/0xF3 selects an encoding here; it is not a repeat prefix
+			return group1;
+		}
+		if (opsize16) return 0x66;
+		return 0;
+	}
+	// Records that the 0xF2/0xF3 byte selected this encoding rather than requesting
+	// a repeated string operation.
+	private def markSse() {
+		sseUsed = true;
+	}
+	// The prefixes to report to the visitor. A 0xF2/0xF3 byte that selected an SSE
+	// encoding is not reported as a repeat prefix.
+	private def prefixSet() -> X86_64Prefix.set {
+		if (!sseUsed) return prefixes;
+		return prefixes - (X86_64Prefix.REP | X86_64Prefix.REPNE);
+	}
+	// Like {sse4}, but selects a memory operand width rather than a mnemonic.
+	private def sseSz4(none: X86_64Size, p66: X86_64Size, pF3: X86_64Size, pF2: X86_64Size) -> X86_64Size {
+		match (sse()) {
+			0x66 => return p66;
+			0xF3 => return pF3;
+			0xF2 => return pF2;
+			_ => return none;
+		}
+	}
+	private def sse4(none: string, p66: string, pF3: string, pF2: string) -> string {
+		match (sse()) {
+			0x66 => return p66;
+			0xF3 => return pF3;
+			0xF2 => return pF2;
+			_ => return none;
+		}
+	}
+
+	//========================================================================================
+	// ModRM / SIB / displacement decoding
+	//========================================================================================
+
+	private def modrm() {
+		var b = r.read1();
+		mod = (b >> 6) & 3;
+		regf = ((b >> 3) & 7) | (if((rex & REX_R_BIT) != 0, 8, 0));
+		var rm3 = b & 7;
+		rmAddr = null;
+		if (mod == 3) {
+			rmIsReg = true;
+			rmf = rm3 | (if((rex & REX_B_BIT) != 0, 8, 0));
+			return;
+		}
+		rmIsReg = false;
+		var base: X86_64Gpr, index: X86_64Gpr, scale: byte = 1, disp = 0;
+		if (rm3 == 4) {			// SIB byte follows
+			var sib = r.read1();
+			var idx = ((sib >> 3) & 7) | (if((rex & REX_X_BIT) != 0, 8, 0));
+			var bs3 = sib & 7;
+			if (idx != 4) {		// rm=100 with REX.X clear means "no index"
+				index = X86_64Regs.GPRs[idx];
+				scale = byte.view(1 << u5.view((sib >> 6) & 3));
+			}
+			if (bs3 == 5 && mod == 0) {
+				disp = read_i32();	// no base register; disp32 follows
+			} else {
+				base = X86_64Regs.GPRs[bs3 | (if((rex & REX_B_BIT) != 0, 8, 0))];
+			}
+		} else if (rm3 == 5 && mod == 0) {
+			base = X86_64Disassemblers.RIP;	// RIP-relative
+			disp = read_i32();
+		} else {
+			base = X86_64Regs.GPRs[rm3 | (if((rex & REX_B_BIT) != 0, 8, 0))];
+		}
+		if (mod == 1) disp = read_i8();
+		else if (mod == 2) disp = read_i32();
+		if (!r.ok) return;
+		rmAddr = X86_64Addr.new(base, index, scale, disp);
+	}
+
+	//========================================================================================
+	// Immediate reading
+	//========================================================================================
+
+	private def read_i8() -> int {
+		var b = int.!(r.read1());
+		return if(b >= 0x80, b - 0x100, b);
+	}
+	private def read_u8() -> int {
+		return r.read1();
+	}
+	private def read_i16() -> int {
+		var b0 = int.!(r.read1()), b1 = int.!(r.read1());
+		var v = b0 | (b1 << 8);
+		return if(v >= 0x8000, v - 0x10000, v);
+	}
+	private def read_i32() -> int {
+		return int.view(r.read_u32());
+	}
+	private def read_i64() -> long {
+		return long.view(r.read_u64());
+	}
+	// Reads an immediate of the given size, sign-extended to {int}.
+	private def read_imm(sz: X86_64Size) -> int {
+		match (sz) {
+			BYTE => return read_i8();
+			WORD => return read_i16();
+			_ => return read_i32();
+		}
+	}
+
+	//========================================================================================
+	// Visitor dispatch. Each helper checks that the instruction decoded completely and
+	// that a mnemonic was found before reporting it.
+	//========================================================================================
+
+	private def bad(name: string) -> bool {
+		return name == null || !r.ok;
+	}
+	private def f_none(name: string) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_none(prefixSet(), name);
 		return true;
 	}
-	def do_imm_b(name: string, p: byte) -> bool {
-		if (!r.ok) return do_illegal();
-		v.visit_imm_b(prefixes, name, p);
+	private def f_imm_b(name: string, i: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_imm_b(prefixSet(), name, i);
+		return true;
+	}
+	private def f_imm_i(name: string, i: int) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_imm_i(prefixSet(), name, i);
+		return true;
+	}
+	private def f_rel(name: string, i: int) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_rel(prefixSet(), name, i);
+		return true;
+	}
+	private def f_imm_2(name: string, a: int, b: int) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_imm_2(prefixSet(), name, a, b);
+		return true;
+	}
+	private def f_r(name: string, sz: X86_64Size, a: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r(prefixSet(), name, sz, a);
+		return true;
+	}
+	private def f_m(name: string, sz: X86_64Size, a: X86_64Addr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_m(prefixSet(), name, sz, a);
+		return true;
+	}
+	private def f_r_r(name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_r(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_r_m(name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Addr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_m(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_m_r(name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_m_r(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_r_i(name: string, sz: X86_64Size, a: X86_64Gpr, i: int) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_i(prefixSet(), name, sz, a, i);
+		return true;
+	}
+	private def f_m_i(name: string, sz: X86_64Size, a: X86_64Addr, i: int) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_m_i(prefixSet(), name, sz, a, i);
+		return true;
+	}
+	private def f_r_l(name: string, sz: X86_64Size, a: X86_64Gpr, i: long) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_l(prefixSet(), name, sz, a, i);
+		return true;
+	}
+	private def f_r_off(name: string, sz: X86_64Size, a: X86_64Gpr, off: long) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_off(prefixSet(), name, sz, a, off);
+		return true;
+	}
+	private def f_off_r(name: string, sz: X86_64Size, off: long, a: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_off_r(prefixSet(), name, sz, off, a);
+		return true;
+	}
+	private def f_r_cl(name: string, sz: X86_64Size, a: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_cl(prefixSet(), name, sz, a);
+		return true;
+	}
+	private def f_m_cl(name: string, sz: X86_64Size, a: X86_64Addr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_m_cl(prefixSet(), name, sz, a);
+		return true;
+	}
+	private def f_r_r_i(name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr, i: int) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_r_i(prefixSet(), name, sz, a, b, i);
+		return true;
+	}
+	private def f_r_m_i(name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Addr, i: int) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_m_i(prefixSet(), name, sz, a, b, i);
+		return true;
+	}
+	private def f_m_r_i(name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr, i: int) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_m_r_i(prefixSet(), name, sz, a, b, i);
+		return true;
+	}
+	private def f_r_r_cl(name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_r_cl(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_m_r_cl(name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_m_r_cl(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_i_r(name: string, i: int, sz: X86_64Size, a: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_i_r(prefixSet(), name, i, sz, a);
+		return true;
+	}
+	private def f_r_r2(name: string, sz: X86_64Size, a: X86_64Gpr, sz2: X86_64Size, b: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_r2(prefixSet(), name, sz, a, sz2, b);
+		return true;
+	}
+	private def f_r_m2(name: string, sz: X86_64Size, a: X86_64Gpr, sz2: X86_64Size, b: X86_64Addr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_m2(prefixSet(), name, sz, a, sz2, b);
+		return true;
+	}
+	private def f_s_s(name: string, a: X86_64Xmmr, b: X86_64Xmmr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_s_s(prefixSet(), name, a, b);
+		return true;
+	}
+	private def f_s_m(name: string, sz: X86_64Size, a: X86_64Xmmr, b: X86_64Addr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_s_m(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_m_s(name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Xmmr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_m_s(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_r_s(name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Xmmr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_s(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_s_r(name: string, sz: X86_64Size, a: X86_64Xmmr, b: X86_64Gpr) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_s_r(prefixSet(), name, sz, a, b);
+		return true;
+	}
+	private def f_s_i(name: string, a: X86_64Xmmr, i: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_s_i(prefixSet(), name, a, i);
+		return true;
+	}
+	private def f_s_s_i(name: string, a: X86_64Xmmr, b: X86_64Xmmr, i: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_s_s_i(prefixSet(), name, a, b, i);
+		return true;
+	}
+	private def f_s_m_i(name: string, sz: X86_64Size, a: X86_64Xmmr, b: X86_64Addr, i: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_s_m_i(prefixSet(), name, sz, a, b, i);
+		return true;
+	}
+	private def f_m_s_i(name: string, sz: X86_64Size, a: X86_64Addr, b: X86_64Xmmr, i: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_m_s_i(prefixSet(), name, sz, a, b, i);
+		return true;
+	}
+	private def f_r_s_i(name: string, sz: X86_64Size, a: X86_64Gpr, b: X86_64Xmmr, i: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_r_s_i(prefixSet(), name, sz, a, b, i);
+		return true;
+	}
+	private def f_s_r_i(name: string, sz: X86_64Size, a: X86_64Xmmr, b: X86_64Gpr, i: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_s_r_i(prefixSet(), name, sz, a, b, i);
+		return true;
+	}
+	private def f_t(name: string, a: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_t(prefixSet(), name, a);
+		return true;
+	}
+	private def f_t_t(name: string, a: byte, b: byte) -> bool {
+		if (bad(name)) return do_illegal();
+		v.visit_t_t(prefixSet(), name, a, b);
 		return true;
 	}
 	def do_illegal() -> bool {
@@ -166,16 +747,1539 @@ class X86_64Disassembler(v: X86_64DisVisitor) {
 		v.unsupported(msg);
 		return false;
 	}
+
+	//========================================================================================
+	// Common operand patterns
+	//========================================================================================
+
+	// {name} r/m, reg
+	private def do_rm_r(name: string, sz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = gpr(sz, regf);
+		if (rmIsReg) return f_r_r(name, sz, gpr(sz, rmf), reg);
+		return f_m_r(name, sz, rmAddr, reg);
+	}
+	// {name} reg, r/m
+	private def do_r_rm(name: string, sz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = gpr(sz, regf);
+		if (rmIsReg) return f_r_r(name, sz, reg, gpr(sz, rmf));
+		return f_r_m(name, sz, reg, rmAddr);
+	}
+	// {name} reg, r/m where the two operands have different sizes (movsx/movzx)
+	private def do_r_rm2(name: string, sz: X86_64Size, sz2: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = gpr(sz, regf);
+		if (rmIsReg) return f_r_r2(name, sz, reg, sz2, gpr(sz2, rmf));
+		return f_r_m2(name, sz, reg, sz2, rmAddr);
+	}
+	// {name} r/m  (unary, ModRM.reg is an opcode extension already consumed)
+	private def do_rm(name: string, sz: X86_64Size) -> bool {
+		if (rmIsReg) return f_r(name, sz, gpr(sz, rmf));
+		return f_m(name, sz, rmAddr);
+	}
+	// {name} r/m, imm
+	private def do_rm_i(name: string, sz: X86_64Size, i: int) -> bool {
+		if (rmIsReg) return f_r_i(name, sz, gpr(sz, rmf), i);
+		return f_m_i(name, sz, rmAddr, i);
+	}
+	// {name} r/m, cl
+	private def do_rm_cl(name: string, sz: X86_64Size) -> bool {
+		if (rmIsReg) return f_r_cl(name, sz, gpr(sz, rmf));
+		return f_m_cl(name, sz, rmAddr);
+	}
+	// {name} accumulator, imm
+	private def do_acc_i(name: string, sz: X86_64Size) -> bool {
+		var i = read_imm(if(sz == X86_64Size.BYTE, X86_64Size.BYTE, immsize()));
+		return f_r_i(name, sz, gpr(sz, 0), i);
+	}
+	// {name} xmm, xmm/m; {msz} is the width of the memory operand.
+	private def do_s_sm(name: string, msz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) return f_s_s(name, reg, xmm(rmf));
+		return f_s_m(name, msz, reg, rmAddr);
+	}
+	// {name} xmm/m, xmm
+	private def do_sm_s(name: string, msz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) return f_s_s(name, xmm(rmf), reg);
+		return f_m_s(name, msz, rmAddr, reg);
+	}
+	// {name} xmm, xmm/m, imm8
+	private def do_s_sm_i(name: string, msz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) {
+			var b = xmm(rmf), i = byte.view(read_u8());
+			return f_s_s_i(name, reg, b, i);
+		}
+		var a = rmAddr, i = byte.view(read_u8());
+		return f_s_m_i(name, msz, reg, a, i);
+	}
+	// {name} xmm, r/m, imm8   (pinsrb/pinsrd/pinsrq/pinsrw). The register and memory
+	// forms of these instructions differ in width: pinsrw takes r32 but m16.
+	private def do_s_rm_i(name: string, rsz: X86_64Size, msz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) {
+			var b = gpr(rsz, rmf), i = byte.view(read_u8());
+			return f_s_r_i(name, rsz, reg, b, i);
+		}
+		var a = rmAddr, i = byte.view(read_u8());
+		return f_s_m_i(name, msz, reg, a, i);
+	}
+	// {name} r/m, xmm, imm8   (pextrb/pextrd/pextrq/extractps)
+	private def do_rm_s_i(name: string, rsz: X86_64Size, msz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) {
+			var a = gpr(rsz, rmf), i = byte.view(read_u8());
+			return f_r_s_i(name, rsz, a, reg, i);
+		}
+		var a = rmAddr, i = byte.view(read_u8());
+		return f_m_s_i(name, msz, a, reg, i);
+	}
+	// {name} xmm, r/m  (movd/movq xmm <- gpr)
+	private def do_s_rm(name: string, sz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) return f_s_r(name, sz, reg, gpr(sz, rmf));
+		return f_s_m(name, sz, reg, rmAddr);
+	}
+	// {name} r/m, xmm  (movd/movq gpr <- xmm)
+	private def do_rm_s(name: string, sz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) return f_r_s(name, sz, gpr(sz, rmf), reg);
+		return f_m_s(name, sz, rmAddr, reg);
+	}
+	// {name} reg, xmm  (movmskps/pmovmskb: reg is always 32 or 64 bits)
+	private def do_r_s(name: string) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		if (!rmIsReg) return do_illegal();
+		var sz = if((rex & REX_W_BIT) != 0, X86_64Size.QWORD, X86_64Size.DWORD);
+		return f_r_s(name, sz, gpr(sz, regf), xmm(rmf));
+	}
+	// SSE integer instructions share their opcodes with MMX; without the 0x66 mandatory
+	// prefix the operands are MMX registers, which this disassembler does not model.
+	private def needs66() -> bool {
+		return sse() == 0x66;
+	}
+
+	//========================================================================================
+	// One-byte opcode map
+	//========================================================================================
+
+	private def decode_1(op: byte) -> bool {
+		// 0x00-0x3F: the eight basic ALU operations, six encodings each.
+		if (op < 0x40) {
+			var lo = op & 7;
+			if (lo >= 6) return do_illegal();	// segment push/pop and BCD, invalid in long mode
+			var name = ARITH[(op >> 3) & 7];
+			match (lo) {
+				0 => return do_rm_r(name, X86_64Size.BYTE);
+				1 => return do_rm_r(name, opsize());
+				2 => return do_r_rm(name, X86_64Size.BYTE);
+				3 => return do_r_rm(name, opsize());
+				4 => return do_acc_i(name, X86_64Size.BYTE);
+				_ => return do_acc_i(name, opsize());
+			}
+		}
+		if (op >= 0x50 && op <= 0x57) return f_r("push", stacksize(), gpr(stacksize(), (op - 0x50) | rexB()));
+		if (op >= 0x58 && op <= 0x5F) return f_r("pop", stacksize(), gpr(stacksize(), (op - 0x58) | rexB()));
+		if (op >= 0x70 && op <= 0x7F) return do_jcc_rel8(JCC[op - 0x70]);
+		if (op >= 0xB0 && op <= 0xB7) {
+			var reg = gpr(X86_64Size.BYTE, (op - 0xB0) | rexB());
+			return f_r_i("mov", X86_64Size.BYTE, reg, read_i8());
+		}
+		if (op >= 0xB8 && op <= 0xBF) {
+			var sz = opsize(), reg = gpr(sz, (op - 0xB8) | rexB());
+			if (sz == X86_64Size.QWORD) return f_r_l("movabs", sz, reg, read_i64());
+			return f_r_i("mov", sz, reg, read_imm(immsize()));
+		}
+		if (op >= 0x91 && op <= 0x97) {
+			var sz = opsize();
+			return f_r_r("xchg", sz, gpr(sz, 0), gpr(sz, (op - 0x90) | rexB()));
+		}
+		match (op) {
+			0x63 => return do_r_rm2("movsxd", opsize(), X86_64Size.DWORD);
+			0x68 => return f_imm_i("push", read_imm(immsize()));
+			0x69 => return do_imul_i(immsize());
+			0x6A => return f_imm_i("push", read_i8());
+			0x6B => return do_imul_i(X86_64Size.BYTE);
+			0x6C => return f_none("insb");
+			0x6D => return f_none(if(opsize16, "insw", "insd"));
+			0x6E => return f_none("outsb");
+			0x6F => return f_none(if(opsize16, "outsw", "outsd"));
+			0x80 => return do_group1(X86_64Size.BYTE, X86_64Size.BYTE);
+			0x81 => return do_group1(opsize(), immsize());
+			0x83 => return do_group1(opsize(), X86_64Size.BYTE);
+			0x84 => return do_rm_r("test", X86_64Size.BYTE);
+			0x85 => return do_rm_r("test", opsize());
+			0x86 => return do_rm_r("xchg", X86_64Size.BYTE);
+			0x87 => return do_rm_r("xchg", opsize());
+			0x88 => return do_rm_r("mov", X86_64Size.BYTE);
+			0x89 => return do_rm_r("mov", opsize());
+			0x8A => return do_r_rm("mov", X86_64Size.BYTE);
+			0x8B => return do_r_rm("mov", opsize());
+			0x8C => {
+				modrm();
+				if (!r.ok) return do_illegal();
+				var seg = X86_64Disassemblers.SEGs[regf & 7];
+				if (rmIsReg) return f_r_r("mov", opsize(), gpr(opsize(), rmf), seg);
+				return f_m_r("mov", X86_64Size.WORD, rmAddr, seg);
+			}
+			0x8D => {
+				modrm();
+				if (!r.ok || rmIsReg) return do_illegal();	// LEA requires a memory operand
+				return f_r_m("lea", opsize(), gpr(opsize(), regf), rmAddr);
+			}
+			0x8E => {
+				modrm();
+				if (!r.ok) return do_illegal();
+				var seg = X86_64Disassemblers.SEGs[regf & 7];
+				// Only the low 16 bits of a register source are used, but the
+				// register is named at the instruction's operand size.
+				if (rmIsReg) return f_r_r("mov", opsize(), seg, gpr(opsize(), rmf));
+				return f_r_m("mov", X86_64Size.WORD, seg, rmAddr);
+			}
+			0x8F => {
+				modrm();
+				if (!r.ok || (regf & 7) != 0) return do_illegal();
+				return do_rm("pop", stacksize());
+			}
+			0x90 => {
+				// 0x90 is an alias of "xchg rAX, rAX"; it only means "nop" when no
+				// prefix makes the exchange observable.
+				if (group1 == 0xF3) { markSse(); return f_none("pause"); }
+				var sz = opsize();
+				if ((rex & REX_B_BIT) != 0) return f_r_r("xchg", sz, gpr(sz, 0), gpr(sz, 8));
+				if (opsize16 || (rex & REX_W_BIT) != 0) return f_r_r("xchg", sz, gpr(sz, 0), gpr(sz, 0));
+				return f_none("nop");
+			}
+			0x98 => return f_none(sizeSel("cbw", "cwde", "cdqe"));
+			0x99 => return f_none(sizeSel("cwd", "cdq", "cqo"));
+			0x9B => return f_none("fwait");
+			0x9C => return f_none(if(opsize16, "pushfw", "pushfq"));
+			0x9D => return f_none(if(opsize16, "popfw", "popfq"));
+			0x9E => return f_none("sahf");
+			0x9F => return f_none("lahf");
+			0xA0 => return do_moffs("mov", X86_64Size.BYTE, false);
+			0xA1 => return do_moffs("mov", opsize(), false);
+			0xA2 => return do_moffs("mov", X86_64Size.BYTE, true);
+			0xA3 => return do_moffs("mov", opsize(), true);
+			0xA4 => return f_none("movsb");
+			0xA5 => return f_none(STRSZ("movs", opsize()));
+			0xA6 => return f_none("cmpsb");
+			0xA7 => return f_none(STRSZ("cmps", opsize()));
+			0xA8 => return do_acc_i("test", X86_64Size.BYTE);
+			0xA9 => return do_acc_i("test", opsize());
+			0xAA => return f_none("stosb");
+			0xAB => return f_none(STRSZ("stos", opsize()));
+			0xAC => return f_none("lodsb");
+			0xAD => return f_none(STRSZ("lods", opsize()));
+			0xAE => return f_none("scasb");
+			0xAF => return f_none(STRSZ("scas", opsize()));
+			0xC0 => return do_group2_i(X86_64Size.BYTE);
+			0xC1 => return do_group2_i(opsize());
+			0xC2 => return f_imm_i("ret", read_i16() & 0xFFFF);
+			0xC3 => return f_none("ret");
+			0xC6 => {
+				modrm();
+				if (!r.ok) return do_illegal();
+				if ((regf & 7) == 7 && rmIsReg) return f_imm_b("xabort", byte.view(read_u8()));
+				if ((regf & 7) != 0) return do_illegal();
+				return do_rm_i("mov", X86_64Size.BYTE, read_i8());
+			}
+			0xC7 => {
+				modrm();
+				if (!r.ok) return do_illegal();
+				if ((regf & 7) == 7 && rmIsReg) return f_rel("xbegin", read_imm(immsize()));
+				if ((regf & 7) != 0) return do_illegal();
+				return do_rm_i("mov", opsize(), read_imm(immsize()));
+			}
+			0xC8 => {
+				var a = read_i16() & 0xFFFF;
+				return f_imm_2("enter", a, read_u8());
+			}
+			0xC9 => return f_none("leave");
+			0xCA => return f_imm_i("retf", read_i16() & 0xFFFF);
+			0xCB => return f_none("retf");
+			0xCC => return f_imm_b("int", 3);
+			0xCD => return f_imm_b("int", byte.view(read_u8()));
+			0xCF => return f_none(sizeSel("iretw", "iret", "iretq"));
+			0xD0 => return do_group2_1(X86_64Size.BYTE);
+			0xD1 => return do_group2_1(opsize());
+			0xD2 => return do_group2_cl(X86_64Size.BYTE);
+			0xD3 => return do_group2_cl(opsize());
+			0xD7 => return f_none("xlatb");
+			0xE0 => return do_jcc_rel8("loopne");
+			0xE1 => return do_jcc_rel8("loope");
+			0xE2 => return do_jcc_rel8("loop");
+			0xE3 => return do_jcc_rel8(if(addrsize32, "jecxz", "jrcxz"));
+			0xE4 => return f_r_i("in", X86_64Size.BYTE, gpr(X86_64Size.BYTE, 0), read_u8());
+			0xE5 => return f_r_i("in", immsize(), gpr(immsize(), 0), read_u8());
+			0xE6 => return f_i_r("out", read_u8(), X86_64Size.BYTE, gpr(X86_64Size.BYTE, 0));
+			0xE7 => return f_i_r("out", read_u8(), immsize(), gpr(immsize(), 0));
+			// In 64-bit mode the operand size of a near branch is fixed at 64 bits:
+			// the rel16 forms are listed as "N.S." in the Intel SDM, so a 0x66
+			// prefix does not shrink the displacement.
+			0xE8 => return f_rel("call", read_i32());
+			0xE9 => return f_rel("jmp", read_i32());
+			0xEB => return do_jcc_rel8("jmp");
+			0xEC => return f_r_r2("in", X86_64Size.BYTE, gpr(X86_64Size.BYTE, 0), X86_64Size.WORD, X86_64Regs.RDX);
+			0xED => return f_r_r2("in", immsize(), gpr(immsize(), 0), X86_64Size.WORD, X86_64Regs.RDX);
+			0xEE => return f_r_r2("out", X86_64Size.WORD, X86_64Regs.RDX, X86_64Size.BYTE, gpr(X86_64Size.BYTE, 0));
+			0xEF => return f_r_r2("out", X86_64Size.WORD, X86_64Regs.RDX, immsize(), gpr(immsize(), 0));
+			0xF1 => return f_none("int1");
+			0xF4 => return f_none("hlt");
+			0xF5 => return f_none("cmc");
+			0xF6 => return do_group3(X86_64Size.BYTE);
+			0xF7 => return do_group3(opsize());
+			0xF8 => return f_none("clc");
+			0xF9 => return f_none("stc");
+			0xFA => return f_none("cli");
+			0xFB => return f_none("sti");
+			0xFC => return f_none("cld");
+			0xFD => return f_none("std");
+			0xFE => return do_group4();
+			0xFF => return do_group5();
+		}
+		if (op >= 0xD8 && op <= 0xDF) return decode_x87(op);
+		return do_illegal();	// 0x9A, 0xC4/0xC5 (handled earlier), 0xCE, 0xD4-0xD6, 0xEA, 0x60-0x62 ...
+	}
+
+	private def rexB() -> int {
+		return if((rex & REX_B_BIT) != 0, 8, 0);
+	}
+	// Selects a mnemonic based on the operand size, e.g. cwd / cdq / cqo.
+	private def sizeSel(w: string, d: string, q: string) -> string {
+		match (opsize()) {
+			WORD => return w;
+			QWORD => return q;
+			_ => return d;
+		}
+	}
+	private def do_jcc_rel8(name: string) -> bool {
+		return f_rel(name, read_i8());
+	}
+	// ModRM.reg selects one of the eight ALU operations; an immediate follows.
+	private def do_group1(sz: X86_64Size, isz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var name = ARITH[regf & 7];
+		return do_rm_i(name, sz, read_imm(isz));
+	}
+	private def do_group2_i(sz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var name = SHIFT[regf & 7];
+		return do_rm_i(name, sz, read_u8());
+	}
+	private def do_group2_1(sz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		return do_rm_i(SHIFT[regf & 7], sz, 1);
+	}
+	private def do_group2_cl(sz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		return do_rm_cl(SHIFT[regf & 7], sz);
+	}
+	private def do_group3(sz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		match (regf & 7) {
+			0, 1 => return do_rm_i("test", sz, read_imm(if(sz == X86_64Size.BYTE, X86_64Size.BYTE, immsize())));
+			2 => return do_rm("not", sz);
+			3 => return do_rm("neg", sz);
+			4 => return do_rm("mul", sz);
+			5 => return do_rm("imul", sz);
+			6 => return do_rm("div", sz);
+			_ => return do_rm("idiv", sz);
+		}
+	}
+	private def do_group4() -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		match (regf & 7) {
+			0 => return do_rm("inc", X86_64Size.BYTE);
+			1 => return do_rm("dec", X86_64Size.BYTE);
+			_ => return do_illegal();
+		}
+	}
+	private def do_group5() -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		match (regf & 7) {
+			0 => return do_rm("inc", opsize());
+			1 => return do_rm("dec", opsize());
+			2 => return do_rm("call", stacksize());
+			3 => { if (rmIsReg) return do_illegal(); return f_m("callf", farSize(), rmAddr); }
+			4 => return do_rm("jmp", stacksize());
+			5 => { if (rmIsReg) return do_illegal(); return f_m("jmpf", farSize(), rmAddr); }
+			6 => return do_rm("push", stacksize());
+			_ => return do_illegal();
+		}
+	}
+	// The width of the far pointer read by an indirect far call or jump.
+	private def farSize() -> X86_64Size {
+		if ((rex & REX_W_BIT) != 0) return X86_64Size.TWORD;
+		if (opsize16) return X86_64Size.DWORD;
+		return X86_64Size.FWORD;
+	}
+	// imul reg, r/m, imm
+	private def do_imul_i(isz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var sz = opsize(), reg = gpr(sz, regf);
+		if (rmIsReg) {
+			var b = gpr(sz, rmf);
+			return f_r_r_i("imul", sz, reg, b, read_imm(isz));
+		}
+		var a = rmAddr;
+		return f_r_m_i("imul", sz, reg, a, read_imm(isz));
+	}
+	// mov to/from a 64-bit absolute address.
+	private def do_moffs(name: string, sz: X86_64Size, store: bool) -> bool {
+		var off = read_i64();
+		if (!r.ok) return do_illegal();
+		var acc = gpr(sz, 0);
+		if (store) return f_off_r(name, sz, off, acc);
+		return f_r_off(name, sz, acc, off);
+	}
+
+	//========================================================================================
+	// Two-byte opcode map (0x0F xx)
+	//========================================================================================
+
+	private def decode_0F() -> bool {
+		var op = r.read1();
+		if (!r.ok) return do_illegal();
+		if (op >= 0x40 && op <= 0x4F) return do_r_rm(CMOVCC[op - 0x40], opsize());
+		if (op >= 0x80 && op <= 0x8F) return f_rel(JCC[op - 0x80], read_i32());	// rel32 only in 64-bit mode
+		if (op >= 0x90 && op <= 0x9F) {
+			modrm();
+			if (!r.ok) return do_illegal();
+			return do_rm(SETCC[op - 0x90], X86_64Size.BYTE);
+		}
+		if (op >= 0xC8 && op <= 0xCF) {
+			var sz = opsize();
+			return f_r("bswap", sz, gpr(sz, (op - 0xC8) | rexB()));
+		}
+		match (op) {
+			0x00 => return do_group6();
+			0x01 => return do_group7();
+			0x02 => return do_r_rm2("lar", opsize(), X86_64Size.WORD);
+			0x03 => return do_r_rm2("lsl", opsize(), X86_64Size.WORD);
+			0x05 => return f_none("syscall");
+			0x06 => return f_none("clts");
+			0x07 => return f_none("sysret");
+			0x08 => return f_none("invd");
+			0x09 => {
+				if (group1 == 0xF3) { markSse(); return f_none("wbnoinvd"); }
+				if (sse() != 0) return do_illegal();
+				return f_none("wbinvd");
+			}
+			0x0B => return f_none("ud2");
+			0x0D => {
+				modrm();
+				if (!r.ok) return do_illegal();
+				match (regf & 7) {
+					1 => return do_rm("prefetchw", X86_64Size.BYTE);
+					2 => return do_rm("prefetchwt1", X86_64Size.BYTE);
+					_ => return do_rm("prefetch", X86_64Size.BYTE);
+				}
+			}
+			0x0E => return f_none("femms");
+			0x0F => {
+				bank = MMX_REGS;
+				modrm();
+				if (!r.ok) return do_illegal();
+				var dst = xmm(regf);
+				var src = if(rmIsReg, xmm(rmf));
+				var addr = rmAddr;
+				var suffix = r.read1();
+				if (!r.ok) return do_illegal();
+				var name = AMD_3DNOW[suffix];
+				if (name == null) return do_illegal();
+				if (src != null) return f_s_s(name, dst, src);
+				return f_s_m(name, X86_64Size.QWORD, dst, addr);
+			}
+			0x10 => return do_s_sm(sse4("movups", "movupd", "movss", "movsd"), sseSize());
+			0x11 => return do_sm_s(sse4("movups", "movupd", "movss", "movsd"), sseSize());
+			0x12 => {
+				modrm();
+				if (!r.ok) return do_illegal();
+				match (sse()) {
+					0x66 => { if (rmIsReg) return do_illegal(); return f_s_m("movlpd", X86_64Size.QWORD, xmm(regf), rmAddr); }
+					0xF3 => return do_rm_as_s("movsldup", X86_64Size.OWORD);
+					0xF2 => return do_rm_as_s("movddup", X86_64Size.QWORD);
+					_ => {
+						if (rmIsReg) return f_s_s("movhlps", xmm(regf), xmm(rmf));
+						return f_s_m("movlps", X86_64Size.QWORD, xmm(regf), rmAddr);
+					}
+				}
+			}
+			0x13 => {
+				modrm();
+				if (!r.ok || rmIsReg) return do_illegal();
+				return f_m_s(sse4("movlps", "movlpd", null, null), X86_64Size.QWORD, rmAddr, xmm(regf));
+			}
+			0x14 => return do_s_sm(sse4("unpcklps", "unpcklpd", null, null), X86_64Size.OWORD);
+			0x15 => return do_s_sm(sse4("unpckhps", "unpckhpd", null, null), X86_64Size.OWORD);
+			0x16 => {
+				modrm();
+				if (!r.ok) return do_illegal();
+				match (sse()) {
+					0x66 => { if (rmIsReg) return do_illegal(); return f_s_m("movhpd", X86_64Size.QWORD, xmm(regf), rmAddr); }
+					0xF3 => return do_rm_as_s("movshdup", X86_64Size.OWORD);
+					_ => {
+						if (rmIsReg) return f_s_s("movlhps", xmm(regf), xmm(rmf));
+						return f_s_m("movhps", X86_64Size.QWORD, xmm(regf), rmAddr);
+					}
+				}
+			}
+			0x17 => {
+				modrm();
+				if (!r.ok || rmIsReg) return do_illegal();
+				return f_m_s(sse4("movhps", "movhpd", null, null), X86_64Size.QWORD, rmAddr, xmm(regf));
+			}
+			0x18 => return do_group16();
+			0x1A, 0x1B => return do_mpx(op);
+			0x1E => {
+				if (group1 == 0xF3) {
+					markSse();
+					var b = r.read1();
+					if (b == 0xFA) return f_none("endbr64");
+					if (b == 0xFB) return f_none("endbr32");
+					return do_illegal();
+				}
+				modrm();
+				if (!r.ok) return do_illegal();
+				return do_rm("nop", opsize());
+			}
+			0x1C => {
+				modrm();
+				if (!r.ok) return do_illegal();
+				if (group1 == 0 && !opsize16 && !rmIsReg && (regf & 7) == 0) {
+					return do_rm("cldemote", X86_64Size.BYTE);
+				}
+				return do_rm("nop", opsize());
+			}
+			0x19, 0x1D, 0x1F => { modrm(); if (!r.ok) return do_illegal(); return do_rm("nop", opsize()); }
+			0x20, 0x21, 0x22, 0x23 => {
+				// The mod field of these encodings is ignored: there is no memory
+				// form, so the ModRM byte is decoded by hand. Both operands are
+				// always 64 bits wide in long mode.
+				var b = r.read1();
+				if (!r.ok) return do_illegal();
+				var num = ((b >> 3) & 7) | (if((rex & REX_R_BIT) != 0, 8, 0));
+				var sys = if((op & 1) == 0,
+					X86_64Disassemblers.CRs[num], X86_64Disassemblers.DRs[num]);
+				var gp = gpr(X86_64Size.QWORD, (b & 7) | (if((rex & REX_B_BIT) != 0, 8, 0)));
+				if (op < 0x22) return f_r_r("mov", X86_64Size.QWORD, gp, sys);
+				return f_r_r("mov", X86_64Size.QWORD, sys, gp);
+			}
+			0x28 => return do_s_sm(sse4("movaps", "movapd", null, null), X86_64Size.OWORD);
+			0x29 => return do_sm_s(sse4("movaps", "movapd", null, null), X86_64Size.OWORD);
+			0x2A => {
+				var name = sse4("cvtpi2ps", "cvtpi2pd", "cvtsi2ss", "cvtsi2sd");
+				if (sse() == 0) {
+					// the source is an MMX register or a 64-bit memory operand
+					modrm();
+					if (!r.ok) return do_illegal();
+					var dst = xmm(regf);
+					if (rmIsReg) return f_s_s(name, dst, MMX_REGS[rmf & 7]);
+					return f_s_m(name, X86_64Size.QWORD, dst, rmAddr);
+				}
+				if (sse() == 0x66) return do_s_sm(name, X86_64Size.OWORD);
+				return do_s_rm(name, sseGprSize());
+			}
+			0x2B => return do_sm_s(sse4("movntps", "movntpd", "movntss", "movntsd"), sseSize());
+			0x2C => {
+				if (sse() == 0 || sse() == 0x66) {
+					// the destination is an MMX register
+					var mname = if(sse() == 0, "cvttps2pi", "cvttpd2pi");
+					var msz = if(sse() == 0, X86_64Size.QWORD, X86_64Size.OWORD);
+					bank = MMX_REGS;
+					modrm();
+					if (!r.ok) return do_illegal();
+					var dst = MMX_REGS[regf & 7];
+					if (rmIsReg) return f_s_s(mname, dst, X86_64Regs.XMMs[rmf]);
+					return f_s_m(mname, msz, dst, rmAddr);
+				}
+				var name = sse4(null, null, "cvttss2si", "cvttsd2si");
+				return do_rm_as_r(name, sseSize());
+			}
+			0x2D => {
+				if (sse() == 0 || sse() == 0x66) {
+					// the destination is an MMX register
+					var mname = if(sse() == 0, "cvtps2pi", "cvtpd2pi");
+					var msz = if(sse() == 0, X86_64Size.QWORD, X86_64Size.OWORD);
+					bank = MMX_REGS;
+					modrm();
+					if (!r.ok) return do_illegal();
+					var dst = MMX_REGS[regf & 7];
+					if (rmIsReg) return f_s_s(mname, dst, X86_64Regs.XMMs[rmf]);
+					return f_s_m(mname, msz, dst, rmAddr);
+				}
+				var name = sse4(null, null, "cvtss2si", "cvtsd2si");
+				return do_rm_as_r(name, sseSize());
+			}
+			0x2E => return do_s_sm(sse4("ucomiss", "ucomisd", null, null), if(sse() == 0x66, X86_64Size.QWORD, X86_64Size.DWORD));
+			0x2F => return do_s_sm(sse4("comiss", "comisd", null, null), if(sse() == 0x66, X86_64Size.QWORD, X86_64Size.DWORD));
+			0x30 => return f_none("wrmsr");
+			0x31 => return f_none("rdtsc");
+			0x32 => return f_none("rdmsr");
+			0x33 => return f_none("rdpmc");
+			0x34 => return f_none("sysenter");
+			0x35 => return f_none("sysexit");
+			0x37 => return f_none("getsec");
+			0x38 => return decode_0F38();
+			0x3A => return decode_0F3A();
+			0x50 => return do_r_s(sse4("movmskps", "movmskpd", null, null));
+			0x51 => return do_s_sm(sse4("sqrtps", "sqrtpd", "sqrtss", "sqrtsd"), sseSize());
+			0x52 => return do_s_sm(sse4("rsqrtps", null, "rsqrtss", null), sseSize());
+			0x53 => return do_s_sm(sse4("rcpps", null, "rcpss", null), sseSize());
+			0x54 => return do_s_sm(sse4("andps", "andpd", null, null), X86_64Size.OWORD);
+			0x55 => return do_s_sm(sse4("andnps", "andnpd", null, null), X86_64Size.OWORD);
+			0x56 => return do_s_sm(sse4("orps", "orpd", null, null), X86_64Size.OWORD);
+			0x57 => return do_s_sm(sse4("xorps", "xorpd", null, null), X86_64Size.OWORD);
+			0x58 => return do_s_sm(sse4("addps", "addpd", "addss", "addsd"), sseSize());
+			0x59 => return do_s_sm(sse4("mulps", "mulpd", "mulss", "mulsd"), sseSize());
+			0x5A => return do_s_sm(sse4("cvtps2pd", "cvtpd2ps", "cvtss2sd", "cvtsd2ss"),
+					sseSz4(X86_64Size.QWORD, X86_64Size.OWORD, X86_64Size.DWORD, X86_64Size.QWORD));
+			0x5B => return do_s_sm(sse4("cvtdq2ps", "cvtps2dq", "cvttps2dq", null), X86_64Size.OWORD);
+			0x5C => return do_s_sm(sse4("subps", "subpd", "subss", "subsd"), sseSize());
+			0x5D => return do_s_sm(sse4("minps", "minpd", "minss", "minsd"), sseSize());
+			0x5E => return do_s_sm(sse4("divps", "divpd", "divss", "divsd"), sseSize());
+			0x5F => return do_s_sm(sse4("maxps", "maxpd", "maxss", "maxsd"), sseSize());
+			0x60 => return do_p("punpcklbw");
+			0x61 => return do_p("punpcklwd");
+			0x62 => return do_p("punpckldq");
+			0x63 => return do_p("packsswb");
+			0x64 => return do_p("pcmpgtb");
+			0x65 => return do_p("pcmpgtw");
+			0x66 => return do_p("pcmpgtd");
+			0x67 => return do_p("packuswb");
+			0x68 => return do_p("punpckhbw");
+			0x69 => return do_p("punpckhwd");
+			0x6A => return do_p("punpckhdq");
+			0x6B => return do_p("packssdw");
+			0x6C => return do_p66("punpcklqdq");
+			0x6D => return do_p66("punpckhqdq");
+			0x6E => {
+				if (sse() == 0xF2 || sse() == 0xF3) return do_illegal();
+				if (!needs66()) bank = MMX_REGS;
+				var sz = sseGprSize();
+				return do_s_rm(if(sz == X86_64Size.QWORD, "movq", "movd"), sz);
+			}
+			0x6F => {
+				match (sse()) {
+					0x66 => return do_s_sm("movdqa", X86_64Size.OWORD);
+					0xF3 => return do_s_sm("movdqu", X86_64Size.OWORD);
+					_ => { bank = MMX_REGS; return do_s_sm("movq", X86_64Size.QWORD); }
+				}
+			}
+			0x70 => {
+				var name = sse4("pshufw", "pshufd", "pshufhw", "pshuflw");
+				if (sse() == 0) { bank = MMX_REGS; return do_s_sm_i(name, X86_64Size.QWORD); }
+				return do_s_sm_i(name, X86_64Size.OWORD);
+			}
+			0x71 => return do_shift_group(SHIFT_W);
+			0x72 => return do_shift_group(SHIFT_D);
+			0x73 => return do_shift_group(SHIFT_Q);
+			0x74 => return do_p("pcmpeqb");
+			0x75 => return do_p("pcmpeqw");
+			0x76 => return do_p("pcmpeqd");
+			0x77 => {
+				if (sse() != 0) return do_illegal();
+				return f_none("emms");
+			}
+			0x78 => {
+				if (sse() != 0) return unsupported("SSE4a extrq/insertq");
+				return do_rm_r("vmread", X86_64Size.QWORD);
+			}
+			0x79 => {
+				if (sse() == 0x66) return do_s_sm("extrq", X86_64Size.OWORD);
+				if (sse() == 0xF2) return do_s_sm("insertq", X86_64Size.OWORD);
+				if (sse() != 0) return do_illegal();
+				return do_r_rm("vmwrite", X86_64Size.QWORD);
+			}
+			0x7C => return do_s_sm(sse4(null, "haddpd", null, "haddps"), X86_64Size.OWORD);
+			0x7D => return do_s_sm(sse4(null, "hsubpd", null, "hsubps"), X86_64Size.OWORD);
+			0x7E => {
+				match (sse()) {
+					0xF3 => return do_s_sm("movq", X86_64Size.QWORD);
+					0x66 => {
+						var sz = sseGprSize();
+						return do_rm_s(if(sz == X86_64Size.QWORD, "movq", "movd"), sz);
+					}
+					_ => {
+						bank = MMX_REGS;
+						var sz = sseGprSize();
+						return do_rm_s(if(sz == X86_64Size.QWORD, "movq", "movd"), sz);
+					}
+				}
+			}
+			0x7F => {
+				match (sse()) {
+					0x66 => return do_sm_s("movdqa", X86_64Size.OWORD);
+					0xF3 => return do_sm_s("movdqu", X86_64Size.OWORD);
+					_ => { bank = MMX_REGS; return do_sm_s("movq", X86_64Size.QWORD); }
+				}
+			}
+			0xA0 => return f_r("push", X86_64Size.WORD, X86_64Disassemblers.SEGs[4]);
+			0xA1 => return f_r("pop", X86_64Size.WORD, X86_64Disassemblers.SEGs[4]);
+			0xA2 => return f_none("cpuid");
+			0xA3 => return do_rm_r("bt", opsize());
+			0xA4 => return do_shld("shld", true);
+			0xA5 => return do_shld("shld", false);
+			0xA8 => return f_r("push", X86_64Size.WORD, X86_64Disassemblers.SEGs[5]);
+			0xA9 => return f_r("pop", X86_64Size.WORD, X86_64Disassemblers.SEGs[5]);
+			0xAA => return f_none("rsm");
+			0xAB => return do_rm_r("bts", opsize());
+			0xAC => return do_shld("shrd", true);
+			0xAD => return do_shld("shrd", false);
+			0xAE => return do_group15();
+			0xAF => return do_r_rm("imul", opsize());
+			0xB0 => return do_rm_r("cmpxchg", X86_64Size.BYTE);
+			0xB1 => return do_rm_r("cmpxchg", opsize());
+			0xB2 => return do_r_rm("lss", opsize());
+			0xB3 => return do_rm_r("btr", opsize());
+			0xB4 => return do_r_rm("lfs", opsize());
+			0xB5 => return do_r_rm("lgs", opsize());
+			0xB6 => return do_r_rm2("movzx", opsize(), X86_64Size.BYTE);
+			0xB7 => return do_r_rm2("movzx", opsize(), X86_64Size.WORD);
+			0xB8 => {
+				if (group1 != 0xF3) return do_illegal();
+				markSse();
+				return do_r_rm("popcnt", opsize());
+			}
+			0xB9 => return do_r_rm("ud1", opsize());
+			0xBA => return do_group8();
+			0xBB => return do_rm_r("btc", opsize());
+			0xBC => { if (group1 == 0xF3) markSse(); return do_r_rm(if(group1 == 0xF3, "tzcnt", "bsf"), opsize()); }
+			0xBD => { if (group1 == 0xF3) markSse(); return do_r_rm(if(group1 == 0xF3, "lzcnt", "bsr"), opsize()); }
+			0xBE => return do_r_rm2("movsx", opsize(), X86_64Size.BYTE);
+			0xBF => return do_r_rm2("movsx", opsize(), X86_64Size.WORD);
+			0xC0 => return do_rm_r("xadd", X86_64Size.BYTE);
+			0xC1 => return do_rm_r("xadd", opsize());
+			0xC2 => return do_cmp_sse();
+			0xC3 => {
+				if (sse() != 0) return do_illegal();	// movnti takes no mandatory prefix
+				modrm();
+				if (!r.ok || rmIsReg) return do_illegal();
+				return f_m_r("movnti", opsize(), rmAddr, gpr(opsize(), regf));
+			}
+			0xC4 => {
+				if (sse() == 0xF2 || sse() == 0xF3) return do_illegal();
+				if (!needs66()) bank = MMX_REGS;
+				return do_s_rm_i("pinsrw", X86_64Size.DWORD, X86_64Size.WORD);
+			}
+			0xC5 => {
+				if (sse() == 0xF2 || sse() == 0xF3) return do_illegal();
+				if (!needs66()) bank = MMX_REGS;
+				modrm();
+				if (!r.ok || !rmIsReg) return do_illegal();
+				var sz = if((rex & REX_W_BIT) != 0, X86_64Size.QWORD, X86_64Size.DWORD);
+				var a = gpr(sz, regf), b = xmm(rmf);
+				return f_r_s_i("pextrw", sz, a, b, byte.view(read_u8()));
+			}
+			0xC6 => return do_s_sm_i(sse4("shufps", "shufpd", null, null), X86_64Size.OWORD);
+			0xC7 => return do_group9();
+			0xD0 => return do_s_sm(sse4(null, "addsubpd", null, "addsubps"), X86_64Size.OWORD);
+			0xD1 => return do_p("psrlw");
+			0xD2 => return do_p("psrld");
+			0xD3 => return do_p("psrlq");
+			0xD4 => return do_p("paddq");
+			0xD5 => return do_p("pmullw");
+			0xD6 => {
+				match (sse()) {
+					0x66 => return do_sm_s("movq", X86_64Size.QWORD);
+					0xF3 => {	// movq2dq xmm, mm
+						modrm();
+						if (!r.ok || !rmIsReg) return do_illegal();
+						return f_s_s("movq2dq", X86_64Regs.XMMs[regf], MMX_REGS[rmf & 7]);
+					}
+					0xF2 => {	// movdq2q mm, xmm
+						modrm();
+						if (!r.ok || !rmIsReg) return do_illegal();
+						return f_s_s("movdq2q", MMX_REGS[regf & 7], X86_64Regs.XMMs[rmf]);
+					}
+					_ => return do_illegal();
+				}
+			}
+			0xD7 => {
+				if (sse() == 0xF2 || sse() == 0xF3) return do_illegal();
+				if (!needs66()) bank = MMX_REGS;
+				return do_r_s("pmovmskb");
+			}
+			0xD8 => return do_p("psubusb");
+			0xD9 => return do_p("psubusw");
+			0xDA => return do_p("pminub");
+			0xDB => return do_p("pand");
+			0xDC => return do_p("paddusb");
+			0xDD => return do_p("paddusw");
+			0xDE => return do_p("pmaxub");
+			0xDF => return do_p("pandn");
+			0xE0 => return do_p("pavgb");
+			0xE1 => return do_p("psraw");
+			0xE2 => return do_p("psrad");
+			0xE3 => return do_p("pavgw");
+			0xE4 => return do_p("pmulhuw");
+			0xE5 => return do_p("pmulhw");
+			0xE6 => return do_s_sm(sse4(null, "cvttpd2dq", "cvtdq2pd", "cvtpd2dq"),
+					sseSz4(X86_64Size.OWORD, X86_64Size.OWORD, X86_64Size.QWORD, X86_64Size.OWORD));
+			0xE7 => {
+				if (sse() == 0xF2 || sse() == 0xF3) return do_illegal();
+				if (!needs66()) { bank = MMX_REGS; return do_sm_s("movntq", X86_64Size.QWORD); }
+				return do_sm_s("movntdq", X86_64Size.OWORD);
+			}
+			0xE8 => return do_p("psubsb");
+			0xE9 => return do_p("psubsw");
+			0xEA => return do_p("pminsw");
+			0xEB => return do_p("por");
+			0xEC => return do_p("paddsb");
+			0xED => return do_p("paddsw");
+			0xEE => return do_p("pmaxsw");
+			0xEF => return do_p("pxor");
+			0xF0 => {
+				if (group1 != 0xF2) return do_illegal();
+				markSse();
+				return do_s_sm("lddqu", X86_64Size.OWORD);
+			}
+			0xF1 => return do_p("psllw");
+			0xF2 => return do_p("pslld");
+			0xF3 => return do_p("psllq");
+			0xF4 => return do_p("pmuludq");
+			0xF5 => return do_p("pmaddwd");
+			0xF6 => return do_p("psadbw");
+			0xF7 => {
+				if (sse() == 0xF2 || sse() == 0xF3) return do_illegal();
+				var name = "maskmovdqu";
+				if (!needs66()) { bank = MMX_REGS; name = "maskmovq"; }
+				modrm();
+				if (!r.ok || !rmIsReg) return do_illegal();
+				return f_s_s(name, xmm(regf), xmm(rmf));
+			}
+			0xF8 => return do_p("psubb");
+			0xF9 => return do_p("psubw");
+			0xFA => return do_p("psubd");
+			0xFB => return do_p("psubq");
+			0xFC => return do_p("paddb");
+			0xFD => return do_p("paddw");
+			0xFE => return do_p("paddd");
+			0xFF => return do_r_rm("ud0", opsize());
+		}
+		return do_illegal();
+	}
+
+	// A packed-integer operation. With the 0x66 prefix the operands are 128-bit SSE
+	// registers; without it they are 64-bit MMX registers.
+	private def do_p(name: string) -> bool {
+		if (needs66()) return do_s_sm(name, X86_64Size.OWORD);
+		if (sse() != 0) return do_illegal();	// 0xF2/0xF3 select no encoding here
+		bank = MMX_REGS;
+		return do_s_sm(name, X86_64Size.QWORD);
+	}
+	// A packed-integer operation that has no MMX form: the 0x66 prefix is mandatory.
+	private def do_p66(name: string) -> bool {
+		if (!needs66()) return do_illegal();
+		return do_s_sm(name, X86_64Size.OWORD);
+	}
+	// A packed-integer operation whose memory operand is narrower than the register,
+	// e.g. pmovsxbw, which reads eight bytes into a 128-bit register.
+	private def do_pn(name: string, msz: X86_64Size) -> bool {
+		if (!needs66()) return unsupported("MMX register operand");
+		return do_s_sm(name, msz);
+	}
+	// {name} xmm, xmm/m with the ModRM already decoded.
+	private def do_rm_as_s(name: string, msz: X86_64Size) -> bool {
+		if (rmIsReg) return f_s_s(name, xmm(regf), xmm(rmf));
+		return f_s_m(name, msz, xmm(regf), rmAddr);
+	}
+	// {name} reg, xmm/m — a conversion whose destination is a general-purpose register
+	// and whose memory source is narrower (m32 for the single-precision forms).
+	private def do_rm_as_r(name: string, msz: X86_64Size) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var sz = if((rex & REX_W_BIT) != 0, X86_64Size.QWORD, X86_64Size.DWORD);
+		var a = gpr(sz, regf);
+		if (rmIsReg) return f_r_s(name, sz, a, xmm(rmf));
+		return f_r_m2(name, sz, a, msz, rmAddr);
+	}
+	// The width of the memory operand for the ps/pd/ss/sd family of SSE opcodes.
+	private def sseSize() -> X86_64Size {
+		match (sse()) {
+			0xF3 => return X86_64Size.DWORD;	// scalar single
+			0xF2 => return X86_64Size.QWORD;	// scalar double
+			_ => return X86_64Size.OWORD;		// packed
+		}
+	}
+	// shld/shrd r/m, reg, imm8 or r/m, reg, cl
+	private def do_shld(name: string, imm: bool) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var sz = opsize(), reg = gpr(sz, regf);
+		if (imm) {
+			if (rmIsReg) {
+				var a = gpr(sz, rmf);
+				return f_r_r_i(name, sz, a, reg, read_u8());
+			}
+			var a = rmAddr;
+			return f_m_r_i(name, sz, a, reg, read_u8());
+		}
+		if (rmIsReg) return f_r_r_cl(name, sz, gpr(sz, rmf), reg);
+		return f_m_r_cl(name, sz, rmAddr, reg);
+	}
+	// The SSE shift-by-immediate groups behind 0x0F 0x71/0x72/0x73.
+	private def do_shift_group(names: Array<string>) -> bool {
+		if (sse() == 0xF2 || sse() == 0xF3) return do_illegal();
+		if (!needs66()) bank = MMX_REGS;
+		modrm();
+		if (!r.ok || !rmIsReg) return do_illegal();
+		var name = names[regf & 7];
+		var a = xmm(rmf);
+		return f_s_i(name, a, byte.view(read_u8()));
+	}
+	private def do_group6() -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		match (regf & 7) {
+			0 => return do_rm("sldt", opsize());
+			1 => return do_rm("str", opsize());
+			2 => return do_rm("lldt", X86_64Size.WORD);
+			3 => return do_rm("ltr", X86_64Size.WORD);
+			4 => return do_rm("verr", X86_64Size.WORD);
+			5 => return do_rm("verw", X86_64Size.WORD);
+			_ => return do_illegal();
+		}
+	}
+	private def do_group7() -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		if (rmIsReg) {
+			var sub = ((regf & 7) << 3) | (rmf & 7);	// ModRM.reg : ModRM.rm
+			match (sub) {
+				0x01 => return f_none("vmcall");
+				0x02 => return f_none("vmlaunch");
+				0x03 => return f_none("vmresume");
+				0x04 => return f_none("vmxoff");
+				0x08 => return f_none("monitor");
+				0x09 => return f_none("mwait");
+				0x0A => return f_none("clac");
+				0x0B => return f_none("stac");
+				0x0F => return f_none("encls");
+				0x0C => return f_none("stgi");
+				0x0D => return f_none("clgi");
+				0x0E => return f_none("invlpga");
+				0x18 => return f_none("swapgs32");
+				0x1F => return f_none("enclv");
+				0x3D => return f_none("tlbsync");
+				0x10 => return f_none("xgetbv");
+				0x11 => return f_none("xsetbv");
+				0x14 => return f_none("vmfunc");
+				0x15 => return f_none("xend");
+				0x16 => return f_none("xtest");
+				0x17 => return f_none("enclu");
+				0x38 => return f_none("swapgs");
+				0x39 => return f_none("rdtscp");
+				_ => return do_illegal();
+			}
+		}
+		match (regf & 7) {
+			0 => return f_m("sgdt", X86_64Size.QWORD, rmAddr);
+			1 => return f_m("sidt", X86_64Size.QWORD, rmAddr);
+			2 => return f_m("lgdt", X86_64Size.QWORD, rmAddr);
+			3 => return f_m("lidt", X86_64Size.QWORD, rmAddr);
+			4 => return f_m("smsw", X86_64Size.WORD, rmAddr);
+			6 => return f_m("lmsw", X86_64Size.WORD, rmAddr);
+			7 => return f_m("invlpg", X86_64Size.BYTE, rmAddr);
+			_ => return do_illegal();
+		}
+	}
+	private def do_group8() -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		match (regf & 7) {
+			4 => return do_rm_i("bt", opsize(), read_u8());
+			5 => return do_rm_i("bts", opsize(), read_u8());
+			6 => return do_rm_i("btr", opsize(), read_u8());
+			7 => return do_rm_i("btc", opsize(), read_u8());
+			_ => return do_illegal();
+		}
+	}
+	private def do_group9() -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		if (!rmIsReg) {
+			match (regf & 7) {
+				1 => return f_m(if((rex & REX_W_BIT) != 0, "cmpxchg16b", "cmpxchg8b"),
+						if((rex & REX_W_BIT) != 0, X86_64Size.OWORD, X86_64Size.QWORD), rmAddr);
+				3 => return f_m("xrstors", X86_64Size.BYTE, rmAddr);
+				4 => return f_m("xsavec", X86_64Size.BYTE, rmAddr);
+				5 => return f_m("xsaves", X86_64Size.BYTE, rmAddr);
+				6 => return f_m(if(sse() == 0x66, "vmclear", "vmptrld"), X86_64Size.QWORD, rmAddr);
+				7 => return f_m("vmptrst", X86_64Size.QWORD, rmAddr);
+				_ => return do_illegal();
+			}
+		}
+		match (regf & 7) {
+			6 => return do_rm("rdrand", opsize());
+			7 => return do_rm("rdseed", opsize());
+			_ => return do_illegal();
+		}
+	}
+	private def do_group15() -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		if (rmIsReg) {
+			if (group1 == 0xF3) {	// FSGSBASE
+				markSse();
+				var sz = opsize();
+				match (regf & 7) {
+					0 => return f_r("rdfsbase", sz, gpr(sz, rmf));
+					1 => return f_r("rdgsbase", sz, gpr(sz, rmf));
+					2 => return f_r("wrfsbase", sz, gpr(sz, rmf));
+					3 => return f_r("wrgsbase", sz, gpr(sz, rmf));
+					_ => return do_illegal();
+				}
+			}
+			match (regf & 7) {
+				5 => return f_none("lfence");
+				6 => return f_none("mfence");
+				7 => return f_none("sfence");
+				_ => return do_illegal();
+			}
+		}
+		match (regf & 7) {
+			0 => return f_m("fxsave", X86_64Size.BYTE, rmAddr);
+			1 => return f_m("fxrstor", X86_64Size.BYTE, rmAddr);
+			2 => return f_m("ldmxcsr", X86_64Size.DWORD, rmAddr);
+			3 => return f_m("stmxcsr", X86_64Size.DWORD, rmAddr);
+			4 => return f_m("xsave", X86_64Size.BYTE, rmAddr);
+			5 => return f_m("xrstor", X86_64Size.BYTE, rmAddr);
+			6 => return f_m("xsaveopt", X86_64Size.BYTE, rmAddr);
+			_ => return f_m("clflush", X86_64Size.BYTE, rmAddr);
+		}
+	}
+	// The MPX instructions behind 0x0F 0x1A and 0x0F 0x1B. Their bound registers
+	// are numbered by ModRM.reg and are never REX-extended.
+	private def do_mpx(op: byte) -> bool {
+		var kind = sse();
+		if (kind != 0) markSse();
+		modrm();
+		if (!r.ok) return do_illegal();
+		var bnd = X86_64Disassemblers.BNDs[regf & 3];
+		var load = op == 0x1A;
+		match (kind) {
+			0x66 => {	// bndmov
+				if (rmIsReg) {
+					var other = X86_64Disassemblers.BNDs[rmf & 3];
+					if (load) return f_r_r("bndmov", X86_64Size.OWORD, bnd, other);
+					return f_r_r("bndmov", X86_64Size.OWORD, other, bnd);
+				}
+				if (load) return f_r_m("bndmov", X86_64Size.OWORD, bnd, rmAddr);
+				return f_m_r("bndmov", X86_64Size.OWORD, rmAddr, bnd);
+			}
+			0xF3 => {	// bndcl / bndmk
+				if (load) {
+					if (rmIsReg) return f_r_r("bndcl", X86_64Size.QWORD, bnd, gpr(X86_64Size.QWORD, rmf));
+					return f_r_m("bndcl", X86_64Size.QWORD, bnd, rmAddr);
+				}
+				if (rmIsReg) return do_illegal();
+				return f_r_m("bndmk", X86_64Size.QWORD, bnd, rmAddr);
+			}
+			0xF2 => {	// bndcu / bndcn
+				var name = if(load, "bndcu", "bndcn");
+				if (rmIsReg) return f_r_r(name, X86_64Size.QWORD, bnd, gpr(X86_64Size.QWORD, rmf));
+				return f_r_m(name, X86_64Size.QWORD, bnd, rmAddr);
+			}
+			_ => {		// bndldx / bndstx, whose operand is a base+index pair
+				if (rmIsReg) return do_illegal();
+				if (load) return f_r_m("bndldx", X86_64Size.QWORD, bnd, rmAddr);
+				return f_m_r("bndstx", X86_64Size.QWORD, rmAddr, bnd);
+			}
+		}
+	}
+	private def do_group16() -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		if (rmIsReg) return do_rm("nop", opsize());	// hints apply to memory only
+		match (regf & 7) {
+			0 => return do_rm("prefetchnta", X86_64Size.BYTE);
+			1 => return do_rm("prefetcht0", X86_64Size.BYTE);
+			2 => return do_rm("prefetcht1", X86_64Size.BYTE);
+			3 => return do_rm("prefetcht2", X86_64Size.BYTE);
+			_ => return do_rm("nop", opsize());
+		}
+	}
+
+	//========================================================================================
+	// Three-byte opcode maps (0x0F 0x38 xx and 0x0F 0x3A xx)
+	//========================================================================================
+
+	private def decode_0F38() -> bool {
+		var op = r.read1();
+		if (!r.ok) return do_illegal();
+		match (op) {
+			0x00 => return do_p("pshufb");
+			0x01 => return do_p("phaddw");
+			0x02 => return do_p("phaddd");
+			0x03 => return do_p("phaddsw");
+			0x04 => return do_p("pmaddubsw");
+			0x05 => return do_p("phsubw");
+			0x06 => return do_p("phsubd");
+			0x07 => return do_p("phsubsw");
+			0x08 => return do_p("psignb");
+			0x09 => return do_p("psignw");
+			0x0A => return do_p("psignd");
+			0x0B => return do_p("pmulhrsw");
+			0x10 => return do_p66("pblendvb");
+			0x14 => return do_p66("blendvps");
+			0x15 => return do_p66("blendvpd");
+			0x17 => return do_p66("ptest");
+			0x1C => return do_p("pabsb");
+			0x1D => return do_p("pabsw");
+			0x1E => return do_p("pabsd");
+			0x20 => return do_pn("pmovsxbw", X86_64Size.QWORD);
+			0x21 => return do_pn("pmovsxbd", X86_64Size.DWORD);
+			0x22 => return do_pn("pmovsxbq", X86_64Size.WORD);
+			0x23 => return do_pn("pmovsxwd", X86_64Size.QWORD);
+			0x24 => return do_pn("pmovsxwq", X86_64Size.DWORD);
+			0x25 => return do_pn("pmovsxdq", X86_64Size.QWORD);
+			0x28 => return do_p66("pmuldq");
+			0x29 => return do_p66("pcmpeqq");
+			0x2A => {
+				if (!needs66()) return unsupported("MMX register operand");
+				modrm();
+				if (!r.ok || rmIsReg) return do_illegal();
+				return f_s_m("movntdqa", X86_64Size.OWORD, xmm(regf), rmAddr);
+			}
+			0x2B => return do_p66("packusdw");
+			0x30 => return do_pn("pmovzxbw", X86_64Size.QWORD);
+			0x31 => return do_pn("pmovzxbd", X86_64Size.DWORD);
+			0x32 => return do_pn("pmovzxbq", X86_64Size.WORD);
+			0x33 => return do_pn("pmovzxwd", X86_64Size.QWORD);
+			0x34 => return do_pn("pmovzxwq", X86_64Size.DWORD);
+			0x35 => return do_pn("pmovzxdq", X86_64Size.QWORD);
+			0x37 => return do_p66("pcmpgtq");
+			0x38 => return do_p66("pminsb");
+			0x39 => return do_p66("pminsd");
+			0x3A => return do_p66("pminuw");
+			0x3B => return do_p66("pminud");
+			0x3C => return do_p66("pmaxsb");
+			0x3D => return do_p66("pmaxsd");
+			0x3E => return do_p66("pmaxuw");
+			0x3F => return do_p66("pmaxud");
+			0x40 => return do_p66("pmulld");
+			0x41 => return do_p66("phminposuw");
+			0xDB => return do_p66("aesimc");
+			0xDC => return do_p66("aesenc");
+			0xDD => return do_p66("aesenclast");
+			0xDE => return do_p66("aesdec");
+			0xDF => return do_p66("aesdeclast");
+			0xF0 => {
+				if (group1 == 0xF2) { markSse(); return do_r_rm2("crc32", opsize(), X86_64Size.BYTE); }
+				return do_r_rm("movbe", opsize());
+			}
+			0xF1 => {
+				if (group1 == 0xF2) { markSse(); return do_r_rm("crc32", opsize()); }
+				return do_rm_r("movbe", opsize());
+			}
+		}
+		return do_illegal();
+	}
+
+	private def decode_0F3A() -> bool {
+		var op = r.read1();
+		if (!r.ok) return do_illegal();
+		match (op) {
+			0x08 => return do_p_i("roundps");
+			0x09 => return do_p_i("roundpd");
+			0x0A => return do_pn_i("roundss", X86_64Size.DWORD);
+			0x0B => return do_pn_i("roundsd", X86_64Size.QWORD);
+			0x0C => return do_p_i("blendps");
+			0x0D => return do_p_i("blendpd");
+			0x0E => return do_p_i("pblendw");
+			0x0F => return do_p_i("palignr");
+			0x14 => {
+				if (!needs66()) return unsupported("MMX register operand");
+				return do_rm_s_i("pextrb", X86_64Size.DWORD, X86_64Size.BYTE);
+			}
+			0x15 => {
+				if (!needs66()) return unsupported("MMX register operand");
+				return do_rm_s_i("pextrw", X86_64Size.DWORD, X86_64Size.WORD);
+			}
+			0x16 => {
+				if (!needs66()) return unsupported("MMX register operand");
+				var sz = sseGprSize();
+				return do_rm_s_i(if(sz == X86_64Size.QWORD, "pextrq", "pextrd"), sz, sz);
+			}
+			0x17 => {
+				if (!needs66()) return unsupported("MMX register operand");
+				return do_rm_s_i("extractps", X86_64Size.DWORD, X86_64Size.DWORD);
+			}
+			0x20 => {
+				if (!needs66()) return unsupported("MMX register operand");
+				return do_s_rm_i("pinsrb", X86_64Size.DWORD, X86_64Size.BYTE);
+			}
+			0x21 => return do_pn_i("insertps", X86_64Size.DWORD);
+			0x22 => {
+				if (!needs66()) return unsupported("MMX register operand");
+				var sz = sseGprSize();
+				return do_s_rm_i(if(sz == X86_64Size.QWORD, "pinsrq", "pinsrd"), sz, sz);
+			}
+			0x40 => return do_p_i("dpps");
+			0x41 => return do_p_i("dppd");
+			0x42 => return do_p_i("mpsadbw");
+			0x44 => return do_pclmul();
+			0x60 => return do_p_i("pcmpestrm");
+			0x61 => return do_p_i("pcmpestri");
+			0x62 => return do_p_i("pcmpistrm");
+			0x63 => return do_p_i("pcmpistri");
+			0xDF => return do_p_i("aeskeygenassist");
+		}
+		return do_illegal();
+	}
+
+	// cmpps/cmppd/cmpss/cmpsd. Predicates 0-7 have their own mnemonics, which is how
+	// both binutils and NASM render them; larger predicates keep the immediate.
+	private def do_cmp_sse() -> bool {
+		var kind = 0;
+		match (sse()) {
+			0x66 => kind = 1;
+			0xF3 => kind = 2;
+			0xF2 => kind = 3;
+			_ => kind = 0;
+		}
+		var msz = sseSize();
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) {
+			var b = xmm(rmf), i = read_u8();
+			if (i < 8) return f_s_s(CMP_SSE[kind * 8 + i], reg, b);
+			return f_s_s_i(CMP_SSE_GENERIC[kind], reg, b, byte.view(i));
+		}
+		var a = rmAddr, i = read_u8();
+		if (i < 8) return f_s_m(CMP_SSE[kind * 8 + i], msz, reg, a);
+		return f_s_m_i(CMP_SSE_GENERIC[kind], msz, reg, a, byte.view(i));
+	}
+	// pclmulqdq. Only bits 0 and 4 of the immediate are defined, selecting which
+	// quadword of each source is multiplied; those four combinations have their own
+	// mnemonics, which is how both binutils and NASM render them.
+	private def do_pclmul() -> bool {
+		if (!needs66()) return unsupported("MMX register operand");
+		modrm();
+		if (!r.ok) return do_illegal();
+		var reg = xmm(regf);
+		if (rmIsReg) {
+			var b = xmm(rmf), i = read_u8();
+			var name = PCLMUL[i];
+			if (name != null) return f_s_s(name, reg, b);
+			return f_s_s_i("pclmulqdq", reg, b, byte.view(i));
+		}
+		var a = rmAddr, i = read_u8();
+		var name = PCLMUL[i];
+		if (name != null) return f_s_m(name, X86_64Size.OWORD, reg, a);
+		return f_s_m_i("pclmulqdq", X86_64Size.OWORD, reg, a, byte.view(i));
+	}
+	// An SSE packed operation with a trailing imm8; requires the 0x66 mandatory prefix.
+	private def do_p_i(name: string) -> bool {
+		if (!needs66()) return unsupported("MMX register operand");
+		return do_s_sm_i(name, X86_64Size.OWORD);
+	}
+	private def do_pn_i(name: string, msz: X86_64Size) -> bool {
+		if (!needs66()) return unsupported("MMX register operand");
+		return do_s_sm_i(name, msz);
+	}
+
+	//========================================================================================
+	// x87 floating point (0xD8 - 0xDF)
+	//========================================================================================
+
+	private def decode_x87(op: byte) -> bool {
+		modrm();
+		if (!r.ok) return do_illegal();
+		var idx = op - 0xD8, ext = regf & 7;
+		if (!rmIsReg) {	// memory operand forms
+			var name = X87_MEM[idx * 8 + ext];
+			if (name == null) return do_illegal();
+			return f_m(name, X87_MEM_SIZE[idx * 8 + ext], rmAddr);
+		}
+		// register operand forms
+		var sti = byte.view(rmf & 7);
+		match (op) {
+			0xD8 => {
+				if (ext == 2) return f_t("fcom", sti);
+				if (ext == 3) return f_t("fcomp", sti);
+				return f_t_t(X87_ARITH[ext], 0, sti);
+			}
+			0xDC => {
+				if (ext == 2) return f_t("fcom", sti);
+				if (ext == 3) return f_t("fcomp", sti);
+				return f_t_t(X87_ARITH_R[ext], sti, 0);
+			}
+			0xDE => {
+				if (ext == 3) {
+					if (sti != 1) return do_illegal();
+					return f_none("fcompp");
+				}
+				if (ext == 2) return f_t("fcomp", sti);
+				return f_t_t(X87_ARITHP[ext], sti, 0);
+			}
+			0xD9 => {
+				match (ext) {
+					0 => return f_t("fld", sti);
+					1 => return f_t("fxch", sti);
+					2 => { if (sti != 0) return do_illegal(); return f_none("fnop"); }
+					_ => {
+						var name = X87_D9[((ext - 4) << 3) | sti];
+						if (name == null) return do_illegal();
+						return f_none(name);
+					}
+				}
+			}
+			0xDA => {
+				if (ext == 5) {
+					if (sti != 1) return do_illegal();
+					return f_none("fucompp");
+				}
+				var name = X87_DA[ext];
+				if (name == null) return do_illegal();
+				return f_t_t(name, 0, sti);
+			}
+			0xDB => {
+				match (ext) {
+					0 => return f_t_t("fcmovnb", 0, sti);
+					1 => return f_t_t("fcmovne", 0, sti);
+					2 => return f_t_t("fcmovnbe", 0, sti);
+					3 => return f_t_t("fcmovnu", 0, sti);
+					4 => {
+						match (sti) {
+							2 => return f_none("fnclex");
+							3 => return f_none("fninit");
+							_ => return do_illegal();
+						}
+					}
+					5 => return f_t_t("fucomi", 0, sti);
+					6 => return f_t_t("fcomi", 0, sti);
+					_ => return do_illegal();
+				}
+			}
+			0xDD => {
+				match (ext) {
+					0 => return f_t("ffree", sti);
+					2 => return f_t("fst", sti);
+					3 => return f_t("fstp", sti);
+					4 => return f_t("fucom", sti);
+					5 => return f_t("fucomp", sti);
+					_ => return do_illegal();
+				}
+			}
+			0xDF => {
+				match (ext) {
+					0 => return f_t("ffreep", sti);
+					4 => { if (sti != 0) return do_illegal(); return f_none("fnstsw"); }
+					5 => return f_t_t("fucomip", 0, sti);
+					6 => return f_t_t("fcomip", 0, sti);
+					_ => return do_illegal();
+				}
+			}
+		}
+		return do_illegal();
+	}
 }
 
-// Prefixes
-def ESCAPE_PREFIX = 0x0F;
-def SEGMENT_FS_OVERRIDE_PREFIX = 0x64;
-def OPERAND_SIZE_OVERRIDE_PREFIX = 0x66;
-def ADDRESS_SIZE_OVERRIDE_PREFIX = 0x67;
-def VEX3_PREFIX = 0xC4;
-def VEX2_PREFIX = 0xC5;
-def LOCK_PREFIX = 0xF0;
-def REPNE_PREFIX = 0xF2;
-def REP_PREFIX = 0xF3;
-def REPEQ_PREFIX = REP_PREFIX;
+// REX bits within the low nibble of the prefix byte.
+def REX_W_BIT: byte	= 0b1000;
+def REX_R_BIT: byte	= 0b0100;
+def REX_X_BIT: byte	= 0b0010;
+def REX_B_BIT: byte	= 0b0001;
+
+// The eight basic ALU operations, in ModRM.reg order.
+def ARITH = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"];
+// Group 2 shifts and rotates, in ModRM.reg order. Encoding 6 is an undocumented alias of shl.
+def SHIFT = ["rol", "ror", "rcl", "rcr", "shl", "shr", "shl", "sar"];
+// The SSE shift-by-immediate groups, in ModRM.reg order.
+def SHIFT_W = [null, null, "psrlw", null, "psraw", null, "psllw", null];
+def SHIFT_D = [null, null, "psrld", null, "psrad", null, "pslld", null];
+def SHIFT_Q = [null, null, "psrlq", "psrldq", null, null, "psllq", "pslldq"];
+
+// Condition-code suffixes, in encoding order. These are the primary names used by
+// NASM and binutils; the aliases (jc/jnae, jz, jnz, jna, jnbe, ...) denote the same
+// encodings.
+def JCC = ["jo", "jno", "jb", "jae", "je", "jne", "jbe", "ja",
+	   "js", "jns", "jp", "jnp", "jl", "jge", "jle", "jg"];
+def SETCC = ["seto", "setno", "setb", "setae", "sete", "setne", "setbe", "seta",
+	     "sets", "setns", "setp", "setnp", "setl", "setge", "setle", "setg"];
+def CMOVCC = ["cmovo", "cmovno", "cmovb", "cmovae", "cmove", "cmovne", "cmovbe", "cmova",
+	      "cmovs", "cmovns", "cmovp", "cmovnp", "cmovl", "cmovge", "cmovle", "cmovg"];
+
+// String instruction mnemonics by operand size.
+def STRSZ(base: string, sz: X86_64Size) -> string {
+	match (base[0]) {
+		'm' => match (sz) { WORD => return "movsw"; QWORD => return "movsq"; _ => return "movsd"; }
+		'c' => match (sz) { WORD => return "cmpsw"; QWORD => return "cmpsq"; _ => return "cmpsd"; }
+		's' => {
+			if (base[1] == 't') match (sz) { WORD => return "stosw"; QWORD => return "stosq"; _ => return "stosd"; }
+			match (sz) { WORD => return "scasw"; QWORD => return "scasq"; _ => return "scasd"; }
+		}
+		_ => match (sz) { WORD => return "lodsw"; QWORD => return "lodsq"; _ => return "lodsd"; }
+	}
+}
+
+// x87 memory-operand forms, indexed by (opcode - 0xD8) * 8 + ModRM.reg.
+def X87_MEM = [
+	// D8: single-precision arithmetic
+	"fadd", "fmul", "fcom", "fcomp", "fsub", "fsubr", "fdiv", "fdivr",
+	// D9: single-precision load/store and control
+	"fld", null, "fst", "fstp", "fldenv", "fldcw", "fnstenv", "fnstcw",
+	// DA: 32-bit integer arithmetic
+	"fiadd", "fimul", "ficom", "ficomp", "fisub", "fisubr", "fidiv", "fidivr",
+	// DB: 32-bit integer load/store, extended-precision load/store
+	"fild", "fisttp", "fist", "fistp", null, "fld", null, "fstp",
+	// DC: double-precision arithmetic
+	"fadd", "fmul", "fcom", "fcomp", "fsub", "fsubr", "fdiv", "fdivr",
+	// DD: double-precision load/store and state
+	"fld", "fisttp", "fst", "fstp", "frstor", null, "fnsave", "fnstsw",
+	// DE: 16-bit integer arithmetic
+	"fiadd", "fimul", "ficom", "ficomp", "fisub", "fisubr", "fidiv", "fidivr",
+	// DF: 16-bit and 64-bit integer load/store, packed BCD
+	"fild", "fisttp", "fist", "fistp", "fbld", "fild", "fbstp", "fistp"
+];
+def X87_MEM_SIZE = [
+	X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD,
+	X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD,
+
+	X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD,
+	X86_64Size.BYTE, X86_64Size.WORD, X86_64Size.BYTE, X86_64Size.WORD,
+
+	X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD,
+	X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD,
+
+	X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD, X86_64Size.DWORD,
+	X86_64Size.TWORD, X86_64Size.TWORD, X86_64Size.TWORD, X86_64Size.TWORD,
+
+	X86_64Size.QWORD, X86_64Size.QWORD, X86_64Size.QWORD, X86_64Size.QWORD,
+	X86_64Size.QWORD, X86_64Size.QWORD, X86_64Size.QWORD, X86_64Size.QWORD,
+
+	X86_64Size.QWORD, X86_64Size.QWORD, X86_64Size.QWORD, X86_64Size.QWORD,
+	X86_64Size.BYTE, X86_64Size.BYTE, X86_64Size.BYTE, X86_64Size.WORD,
+
+	X86_64Size.WORD, X86_64Size.WORD, X86_64Size.WORD, X86_64Size.WORD,
+	X86_64Size.WORD, X86_64Size.WORD, X86_64Size.WORD, X86_64Size.WORD,
+
+	X86_64Size.WORD, X86_64Size.WORD, X86_64Size.WORD, X86_64Size.WORD,
+	X86_64Size.TWORD, X86_64Size.QWORD, X86_64Size.TWORD, X86_64Size.QWORD
+];
+// x87 register-operand arithmetic, in ModRM.reg order.
+def X87_ARITH = ["fadd", "fmul", "fcom", "fcomp", "fsub", "fsubr", "fdiv", "fdivr"];
+// The 0xDC forms reverse the sense of the non-commutative operations.
+def X87_ARITH_R = ["fadd", "fmul", "fcom", "fcomp", "fsubr", "fsub", "fdivr", "fdiv"];
+def X87_ARITHP = ["faddp", "fmulp", "fcomp", null, "fsubrp", "fsubp", "fdivrp", "fdivp"];
+// 0xD9 with ModRM.reg 4-7 and mod == 3: a fixed operation per ModRM.rm.
+def X87_D9 = [
+	"fchs", "fabs", null, null, "ftst", "fxam", null, null,
+	"fld1", "fldl2t", "fldl2e", "fldpi", "fldlg2", "fldln2", "fldz", null,
+	"f2xm1", "fyl2x", "fptan", "fpatan", "fxtract", "fprem1", "fdecstp", "fincstp",
+	"fprem", "fyl2xp1", "fsqrt", "fsincos", "frndint", "fscale", "fsin", "fcos"
+];
+// 0xDA with mod == 3: the conditional moves.
+def X87_DA = ["fcmovb", "fcmove", "fcmovbe", "fcmovu", null, null, null, null];
+
+// Renders disassembled instructions as text, in an Intel/NASM-like syntax:
+// {[lock] [rep] mnemonic dest, src}, with memory operands written as
+// {size [base+index*scale+disp]}. Segment overrides are rendered as a leading
+// prefix word, since the addressing mode itself does not model them.
+class X86_64DisassemblyPrinter(buf: StringBuilder) extends X86_64DisVisitor {
+	var ok: bool;		// false if the last instruction was illegal or unsupported
+
+	def visit(p: X86_64Prefix.set, name: string, mode: X86_64AddrMode) {
+		ok = true;
+		putPrefixes(p);
+		buf.puts(name);
+		if (mode != X86_64AddrMode.none) mode.renderWith(buf.sp(), p.ADDRESS_SIZE_OVERRIDE);
+	}
+	def unsupported(msg: string) {
+		ok = false;
+		buf.puts("(unsupported: ").puts(msg).putc(')');
+	}
+	def illegal(bytes: Range<byte>) {
+		ok = false;
+		buf.puts("(bad)");
+	}
+	private def putPrefixes(p: X86_64Prefix.set) {
+		if (p.LOCK) buf.puts("lock ");
+		if (p.REP) buf.puts("rep ");
+		if (p.REPNE) buf.puts("repne ");
+		if (p.CS_OVERRIDE) buf.puts("cs ");
+		if (p.SS_OVERRIDE) buf.puts("ss ");
+		if (p.DS_OVERRIDE) buf.puts("ds ");
+		if (p.ES_OVERRIDE) buf.puts("es ");
+		if (p.FS_OVERRIDE) buf.puts("fs ");
+		if (p.GS_OVERRIDE) buf.puts("gs ");
+	}
+}
+
+// The comparison predicates of 0x0F 0xC2, indexed by (encoding kind * 8 + imm8).
+def CMP_SSE = [
+	"cmpeqps", "cmpltps", "cmpleps", "cmpunordps", "cmpneqps", "cmpnltps", "cmpnleps", "cmpordps",
+	"cmpeqpd", "cmpltpd", "cmplepd", "cmpunordpd", "cmpneqpd", "cmpnltpd", "cmpnlepd", "cmpordpd",
+	"cmpeqss", "cmpltss", "cmpless", "cmpunordss", "cmpneqss", "cmpnltss", "cmpnless", "cmpordss",
+	"cmpeqsd", "cmpltsd", "cmplesd", "cmpunordsd", "cmpneqsd", "cmpnltsd", "cmpnlesd", "cmpordsd"
+];
+def CMP_SSE_GENERIC = ["cmpps", "cmppd", "cmpss", "cmpsd"];
+
+// The eight MMX registers, modelled as SSE registers so that they can share the
+// same operand shapes. They alias the x87 stack and are never REX-extended.
+def MMX_REGS = [
+	X86_64Xmmr.new("mm0", 0), X86_64Xmmr.new("mm1", 1),
+	X86_64Xmmr.new("mm2", 2), X86_64Xmmr.new("mm3", 3),
+	X86_64Xmmr.new("mm4", 4), X86_64Xmmr.new("mm5", 5),
+	X86_64Xmmr.new("mm6", 6), X86_64Xmmr.new("mm7", 7)
+];
+
+// The 3DNow! opcode map. These instructions place their opcode in a byte that
+// follows the operands rather than preceding them.
+def AMD_3DNOW = buildAmd3DNow();
+def buildAmd3DNow() -> Array<string> {
+	var t = Array<string>.new(256);
+	t[0x0C] = "pi2fw";	t[0x0D] = "pi2fd";	t[0x1C] = "pf2iw";
+	t[0x1D] = "pf2id";	t[0x8A] = "pfnacc";	t[0x8E] = "pfpnacc";
+	t[0x90] = "pfcmpge";	t[0x94] = "pfmin";	t[0x96] = "pfrcp";
+	t[0x97] = "pfrsqrt";	t[0x9A] = "pfsub";	t[0x9E] = "pfadd";
+	t[0xA0] = "pfcmpgt";	t[0xA4] = "pfmax";	t[0xA6] = "pfrcpit1";
+	t[0xA7] = "pfrsqit1";	t[0xAA] = "pfsubr";	t[0xAE] = "pfacc";
+	t[0xB0] = "pfcmpeq";	t[0xB4] = "pfmul";	t[0xB6] = "pfrcpit2";
+	t[0xB7] = "pmulhrw";	t[0xBB] = "pswapd";	t[0xBF] = "pavgusb";
+	return t;
+}
+
+// The named forms of pclmulqdq, indexed by the immediate. Only the combinations
+// that use no reserved bits have a mnemonic of their own.
+def PCLMUL = buildPclmul();
+def buildPclmul() -> Array<string> {
+	var t = Array<string>.new(256);
+	t[0x00] = "pclmullqlqdq";
+	t[0x01] = "pclmulhqlqdq";
+	t[0x10] = "pclmullqhqdq";
+	t[0x11] = "pclmulhqhqdq";
+	return t;
+}

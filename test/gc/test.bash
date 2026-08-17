@@ -8,37 +8,39 @@ else
   ALL_TESTS=$(cat *.gc)
 fi
 
-function set_rt_files() {
-    target=$1
-    N="$RT_LOC/native/"
-    GC_SOURCES="${GC_LOC}/*.v3"
-
-    if [ "$target" = "x86-darwin" ]; then
-	export RT_FILES="$RT_LOC/x86-darwin/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
-    elif [ "$target" = "x86-64-darwin" ]; then
-	export RT_FILES="$RT_LOC/x86-64-darwin/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
-    elif [ "$target" = "x86-linux" ]; then
-	export RT_FILES="$RT_LOC/x86-linux/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
-    elif [ "$target" = "x86-64-linux" ]; then
-	export RT_FILES="$RT_LOC/x86-64-linux/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
-    elif [ "$target" = "arm64-linux" ]; then
-	export RT_FILES="$RT_LOC/arm64-linux/*.v3 $N/*.v3 $GC_SOURCES ./TagUtils.v3"
-    elif [ "$target" = "wasm" ]; then
-	export RT_FILES="./EmptySystem.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3 $GC_SOURCES ./TagUtils.v3"
-    fi
-}
-
 
 function compile_gc_tests() {
     local SHARDING=80
     local target=$1
     shift
 
+    # TODO: special-casing on smoke test size
+    local micro="" smoke=""
+    for t in "$@"; do
+	case "$t" in
+	    ../smoke/*) smoke="$smoke $t" ;;
+	    *)          micro="$micro $t" ;;
+	esac
+    done
+
+    RT_OPT="-rt.files=$RT_FILES"
+    compile_gc_shard "$target" 4k $micro
+    compile_gc_shard "$target" 256k $smoke
+}
+
+function compile_gc_shard() {
+    local SHARDING=80
+    local target=$1
+    local sstack=$2
+    shift 2
+    if [ $# = 0 ]; then
+	return 0
+    fi
+
     local i=1
-    RT_OPT="-rt.files=$(echo $RT_FILES)"
     while [ $i -le $# ]; do
 	local args=${@:$i:$SHARDING}
-	run_v3c "" -symbols -output=$T -target=$target-test -tr -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=4k -heap-size=10k "$RT_OPT" -multiple $args
+	run_v3c "" -symbols -output=$T -target=$target-test -tr -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=$sstack -heap-size=10k "$RT_OPT" -multiple $args
 	i=$(($i + $SHARDING))
     done
 }
@@ -49,7 +51,8 @@ function do_int_test() {
     ALL=$T/compile.all.out
     rm -f $ALL
 
-    if [[ "$target" =~ "x86-64" ]]; then
+    # TODO: factor out helper function for is64 into common.bash
+    if [[ "$target" =~ "x86-64" || "$target" =~ "arm64" ]]; then
         HEAP='-heap-size=65m' # 64-bit needs more heap
     else
         HEAP='-heap-size=32m'
@@ -71,7 +74,7 @@ function do_int_test() {
 }
 
 function do_exe_test() {
-    set_rt_files $target
+    RT_FILES="$(get_rt_files $target) $(get_gc_files $target) ./TagUtils.v3"
     T=$OUT/$target
     mkdir -p $T
     C=$T/compile.out

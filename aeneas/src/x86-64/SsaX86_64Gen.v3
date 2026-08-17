@@ -331,6 +331,15 @@ class SsaX86_64Gen extends SsaMachGen {
 				refmap(null); // TODO: refmap should not be necessary for kill
 				emitN(I_KILL_REGS);
 			}
+			ForceGc => {
+				if (mach.gcStub == null) return; // no runtime GC; nop
+				// generate a call to the forced-GC stub
+				kill(Regs.ALL);
+				refmap(null);
+				useImm(mach.gcStub);
+				useExSource(null, i.source);
+				emitN(I_CALL);
+			}
 			CallKernel(kernel) => emitCallKernel(i, kernel);
 			ReturnTo => emitReturnTo(i);
 			TupleGetElem => ; // do nothing; calls will define their projections
@@ -416,9 +425,9 @@ class SsaX86_64Gen extends SsaMachGen {
 	def emitIntViewB(i: SsaApplyOp) {
 		def tt = IntType.!(i.op.typeArgs[1]);
 		if (tt.width > 32) {
-			emitShiftShift(i, I_SHLQ, I_SHRQ, tt.lshift - 1);
+			emitShiftShift(i, I_SHLQ, I_SHRQ, 63);
 		} else {
-			emitShiftShift(i, I_SHLD, I_SHRD, tt.ishift - 1);
+			emitShiftShift(i, I_SHLD, I_SHRD, 31);
 		}
 	}
 	def emitShiftShift(i: SsaApplyOp, op1: int, op2: int, width: int) {
@@ -770,8 +779,14 @@ class SsaX86_64Gen extends SsaMachGen {
 			return;
 		}
 		var scratch = Regs.SCRATCH_GPR;
-		genMoveConstReg(val, Operand.Def(null, scratch), regClass);
-		genMoveLocLoc(Operand.Use(null, scratch), dst, regClass);
+		var bitClass = regClass;
+		match (regClass) {
+			F32 => bitClass = RegClass.I32;
+			F64 => bitClass = RegClass.I64;
+			_ => ;
+		}
+		genMoveConstReg(val, Operand.Def(null, scratch), bitClass);
+		genMoveLocLoc(Operand.Use(null, scratch), dst, bitClass);
 	}
 	def genMoveConstReg(val: SsaConst, dst: Operand.Def, regClass: RegClass) {
 		var isImm32 = tryUseImm32(val), immOp = if(isImm32, popLastOperand());
@@ -819,12 +834,21 @@ class SsaX86_64Gen extends SsaMachGen {
 		if (opcode < 0) {
 			match (opcode) {
 				ArchInstrs.ARCH_ENTRY => {
+					if (dwarf != null) dwarf.addFuncEntry(asm.pos());
 					var adjust = frameAdjust();
 					if (CLOptions.RT_FP.val) {
 						asm.pushq_r(X86_64Regs.RBP);
+						// after the push, the CFA is 16 bytes above %rsp and %rbp is saved at CFA-16
+						cfi(DwarfCfi.DefCfaOffset(16));
+						cfi(DwarfCfi.SaveReg(DW.DW_X86_64_RBP, -16));
 						asm.movq_r_r(X86_64Regs.RBP, X86_64Regs.RSP);
+						cfi(DwarfCfi.DefCfaRegister(DW.DW_X86_64_RBP));
 					}
-					if (adjust > 0) asm.sub_r_i(X86_64Regs.RSP, adjust); // allocate frame
+					if (adjust > 0) {
+						asm.sub_r_i(X86_64Regs.RSP, adjust); // allocate frame
+						// without a frame pointer the CFA is tracked relative to %rsp
+						if (!CLOptions.RT_FP.val) cfi(DwarfCfi.DefCfaOffset(adjust + 8));
+					}
 					return;
 				}
 				ArchInstrs.ARCH_BLOCK => {
@@ -873,10 +897,23 @@ class SsaX86_64Gen extends SsaMachGen {
 				}
 				ArchInstrs.ARCH_RET => {
 					var adjust = frameAdjust();
+					// The epilogue restores the entry state; save and restore the
+					// unwind rules around it, since more code may follow in this method.
+					var restore = (dwarf != null) && (adjust > 0 || CLOptions.RT_FP.val);
+					if (restore) cfi(DwarfCfi.RememberState);
 					// XXX: use mov %rsp, %rbp if %rbp is properly handled as callee-saved
-					if (adjust > 0) asm.add_r_i(X86_64Regs.RSP, adjust); // deallocate frame
-					if (CLOptions.RT_FP.val) asm.popq_r(X86_64Regs.RBP);
+					if (adjust > 0) {
+						asm.add_r_i(X86_64Regs.RSP, adjust); // deallocate frame
+						if (!CLOptions.RT_FP.val) cfi(DwarfCfi.DefCfaOffset(8));
+					}
+					if (CLOptions.RT_FP.val) {
+						asm.popq_r(X86_64Regs.RBP);
+						cfi(DwarfCfi.DefCfaRegister(DW.DW_X86_64_RSP));
+						cfi(DwarfCfi.DefCfaOffset(8));
+						cfi(DwarfCfi.RestoreReg(DW.DW_X86_64_RBP));
+					}
 					asm.ret();
+					if (restore) cfi(DwarfCfi.RestoreState);
 					return;
 				}
 				ArchInstrs.ARCH_SAVE => {
@@ -1538,6 +1575,10 @@ class SsaX86_64Gen extends SsaMachGen {
 				return 0;
 			}
 		}
+	}
+	// Record a call frame instruction that takes effect at the current position.
+	def cfi(op: DwarfCfi) {
+		if (dwarf != null) dwarf.addCfi(asm.pos(), op);
 	}
 	def getLoc(o: Operand) -> (X86_64Reg, int) {
 		var loc = toLoc(o);

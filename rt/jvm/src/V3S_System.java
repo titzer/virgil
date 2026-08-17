@@ -578,7 +578,7 @@ public class V3S_System {
     }
 
     public static double readBytesDouble_be(byte[] bytes, int offset, int staticOffset) {
-        long bits = V3S_System.readBytes8(bytes, offset, staticOffset);
+        long bits = V3S_System.readBytes8_be(bytes, offset, staticOffset);
         return Double.longBitsToDouble(bits);
     }
 
@@ -693,7 +693,7 @@ public class V3S_System {
         int fullOffset = offset + staticOffset;
         bytes[fullOffset + 5] = (byte)value;
         bytes[fullOffset + 4] = (byte)(value >> 8);
-        bytes[fullOffset + 2] = (byte)(value >> 16);
+        bytes[fullOffset + 3] = (byte)(value >> 16);
         bytes[fullOffset + 2] = (byte)(value >> 24);
         bytes[fullOffset + 1] = (byte)(value >> 32);
         bytes[fullOffset + 0] = (byte)(value >> 40);

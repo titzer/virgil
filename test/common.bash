@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+# Find the directory that this script is in.
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
   DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
@@ -9,6 +10,7 @@ done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 CONFIG=$DIR/config
 
+# Terminal color constants.
 CYAN='[0;36m'
 BLUE='[0;34m'
 GREEN='[0;32m'
@@ -16,17 +18,20 @@ YELLOW='[0;33m'
 RED='[0;31m'
 NORM='[0;00m'
 
+# Set up the test output directory.
 SUITE=$1
-# CI_DIR is so that CI tests can use separate directories and run in parallel
 export VIRGIL_TEST_OUT=/tmp/$USER/virgil-test${CI_DIR:+/$CI_DIR}
 OUT=$VIRGIL_TEST_OUT/$SUITE
 mkdir -p $OUT
 
+# Find all the directories relative to this script.
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $(dirname ${BASH_SOURCE[0]}) && cd .. && pwd)}
 RT_LOC=$VIRGIL_LOC/rt
 GC_LOC=$RT_LOC/gc
 AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
+
+# Set defaults.
 V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=1500m"}
 TEST_GC_WASM=${TEST_GC_WASM:=1}
 
@@ -35,15 +40,18 @@ TEST_GC_WASM=${TEST_GC_WASM:=1}
 PROGRESS_ARGS=${PROGRESS_ARGS:=i}
 PROGRESS="${VIRGIL_LOC}/test/config/progress $PROGRESS_ARGS"
 
+# Use xargs for sharding.
 XARGS=${XARGS:=0}
 
+# Set the compiler under test.
 AENEAS_TEST=${AENEAS_TEST:=$VIRGIL_LOC/bin/v3c}
-TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm wasm-gc x86-linux x86-64-linux x86-darwin x86-64-darwin"}
-
 if [[ ! -x "$AENEAS_TEST" && "$AENEAS_TEST" != auto ]]; then
     echo $AENEAS_TEST: not found or not executable
     exit 1
 fi
+
+# Set the test targets.
+TEST_TARGETS=${TEST_TARGETS:="v3i jvm wasm wasm-gc x86-linux x86-64-linux x86-darwin x86-64-darwin"}
 
 function print_line() {
     echo --------------------------------------------------------------------------------
@@ -386,7 +394,7 @@ function execute_target_tests() {
 	    fi
 	done
 
-	if [ "RAN" = 0 ]; then
+	if [ "$RAN" = 0 ]; then
 	    print_status "  skipped" ""
 	    count=$(echo $(echo $TORUN | wc -w))
 	    printf "$count ${YELLOW}no runners found${NORM}\n"
@@ -429,7 +437,7 @@ function compile_aeneas() {
     if [ ! -x $CMD ]; then
 	CMD=bin/dev/v3c-$target
     fi
-    V3C=$HOST_AENEAS $CMD $V3C_HEAP_SIZE $V3C_OPTS -fp -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
+    V3C=$HOST_AENEAS $CMD $V3C_HEAP_SIZE $V3C_OPTS -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
     EXIT_CODE=$?
     popd > /dev/null
     if [ $EXIT_CODE != 0 ]; then
@@ -461,36 +469,62 @@ function get_io_targets() {
 }
 
 function is_gc_target() {
-    if [ "$target" = "x86-darwin" ]; then
-	return 0
-    elif [ "$target" = "x86-64-darwin" ]; then
-	return 0
-    elif [ "$target" = "x86-linux" ]; then
-	return 0
-    elif [ "$target" = "x86-64-linux" ]; then
-	return 0
-    elif [ "$target" = "arm64-linux" ]; then
-	return 0
-    elif [[ "$target" = "wasm" && "$TEST_GC_WASM" != 0 ]]; then
-        return 0
-    fi
+    case $target in
+	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux)
+	    return 0
+	    ;;
+	wasm)
+	    [ "$TEST_GC_WASM" != 0 ] && return 0
+	    ;;
+    esac
     return 1
 }
 
 function get_vm_addr_width() {
-    if [ "$target" = "x86-darwin" ]; then
-	echo 32
-    elif [ "$target" = "x86-64-darwin" ]; then
-	echo 48
-    elif [ "$target" = "x86-linux" ]; then
-	echo 32
-    elif [ "$target" = "x86-64-linux" ]; then
-	echo 48
-    elif [ "$target" = "arm64-linux" ]; then
-	echo 48
-    elif [ "$target" = "wasm" ]; then
-        echo 32
-    fi
+    case $target in
+	x86-darwin|x86-linux|wasm)
+	    echo 32
+	    ;;
+	x86-64-darwin|x86-64-linux|arm64-linux)
+	    echo 48
+	    ;;
+    esac
+}
+
+function get_addr_width() {
+    case $target in
+	x86-darwin|x86-linux|wasm)
+	    echo 32
+	    ;;
+	x86-64-darwin|x86-64-linux|arm64-linux)
+	    echo 64
+	    ;;
+    esac
+}
+
+function get_rt_files() {
+    target=$1
+    N="$RT_LOC/native/"
+
+    case $target in
+	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux)
+	    echo $RT_LOC/$target/*.v3 $N/*.v3
+	    ;;
+	wasm)
+	    echo $RT_LOC/wasm-test/*.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3
+	    ;;
+    esac
+}
+
+function get_gc_files() {
+    target=$1
+    GC_SOURCES="${GC_LOC}/*.v3"
+
+    case $target in
+	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux|wasm)
+	    echo $GC_SOURCES
+	    ;;
+    esac
 }
 
 function do_nothing() {

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
-#Copyright 2024 Virgil Authors. All rights reserved.
-#See LICENSE for details of Apache 2.0 license.
+. ../../common.bash arm64-asm
+
+if [ "$TEST_ASM" = 0 ]; then
+    echo "arm64 assembler tests skipped."
+    exit 0
+fi
 
 # See ./Arm64AssemblerTestGen.v3 for details on this test script.
-
-. ../../common.bash arm64-asm
 
 VIRGIL_OBJDUMP=${OUT}/virgil-objdump.txt
 ASM=${OUT}/asm.s
