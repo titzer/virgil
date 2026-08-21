@@ -376,11 +376,13 @@ class SsaRaNormalizer extends SsaRebuilder {
 				if (context.compiler.boundsCheck(i_old.facts)) {
 					// XXX: manually CSE the promotions here?
 					var array = ai_new[0], offset = ai_new[an.size];
-					curBlock.opBoundsCheck(an.newType, array, offset);
+					var array_length = curBlock.opArrayGetLength(an.newType, array);
+					// offset == length is legal for a zero-size layout; unsigned compare rejects negative offsets
+					var c0 = curBlock.opIntULt(norm.config.ArrayLengthType, norm.config.ArrayLengthType, array_length, offset);
+					curBlock.opConditionalThrow(V3Exception.BoundsCheck, c0);
 					var t = RefType.!(op.typeArgs[0]);
 					var layout_size = newGraph.intConst(t.layoutDecl.byteSize);
 					var end_index = curBlock.opIntAdd(offset, layout_size);
-					var array_length = curBlock.opArrayGetLength(an.newType, array);
 					var c1 = curBlock.opIntULt(norm.config.ArrayLengthType, norm.config.ArrayLengthType, array_length, end_index);
 					curBlock.opConditionalThrow(V3Exception.BoundsCheck, c1);
 				}
@@ -412,6 +414,22 @@ class SsaRaNormalizer extends SsaRebuilder {
 					curBlock.opRangeStartPlusIndex(an.oldType, Int.TYPE, i_old.facts, array, start, newGraph.intConst(offset)),
 					curBlock.opIntAdd(start, newGraph.intConst(offset)));
 				return mapN(i_old, ai_new);
+			}
+			RefLayoutAtRepeatedField(offset, scale, max) => {
+				var an = arrayByteNorm;
+				var ai_new = genRefs(args);
+				var array = ai_new[0], start = ai_new[1], index = ai_new[2];
+				if (context.compiler.boundsCheck(i_old.facts)) {
+					var oob = curBlock.opBoolNot(curBlock.opIntULt(norm.config.ArrayLengthType, norm.config.ArrayLengthType,
+						index, newGraph.intConst(max)));
+					curBlock.opConditionalThrow(V3Exception.BoundsCheck, oob);
+				}
+				var delta = if(scale == 1, index, curBlock.opIntMul(index, newGraph.intConst(scale)));
+				if (offset != 0) delta = curBlock.opIntAdd(newGraph.intConst(offset), delta);
+				start = if(norm.config.NormalizeRange,
+					curBlock.opRangeStartPlusIndex(an.oldType, Int.TYPE, i_old.facts, array, start, delta),
+					curBlock.opIntAdd(start, delta));
+				return mapN(i_old, [array, start]);
 			}
 			RefLayoutGetField(offset, order) => {
 				var an = arrayByteNorm;
@@ -470,8 +488,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 				);
 				var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
 				match (fn.oldType) {
-					x: IntType => result = curBlock.opByteArrayGetField(x, rangeStartType, offset, order, facts, array, start);
-					x: FloatType => result = curBlock.opByteArrayGetField(x, rangeStartType, offset, order, facts, array, start);
+					x: BoolType,
+					x: IntType,
+					x: FloatType => result = curBlock.opByteArrayGetField(fn.oldType, rangeStartType, offset, order, facts, array, start);
 					x: EnumType => {
 						var it = IntType.!(x.enumDecl.tagType);
 						result = curBlock.opByteArrayGetField(it, rangeStartType, offset, order, facts, array, start);
@@ -499,7 +518,8 @@ class SsaRaNormalizer extends SsaRebuilder {
 				var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
 				var result: SsaInstr;
 				match (fn.oldType) {
-					x: IntType => result = curBlock.opByteArraySetField(fn.oldType, rangeStartType, offset, order, facts, array, start, val);
+					x: BoolType,
+					x: IntType,
 					x: FloatType => result = curBlock.opByteArraySetField(fn.oldType, rangeStartType, offset, order, facts, array, start, val);
 					x: EnumType => {
 						var it = IntType.!(x.enumDecl.tagType);
@@ -707,7 +727,10 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var tn = normTypeArg(op, 0);
 		var refs = genRefs(i_old.inputs);
 		match (tn) {
-			x: VariantNorm => if (!x.isEnum()) return map1(i_old, normUnboxedVariantEqual(i_old, x, refs));
+			x: VariantNorm => {
+				if (!x.isEnum()) return map1(i_old, normUnboxedVariantEqual(i_old, x, refs));
+				if (hasUnequalCase(x.oldType)) return map1(i_old, normEnumVariantEqual(i_old, x, refs));
+			}
 			_ => if (V3.isVariant(tn.newType)) return map1(i_old, normVariantEqual(i_old, tn.newType, refs[0], refs[1]));
 		}
 		map1(i_old, normEqual(i_old, tn, refs));
@@ -835,8 +858,39 @@ class SsaRaNormalizer extends SsaRebuilder {
 		call.setFact(facts);
 		return call;
 	}
+	// A case whose fields all folded to constants is never equal to itself if one of those
+	// constants is not equal to itself, e.g. a NaN. No two of its values are ever equal.
+	def isUnequalCase(t: Type) -> bool {
+		var rc = norm.ra.getClass(t);
+		if (rc == null) return false;
+		for (rf in rc.fields) {
+			if (rf != null && rf.isConst() && !Values.isReflexive(rf.val)) return true;
+		}
+		return false;
+	}
+	// Returns {true} if any live case of {t} is never equal to itself.
+	def hasUnequalCase(t: Type) -> bool {
+		var rc = norm.ra.getClass(t);
+		if (rc == null) return false;
+		for (l = rc.subtypes; l != null; l = l.tail) if (isUnequalCase(l.head.oldType)) return true;
+		return isUnequalCase(t);
+	}
+	// Normalize equality of a variant represented by only its tag. The tags must match, and
+	// the case must not be one that is never equal to itself.
+	def normEnumVariantEqual(i_old: SsaApplyOp, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
+		var expr = normEqual(i_old, vn, refs);
+		var rc = norm.ra.getClass(vn.oldType);
+		for (l = rc.subtypes; l != null; l = l.tail) {
+			var c = l.head;
+			if (!isUnequalCase(c.oldType)) continue;
+			var tag = newGraph.intConst(c.normClass.getRepTag());
+			expr = opBoolAnd(expr, curBlock.opBoolNot(curBlock.opEqual(vn.tagType(), refs[0], tag)));
+		}
+		return expr;
+	}
 	// Normalize equality between two unboxed variants of the same case (e.g. x: T.A == y: T.A)
 	def normUnboxedVariantCaseEqual(i_old: SsaApplyOp, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
+		if (isUnequalCase(vn.oldType)) return newGraph.falseConst();
 		var join = opBoolAnd;
 		var expr: SsaInstr;
 		for (i < vn.fields.length) {
@@ -856,7 +910,11 @@ class SsaRaNormalizer extends SsaRebuilder {
 	// Normalize equality between two unboxed variants of unknown case (e.g. x: T == y: T)
 	def normUnboxedVariantEqual(i_old: SsaApplyOp, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
 		// XXX: compare scalars, not individual fields.
-		if (vn.hasNoTag()) return normEqual(i_old, vn, refs); // we can always do a scalar-by-scalar comparison if no boxes are involved.
+		if (vn.hasNoTag()) {
+			if (hasUnequalCase(vn.oldType)) return newGraph.falseConst();	// a dropped constant is never equal
+			return normEqual(i_old, vn, refs); // we can always do a scalar-by-scalar comparison if no boxes are involved.
+		}
+		if (isUnequalCase(vn.oldType)) return newGraph.falseConst();
 		var ct = ClassType.!(vn.oldType);
 		if (ct.superType != null) return normUnboxedVariantCaseEqual(i_old, vn, refs);
 
@@ -1811,6 +1869,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 					def scalarIdx = field.indexes[i];
 					def interval = field.intervals[i];
 					def scalar = ninputs[scalarIdx];
+					if (!IntType.?(scalar.getType())) { vals[i] = scalar; continue; }
 					vals[i] = genExtractInterval(scalar, interval, scalar.getType(), field.tn.at(i));
 				}
 			} else {
