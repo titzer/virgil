@@ -24,6 +24,8 @@ ADDRS_48="0x100000000 0x200000000 0x333330000 0x4400044000 0x555500000000"
 # themselves to the heap they are given. Large sizes only reserve virtual address
 # space, since the tests touch just a few pages of it.
 HEAP_SIZES_32=${HEAP_SIZES_32:="1m 1000m 1900m"}
+# Wizard's JVM target caps a wasm memory at 30000 pages (1875MB), so stay below that.
+HEAP_SIZES_WASM=${HEAP_SIZES_WASM:="1m 1000m 1800m"}
 HEAP_SIZES_48=${HEAP_SIZES_48:="1m 3g 5g 12g 17000m"}
 # Start addresses to combine with the heap sizes above.
 HEAP_ADDRS_32=${HEAP_ADDRS_32:="0x00300000"}
@@ -63,7 +65,11 @@ done
 for target in $TEST_TARGETS; do
     case "$(get_vm_addr_width $target)" in
 	"32")
-	    HEAPS="$HEAP_SIZES_32"
+	    if [ "$target" = wasm ]; then
+		HEAPS="$HEAP_SIZES_WASM"
+	    else
+		HEAPS="$HEAP_SIZES_32"
+	    fi
 	    ADDRS="$HEAP_ADDRS_32"
 	    TESTS=$(echo $HEAP_TEST_LIST | tr ' ' '\n' | grep -v _64.v3)
 	    ;;
