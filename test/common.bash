@@ -511,7 +511,7 @@ function get_rt_files() {
 	    echo $RT_LOC/$target/*.v3 $N/*.v3
 	    ;;
 	wasm)
-	    echo $RT_LOC/wasm-test/*.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3
+	    echo $RT_LOC/wasm-test/*.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3 $RT_LOC/wasm-wave/ShadowStackScanner.v3
 	    ;;
     esac
 }
