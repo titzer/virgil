@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-. ../common.bash pointer
+. ../common.bash descext
 
 if [ $# -gt 0 ]; then
     TEST_LIST="$@"
