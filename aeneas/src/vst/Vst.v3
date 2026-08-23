@@ -23,6 +23,9 @@ class VstFile extends ParsedFile {
 	def exports = Vector<ExportDecl>.new();
 	def layouts = Vector<VstLayout>.new();
 	def packings = Vector<VstPacking>.new();
+	def annotations = Vector<VstAnnotation>.new();	// from @file(...)
+	def annotationDecls = Vector<VstAnnotationDecl>.new();	// @type declarations
+	def annotationAliases = Vector<VstAnnotationAlias>.new();	// @def declarations
 	var synthetic: VstComponent;	// declaration for synthesized component
 	var typeEnv: TypeEnv;
 
@@ -121,6 +124,7 @@ class VstCompound extends Decl {
 	def isPrivate: bool;
 	var verifier: VstCompoundVerifier;
 	var repHints: List<VstRepHint>;
+	var annotations: VstList<VstAnnotation>;
 
 	new(isPrivate, name: Token, typeParams, params, superclause, members) super(name) {
 		fullName = name.image;
@@ -315,6 +319,7 @@ class VstMember extends Decl {
 	var receiver: VstCompound;
 	var index: int;
 	var repHints: List<VstRepHint>;
+	var annotations: VstList<VstAnnotation>;
 	var initEnv: MethodEnv;
 
 	new(isPrivate, name: Token) super(name) { }
@@ -495,6 +500,53 @@ type VstRepHint {
 	}
 }
 
+// An applied annotation: "@name" or "@name(args)". Unlike VstRepHint, which enumerates a
+// closed set of hints the compiler knows, annotations are open and user-declared, so this
+// is a class with a mutable slot for the declaration the verifier will resolve it to.
+class VstAnnotation(at: FilePoint, name: Token, args: VstList<VstAnnArg>) {
+	var decl: VstAnnotationDecl;	// resolved by the verifier; null after parsing
+
+	def range() -> FileRange {
+		if (args != null) return FileRanges.add(at, args.range());
+		return FileRanges.add(at, name.range());
+	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.putc('@').puts(name.image);
+		if (args != null) buf.puts("(...)");
+		return buf;
+	}
+}
+
+// One argument of an applied annotation. {name} is null for the positional form.
+class VstAnnArg(name: Token, value: Expr) {
+	def range() -> FileRange {
+		var r = FileRanges.ofExpr(value);
+		return if(name != null, FileRanges.add(name, r), r);
+	}
+}
+
+// An annotation type declaration: "@type name(fields) { methods }".
+// Extends Decl rather than VstCompound: a compound requires a Kind, and Kind is the
+// type-system-wide enum, so promoting this is a type-system change that belongs with the
+// decision about how annotations are represented as types. See doc/annotations-parser.md.
+class VstAnnotationDecl extends Decl {
+	def isPrivate: bool;
+	def annotations: VstList<VstAnnotation>;	// meta-annotations on this declaration
+	def fields: VstList<VarDecl>;			// VarDecl, not ParamDecl: fields may have defaults
+	def members: List<VstMember>;			// methods only
+
+	new(isPrivate, annotations, name: Token, fields, members) super(name) { }
+}
+
+// An annotation alias declaration: "@def name = ann, ann, ...;".
+class VstAnnotationAlias extends Decl {
+	def isPrivate: bool;
+	def annotations: VstList<VstAnnotation>;
+	def expansion: VstList<VstAnnotation>;
+
+	new(isPrivate, annotations, name: Token, expansion) super(name) { }
+}
+
 type VstPackingExpr {
 	case Bits(token: Token, rep: Array<(int, PackingBit)>);
 	case Solve(l: VstList<VstPackingExpr>);				// #solve(_, ...)
@@ -536,6 +588,8 @@ class VstVisitor<E, R> {
 	def visitBinOp(expr: BinOpExpr, env: E) -> R;
 	def visitIfExpr(expr: IfExpr, env: E) -> R;
 	def visitFunExpr(expr: FunExpr, env: E) -> R;
+	def visitAnnotation(expr: AnnotationExpr, env: E) -> R;
+	def visitAnnotated(expr: AnnotatedExpr, env: E) -> R;
 }
 // The return type of a method or function.
 type ReturnType {
@@ -547,6 +601,7 @@ type ReturnType {
 // base class of all TypeRefs
 class TypeRef {
 	var binding: Type;
+	var annotations: VstList<VstAnnotation>;	// prefixed annotations, if any
 	def render(buf: StringBuilder) -> StringBuilder {
 		if (binding == null) return buf.puts("?");
 		return binding.render(buf);
@@ -639,6 +694,7 @@ class VarDecl extends Decl {
 	var isReadOnly: bool;
 	var ssa: VstSsaVar;
 	var repHints: List<VstRepHint>;
+	var annotations: VstList<VstAnnotation>;
 
 	new(name: Token, tref, init) super(name) { }
 
@@ -671,6 +727,7 @@ class IfStmt(start: FilePoint, cond: Expr, tbranch: Stmt, fbranch: Stmt) extends
 // { stmts }
 class BlockStmt(stmts: VstList<Stmt>) extends Stmt {
 	var localVars: Array<VarDecl>;
+	var annotations: VstList<VstAnnotation>;
 	def accept<E, R>(v: VstVisitor<E, R>, env: E) -> R { return v.visitBlock(this, env); }
 	def range() -> FileRange { return stmts.range(); }
 }
@@ -778,6 +835,18 @@ class TupleExpr(exprs: VstList<Expr>) extends Expr {
 class ArrayExpr(exprs: VstList<Expr>) extends Expr {
 	def accept<E, R>(v: VstVisitor<E, R>, env: E) -> R { return v.visitArray(this, env); }
 	def range() -> FileRange { return exprs.range(); }
+}
+// An annotation used as a value, e.g. the "@atomic" in "@clones_type(@atomic)", or the
+// "@outer" that a ".@name" query hangs off.
+class AnnotationExpr(ann: VstAnnotation) extends Expr {
+	def accept<E, R>(v: VstVisitor<E, R>, env: E) -> R { return v.visitAnnotation(this, env); }
+	def range() -> FileRange { return ann.range(); }
+}
+// Annotations prefixed to a term, e.g. "@atomic Vector<int>.new()". The annotations attach
+// to the type use, not to the call; the verifier sorts that out.
+class AnnotatedExpr(annotations: VstList<VstAnnotation>, expr: Expr) extends Expr {
+	def accept<E, R>(v: VstVisitor<E, R>, env: E) -> R { return v.visitAnnotated(this, env); }
+	def range() -> FileRange { return FileRanges.add(annotations.range(), FileRanges.ofExpr(expr)); }
 }
 // var|literal
 class VarExpr(expr: Expr, dot: FilePoint, ident: VstIdent<TypeRef>) extends Expr {

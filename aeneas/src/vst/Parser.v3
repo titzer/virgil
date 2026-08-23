@@ -106,6 +106,7 @@ component Parser {
 		p.enableSimpleBodies = CLOptions.SIMPLE_BODIES.get();
 		p.enableOpenTypes = CLOptions.OPEN_TYPES.get();
 		p.enableDescriptors = CLOptions.DESCRIPTORS.get();
+		p.enableAnnotations = CLOptions.ANNOTATIONS.get();
 
 		file.input = input;
 		file.lineEnds = p.lineEnds;
@@ -125,10 +126,97 @@ component Parser {
 		return (file, parseList(0, p, 0, COMMA, 0, parseRedefField));
 	}
 	def parseToplevelDecl(p: ParserState, file: VstFile) -> bool {
+		if (!p.enableAnnotations) return parseToplevelDeclBody(p, file, null);
+		var anns = parseAnnotations(p);
+		if (p.curByte == '@') return parseAnnotationDecl(p, file, anns);   // @type / @def
+		// "@file(...)" must stand alone and be terminated by ';'. Checking for the name as
+		// well as for the ';' is what makes both "@file(@x) class C { }" and a stray
+		// "@deprecated;" errors, rather than silently retargeting an annotation.
+		if (anns != null && (p.curByte == ';' || namesFile(anns))) return parseFileAnnotation(p, file, anns);
+		return parseToplevelDeclBody(p, file, anns);
+	}
+	// "@type name(fields) { methods }" or "@def name = ann, ...;". Reached with the cursor
+	// on the '@' that parseAnnotations stopped at, because it is followed by a keyword.
+	def parseAnnotationDecl(p: ParserState, file: VstFile, anns: VstList<VstAnnotation>) -> bool {
+		p.eat1(); // '@'
+		var isPrivate = false; // XXX: "private" before "@type" once modifiers are settled
+		if (optKeyword(p, "type") != null) {
+			var id = parseIdentVoid(p).name;
+			var fields = if(p.curByte == '(', parseList(0, p, '(', COMMA, ')', parseAnnField));
+			var members: List<VstMember>;
+			if (p.curByte == ';') p.advance1();
+			else members = parseMembers(p, false);
+			for (l = members; l != null; l = l.tail) {
+				match (l.head) {
+					x: VstNew => p.errorAt(x.token.range(), "'new' not allowed in an annotation declaration");
+					x: VstField => p.errorAt(x.token.range(), "'var' not allowed in an annotation declaration");
+				}
+			}
+			file.annotationDecls.put(VstAnnotationDecl.new(isPrivate, anns, id, fields, members));
+			return true;
+		}
+		if (optKeyword(p, "def") != null) {
+			var id = parseIdentVoid(p).name;
+			p.req1('=');
+			var start = p.point();
+			var list: List<VstAnnotation>;
+			while (true) {
+				var a = parseAnnotation(p);
+				if (a == null) break;
+				list = List.new(a, list);
+				if (p.opt1(',') < 0) break;
+			}
+			p.req1(';');
+			var expansion = VstList.new(p.end(start), Lists.reverse(list));
+			file.annotationAliases.put(VstAnnotationAlias.new(isPrivate, anns, id, expansion));
+			return true;
+		}
+		p.error("expected \"type\" or \"def\" after \"@\"");
+		return false;
+	}
+	// A top-level annotation list terminated by ';' applies to the file. Spelled "@file(...)";
+	// the name is reserved so that a stray semicolon cannot silently retarget an annotation
+	// from the following declaration to the whole file.
+	def namesFile(anns: VstList<VstAnnotation>) -> bool {
+		for (l = anns.list; l != null; l = l.tail) {
+			if (Strings.equal(l.head.name.image, "file")) return true;
+		}
+		return false;
+	}
+	def parseFileAnnotation(p: ParserState, file: VstFile, anns: VstList<VstAnnotation>) -> bool {
+		var only = anns.list;
+		if (only.tail != null || !Strings.equal(only.head.name.image, "file")) {
+			p.errorAt(anns.range(), "a top-level annotation must be followed by a declaration, or be @file(...)");
+			p.opt1(';');
+			return true;
+		}
+		p.req1(';');
+		if (only.head.args != null) {
+			for (l = only.head.args.list; l != null; l = l.tail) {
+				var v = l.head.value;
+				if (AnnotationExpr.?(v)) file.annotations.put(AnnotationExpr.!(v).ann);
+				else p.errorAt(FileRanges.ofExpr(v), "@file expects annotation arguments");
+			}
+		}
+		return true;
+	}
+	// AnnField ::= Annotation* Id ':' TypeRef ('=' Expr)?
+	def parseAnnField(p: ParserState) -> VarDecl {
+		var anns = parseAnnotations(p);
+		var id = parseIdentVoid(p).name;
+		p.req1(':');
+		var tref = parseTypeRef(p);
+		var init = if(p.opt1('=') >= 0, parseExpr(p));
+		var d = VarDecl.new(id, tref, init);
+		d.isReadOnly = true;
+		d.annotations = anns;
+		return d;
+	}
+	def parseToplevelDeclBody(p: ParserState, file: VstFile, anns: VstList<VstAnnotation>) -> bool {
 		match (p.curByte) {
 			'c' => {
-				if (optKeyword(p, "class") != null) return parseClass(p, file, false);
-				if (optKeyword(p, "component") != null) return parseComponent(p, file, false, false);
+				if (optKeyword(p, "class") != null) return parseClass(p, file, false, anns);
+				if (optKeyword(p, "component") != null) return parseComponent(p, file, false, false, anns);
 			}
 			'i' => {
 				var importToken = optKeyword(p, "import");
@@ -139,6 +227,7 @@ component Parser {
 						var members = parseMembers(p, true);
 						if (importName == null) importName = id;
 						var decl = VstComponent.new(false, false, importName, id, members);
+						decl.annotations = anns;
 						file.components.put(decl);
 						return true;
 					}
@@ -146,41 +235,46 @@ component Parser {
 			}
 			'v' => if (optKeyword(p, "var") != null) {
 				var synthetic = file.getSyntheticComponent();
-				synthetic.members = PUBLIC_VAR.parseVar(p, synthetic.members);
+				var before = synthetic.members;
+				synthetic.members = annotate(PUBLIC_VAR.parseVar(p, before), before, anns);
 				return true;
 			}
 			'd' => if (optKeyword(p, "def") != null) {
 				var synthetic = file.getSyntheticComponent();
-				synthetic.members = PUBLIC_DEF.parseDef(p, synthetic.members, null);
+				var before = synthetic.members;
+				synthetic.members = annotate(PUBLIC_DEF.parseDef(p, before, null), before, anns);
 				return true;
 			}
 			't' => {
-				if (optKeyword(p, "type") != null) return parseVariant(p, file, false);
-				if (optKeyword(p, "thread") != null && optKeyword(p, "component") != null) return parseComponent(p, file, false, true);
+				if (optKeyword(p, "type") != null) return parseVariant(p, file, false, anns);
+				if (optKeyword(p, "thread") != null && optKeyword(p, "component") != null) return parseComponent(p, file, false, true, anns);
 			}
 			'e' => {
-				if (optKeyword(p, "enum") != null) return parseEnum(p, file, false);
-				if (optKeyword(p, "export") != null) return parseExport(p, file);
+				if (optKeyword(p, "enum") != null) return parseEnum(p, file, false, anns);
+				if (optKeyword(p, "export") != null) {
+					if (anns != null) p.errorAt(anns.range(), "annotations are not supported on an export declaration");
+					return parseExport(p, file);
+				}
 			}
 			'p' => {
 				if (optKeyword(p, "private") != null) {
-					if (optKeyword(p, "class") != null) return parseClass(p, file, true);
-					if (optKeyword(p, "component") != null) return parseComponent(p, file, true, false);
-					if (optKeyword(p, "thread") != null && optKeyword(p, "component") != null) return parseComponent(p, file, true, true);
-					if (optKeyword(p, "type") != null) return parseVariant(p, file, true);
-					if (optKeyword(p, "enum") != null) return parseEnum(p, file, true);
-					if (optKeyword(p, "packing") != null) return parsePacking(p, file, true);
+					if (optKeyword(p, "class") != null) return parseClass(p, file, true, anns);
+					if (optKeyword(p, "component") != null) return parseComponent(p, file, true, false, anns);
+					if (optKeyword(p, "thread") != null && optKeyword(p, "component") != null) return parseComponent(p, file, true, true, anns);
+					if (optKeyword(p, "type") != null) return parseVariant(p, file, true, anns);
+					if (optKeyword(p, "enum") != null) return parseEnum(p, file, true, anns);
+					if (optKeyword(p, "packing") != null) return parsePacking(p, file, true, anns);
 				}
-				if (optKeyword(p, "packing") != null) return parsePacking(p, file, false);
+				if (optKeyword(p, "packing") != null) return parsePacking(p, file, false, anns);
 			}
 			'l' => {
-				if (optKeyword(p, "layout") != null) return parseLayout(p, file);
+				if (optKeyword(p, "layout") != null) return parseLayout(p, file, anns);
 			}
 		}
 		p.error("expected type, variable, or method declaration");
 		return false;
 	}
-	def parseClass(p: ParserState, file: VstFile, isPrivate: bool) -> bool {
+	def parseClass(p: ParserState, file: VstFile, isPrivate: bool, anns: VstList<VstAnnotation>) -> bool {
 		var id = parseIdent(p, parseTypeParam);
 		var params = parseOptionalParams(p, parseClassParam);
 		var parent = if(optKeyword(p, "extends") != null, parseTypeRef(p));
@@ -194,6 +288,7 @@ component Parser {
 		var members = parseMembers(p, false);
 		var decl = VstClass.new(isPrivate, id.name, id.list(), params, parent, superclause, members);
 		decl.repHints = repHints;
+		decl.annotations = anns;
 		decl.descriptorInfo = descriptorInfo;
 		file.classes.put(decl);
 		return true;
@@ -210,14 +305,15 @@ component Parser {
 		}
 		return info;
 	}
-	def parseComponent(p: ParserState, file: VstFile, isPrivate: bool, isThread: bool) -> bool {
+	def parseComponent(p: ParserState, file: VstFile, isPrivate: bool, isThread: bool, anns: VstList<VstAnnotation>) -> bool {
 		var id = parseIdentVoid(p).name;
 		var members = parseMembers(p, false);
 		var decl = VstComponent.new(isPrivate, isThread, null, id, members);
+		decl.annotations = anns;
 		file.components.put(decl);
 		return true;
 	}
-	def parseVariant(p: ParserState, file: VstFile, isPrivate: bool) -> bool {
+	def parseVariant(p: ParserState, file: VstFile, isPrivate: bool, anns: VstList<VstAnnotation>) -> bool {
 		var id = parseIdent(p, parseTypeParam);
 		var params = parseOptionalParams(p, parseClassParam);
 		var parent: TypeRef;
@@ -230,6 +326,7 @@ component Parser {
 		var repHints = parseRepHints(p);
 		var decl = desugar.synthesizeTopLevelClass(parseVariantCases(p, desugar));
 		decl.repHints = repHints;
+		decl.annotations = anns;
 		file.classes.put(decl);
 		// lift case classes to top-level of file
 		for (cdecl in decl.cases) {
@@ -297,7 +394,7 @@ component Parser {
 			
 		return VstPackingExpr.Literal(parseNumber(p));
 	}
-	def parsePacking(p: ParserState, file: VstFile, isPrivate: bool) -> bool {
+	def parsePacking(p: ParserState, file: VstFile, isPrivate: bool, anns: VstList<VstAnnotation>) -> bool {
 		var id = parseIdentVoid(p).name;
 		var params = parseList(0, p, '(', COMMA, ')', parsePackingParam);
 		p.req1(':');
@@ -306,8 +403,80 @@ component Parser {
 		var expr = parsePackingExpr(p, true, false);
 		p.req1(';');
 		var decl = VstPacking.new(id, params, expr, size);
+		decl.annotations = anns;
 		file.packings.put(decl);
 		return true;
+	}
+	// Parse a run of prefix annotations: "@name", "@name(args)", ...
+	// Stops at "@" followed by a keyword, which introduces a declaration form ("@type",
+	// "@def") and belongs to the caller. Returns null if there are none.
+	def parseAnnotations(p: ParserState) -> VstList<VstAnnotation> {
+		if (p.curByte != '@') return null;
+		var start = p.point();
+		var list: List<VstAnnotation>;
+		while (p.curByte == '@' && !isKeywordAfterAt(p)) {
+			var a = parseAnnotation(p);
+			if (a == null) break;
+			list = List.new(a, list);
+		}
+		if (list == null) return null;
+		return VstList.new(p.end(start), Lists.reverse(list));
+	}
+	// Is the identifier immediately after the "@" a keyword? Scans the raw input without
+	// moving the cursor, so that "@type" and "@def" are left for the caller.
+	def isKeywordAfterAt(p: ParserState) -> bool {
+		var d = p.input, q = p.curPos + 1;
+		if (q >= d.length || !Char.isIdentStart(d[q])) return false;
+		var s = q;
+		while (q < d.length && Char.isIdentMiddle(d[q])) q++;
+		if (q - s < 2) return false; // keywords are all at least 2 chars
+		var image = Arrays.range(d, s, q);
+		var index = Keywords.kwIndex(image);
+		var kw = Keywords.kwKeys[index];
+		return kw != null && Strings.equal(kw, image);
+	}
+	// Parse a single "@name" or "@name(args)".
+	def parseAnnotation(p: ParserState) -> VstAnnotation {
+		var at = p.point();
+		p.eat1(); // '@', deliberately without skipping whitespace
+		if (!Char.isIdentStart(p.curByte)) {
+			p.error("annotation name expected");
+			return null;
+		}
+		// Scan the name directly rather than via parseIdentCommon, which would take a
+		// following '<' as type arguments; annotation names are not parameterized.
+		var q = p.star(0, Char.isIdentMiddle);
+		// The argument list must be glued to the name: "@ann(x)" is arguments, while
+		// "@ann (x)" applies @ann to the parenthesized type or expression. This must be
+		// read from the raw input BEFORE extractIdent, which advances past whitespace.
+		var glued = q < p.input.length && p.input[q] == '(';
+		var id = extractIdent<void>(p, q);
+		var args = if(glued, parseList(0, p, '(', COMMA, ')', parseAnnArg));
+		return VstAnnotation.new(at, id.name, args);
+	}
+	// Parse one annotation argument, either "name = value" or a bare value.
+	def parseAnnArg(p: ParserState) -> VstAnnArg {
+		var e = if(p.curByte == '@', parseAnnValue(p), parseExpr(p));
+		if (AssignExpr.?(e)) {
+			// "name = value": parseExpr already builds an AssignExpr for this, so the
+			// keyword form is recognized by shape rather than by lookahead.
+			var a = AssignExpr.!(e);
+			if (a.infix == null && isBareVarExpr(a.target)) {
+				return VstAnnArg.new(VarExpr.!(a.target).ident.name, a.expr);
+			}
+		}
+		return VstAnnArg.new(null, e);
+	}
+	// An annotation used as a value, plus any suffixes: "@outer.@atomicity.value".
+	def parseAnnValue(p: ParserState) -> Expr {
+		var a = parseAnnotation(p);
+		if (a == null) return null;
+		return addBinOpSuffixes(p, addTermSuffixes(p, AnnotationExpr.new(a)));
+	}
+	def isBareVarExpr(e: Expr) -> bool {
+		if (!VarExpr.?(e)) return false;
+		var v = VarExpr.!(e);
+		return v.expr == null && v.ident.params == null;
 	}
 	def isRepHintMiddle(c: byte) -> bool {
 		return
@@ -374,9 +543,10 @@ component Parser {
 	}
 	def parseVariantCase(p: ParserState, desugar: VariantDesugaring, prev: List<VstMember>) -> List<VstMember> {
 		var kw: FilePoint;
+		var anns = if(p.enableAnnotations, parseAnnotations(p));
 		match (p.curByte) {
 			'd' => if (optKeyword(p, "def") != null) {
-				return PUBLIC_DEF.parseDef(p, prev, null);
+				return annotate(PUBLIC_DEF.parseDef(p, prev, null), prev, anns);
 			}
 			'c' => if ((kw = optKeyword(p, "case")) != null) {
 				if (desugar.params != null) p.errorAt(kw.rangeOf(4), "data type declared with parameters cannot have cases");
@@ -398,6 +568,8 @@ component Parser {
 					var decl = desugar.synthesizeVariantCaseMember(uid, null, members);
 					decl.repHints = repHints;
 					decl.decl.repHints = repHints;
+					decl.annotations = anns;
+					decl.decl.annotations = anns;
 					return List.new(decl, prev);
 				}
 				var id = parseIdentVoid(p);
@@ -409,6 +581,8 @@ component Parser {
 				var decl = desugar.synthesizeVariantCaseMember(id, params, members);
 				decl.repHints = repHints;
 				decl.decl.repHints = repHints;
+				decl.annotations = anns;
+				decl.decl.annotations = anns;
 				return List.new(decl, prev);
 			}
 		}
@@ -461,7 +635,7 @@ component Parser {
 		file.exports.put(ExportDecl.new(token, name, synthetic, expr));
 		return true;
 	}
-	def parseEnum(p: ParserState, file: VstFile, isPrivate: bool) -> bool {
+	def parseEnum(p: ParserState, file: VstFile, isPrivate: bool, anns: VstList<VstAnnotation>) -> bool {
 		var id = parseIdentVoid(p);
 		var params = parseOptionalParams(p, parseEnumParam);
 		// Synthesize "tag" and "name" members
@@ -481,17 +655,23 @@ component Parser {
 			list = List.new(c, list);
 		}
 		var decl = VstEnum.new(isPrivate, id.name, params, cases.extract(), list);
+		decl.annotations = anns;
 		file.enums.put(decl);
 		return true;
 	}
 	def parseEnumCase(p: ParserState, tag: int) -> VstEnumCase {
+		var anns = if(p.enableAnnotations, parseAnnotations(p));
 		var id = parseIdentVoid(p);
 		var args = if(p.curByte == '(', parseList(0, p, '(', COMMA, ')', parseExpr));
 		p.opt1(',');
-		if (id.name.image.length > 0) return VstEnumCase.new(tag, id.name, args);
+		if (id.name.image.length > 0) {
+			var c = VstEnumCase.new(tag, id.name, args);
+			c.annotations = anns;
+			return c;
+		}
 		return null;
 	}
-	def parseLayout(p: ParserState, file: VstFile) -> bool {
+	def parseLayout(p: ParserState, file: VstFile, anns: VstList<VstAnnotation>) -> bool {
 		var id = parseIdentVoid(p).name;
 		var repHints = parseRepHints(p);
 		p.req1('{');
@@ -506,6 +686,7 @@ component Parser {
 		p.req1(';');
 		p.req1('}');
 		var decl = VstLayout.new(size, id, null, Lists.reverse(list), repHints);
+		decl.annotations = anns;
 		file.layouts.put(decl);
 		return true;
 	}
@@ -531,6 +712,7 @@ component Parser {
 		return Lists.reverse(list);
 	}
 	def parseMember(p: ParserState, prev: List<VstMember>, allowImportName: bool) -> List<VstMember> {
+		var anns = if(p.enableAnnotations, parseAnnotations(p));
 		var isPrivate = optKeyword(p, "private") != null;
 		var importName = if(allowImportName, parseOptString(p));
 		match (p.curByte) {
@@ -541,19 +723,26 @@ component Parser {
 					parser = PUBLIC_DEFVAR;
 				}
 				var d = parser.parseDef(p, prev, importName);
-				return d;
+				return annotate(d, prev, anns);
 			}
 			'n' => {
 				var start = optKeyword(p, "new");
-				if (start != null) return List.new(parseNew(p, isPrivate, start), prev);
+				if (start != null) return annotate(List.new(parseNew(p, isPrivate, start), prev), prev, anns);
 			}
 			'v' => if (optKeyword(p, "var") != null) {
 				var parser = if(isPrivate, PRIVATE_VAR, PUBLIC_VAR);
-				return parser.parseVar(p, prev);
+				return annotate(parser.parseVar(p, prev), prev, anns);
 			}
 		}
 		p.error("invalid start of member declaration");
 		return null;
+	}
+	// Attach {anns} to every member added to {list} since {prev}. A single declaration
+	// such as "def a, b, c;" produces several members, and all of them are annotated.
+	def annotate(list: List<VstMember>, prev: List<VstMember>, anns: VstList<VstAnnotation>) -> List<VstMember> {
+		if (anns == null) return list;
+		for (l = list; l != null && l != prev; l = l.tail) l.head.annotations = anns;
+		return list;
 	}
 	def parseNew(p: ParserState, isPrivate: bool, start: FilePoint) -> VstNew {
 		var params = parseMethodParams(p);
@@ -629,6 +818,7 @@ component Parser {
 	def parseEnumParam = parseParamCommon(_, false, true, true);
 	def parseVariantCaseParam = parseEnumParam;
 	def parseTypeRef(p: ParserState) -> TypeRef {
+		var anns = if(p.enableAnnotations, parseAnnotations(p));
 		var tref: TypeRef;
 		if (p.curByte == '(') {
 			var list = parseList(0, p, '(', COMMA, ')', parseTypeRef);
@@ -648,6 +838,9 @@ component Parser {
 			tref = FuncTypeRef.new(tref, rtype);
 			arrow = p.optN("->");
 		}
+		// Attached after the arrow loop, so "@atomic int -> int" annotates the whole
+		// function type; write "(@atomic int) -> int" to annotate only the argument.
+		if (anns != null) tref.annotations = anns;
 		return tref;
 	}
 	def parseMemoryTypeRef(p: ParserState) -> MemoryTypeRef {
@@ -661,10 +854,14 @@ component Parser {
 		return MemoryTypeRef.new(tname, repeat);
 	}
 	def parseTypeParam(p: ParserState) -> TypeParamType {
+		var anns = if(p.enableAnnotations, parseAnnotations(p));
 		var id = parseIdentVoid(p).name;
-		return TypeUtil.newTypeParam(id, p.typeCache);
+		var tp = TypeUtil.newTypeParam(id, p.typeCache);
+		tp.annotations = anns;
+		return tp;
 	}
 	def parseStmt(p: ParserState) -> Stmt {
+		if (p.curByte == '@' && p.enableAnnotations) return parseAnnotatedStmt(p);
 		match (p.curByte) {
 			'{' => return parseBlockStmt(p);
 			';' => return parseEmptyStmt(p);
@@ -685,6 +882,20 @@ component Parser {
 			'f' => return parseForStmt(p);
 		}
 		return parseExprStmt(p);
+	}
+	// Only the Block target is supported in statement position. Anything else gets a
+	// diagnostic that names the target rather than a generic parse error.
+	def parseAnnotatedStmt(p: ParserState) -> Stmt {
+		var start = p.point();
+		var anns = parseAnnotations(p);
+		if (anns == null) return parseExprStmt(p);
+		if (p.curByte != '{') {
+			p.errorAt(p.end(start), "annotations in statement position are only supported on a block");
+			return parseStmt(p);
+		}
+		var block = parseBlockStmt(p);
+		block.annotations = anns;
+		return block;
 	}
 	def parseBlockStmt(p: ParserState) -> BlockStmt {
 		return BlockStmt.new(parseList(0, p, '{', NONE, '}', parseStmt));
@@ -946,6 +1157,13 @@ component Parser {
 	}
 	def parseTerm(p: ParserState) -> Expr {
 		var ch = p.curByte;
+		if (ch == '@' && p.enableAnnotations) {
+			// Annotations prefixing a term: "@atomic Vector<int>.new()". The annotation
+			// attaches to the type use; the verifier decides what that means.
+			var anns = parseAnnotations(p);
+			if (anns == null) return null;
+			return AnnotatedExpr.new(anns, parseTerm(p));
+		}
 		if (ch == 'i') {
 			var start = optKeyword(p, "if");
 			if (start != null) {
@@ -1204,6 +1422,15 @@ component Parser {
 			var end = p.plus(0, Char.isDecimal);
 			var token = p.token(end - p.curPos);
 			return VarExpr.new(expr, pos, VstIdent<TypeRef>.new(token, 0, null));
+		}
+		if (ch == '@' && p.enableAnnotations) {
+			// expr.@ann -- an annotation query. The '@' is kept in the token image, the
+			// way the operator arms above keep theirs; identifiers cannot contain '@',
+			// so this can never collide with a real member name.
+			var q = p.star(1, Char.isIdentMiddle);
+			if (q > p.curPos + 1) return VarExpr.new(expr, pos, VstIdent<TypeRef>.new(p.token(q - p.curPos), 0, null));
+			p.error("annotation name expected");
+			return expr;
 		}
 		if (ch == '~') {
 			// expr.~
