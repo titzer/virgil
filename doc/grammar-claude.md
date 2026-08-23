@@ -13,7 +13,12 @@ declarator lists such as `var x = 1, y = 2;`, which still require a `;`.
 ```
 File ::= ToplevelDecl*
 
-ToplevelDecl ::=
+ToplevelDecl ::= Annotation* ToplevelDeclBody      // see Annotations, below
+               | FileAnnotation
+               | AnnotationTypeDecl
+               | AnnotationAliasDecl
+
+ToplevelDeclBody ::=
     | ['private'] 'class'              ClassDecl
     | ['private'] 'component'          id Members
     | ['private'] 'thread' 'component' id Members
@@ -35,9 +40,9 @@ ToplevelDecl ::=
 ClassDecl   ::= id TypeParams? ClassParams? ('extends' TypeRef TupleExpr?)? RepHints? Members
 
 VariantDecl ::= DottedId TypeParams? VariantCaseParams? RepHints? (';' | '{' VariantCase* '}')
-VariantCase ::= 'case' id VariantCaseParams? RepHints? (';' | Members)   // named case
-              | 'case' '_' RepHints? (';' | DefaultCaseMembers)           // default case: optional, must be last, at most one
-              | 'def' DefDef
+VariantCase ::= Annotation* 'case' id VariantCaseParams? RepHints? (';' | Members)   // named case
+              | Annotation* 'case' '_' RepHints? (';' | DefaultCaseMembers)           // default case: optional, must be last, at most one
+              | Annotation* 'def' DefDef
 
 DefaultCaseMembers ::= '{' (['private'] 'def' DefDef)* '}'               // only methods allowed (no 'var' or 'new')
 
@@ -81,7 +86,7 @@ In match patterns, unqualified subtype names (`Bar =>` or `b: Bar =>`) automatic
 ```
 
 EnumDecl    ::= id EnumParams? '{' EnumCase* '}'
-EnumCase    ::= id ['(' Expr,* ')'] ','?
+EnumCase    ::= Annotation* id ['(' Expr,* ')'] ','?
 
 PackingDecl ::= id '(' PackingParam,* ')' ':' int '=' PackingExpr ';'
 PackingParam ::= id ':' int
@@ -103,7 +108,7 @@ ExportDecl  ::= [string] ('def' DefDef | id ['=' DottedVarExpr] ';')
 
 ```
 Members ::= '{' Member* '}'
-Member  ::= ['private'] [string]
+Member  ::= Annotation* ['private'] [string]
             ( 'def' ['var'] DefDef
             | 'new'         NewDef
             | 'var'         VarDef )
@@ -128,13 +133,15 @@ ReturnTypeAndBody ::=
 ## Types
 
 ```
-TypeRef       ::= '(' TypeRef,* ')'              // tuple type
-                | id ('.' id)* ('->' TypeRef)*   // named type / function type
+TypeRef       ::= Annotation*                    // annotation binds to the whole type,
+                                                 //   including any '->' suffixes
+                  ( '(' TypeRef,* ')'            // tuple type
+                  | id ('.' id)* ) ('->' TypeRef)*   // named type / function type
 
 MemoryTypeRef ::= id ('[' int ']')?
 
 TypeParams    ::= '<' TypeParam,+ '>'
-TypeParam     ::= id
+TypeParam     ::= Annotation* id
 
 ClassParams        ::= '(' ParamDecl,* ')'       // class constructor params (typed, def read-only)
 MethodParams       ::= '(' ParamDecl,* ')'       // method params (optionally typed)
@@ -149,7 +156,8 @@ ParamDecl ::= ['var'] id [':' TypeRef]
 ## Statements
 
 ```
-Stmt ::= BlockStmt
+Stmt ::= Annotation* BlockStmt         // Block target; annotations only before a block
+       | BlockStmt
        | ';'
        | 'if'       '(' Expr ')' Stmt ('else' Stmt)?
        | 'while'    '(' Expr ')' Stmt
@@ -218,13 +226,15 @@ Suffix  ::= '.' MemberRef                      // field / method access
           | '--'                               // postfix decrement
 
 MemberRef ::= id ['<' TypeRef,* '>']           // named member
+            | '@' id                           // annotation query (see Annotations)
             | '!' | '?'                        // cast / option operators
             | BinOp                            // operator member (e.g. .+)
             | decimal                          // tuple field by index (e.g. .0)
             | '~'                              // complement member
             | '[]' | '[]='                     // index operator members
 
-Term ::= 'if'  '(' Expr (',' Expr)+ ')'        // ternary if-expression
+Term ::= Annotation+ Term                       // TypeUse target in expression position
+       | 'if'  '(' Expr (',' Expr)+ ')'        // ternary if-expression
        | 'fun' id? Params ReturnTypeAndBody     // function expression (unstable)
        | id ['<' TypeRef,* '>']                // variable reference
        | Number                                // integer, float, hex, binary
@@ -255,6 +265,52 @@ BinOp ::=
 
 ---
 
+## Annotations
+
+**Status: proposed, not implemented.** Full rationale, ambiguity analysis, and worked
+examples are in `doc/annotations-syntax.md`. Gated behind `-lang:annotations`.
+
+```
+Annotation     ::= '@' id AnnotationArgs?       // '@' glued to id: no space, no comment
+AnnotationArgs ::= '(' AnnotationArg,* ')'      // '(' glued to id
+AnnotationArg  ::= id '=' AnnValue              // keyword form
+                 | AnnValue                     // positional form
+
+AnnValue       ::= AnnPrimary Suffix*           // Suffix as in Expressions, above
+AnnPrimary     ::= Annotation                   // @atomic, @outer, @this, ...
+                 | Expr
+
+AnnotationTypeDecl  ::= Annotation* ['private'] '@type' id AnnFields? (';' | AnnBody)
+AnnFields           ::= '(' AnnField,* ')'
+AnnField            ::= Annotation* id ':' TypeRef ('=' Expr)?
+AnnBody             ::= '{' (['private'] 'def' DefDef)* '}'    // methods only
+
+AnnotationAliasDecl ::= Annotation* ['private'] '@def' id '=' Annotation,+ ';'
+
+FileAnnotation      ::= '@file' '(' Annotation,* ')' ';'       // top level only
+```
+
+Rules:
+
+- `@` is glued to the name. `@ deprecated` and `@/*x*/deprecated` are errors.
+- Annotation names are a **separate namespace** from types and values, use the ordinary
+  `id` rule (no `-` or `:`, unlike hint labels), and take no type arguments.
+- `@` + a **keyword** is a declaration (`@type`, `@def`); `@` + an **identifier** is a use.
+- Exactly two names are reserved: `@file` and `@apply` (splice a computed annotation).
+- Annotations precede all existing modifiers, including `private`.
+- **The first `(` after an annotation name is arguments only when glued to it.**
+  `@ann(a, b)` is two arguments; `@ann (a, b)` applies `@ann` to the tuple type `(a, b)`.
+  A *second* `(` always begins the annotated type or expression, spaced or not.
+- `.@name` reaches into the annotation namespace; plain `.name` does not.
+  `T.@ann` is the annotation, `T.@ann.field` one of its fields, `@ann.?(T)` a presence test.
+- Targets: File, AnnotationType, Class, Component, Variant, Enum, VariantCase, EnumCase,
+  Field, Method, Parameter (type parameter), TypeUse, Block. Formal, Actual, Local,
+  Statement, and Expression are not supported.
+- A name may be **overloaded by target**: several `@type` / `@def` declarations may share a
+  name provided their target sets are disjoint. Every position above determines exactly one
+  target kind, so a use resolves by position. `@file` and `@apply` are not overloadable.
+- An alias binds a list, and is legal where every annotation in its expansion is.
+
 ## Representation Hints
 
 Hints are attached to class, variant, enum, layout, and method declarations with `#`.
@@ -279,6 +335,8 @@ HintArgs ::= '<' TypeRef,* '>'          // type hint:  #label<T>
 id          ::= IdentStart IdentMiddle*
 IdentStart  ::= [a-zA-Z]               // '_' is NOT an ident-start; it is a standalone keyword token
 IdentMiddle ::= [a-zA-Z0-9_]
+
+AnnName     ::= '@' id                 // proposed; '@' glued to id, no whitespace
 
 DottedId    ::= (id TypeArgs? '.')* id TypeParams?   // no whitespace around '.'; qualifier parts may carry type args
 
