@@ -1,0 +1,165 @@
+// Copyright 2026 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Binds an annotation's arguments to its declaration's fields and type-checks them.
+//
+// Binding order, per doc/annotations-syntax.md section 3.4:
+//   1. keyword arguments, to the field each names
+//   2. positional arguments, left to right, to the fields not yet bound
+//   3. remaining fields from their initializers; a field marked @required with no value
+//      is an error, and one merely absent takes the default value of its type
+//
+// This must run before target checking, not after as doc/annotations-verifier.md section 10
+// originally had it: deciding whether a use is legal means evaluating "@target"'s argument,
+// which first has to be bound and type-checked like any other.
+//
+// See doc/annotations-verifier.md section 6.
+class AnnotationBinder(ERROR: ErrorGen, prog: Program, env: AnnotationEnv) {
+	private var tc: TypeChecker;
+	private def varEnv = VarEnvironment.new();
+
+	def bindProgram() {
+		var vst = prog.vst;
+		for (i < vst.annotationDecls.length) {
+			var d = vst.annotationDecls[i];
+			bindList(d.annotations);
+			if (d.fields != null) {
+				for (l = d.fields.list; l != null; l = l.tail) bindList(l.head.annotations);
+			}
+		}
+		for (i < vst.annotationAliases.length) {
+			var a = vst.annotationAliases[i];
+			bindList(a.annotations);
+			bindList(a.expansion);
+		}
+		for (i < vst.components.length) bindCompound(vst.components[i]);
+		for (i < vst.classes.length) bindCompound(vst.classes[i]);
+		for (i < vst.enums.length) bindCompound(vst.enums[i]);
+		for (f in vst.files) {
+			if (f == null) continue;
+			for (i < f.annotations.length) bind(f.annotations[i]);
+		}
+	}
+	private def bindCompound(c: VstCompound) {
+		bindList(c.annotations);
+		for (t = c.typeParams; t != null; t = t.tail) bindList(t.head.annotations);
+		for (l = c.members; l != null; l = l.tail) bindList(l.head.annotations);
+	}
+	private def bindList(list: VstList<VstAnnotation>) {
+		if (list == null) return;
+		for (l = list.list; l != null; l = l.tail) bind(l.head);
+	}
+	def bind(a: VstAnnotation) {
+		if (a.boundArgs != null) return; // already bound
+		var d: VstAnnotationDecl;
+		match (a.binding) {
+			Decl(x) => d = x;
+			Alias(x) => {
+				// An alias is a macro: it supplies its own arguments, so a use may not
+				// add more. Its expansion is bound where the alias is declared.
+				if (a.args != null && a.args.list != null) {
+					err(a.name).set("AnnotationError",
+						Strings.format1("\"@%s\" is an alias and takes no arguments", a.name.image));
+				}
+				a.boundArgs = [];
+				return;
+			}
+			_ => return; // unresolved; already reported
+		}
+		var fields = if(d.fields != null, d.fields.asArray(), Array<VarDecl>.new(0));
+		var bound = Array<Expr>.new(fields.length);
+		var fromKeyword = Array<bool>.new(fields.length);
+
+		// 1. keyword arguments
+		if (a.args != null) {
+			for (l = a.args.list; l != null; l = l.tail) {
+				var arg = l.head;
+				if (arg.name == null) continue;
+				var idx = indexOf(fields, arg.name.image);
+				if (idx < 0) {
+					err(arg.name).set("AnnotationError",
+						Strings.format2("\"@%s\" has no field named \"%s\"", a.name.image, arg.name.image));
+					continue;
+				}
+				if (bound[idx] != null) {
+					err(arg.name).set("AnnotationError",
+						Strings.format1("field \"%s\" is given more than once", arg.name.image));
+					continue;
+				}
+				bound[idx] = arg.value;
+				fromKeyword[idx] = true;
+			}
+		}
+		// 2. positional arguments fill the fields not taken by keyword
+		if (a.args != null) {
+			var next = 0;
+			for (l = a.args.list; l != null; l = l.tail) {
+				var arg = l.head;
+				if (arg.name != null) continue;
+				while (next < fields.length && bound[next] != null) next++;
+				if (next >= fields.length) {
+					err(a.name).set("AnnotationError",
+						Strings.format2("\"@%s\" takes %d argument(s)", a.name.image, fields.length));
+					break;
+				}
+				bound[next] = arg.value;
+				next++;
+			}
+		}
+		// 3. defaults, and @required
+		for (i < fields.length) {
+			if (bound[i] != null) continue;
+			var f = fields[i];
+			if (f.init != null) {
+				bound[i] = f.init;
+			} else if (isRequired(f)) {
+				err(a.name).set("AnnotationError",
+					Strings.format2("\"@%s\" requires a value for field \"%s\"", a.name.image, f.name()));
+			}
+			// otherwise the field takes the default value of its type
+		}
+		a.boundArgs = bound;
+		typeCheck(a, d, fields, bound, fromKeyword);
+	}
+	// Type-check each supplied value against its field's declared type. The synthesized
+	// variant supplies the scope: its verifier gives the declaring file's private scope
+	// plus the global one. A use in another file referring to a name private to THAT file
+	// would not resolve; no use needs that yet.
+	private def typeCheck(a: VstAnnotation, d: VstAnnotationDecl, fields: Array<VarDecl>,
+			      bound: Array<Expr>, fromKeyword: Array<bool>) {
+		var host = d.declClass;
+		if (host == null || host.verifier == null || host.params == null) return;
+		// Field types come from the synthesized variant's parameters, not from the
+		// VstAnnotationDecl's own VarDecls: desugaring builds fresh ParamDecls (with the
+		// "Annotation" type reference rewritten), and it is those the verifier resolves,
+		// so only they have a vtype. The two lists are parallel by construction.
+		var params = host.params.asArray();
+		if (tc == null || tc.file != host.verifier.file) tc = TypeChecker.new(ERROR, host.verifier.file);
+		tc.enterCompound(host, false, varEnv);
+		for (i < fields.length) {
+			var e = bound[i];
+			if (e == null || i >= params.length) continue;
+			var vtype = params[i].vtype;
+			if (vtype == null) continue; // field type failed to resolve; already reported
+			tc.typeCheckExpr(e, vtype, "annotation argument");
+		}
+	}
+	private def indexOf(fields: Array<VarDecl>, name: string) -> int {
+		for (i < fields.length) {
+			if (Strings.equal(fields[i].name(), name)) return i;
+		}
+		return -1;
+	}
+	private def isRequired(f: VarDecl) -> bool {
+		if (f.annotations == null) return false;
+		for (l = f.annotations.list; l != null; l = l.tail) {
+			if (Strings.equal(l.head.name.image, "required")) return true;
+		}
+		return false;
+	}
+	private def err(token: Token) -> SourceCodeError {
+		var obj = SourceCodeError.new(token.range(), null);
+		ERROR.addErrorObj(obj);
+		return obj;
+	}
+}
