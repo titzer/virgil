@@ -1,0 +1,157 @@
+// Copyright 2026 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// What a use of "@name" resolves to.
+type AnnotationBinding {
+	case Decl(d: VstAnnotationDecl);	// declared with "@type"
+	case Alias(a: VstAnnotationAlias);	// declared with "@def"
+
+	def token() -> Token {
+		match (this) {
+			Decl(d) => return d.token;
+			Alias(a) => return a.token;
+		}
+	}
+	def isPrivate() -> bool {
+		match (this) {
+			Decl(d) => return d.isPrivate;
+			Alias(a) => return a.isPrivate;
+		}
+	}
+	// The declaring file, whether public or private.
+	def file() -> VstFile {
+		match (this) {
+			Decl(d) => return d.file;
+			Alias(a) => return a.file;
+		}
+	}
+	// The file a private declaration is scoped to; null for a public one.
+	def scope() -> VstFile {
+		match (this) {
+			Decl(d) => return if(d.isPrivate, d.file);
+			Alias(a) => return if(a.isPrivate, a.file);
+		}
+	}
+	// Whether this declaration constrains where it may be attached. Without a @target it
+	// is legal at any supported target, so it overlaps with everything of the same name.
+	def hasTarget() -> bool {
+		var anns: VstList<VstAnnotation>;
+		match (this) {
+			Decl(d) => anns = d.annotations;
+			Alias(a) => anns = a.annotations;
+		}
+		if (anns == null) return false;
+		for (l = anns.list; l != null; l = l.tail) {
+			if (Strings.equal(l.head.name.image, "target")) return true;
+		}
+		return false;
+	}
+}
+
+// The program-wide namespace of annotation names.
+//
+// Annotation names live in a namespace of their own, separate from types and values, so
+// "@foo" and a class named "foo" never collide. A name may be declared more than once,
+// for disjoint sets of targets, so each name maps to a list rather than a single binding;
+// "@type" and "@def" share one overload set per name.
+//
+// "private" scopes a declaration to its file, exactly as it does for a class.
+//
+// See doc/annotations-verifier.md section 3.
+class AnnotationEnv {
+	def map = Strings.newMap<List<AnnotationBinding>>();
+
+	// All bindings for a name that are visible from {file}, most recently declared first.
+	def lookup(name: string, file: VstFile) -> List<AnnotationBinding> {
+		var result: List<AnnotationBinding>;
+		for (l = map[name]; l != null; l = l.tail) {
+			var scope = l.head.scope();
+			if (scope == null || scope == file) result = List.new(l.head, result);
+		}
+		return result;
+	}
+	def add(name: string, b: AnnotationBinding) {
+		map[name] = List.new(b, map[name]);
+	}
+}
+
+// Builds the annotation namespace and reports what can be checked without knowing target
+// sets. Overload disjointness needs @target evaluated, so it is deferred; see checkOverlap.
+class AnnotationEnvBuilder(ERROR: ErrorGen, prog: Program) {
+	def env = AnnotationEnv.new();
+
+	def build() -> AnnotationEnv {
+		var vst = prog.vst;
+		for (i < vst.annotationDecls.length) declare(AnnotationBinding.Decl(vst.annotationDecls[i]));
+		for (i < vst.annotationAliases.length) declare(AnnotationBinding.Alias(vst.annotationAliases[i]));
+		checkAliases();
+		return env;
+	}
+	private def declare(b: AnnotationBinding) {
+		var token = b.token(), name = token.image;
+		// @file and @apply are recognized by the grammar itself (doc/annotations-syntax.md
+		// sections 5 and 3.3), so the compiler knows them structurally and a declaration
+		// would be misleading rather than merely redundant.
+		if (Strings.equal(name, "file") || Strings.equal(name, "apply")) {
+			err(b.file(), token).set("AnnotationDeclError",
+				Strings.format1("\"@%s\" is reserved and cannot be declared", name));
+			return;
+		}
+		checkOverlap(name, b, token);
+		env.add(name, b);
+	}
+	// Two declarations of one name are legal only for disjoint target sets. Deciding that
+	// in general needs @target's argument evaluated, which is a later step, but the case
+	// where either side omits @target is decidable now: it is then legal everywhere and so
+	// necessarily overlaps.
+	private def checkOverlap(name: string, b: AnnotationBinding, token: Token) {
+		for (l = env.map[name]; l != null; l = l.tail) {
+			var prev = l.head;
+			if (prev.scope() != null && b.scope() != null && prev.scope() != b.scope()) {
+				continue; // private to different files; cannot be confused
+			}
+			if (!prev.hasTarget() || !b.hasTarget()) {
+				// Reported at the second declaration, so the diagnostic points at the
+				// mistake rather than at whichever happened to be seen first.
+				err(b.file(), token).set("AnnotationDeclError",
+					Strings.format1("\"@%s\" is already declared without a distinct @target", name));
+				return;
+			}
+		}
+	}
+	// An alias expands to other annotations, so a cycle through aliases would not
+	// terminate. Detect it rather than recursing.
+	private def checkAliases() {
+		var vst = prog.vst;
+		for (i < vst.annotationAliases.length) {
+			var a = vst.annotationAliases[i];
+			if (reaches(a, a, 0)) {
+				err(a.file, a.token).set("AnnotationDeclError",
+					Strings.format1("\"@%s\" is defined in terms of itself", a.name()));
+			}
+		}
+	}
+	private def reaches(from: VstAnnotationAlias, target: VstAnnotationAlias, depth: int) -> bool {
+		if (depth > 100) return true; // pathological nesting; treat as a cycle
+		if (from.expansion == null) return false;
+		for (l = from.expansion.list; l != null; l = l.tail) {
+			for (b = env.lookup(l.head.name.image, from.file); b != null; b = b.tail) {
+				match (b.head) {
+					Alias(next) => {
+						if (next == target) return true;
+						if (reaches(next, target, depth + 1)) return true;
+					}
+					_ => ;
+				}
+			}
+		}
+		return false;
+	}
+	private def err(file: VstFile, token: Token) -> SourceCodeError {
+		var range = token.range();
+		var line = if(file != null, file.extractLine(range.beginLine));
+		var obj = SourceCodeError.new(range, line);
+		ERROR.addErrorObj(obj);
+		return obj;
+	}
+}
