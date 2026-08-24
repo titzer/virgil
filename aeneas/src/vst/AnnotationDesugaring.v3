@@ -1,0 +1,142 @@
+// Copyright 2026 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Desugars annotation type declarations into open variant types.
+//
+// Each "@type" declaration becomes a synthesized variant extending a synthesized open
+// root "Annotation", which is created once per program. Taking two of the declarations in
+// lib/annotations/Standard.v3:
+//
+//	@type retention(value: Retention);   ->   type @retention(value: Retention) extends @Annotation { }
+//	@type repeatable;                    ->   type @repeatable() extends @Annotation { }
+//
+// with the root itself synthesized as:
+//
+//	type @Annotation { case _; }
+//
+// This is what doc/ideas/Annotations.txt sketches (as "A@"), in the language's own
+// open-variant syntax. Reusing variants means annotation instances are ordinary variant
+// values, so Val, type checking, subtyping, and Eval all work with no new machinery.
+//
+// Every synthesized name carries a '@', which cannot appear in an identifier, so a user
+// can neither declare nor reference one. Declaring "@type required" must not create a
+// user-visible type named "required", and the root must not occupy the plain, attractive
+// identifier "Annotation": a user's own "class Annotation" would then collide, and the
+// diagnostic would point at this synthetic file, which the user never wrote.
+//
+// So that lib/annotations/Standard.v3 can still say what it means, a reference to the bare
+// name "Annotation" inside an ANNOTATION FIELD TYPE is rewritten here to "@Annotation":
+//
+//	@type implicit(value: Annotation);   ->   type @implicit(value: @Annotation) extends @Annotation { }
+//
+// The rewrite applies only to annotation field types, so "Annotation" means nothing special
+// anywhere else and a user may define their own. Where a user has done so, an annotation
+// field written "value: Annotation" still means the root, not their class.
+//
+// Each name is used as the token image AND as fullName, which must agree: TypeEnv.add keys
+// on typeCon.name, which comes from fullName (V3Class.v3:10), while the duplicate check in
+// bindTypeCon (Verifier.v3:727) looks up the token image.
+//
+// Note this runs after parsing, so it does not go through the parser's -lang:open-types
+// gates (Parser.v3:322 and :555), which are purely syntactic; the verifier's own checks
+// are ungated. Annotations therefore do not require -lang:open-types.
+//
+// See doc/annotations-verifier.md section 2.
+component AnnotationDesugaring {
+	def ROOT_NAME = "@Annotation";
+	def ROOT_ALIAS = "Annotation";	// how an annotation field type spells the root
+	def SYNTHETIC_FILE = "<annotations>";
+
+	// Desugar every annotation type declared in {files}, appending a synthetic file that
+	// holds the root. Does nothing if no annotation types are declared, so enabling the
+	// flag without declaring anything adds no types to the program.
+	def desugar(files: Vector<VstFile>) {
+		var any = false;
+		for (i < files.length) {
+			if (files[i].annotationDecls.length > 0) { any = true; break; }
+		}
+		if (!any) return;
+
+		var count = files.length; // before appending the root file
+		var rootFile = VstFile.new(SYNTHETIC_FILE, []);
+		synthesizeRoot(rootFile);
+		files.put(rootFile);
+
+		for (i < count) {
+			var file = files[i];
+			for (j < file.annotationDecls.length) synthesizeType(file, file.annotationDecls[j]);
+		}
+	}
+	// Build "type @Annotation { case _; }".
+	private def synthesizeRoot(file: VstFile) {
+		var token = Token.new(file.fileName, ROOT_NAME, 1, 1);
+		var id = VstIdent<TypeParamType>.new(token, 0, null);
+		var desugar = VariantDesugaring.new(false, id, null, null);
+		var members = desugar.synthesizeMembers(file.fileName, 1, 1);
+		// The default case is what makes the root extensible; the verifier rejects
+		// "extends" against a variant without one (Verifier.v3:655).
+		var uToken = Token.new(file.fileName, "_", 1, 1);
+		var uId = VstIdent<void>.new(uToken, 0, null);
+		members = List.new(desugar.synthesizeVariantCaseMember(uId, null, null), members);
+		put(file, desugar.synthesizeTopLevelClass(Lists.reverse(members)));
+	}
+	// Build "type @<name>(fields) extends @Annotation { }" for one annotation declaration.
+	private def synthesizeType(file: VstFile, d: VstAnnotationDecl) {
+		var line = d.token.beginLine, col = d.token.beginColumn, fileName = d.token.fileName;
+		var token = Token.new(fileName, typeName(d.name()), line, col);
+		var id = VstIdent<TypeParamType>.new(token, 0, null);
+		var parent = NamedTypeRef.new(null, Token.new(fileName, ROOT_NAME, line, col), null);
+		var desugar = VariantDesugaring.new(d.isPrivate, id, params(d), parent);
+		var decl = desugar.synthesizeTopLevelClass(d.members);
+		d.declClass = decl;
+		put(file, decl);
+	}
+	// The variant's parameters are the annotation's fields. Default-value expressions stay
+	// on the VstAnnotationDecl's VarDecls: defaults are applied when binding arguments, so
+	// the variant only needs names and types.
+	private def params(d: VstAnnotationDecl) -> VstList<ParamDecl> {
+		var list: List<ParamDecl>;
+		if (d.fields != null) {
+			for (l = d.fields.list; l != null; l = l.tail) {
+				var f = l.head;
+				var pd = ParamDecl.new(f.token, rewriteRoot(f.tref));
+				pd.isReadOnly = true;
+				list = List.new(pd, list);
+			}
+		}
+		// Non-null even when empty: a variant declared without a parameter list is a
+		// constructor function rather than a value, so "@type repeatable;" must desugar
+		// to "type @repeatable() extends @Annotation { }" and be built as "@repeatable()".
+		var src = if(d.fields != null, d.fields.range(), d.token.range());
+		return VstList<ParamDecl>.new(src, Lists.reverse(list));
+	}
+	// Rewrite a bare "Annotation" in an annotation field's type into the root's real name.
+	// Rebuilds rather than mutates, since a NamedTypeRef's name token is immutable. A
+	// qualified reference such as "Foo.Annotation" is left alone: only a bare name means
+	// the root.
+	private def rewriteRoot(tref: TypeRef) -> TypeRef {
+		match (tref) {
+			x: NamedTypeRef => {
+				var nested = if(x.nested != null, x.nested.map(rewriteRoot));
+				var name = x.name;
+				if (x.left == null && Strings.equal(name.image, ROOT_ALIAS)) {
+					name = Token.new(name.fileName, ROOT_NAME, name.beginLine, name.beginColumn);
+				}
+				return NamedTypeRef.new(x.left, name, nested);
+			}
+			x: TupleTypeRef => return TupleTypeRef.new(x.nested.map(rewriteRoot));
+			x: FuncTypeRef => return FuncTypeRef.new(rewriteRoot(x.paramType), rewriteRoot(x.returnType));
+			_ => return tref;
+		}
+	}
+	// Add a synthesized variant and lift its case classes, as parseVariant does.
+	private def put(file: VstFile, decl: VstClass) {
+		file.classes.put(decl);
+		for (c in decl.cases) {
+			if (c.decl != decl) file.classes.put(c.decl);
+		}
+	}
+	def typeName(name: string) -> string {
+		return Strings.builderOf("@").puts(name).toString();
+	}
+}
