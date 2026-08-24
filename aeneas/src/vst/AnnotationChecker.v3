@@ -1,0 +1,206 @@
+// Copyright 2026 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Checks each use of an annotation against its declaration's "@target", selects among
+// overloads, and verifies that declarations sharing a name have disjoint targets.
+//
+// This is the first thing that needs annotation VALUES rather than just types, so it
+// carries a narrow constant evaluator: enum constants, enum-set unions, and reads of a
+// component field whose initializer is itself constant. That is exactly what "@target"
+// admits -- "@target(TargetKind.Class)", "@target(A | B)", "@target(TargetKinds.Container)"
+// -- and no more. A general evaluator is stage 2c; this one rejects rather than guesses.
+//
+// Runs after AnnotationBinder, because "@target"'s own argument must be bound and
+// type-checked before it can be evaluated.
+//
+// See doc/annotations-verifier.md sections 4 and 7.
+class AnnotationChecker(ERROR: ErrorGen, prog: Program, env: AnnotationEnv,
+			resolver: AnnotationResolver, binder: AnnotationBinder) {
+	private var kindEnum: VstEnum;			// the TargetKind enum, if loaded
+	private var kindBit = Array<int>.new(0);	// AnnotationTarget tag -> bit, -1 if absent
+	private var supported: int;			// bits the parser actually accepts
+
+	def checkProgram() {
+		findTargetKind();
+		// Select overloads first: binding an argument needs to know which declaration.
+		for (i < resolver.uses.length) selectOverload(resolver.uses[i]);
+		if (kindEnum == null) return;	// no standard annotations; nothing to check against
+		checkDisjoint();
+		for (i < resolver.uses.length) checkTarget(resolver.uses[i]);
+	}
+	// Locate the TargetKind enum and map each of the compiler's own AnnotationTarget cases
+	// onto it BY NAME, so the two enums need not agree on order.
+	private def findTargetKind() {
+		for (i < prog.vst.enums.length) {
+			var e = prog.vst.enums[i];
+			if (Strings.equal(e.name(), "TargetKind")) { kindEnum = e; break; }
+		}
+		if (kindEnum == null) return;
+		kindBit = Array<int>.new(32);
+		for (i < kindBit.length) kindBit[i] = -1;
+		for (t in AnnotationTarget) {
+			var tag = findCase(t.name);
+			if (t.tag < kindBit.length) kindBit[t.tag] = tag;
+		}
+		// "Supported" is what the parser accepts; anything else can never be used.
+		for (t in AnnotationTarget) {
+			match (t) {
+				Formal, Actual, Local, Statement, Expression, Value => ;
+				_ => {
+					var b = kindBit[t.tag];
+					if (b >= 0 && b < 32) supported = supported | (1 << u5.!(b));
+				}
+			}
+		}
+	}
+	private def findCase(name: string) -> int {
+		for (c in kindEnum.cases) {
+			if (Strings.equal(c.name(), name)) return c.tag;
+		}
+		return -1;
+	}
+	// A name may be declared several times for disjoint targets. Pick the declaration whose
+	// "@target" admits the site this use sits at.
+	private def selectOverload(a: VstAnnotation) {
+		if (a.candidates == null) return;
+		var chosen: AnnotationBinding, count = 0;
+		for (l = a.candidates; l != null; l = l.tail) {
+			if (admits(l.head, a.target)) { chosen = l.head; count++; }
+		}
+		if (count == 1) {
+			a.binding = chosen;
+			a.candidates = null;
+			binder.bind(a);
+			return;
+		}
+		if (count == 0) {
+			err(a).set("AnnotationError", Strings.format2(
+				"no declaration of \"@%s\" applies to a %s", a.name.image, a.target.name));
+		} else {
+			err(a).set("AnnotationError", Strings.format2(
+				"\"@%s\" is declared more than once for a %s", a.name.image, a.target.name));
+		}
+		a.candidates = null;
+	}
+	private def checkTarget(a: VstAnnotation) {
+		if (a.target == AnnotationTarget.Value) return;	// a value is attached to nothing
+		match (a.binding) {
+			Decl(d) => {
+				if (a.candidates != null) return;	// already reported
+				if (!admits(a.binding, a.target)) {
+					err(a).set("AnnotationError", Strings.format2(
+						"\"@%s\" cannot be applied to a %s", a.name.image, a.target.name));
+				}
+			}
+			_ => ;	// unresolved, or an alias whose expansion is checked at its own use
+		}
+	}
+	// Whether {b} may be attached at {target}. A declaration with no "@target" is legal
+	// anywhere the parser accepts an annotation.
+	private def admits(b: AnnotationBinding, target: AnnotationTarget) -> bool {
+		if (target == AnnotationTarget.Value) return true;
+		var bits = targetBits(b);
+		if (bits < 0) return true;		// no @target, or not evaluable; already reported
+		var bit = bitOf(target);
+		if (bit < 0) return false;
+		return (bits & (1 << u5.!(bit))) != 0;
+	}
+	private def bitOf(target: AnnotationTarget) -> int {
+		if (target.tag >= kindBit.length) return -1;
+		return kindBit[target.tag];
+	}
+	// The evaluated "@target" set of a declaration, or -1 if it has none.
+	private def targetBits(b: AnnotationBinding) -> int {
+		var anns: VstList<VstAnnotation>;
+		match (b) {
+			Decl(d) => anns = d.annotations;
+			Alias(a) => anns = a.annotations;
+			_ => return -1;
+		}
+		if (anns == null) return -1;
+		for (l = anns.list; l != null; l = l.tail) {
+			var t = l.head;
+			if (!Strings.equal(t.name.image, "target")) continue;
+			if (t.boundArgs == null || t.boundArgs.length < 1) return -1;
+			var r = evalSet(t.boundArgs[0]);
+			if (!r.0) {
+				err(t).set("AnnotationError",
+					"@target requires a constant TargetKind set");
+				return -1;
+			}
+			return r.1;
+		}
+		return -1;
+	}
+	// The narrow evaluator. Returns (ok, bits).
+	private def evalSet(e: Expr) -> (bool, int) {
+		if (e == null) return (false, 0);
+		match (e) {
+			x: VarExpr => {
+				match (x.varbind) {
+					EnumConst(member) => {
+						// An enum promoted to a set contributes one bit; the type
+						// checker records the promotion in implicitType.
+						if (member.tag >= 32) return (false, 0);
+						if (EnumSetType.?(x.effectiveType())) return (true, 1 << u5.!(member.tag));
+						return (true, member.tag);
+					}
+					ComponentField(member) => return evalSet(member.init);
+					Const(val, vtype) => return (true, V3.unboxI32(val));
+					_ => return (false, 0);
+				}
+			}
+			x: BinOpExpr => {
+				if (x.op.infix != V3Infix.Or) return (false, 0);
+				var l = evalSet(x.left), r = evalSet(x.right);
+				if (!l.0 || !r.0) return (false, 0);
+				return (true, l.1 | r.1);
+			}
+			x: Literal => {
+				if (x.val == null) return (true, 0);
+				return (true, V3.unboxI32(x.val));
+			}
+			_ => return (false, 0);
+		}
+	}
+	// Two declarations of one name are legal only for disjoint targets. The namespace pass
+	// caught the case where either omits "@target"; with values available the rest can be
+	// decided too.
+	private def checkDisjoint() {
+		var seen = Strings.newMap<bool>();
+		for (i < prog.vst.annotationDecls.length) {
+			checkDisjointName(prog.vst.annotationDecls[i].name(), seen);
+		}
+		for (i < prog.vst.annotationAliases.length) {
+			checkDisjointName(prog.vst.annotationAliases[i].name(), seen);
+		}
+	}
+	private def checkDisjointName(name: string, seen: HashMap<string, bool>) {
+		if (seen[name]) return;
+		seen[name] = true;
+		var all = env.map[name];
+		if (all == null || all.tail == null) return;
+		for (l = all; l != null; l = l.tail) {
+			for (m = l.tail; m != null; m = m.tail) {
+				if (l.head.scope() != null && m.head.scope() != null && l.head.scope() != m.head.scope()) continue;
+				var a = targetBits(l.head), b = targetBits(m.head);
+				if (a < 0 || b < 0) continue;	// already reported by the namespace pass
+				if ((a & b) != 0) {
+					var tok = l.head.token();
+					var obj = SourceCodeError.new(tok.range(), null);
+					ERROR.addErrorObj(obj);
+					obj.set("AnnotationDeclError", Strings.format1(
+						"\"@%s\" is declared more than once with overlapping targets", name));
+					return;
+				}
+			}
+		}
+	}
+	private def err(a: VstAnnotation) -> SourceCodeError {
+		var range = a.name.range();
+		var line = if(a.file != null, a.file.extractLine(range.beginLine));
+		var obj = SourceCodeError.new(range, line);
+		ERROR.addErrorObj(obj);
+		return obj;
+	}
+}
