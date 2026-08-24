@@ -1,6 +1,13 @@
 # Virgil Annotations — Parser and AST Plan
 
-Status: **plan**. Nothing here is implemented.
+Status: **implemented** in `6fa363f16`. Kept as the record of why the parser is shaped the
+way it is; §10's handoff list is now carried out in `doc/annotations-verifier.md`.
+
+Two things changed during implementation. `VstAnnotation.decl` became `.binding` (plus
+`.target`, `.boundArgs`, `.values`, `.file` as later stages needed them), since a use may
+resolve to a `@def` alias as well as a `@type`. And annotation fields are `VarDecl` rather
+than `ParamDecl`: `ParamDecl`'s constructor hardcodes a null initializer, so it cannot carry
+a default value.
 
 Scope: stage 1 of the annotation facility — parse the syntax fixed in
 `doc/annotations-syntax.md`, build AST for it, print it, and test it. Annotations are

@@ -1,10 +1,17 @@
 # Virgil Annotations — Syntax Proposal
 
-Status: **proposal**. Nothing here is implemented. This document fixes the concrete syntax
-so that implementation can proceed without further design decisions. The semantics —
-target checking, implicit/derived annotations, type cloning — are sketched in
-`doc/ideas/Annotations.txt` and are deliberately out of scope here except where they
-constrain the grammar.
+Status: the syntax is **implemented and in use**. Parsing landed in stage 1
+(`doc/annotations-parser.md`); resolution, target checking, argument binding and constant
+evaluation landed in stage 2 (`doc/annotations-verifier.md`), which is where each of the
+constructs below is given meaning. Everything is behind `-lang:annotations`.
+
+The forms not yet given meaning are the ones §11 and `doc/annotations-verifier.md` §9 mark
+as stage 3: `@implicit` propagation, `@clones_type` and type cloning, retention, `@this` /
+`@outer`, and the program- and file-level command-line forms. They parse and resolve, but
+nothing acts on them.
+
+This document fixes the concrete syntax. The deeper semantics are sketched in
+`doc/ideas/Annotations.txt`.
 
 Notation follows `doc/grammar-claude.md`: `,*` is a comma-separated list, `?` is optional,
 `*` is zero or more, `+` is one or more.
@@ -683,12 +690,17 @@ Nothing is foreclosed. `@or` is only an annotation name, so reinstating it later
 no grammar change and breaks nothing — and the asymmetry favours waiting, since a form can
 always be added but rarely removed.
 
-**D. Still open: a root `Annotation` type.** Writing the standard annotations file (§12)
-turned up the one genuine gap in this design. `@implicit` and `@clones_type` both need a
-field that *holds an annotation*, and the language has no type for that. The design note
-sketches it as `A@`, the root of a compiler-generated hierarchy; it needs to become a real
-built-in type name, written `Annotation` provisionally in `lib/annotations/Standard.v3`.
-Nothing else in the proposal depends on it, and it is not needed until the verifier stage.
+**D. Resolved: the root `Annotation` type.** Writing the standard annotations file (§12)
+turned up the one genuine gap — `@implicit` and `@clones_type` both need a field that
+*holds an annotation*, and the language had no type for that. Settled by desugaring each
+`@type` into an open variant: annotation types are real types, and the root is one of them.
+See `doc/annotations-verifier.md` §2.
+
+Two consequences for this document. The root is named `@Annotation`, unforgeable like every
+other synthesized annotation type, so it cannot collide with a user's own declaration. And
+a bare `Annotation` written in an **annotation field type** is rewritten to it — which means
+that in that one position `Annotation` denotes the root **even where the user has defined
+their own type of that name**. Everywhere else the name means nothing special.
 
 **E. Chaining `.@` off an annotation is meaningful, and redundant.** See §3.2 — it reaches
 a meta-annotation of the annotation's *type*, so the direct form `@atomicity.@retention` is
@@ -771,4 +783,4 @@ value cannot gate whether syntax is readable.
   does not typecheck.** `Container` and `Code` are enum *sets*, not enum cases; it must be
   `TargetKinds.Container | TargetKinds.Code | TargetKind.Field`.
 - **`@implicit` and `@clones_type` need an annotation-valued field type**, which the
-  language lacks. See §11D — this is the one real gap the exercise found.
+  language lacked. Resolved by desugaring annotation types into open variants; see §11D.

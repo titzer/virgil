@@ -1,8 +1,9 @@
 # Virgil Annotations — Verifier Plan
 
-Status: **partly implemented**. Steps 2a.1 through 2a.3 are done; see §10 for what is
-built and what remains. Sections below describe the design as built where a step is
-complete, and as planned where it is not.
+Status: **stage 2 is complete**; see §10 for the steps, their commits, and the two
+ordering corrections made along the way. The sections below describe the design as built.
+Stage 3 — `@implicit` propagation, `@clones_type` and type cloning, retention, annotation
+methods, IR propagation — remains, and is scoped in §9.
 
 Scope: stage 2 — give the parsed annotations meaning. Desugar annotation declarations into
 real types, resolve each `@name` to its declaration, check it against the target it is
@@ -10,10 +11,11 @@ attached to, bind and type-check its arguments, and evaluate them to compile-tim
 Everything downstream — `@implicit` propagation, `@clones_type` and type cloning, retention,
 IR propagation — is stage 3 and is listed in §9.
 
-Stage 1 (`doc/annotations-parser.md`, commit `6fa363f16`) parses and stores. It resolves
-nothing, and `AnnotationExpr` / `AnnotatedExpr` currently report
-`"annotations are parsed but not yet verified"` if they reach the type checker. Stage 2
-replaces that with real behaviour.
+Stage 1 (`doc/annotations-parser.md`, commit `6fa363f16`) parses and stores; it resolves
+nothing. Its `AnnotationExpr` stub, which reported `"annotations are parsed but not yet
+verified"`, is gone: an annotation used as a value now has the type of its synthesized
+variant. `AnnotatedExpr` still reports, since annotations on a type use have no semantics
+until `@clones_type` (stage 3).
 
 Syntax and semantics settled so far are in `doc/annotations-syntax.md`; the standard
 annotations are drafted in `lib/annotations/`.
@@ -156,14 +158,17 @@ type AnnotationBinding {
 
 Built in `aeneas/src/vst/AnnotationEnv.v3`. `lookup` filters by file so a `private`
 declaration is visible only where it was declared, and returns the whole list: selecting
-among overloads needs the target kind and is deferred to 2a.5.
+among overloads needs the target kind, so the resolver records the candidates and
+`AnnotationChecker` selects once `@target` can be evaluated.
 
 Checks here:
 
 - Declarations sharing a name must have **disjoint** target sets; report at the second
-  declaration, not at a use. Only partly checked so far: deciding this in general needs
-  `@target` evaluated, but the case where either side *omits* `@target` is decidable
-  without it, since the annotation is then legal everywhere and necessarily overlaps.
+  declaration, not at a use. Checked in two places, because the two halves become
+  decidable at different times: the case where either side *omits* `@target` needs no
+  evaluation, since the annotation is then legal everywhere and necessarily overlaps, and
+  is caught here; the general case is caught by `AnnotationChecker` once `@target` can be
+  evaluated.
 - `@type` and `@def` share one overload set per name.
 - `@file` and `@apply` may not be declared.
 - A `@def` expansion resolves to other annotations; detect cycles rather than recursing.
@@ -203,11 +208,14 @@ the file's scope, and set `VstAnnotation.binding`. An undeclared name is reporte
 with more than one visible binding is reported rather than guessed at, since choosing needs
 `@target`.
 
-Still to do, once the standard file is loaded (2a.5): check the recorded target against the
-declaration's `@target` and report a use no overload covers with a message naming the kind
-sought, select among overloads, and enforce `@repeatable`. An annotation declared with no
-`@target` is legal anywhere in `TargetKinds.Supported`; one whose `@target` lies wholly
-outside `Supported` can never be used and should be reported at its declaration.
+`@repeatable` is enforced here too, since "attached twice at the same position" is one
+annotation list and whether a declaration is `@repeatable` is syntactic — neither needs a
+value.
+
+Checking the recorded target against the declaration's `@target`, and selecting among
+overloads, happen later in `AnnotationChecker` (§10), because both need `@target`
+evaluated. An annotation declared with no `@target` is legal anywhere the parser accepts
+one.
 
 One wrinkle the walk turned up: a variant case's annotations are attached both to its
 `VstCaseMember` and to the `VstClass` lifted to top level, so the class walk skips
@@ -264,11 +272,12 @@ var value: Val;                // the variant value, after §7
 ## 7. Constant evaluation
 
 The compiler needs values, not expressions: `@target`'s argument decides whether a use is
-legal. **There is no VST-level constant evaluator today** — `tryUnboxPositiveInt`
-(`Verifier.v3:2742`) and match-pattern extraction (`:1490-1515`) are literals-only, and enum
-case arguments are not evaluated in the verifier at all but at SSA-init time.
+legal. Implemented in `aeneas/src/vst/AnnotationEval.v3`. There was **no VST-level constant
+evaluator** before it — `tryUnboxPositiveInt` (`Verifier.v3:2742`) and match-pattern
+extraction (`:1490-1515`) are literals-only, and enum case arguments are not evaluated in
+the verifier at all but at SSA-init time.
 
-Building one is tractable because two pieces already exist.
+Building one was tractable because two pieces already existed.
 
 **`VarBinding` carries the resolution.** After type checking, a `VarExpr` for
 `TargetKind.Class` has `varbind = EnumConst(member)`; one for `TargetKinds.Container` has
@@ -296,16 +305,28 @@ A new `AnnotationEval` over the post-typecheck AST handles:
 | anything else | not a constant — a diagnostic naming the expression |
 
 The domain is bounded by the design note: integers, floats, enums, enum sets, strings,
-immutable ADTs and read-only arrays of those, plus other annotations. Reject rather than
-guess.
+immutable ADTs and read-only arrays of those, plus other annotations. Rejecting rather than
+guessing is the user-visible point of this pass: before it, `@t(Helper.f())` and
+`@t(Helper.mutableField)` both type-checked and were silently accepted, though the design
+note admits only immutable values.
 
-### A narrow form lands first
+Two wrinkles found in building it. Enum-set operators are VST *sugar* rather than plain
+operators, so `Eval.doOp` does not know them; they reduce to integer bit operations on the
+set's representation. And strings cannot go through `Program.getStringRecord` during
+verification — its `strRecords` table is not populated that early — so the record is built
+directly, and an annotation's string value is not interned with the program's string
+constants.
 
-Target checking cannot bite until `@target`'s argument can be evaluated, so a **narrow
-evaluator ships in step 2a** (§10) covering just what the built-in meta-annotations need:
-enum constants, enum-set unions, and component-field reads. That is three rows of the table
-above, and it keeps every step of the staging meaningful instead of leaving 2a's target
-checks inert. The general evaluator then extends it rather than replacing it.
+### A narrow form landed first
+
+Target checking cannot bite until `@target`'s argument can be evaluated, so a narrow
+evaluator shipped with target checking (`7f0c68e1e`), covering just what the built-in
+meta-annotations need: enum constants, enum-set unions, and component-field reads. That
+kept the step meaningful instead of leaving its target checks inert. It lives in
+`AnnotationChecker` and is deliberately not shared with the general evaluator: the two want
+different answers — the narrow one produces a bit set and rejects everything else, while
+the general one produces a `Val` for any admissible field type. Merging them would trade a
+few duplicated lines for a more awkward interface.
 
 ---
 
@@ -347,29 +368,78 @@ Per `doc/annotations-syntax.md` §12: a `-lang.annotation-files=<path*>` option,
 
 ## 10. Order, and progress
 
-**Corrected ordering.** The first version of this plan scheduled target checking in step
-2a and loading the standard annotations last, which is inconsistent: target checking needs
-`@target`'s argument evaluated, and that argument names `TargetKind`, which lives in
-`lib/annotations/TargetKind.v3` and exists only once the standard file is loaded. Confirmed
-empirically — `@target(TargetKind.Class)` compiles clean today with `TargetKind` defined
-nowhere. **Loading the standard file must precede target checking.**
+**Stage 2 is complete.** It landed in a different order than first planned, corrected twice
+along the way; each correction is recorded below because the reasons outlive the schedule.
 
-| Step | Content | State |
+| Step | Content | Commit |
 |---|---|---|
-| 2a.1 | Desugar annotation types into open variants (§2) | **done** — `93ccc3726` |
-| 2a.2 | Build the annotation namespace (§3) | **done** — `f77d478d7` |
-| 2a.3 | Resolve uses to declarations (§4, §5) | **done** — `c72a669c7` |
-| 2a.4 | Load `lib/annotations/` (§8) | next |
-| 2a.5 | Narrow evaluator, `@target`, target checking, overload selection (§7) | |
-| 2b | Argument binding (§6) | |
-| 2c | General constant evaluation (§7 in full) | |
+| 2a.1 | Desugar annotation types into open variants (§2) | `93ccc3726` |
+| 2a.2 | Build the annotation namespace (§3) | `f77d478d7` |
+| 2a.3 | Resolve uses to declarations (§4, §5) | `c72a669c7` |
+| 2a.4 | Load `lib/annotations/` (§8) | `4d51f0103` |
+| 2b | Argument binding and type checking (§6) | `2a570130d` |
+| 2a.5 | `@target`, target checking, overload selection, `@repeatable` (§7, narrow) | `7f0c68e1e` |
+| 2c | General constant evaluation (§7 in full) | `3c8018b68` |
 
-Two things stay deliberately incomplete until 2a.5, both for the same reason — no
-evaluator, so no target sets:
+### Two ordering corrections
 
-- Overload disjointness is only checked where one side omits `@target` (§3). That case is
-  decidable without evaluation, since an annotation with no `@target` is legal everywhere.
-- A use whose name has more than one visible binding is reported rather than guessed at.
+**Loading the standard file must precede target checking.** The first plan had target
+checking in 2a and the standard file last. But `@target`'s argument names `TargetKind`,
+which lives in `lib/annotations/TargetKind.v3` and exists only once that file is loaded.
+Confirmed empirically before building on it: `@target(TargetKind.Class)` compiled clean with
+`TargetKind` defined nowhere.
+
+**Argument binding must precede target checking.** Planned as 2b, i.e. after. But deciding
+whether a use is legal means *evaluating* `@target`'s argument, and an argument cannot be
+evaluated before it is bound and type-checked like any other. Also confirmed first:
+`@t(no_such_name_at_all)` compiled clean, because arguments were not resolved at all.
+
+The general shape both corrections share: anything that reads an annotation's **value**
+depends on the whole chain — declaration resolved, argument bound, argument type-checked,
+value evaluated — and the standard file present for anything naming `TargetKind`.
+
+### Pass placement, as built
+
+In `Verifier.verify()`:
+
+1. `buildFile` for every file.
+2. **Namespace** (`AnnotationEnvBuilder`) — must precede any `resolveType` call, since
+   annotations on type uses are checked inside it.
+3. **Resolution** (`AnnotationResolver`) — binds names, records every use, enforces
+   `@repeatable`.
+4. The existing `verifyComponent` / `verifyClass` / `verifyEnum` passes, which resolve
+   field types.
+5. **Argument binding** (`AnnotationBinder`) — needs those field types.
+6. The existing `typeCheckVstCompound` passes.
+7. **Target checking** (`AnnotationChecker`) — needs step 6, because
+   `@target(TargetKinds.Container)` reads a component field whose *initializer* is only
+   type-checked there. This was caught by that one spelling failing while
+   `TargetKind.Class` and `A | B` both passed.
+8. **Evaluation** (`AnnotationEval`).
+
+Steps 5 and 8 both iterate the resolver's list of uses rather than walking the AST again,
+which is also what reaches annotations nested inside another's arguments — those are
+attached to no site and a site walk misses them.
+
+### Things the implementation added that the plan did not have
+
+- **Overloaded names need distinct synthesized types.** Two declarations of one name were
+  synthesizing two variants with the same name, so a *legal* overload failed with
+  `TypeRedefined`. Later declarations take a `$n` suffix; the first keeps the plain
+  `@name`.
+- **`@repeatable` needs no evaluation.** "Attached twice at the same position" is one
+  annotation list, and whether a declaration is `@repeatable` is syntactic, so it is
+  enforced during resolution rather than with the other target checks.
+- **An annotation used as a value has a real type** — its synthesized variant, a subtype of
+  the root — so `value: Annotation` accepts any of them by ordinary subtyping. Such uses
+  carry a `Value` target with no `TargetKind` counterpart, since `@target` cannot apply to
+  something attached to nothing.
+- **Strings cannot use `Program.getStringRecord` during verification**; its `strRecords`
+  table is not populated that early. `AnnotationEval` builds the record directly, so an
+  annotation's string value is not interned with the program's string constants.
+- **`-test` mode bypasses `Aeneas.makeProgram`**, so `-lang.annotation-files` had to be
+  applied in `Regression.loadProgram` too — without which the option silently did nothing
+  under the entire test suite.
 
 ### What the seam proved
 
