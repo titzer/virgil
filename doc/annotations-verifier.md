@@ -1,6 +1,8 @@
 # Virgil Annotations — Verifier Plan
 
-Status: **plan**. Nothing here is implemented.
+Status: **partly implemented**. Steps 2a.1 through 2a.3 are done; see §10 for what is
+built and what remains. Sections below describe the design as built where a step is
+complete, and as planned where it is not.
 
 Scope: stage 2 — give the parsed annotations meaning. Desugar annotation declarations into
 real types, resolve each `@name` to its declaration, check it against the target it is
@@ -31,16 +33,20 @@ annotations are drafted in `lib/annotations/`.
 | `BlockStmt.annotations` | " | Block |
 | `TypeParamType.annotations` | " | formal type parameters |
 
-`VstAnnotation.decl` is the mutable slot stage 2 fills in.
+`VstAnnotation.binding` and `.target` are the mutable slots stage 2 fills in. `binding` is
+an `AnnotationBinding`, not a `VstAnnotationDecl`, because a use may resolve to a `@def`
+alias as well as a `@type`; its `None` case makes "unresolved" the default.
 
 ---
 
 ## 2. Annotation types are desugared into open variants
 
-**Decision: each `@type foo` becomes a synthesized variant `A@foo`, a subtype of a
-synthesized open root `A@`.** No type-system change is needed, because variants already
-answer every representation question, and unreachable synthesized variants cost nothing in
-a whole-program compiler.
+**Decision: each `@type foo` becomes a synthesized variant `@foo`, a subtype of a
+synthesized open root `@Annotation`.** No type-system change is needed, because variants
+already answer every representation question, and unreachable synthesized variants cost
+nothing in a whole-program compiler.
+
+Implemented in `aeneas/src/vst/AnnotationDesugaring.v3`, run from `Compiler.parse`.
 
 This is what `doc/ideas/Annotations.txt` already sketches, in the language's own syntax:
 
@@ -52,6 +58,8 @@ type A@deprecated(why: string, date: Date) { }
 ```
 
 `extends` on a `type` is the open-variant feature, so the note is describing exactly this.
+The note spells the names `A@…`; as built they are `@Annotation` and `@name`, for the
+reason in "Naming" below. The structure is the note's.
 
 The machinery exists. `VariantDesugaring` (`Vst.v3:272`) already synthesizes `VstClass`es
 with `kind = Kind.VARIANT`, `isSynthetic = true`, and a `fullName` distinct from the
@@ -65,12 +73,24 @@ the root.
 
 ### Naming keeps them out of the ordinary namespace
 
-Synthesized types are named `A@foo`. `@` cannot appear in an identifier, so a user can
-neither declare nor reference one, and the annotation namespace stays separate from the
-type namespace as `doc/annotations-syntax.md` §2 requires. The name is only a string key in
-the type environment, so nothing needs to parse it. It also reads clearly in diagnostics.
+Every synthesized name carries a `@`, which cannot appear in an identifier, so a user can
+neither declare nor reference one, and the annotation namespace stays separate from the type
+namespace as `doc/annotations-syntax.md` §2 requires. The name is only a string key in the
+type environment, so nothing needs to parse it, and it reads clearly in diagnostics.
 
-`Annotation`, written by a user in an annotation field's type, resolves to the root `A@`.
+That applies to the root as much as to the subtypes. Naming it plain `Annotation` was tried
+and rejected: it occupied an attractive identifier program-wide, and a user's own
+`class Annotation` then collided with a diagnostic pointing at the synthetic `<annotations>`
+file they never wrote.
+
+So that `lib/annotations/Standard.v3` can still say what it means, a bare `Annotation` in an
+**annotation field type** is rewritten to `@Annotation` during desugaring, nested positions
+included. Elsewhere the name means nothing special and a user may define their own — in
+which case an annotation field written `value: Annotation` still means the root.
+
+Each name serves as the token image **and** as `fullName`, which must agree: `TypeEnv.add`
+keys on `typeCon.name`, which comes from `fullName` (`V3Class.v3:10`), while the duplicate
+check in `bindTypeCon` (`Verifier.v3:727`) looks up the token image.
 
 ### Where the root comes from
 
@@ -78,21 +98,28 @@ The root must exist exactly once program-wide, but `@type` declarations are spre
 files, so it cannot be synthesized per file. Synthesize it **before `buildFile`**, into a
 synthetic `VstFile` prepended to `prog.vst.files`, and have each `@type`'s desugaring
 reference it by name. Declaring it in `lib/annotations/Standard.v3` instead is not an
-option, since `A@` is unwriteable.
+option, since `@Annotation` is unwriteable.
+
+A parameterless annotation must desugar with an explicit **empty** parameter list: a variant
+declared without one is a constructor function rather than a value, so `@type repeatable`
+becomes `type @repeatable()` and is built as `@repeatable()`.
 
 The root needs a `case _`, because open-variant subtypes require one.
 
-### Risks worth naming
+### Risks, all since retired
 
-- **Annotations now depend on `-lang:open-types`** as well as `-lang:annotations`. Either
-  gate on both, or have the annotations flag imply open types.
-- The open-variant machinery has not previously been driven by **programmatically
-  synthesized** hierarchies — only by parsed ones. DFS tag assignment, `variantTagHi`
-  ranges, and `case _` handling should be exercised early with a small hand-built case
-  rather than discovered late.
-- Desugaring must not make the synthesized types **reachable**. Nothing constructs them at
-  runtime under Source retention, so reachability analysis should drop them; verify that it
-  does rather than assuming.
+All three risks recorded here before implementation were settled by measurement in 2a.1:
+
+- ~~Annotations depend on `-lang:open-types`.~~ They do not. Both gates (`Parser.v3:322`
+  and `:555`) are purely syntactic and the verifier's own checks are ungated, so desugaring
+  after parsing bypasses them.
+- ~~The open-variant machinery has only been driven by parsed hierarchies.~~ It tolerates
+  programmatic construction: `resolveSuperClass` establishes the `extends` relation and
+  `assignVariantTagsIfRoot` runs. A root without `case _` would have failed at
+  `Verifier.v3:655`.
+- ~~The synthesized types might become reachable.~~ They do not. The same program compiled
+  with and without three annotation declarations differs by exactly one byte — the source
+  filename in the source tables.
 
 ### Annotation methods are out of scope
 
@@ -117,19 +144,26 @@ Because names are **overloadable by disjoint target sets** (`doc/annotations-syn
 
 ```
 class AnnotationEnv {
-	def map: HashMap<string, List<AnnotationBinding>>;   // Strings.newMap()
-	def lookup(name: string, target: TargetKind, file: VstFile) -> AnnotationBinding;
+	def map = Strings.newMap<List<AnnotationBinding>>();
+	def lookup(name: string, file: VstFile) -> List<AnnotationBinding>;
 }
 type AnnotationBinding {
+	case None;                              // unresolved; the default
 	case Decl(d: VstAnnotationDecl);
 	case Alias(a: VstAnnotationAlias);
 }
 ```
 
+Built in `aeneas/src/vst/AnnotationEnv.v3`. `lookup` filters by file so a `private`
+declaration is visible only where it was declared, and returns the whole list: selecting
+among overloads needs the target kind and is deferred to 2a.5.
+
 Checks here:
 
 - Declarations sharing a name must have **disjoint** target sets; report at the second
-  declaration, not at a use.
+  declaration, not at a use. Only partly checked so far: deciding this in general needs
+  `@target` evaluated, but the case where either side *omits* `@target` is decidable
+  without it, since the annotation is then legal everywhere and necessarily overlaps.
 - `@type` and `@def` share one overload set per name.
 - `@file` and `@apply` may not be declared.
 - A `@def` expansion resolves to other annotations; detect cycles rather than recursing.
@@ -145,7 +179,10 @@ only requirement is that this pass does no resolution.
 
 ---
 
-## 4. Pass 2 — resolution and target checking
+## 4. Pass 2 — resolution
+
+Implemented in `aeneas/src/vst/AnnotationResolver.v3`. Target checking is **not** here: see
+§10 for why it must follow the standard file being loaded.
 
 **Do not store the target kind on `VstAnnotation`.** Walk top-down from the declarations, so
 the kind is known at each site by construction. A stored field would be redundant, could
@@ -161,13 +198,20 @@ annotations live:
 | TypeUse | `resolveType` (`Verifier.v3:996`) — see §5 |
 | Block | `visitBlock` in the `TypeChecker`, which already visits every block |
 
-For each annotation: look up the name for that target kind, set `VstAnnotation.decl`,
-report a use no overload covers with a message naming the kind sought, then enforce
-`@repeatable`.
+Done for each annotation: record `VstAnnotation.target` from the walk, look the name up in
+the file's scope, and set `VstAnnotation.binding`. An undeclared name is reported. A name
+with more than one visible binding is reported rather than guessed at, since choosing needs
+`@target`.
 
-An annotation declared with no `@target` is legal anywhere in `TargetKinds.Supported`; one
-whose `@target` lies wholly outside `Supported` can never be used and should be reported at
-its declaration.
+Still to do, once the standard file is loaded (2a.5): check the recorded target against the
+declaration's `@target` and report a use no overload covers with a message naming the kind
+sought, select among overloads, and enforce `@repeatable`. An annotation declared with no
+`@target` is legal anywhere in `TargetKinds.Supported`; one whose `@target` lies wholly
+outside `Supported` can never be used and should be reported at its declaration.
+
+One wrinkle the walk turned up: a variant case's annotations are attached both to its
+`VstCaseMember` and to the `VstClass` lifted to top level, so the class walk skips
+synthetics or every `case` annotation is visited twice.
 
 ---
 
@@ -301,20 +345,57 @@ Per `doc/annotations-syntax.md` §12: a `-lang.annotation-files=<path*>` option,
 
 ---
 
-## 10. Suggested order
+## 10. Order, and progress
 
-Each step independently testable:
+**Corrected ordering.** The first version of this plan scheduled target checking in step
+2a and loading the standard annotations last, which is inconsistent: target checking needs
+`@target`'s argument evaluated, and that argument names `TargetKind`, which lives in
+`lib/annotations/TargetKind.v3` and exists only once the standard file is loaded. Confirmed
+empirically — `@target(TargetKind.Class)` compiles clean today with `TargetKind` defined
+nowhere. **Loading the standard file must precede target checking.**
 
-1. **2a — desugaring, namespace, resolution, target checking.** §2, §3, §4, §5, plus the
-   narrow evaluator of §7. Arguments limited to arity. Testable with `//@seman` cases for
-   unknown names, wrong targets, duplicate non-repeatable annotations, and overlapping
-   overloads — and target checks actually bite, because the narrow evaluator can read
-   `@target`.
-2. **2b — argument binding.** §6: keyword, positional, defaults, `@required`, type-checked.
-3. **2c — general constant evaluation.** §7 in full, extending the narrow form.
-4. **2d — the standard file.** §8, end to end.
+| Step | Content | State |
+|---|---|---|
+| 2a.1 | Desugar annotation types into open variants (§2) | **done** — `93ccc3726` |
+| 2a.2 | Build the annotation namespace (§3) | **done** — `f77d478d7` |
+| 2a.3 | Resolve uses to declarations (§4, §5) | **done** — `c72a669c7` |
+| 2a.4 | Load `lib/annotations/` (§8) | next |
+| 2a.5 | Narrow evaluator, `@target`, target checking, overload selection (§7) | |
+| 2b | Argument binding (§6) | |
+| 2c | General constant evaluation (§7 in full) | |
 
-Step 2a is the largest, because the desugaring in §2 has to be right before anything else
-can be built on it. If it needs splitting, the natural seam is to land the synthesized root
-and one hand-written `@type` first — proving the open-variant machinery tolerates
-programmatic construction — before wiring up the namespace and resolution.
+Two things stay deliberately incomplete until 2a.5, both for the same reason — no
+evaluator, so no target sets:
+
+- Overload disjointness is only checked where one side omits `@target` (§3). That case is
+  decidable without evaluation, since an annotation with no `@target` is legal everywhere.
+- A use whose name has more than one visible binding is reported rather than guessed at.
+
+### What the seam proved
+
+2a.1 was split as suggested — land the synthesized hierarchy alone before building on it —
+and it settled three things by measurement rather than assumption:
+
+- The verifier accepts programmatically built hierarchies. `resolveSuperClass` establishes
+  the `extends` relation and `assignVariantTagsIfRoot` runs; a root without `case _` would
+  have failed at `Verifier.v3:655`.
+- Unreachable synthesized types cost nothing. The same program compiled with and without
+  three annotation declarations differs by exactly one byte — the source filename in the
+  source tables.
+- **Annotations do not require `-lang:open-types`.** Both gates (`Parser.v3:322` and `:555`)
+  are purely syntactic and the verifier's own checks are ungated, so desugaring after
+  parsing bypasses them. This retires the dependency risk recorded in §2.
+
+### Naming, as built
+
+The root is `@Annotation` and each annotation type is `@` plus its name. Every synthesized
+name carries a `@`, which cannot appear in an identifier, so none can be declared or
+referenced by a user. Naming the root plain `Annotation` was tried first and rejected: it
+occupied an attractive identifier program-wide, and a user's own `class Annotation` then
+collided with a diagnostic pointing at the synthetic `<annotations>` file they never wrote.
+
+So that `lib/annotations/Standard.v3` can still say what it means, a bare `Annotation` in
+an **annotation field type** is rewritten to `@Annotation` during desugaring, nested
+positions included. Elsewhere the name means nothing special and a user may define their
+own — in which case an annotation field written `value: Annotation` still means the root,
+not their class.
