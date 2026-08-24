@@ -1,0 +1,223 @@
+// Copyright 2026 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Arguments adapter so a VST expression can be folded with Eval.doOp, the same evaluator
+// the SSA interpreter and the constant folder use. Modelled on FoldingArguments
+// (SsaOptimizer.v3:2347).
+class AnnotationArguments(prog: Program) extends Arguments {
+	var typeArgs: Array<Type> = TypeUtil.NO_TYPES;
+	var failed: bool;
+
+	def reset(op: Operator, vals: Array<Val>) -> this {
+		typeArgs = op.typeArgs;
+		var a = growVals(vals.length);
+		for (i < vals.length) a[i] = vals[i];
+		failed = false;
+	}
+	def notFoldable(msg: string) -> Result { failed = true; return null; }
+	def getTypeArg(i: int) -> Type { return typeArgs[i]; }
+	def getTypeArgs() -> Array<Type> { return Arrays.dup(typeArgs); }
+	def getProgram() -> Program { return prog; }
+	def tailCall(spec: IrSpec, recvr: Val, startArg: int, endArg: int) -> Result {
+		failed = true;  // a call is not a constant
+		return null;
+	}
+	def throw(ex: string, msg: string) -> Exception {
+		failed = true;  // an argument that traps is not a constant
+		return null;
+	}
+}
+
+// Evaluates annotation arguments to compile-time values.
+//
+// The design note limits annotation field types to immutable values: integers and floats,
+// enums and enum sets, strings, and immutable ADTs and read-only arrays of those, plus
+// other annotations. This evaluates exactly that and REJECTS anything else, rather than
+// guessing -- so a method call or a read of a mutable field, both of which type-check
+// perfectly well, are reported instead of silently accepted.
+//
+// Two pieces of the compiler do most of the work. VarBinding carries what the type checker
+// resolved a name to, so an enum constant or a component field read needs no lookup of its
+// own; and Eval.doOp (core/Eval.v3:334) already evaluates operators, so arithmetic and
+// comparisons come for free through a small Arguments adapter.
+//
+// See doc/annotations-verifier.md section 7.
+class AnnotationEval(ERROR: ErrorGen, prog: Program) {
+	private def args = AnnotationArguments.new(prog);
+	// Small enough that a list beats a map, and VstField has no hash.
+	private var fieldCache: List<(VstField, Val)>;
+	private var active: List<VstField>;	// component fields being evaluated, for cycles
+
+	// Evaluate every bound argument of every use, storing the results.
+	def evalUses(uses: Vector<VstAnnotation>) {
+		for (i < uses.length) evalAnnotation(uses[i]);
+	}
+	def evalAnnotation(a: VstAnnotation) {
+		if (a.values != null || a.boundArgs == null) return;
+		var vals = Array<Val>.new(a.boundArgs.length);
+		for (i < a.boundArgs.length) {
+			var e = a.boundArgs[i];
+			if (e == null) continue;	// absent; the field takes its type's default
+			var r = eval(e);
+			if (r.0) vals[i] = r.1;
+			else err(a, e);
+		}
+		a.values = vals;
+	}
+	// Returns (ok, value).
+	def eval(e: Expr) -> (bool, Val) {
+		if (e == null) return (false, null);
+		match (e) {
+			x: Literal => return (true, x.val);
+			x: StringExpr => {
+				// Built directly rather than through Program.getStringRecord, whose
+				// strRecords table is not populated this early in verification. An
+				// annotation's string value is therefore not interned with the
+				// program's string constants; nothing compares the two.
+				if (x.exactType == null) return (false, null);
+				var rec = prog.newRecord(x.exactType, x.array.length);
+				Arrays.mapInto(x.array, Byte.box, rec.values);
+				return (true, rec);
+			}
+			x: VarExpr => return evalVar(x);
+			x: BinOpExpr => return evalOp(x.op.op, [x.left, x.right], x);
+			x: AppExpr => return evalApp(x);
+			x: TupleExpr => {
+				var t = evalAll(x.exprs);
+				if (!t.0) return (false, null);
+				return (true, BoxVal.new(t.1));
+			}
+			x: ArrayExpr => {
+				var t = evalAll(x.exprs);
+				if (!t.0) return (false, null);
+				var at = x.exactType;
+				if (at == null) return (false, null);
+				var rec = prog.newRecord(at, t.1.length);
+				for (i < t.1.length) rec.values[i] = t.1[i];
+				return (true, rec);
+			}
+			x: AnnotationExpr => return evalNested(x);
+			_ => return (false, null);
+		}
+	}
+	private def evalVar(x: VarExpr) -> (bool, Val) {
+		match (x.varbind) {
+			Const(val, vtype) => return (true, val);
+			EnumConst(member) => {
+				// An enum promoted to a set contributes one bit; the type checker
+				// records the promotion in implicitType.
+				if (EnumSetType.?(x.effectiveType())) {
+					var st = EnumSetType.!(x.effectiveType());
+					if (st.repType.width <= 32) return (true, Int.box(1 << u5.!(member.tag)));
+					return (true, Long.box(1L << u6.!(member.tag)));
+				}
+				return (true, Int.box(member.tag));
+			}
+			ComponentField(member) => return evalComponentField(member);
+			DefaultValue(t) => return (true, null);
+			_ => return (false, null);	// a local, a method, a mutable object field, ...
+		}
+	}
+	// A component field is constant only if it is read-only and its initializer is. The
+	// result is cached, and a field that refers to itself is reported rather than looped on.
+	private def evalComponentField(member: VstField) -> (bool, Val) {
+		if (member.writability != Writability.READ_ONLY) return (false, null);
+		for (l = fieldCache; l != null; l = l.tail) {
+			if (l.head.0 == member) return (true, l.head.1);
+		}
+		for (l = active; l != null; l = l.tail) {
+			if (l.head == member) return (false, null);	// cycle
+		}
+		active = List.new(member, active);
+		var r = eval(member.init);
+		active = active.tail;
+		if (r.0) fieldCache = List.new((member, r.1), fieldCache);
+		return r;
+	}
+	private def evalApp(x: AppExpr) -> (bool, Val) {
+		// Only an operator application folds; a call to a method does not.
+		match (x.appbind) {
+			Apply(op, facts) => return evalOp(op, exprsOf(x.args), x);
+			_ => return (false, null);
+		}
+	}
+	private def evalOp(op: Operator, operands: Array<Expr>, at: Expr) -> (bool, Val) {
+		if (op == null) return (false, null);
+		var vals = Array<Val>.new(operands.length);
+		for (i < operands.length) {
+			var r = eval(operands[i]);
+			if (!r.0) return (false, null);
+			vals[i] = r.1;
+		}
+		// Enum-set operators are VST sugar rather than plain operators, so Eval.doOp does
+		// not know them; they reduce to integer bit operations on the set's representation.
+		match (op.opcode) {
+			VstSugar(vst) => return evalSugar(vst, vals, at);
+			_ => ;
+		}
+		args.reset(op, vals);
+		var r = Eval.doOp(op, args);
+		if (args.failed || r == null) return (false, null);
+		match (r) {
+			v: Val => return (true, v);
+			_ => return (false, null);	// an exception is not a constant
+		}
+	}
+	private def evalSugar(vst: VstOperator, vals: Array<Val>, at: Expr) -> (bool, Val) {
+		match (vst) {
+			EnumSetUnion => return (true, intOp(vals, true));
+			EnumSetIntersect => return (true, intOp(vals, false));
+			_ => return (false, null);
+		}
+	}
+	private def intOp(vals: Array<Val>, isUnion: bool) -> Val {
+		var a = unboxLong(vals[0]), b = unboxLong(vals[1]);
+		var r = if(isUnion, a | b, a & b);
+		if (Box<int>.?(vals[0])) return Int.box(int.view(r));
+		return Long.box(r);
+	}
+	private def unboxLong(v: Val) -> long {
+		match (v) {
+			null => return 0;
+			x: Box<int> => return x.val;
+			x: Box<long> => return x.val;
+			_ => return 0;
+		}
+	}
+	private def evalNested(x: AnnotationExpr) -> (bool, Val) {
+		var a = x.ann;
+		evalAnnotation(a);
+		match (a.binding) {
+			Decl(d) => {
+				if (d.declClass == null || a.values == null) return (false, null);
+				// An annotation instance is a value of its synthesized variant.
+				var rec = prog.newRecord(d.declClass.getDeclaredType(), a.values.length);
+				for (i < a.values.length) rec.values[i] = a.values[i];
+				return (true, rec);
+			}
+			_ => return (false, null);
+		}
+	}
+	private def evalAll(list: VstList<Expr>) -> (bool, Array<Val>) {
+		if (list == null) return (true, Array<Val>.new(0));
+		var arr = list.asArray(), vals = Array<Val>.new(arr.length);
+		for (i < arr.length) {
+			var r = eval(arr[i]);
+			if (!r.0) return (false, null);
+			vals[i] = r.1;
+		}
+		return (true, vals);
+	}
+	private def exprsOf(t: TupleExpr) -> Array<Expr> {
+		if (t == null || t.exprs == null) return Array<Expr>.new(0);
+		return t.exprs.asArray();
+	}
+	private def err(a: VstAnnotation, e: Expr) {
+		var range = FileRanges.ofExpr(e);
+		var line = if(a.file != null, a.file.extractLine(range.beginLine));
+		var obj = SourceCodeError.new(range, line);
+		ERROR.addErrorObj(obj);
+		obj.set("AnnotationError", Strings.format1(
+			"argument to \"@%s\" must be a compile-time constant", a.name.image));
+	}
+}
