@@ -1,7 +1,7 @@
 // Copyright 2013 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Constants representing flags for reachability analysis
+// Constants representing flags for reachability analysis.
 enum RaFact {
 	RM_LIVE,
 	RF_NORMALIZED,
@@ -19,6 +19,8 @@ enum RaFact {
 	RC_ENUM,
 	RC_CLOSURE,
 	RC_BOXED,
+	RC_DESC_HEADER,
+	RC_DESC_SLOTS,
 }
 
 def DUMP: Terminal;
@@ -48,12 +50,10 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	var defaultValues: HashMap<Type, Val>;
 	var liveMethods = Vector<RaMethod>.new();
 	var normalizer: ReachabilityNormalizer;
-	// Set if the program brands descriptors with runtime extensions, which requires described
-	// objects to use the descriptor pointer as their object header. Can be forced on, so that
-	// the encoding can be tested independently of a program actually branding a descriptor.
-	var descriptorExtensions = CLOptions.DESCEXT.get();
+	// Forces every hierarchy to use descriptor headers, to test the encoding by itself.
+	def forceDescriptorExtensions = CLOptions.DESCEXT.get();
 
-	// perform the analysis, starting from the roots
+	// Perform the analysis, starting from the roots.
 	def analyze() {
 		for (i < oldIr.roots.length) {
 			var meth = oldIr.roots[i].spec;
@@ -61,6 +61,38 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			makeType(meth.receiver);
 		}
 		queue.drain(); // do all work
+	}
+	// Whether {rc}'s objects use their descriptor as the header or a tag.
+	def usesDescriptorHeader(rc: RaClass) -> bool {
+		return rc != null && rc.orig != null && rc.orig.flags.C_HAS_DESCRIPTOR
+			&& rc.root().raFacts.RC_DESC_HEADER;
+	}
+	// Whether {rc}, a descriptor, reserves the metadata slots that branding writes.
+	def usesDescriptorSlots(rc: RaClass) -> bool {
+		return rc != null && rc.orig != null && rc.orig.flags.C_IS_DESCRIPTOR
+			&& rc.root().raFacts.RC_DESC_SLOTS;
+	}
+	// Branding {dt} makes it the object header of the objects it describes.
+	private def brandDescriptor(dt: ClassType) {
+		var described = dt.getDescribesType();
+		if (described == null) return; // rejected by the type checker
+		// The GC reads the size and reference map that branding writes out of {dt}.
+		makeClass(dt).root().raFacts |= RaFact.RC_DESC_SLOTS;
+		useDescriptorHeader(makeClass(described).root());
+	}
+	// Gives {root}'s hierarchy descriptor headers, which retains the descriptor field.
+	private def useDescriptorHeader(root: RaClass) {
+		root.raFacts |= RaFact.RC_DESC_HEADER;
+		// A descriptor that is itself described has no tag of its own, so the descriptor
+		// check must identify it by the type id in its metadata slots.
+		if (root.orig != null && root.orig.flags.C_IS_DESCRIPTOR) {
+			root.raFacts |= RaFact.RC_DESC_SLOTS;
+		}
+		var f = if(root.orig != null, root.orig.descriptorField());
+		if (f == null) return;
+		var rf = makeField2(root, f);
+		getField(rf);
+		rf.raFacts |= RaFact.RF_RETAIN;
 	}
 	def transform(config: NormalizerConfig) {
 		// make normalizer object available during normalization
@@ -328,13 +360,11 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 				allocation(makeType(mono(op.op.typeArgs[0], context)));
 			}
 			ClassAllocWithDescriptor => {
-				var raType = makeType(mono(op.op.typeArgs[0], context));
-				allocation(raType);
-				readDescriptorField(op, raType, context); // GC implicitly reads descriptor field
+				allocation(makeType(mono(op.op.typeArgs[0], context)));
 			}
 			SetDescriptorExtension => {
-				descriptorExtensions = true; // described objects need a full descriptor, must be retained
-				// TODO: readDescriptorField(op, raType of described class, context)
+				var dt = mono(op.op.typeArgs[0], context);
+				if (ClassType.?(dt)) brandDescriptor(ClassType.!(dt));
 			}
 			ClassNew(method) => {
 				var m = opMethod(op, method, context);
@@ -376,13 +406,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			PtrAtComponentField(field) => if (op.hasNonDebugUses()) getPointerAtField(makeField(op, field, context), op, true);
 			PtrAtUnboxedObjectField(specs) => if (op.hasNonDebugUses()) getPointerAtUnboxedField(op, specs, context);
 			PtrAtUnboxedComponentField(specs) => if (op.hasNonDebugUses()) getPointerAtUnboxedField(op, specs, context);
-			TypeQuery => {
-				// Lowered to a load of the type id out of the descriptor.
-				readDescriptorField(op, makeType(mono(op.op.typeArgs[1], context)), context);
-			}
 			TypeSubsume, TypeCast => {
-				// A class cast is lowered to a load of the type id out of the descriptor.
-				readDescriptorField(op, makeType(mono(op.op.typeArgs[1], context)), context);
 				if (compiler.NormConfig.WrapFuncTypeSubsume) {
 					var ft = mono(op.op.typeArgs[0], context);
 					var tt = mono(op.op.typeArgs[1], context);
@@ -623,19 +647,6 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 			rf.initFacts = rf.initFacts & val.facts & Facts.V_FACTS;
 		}
 	}
-	// Descriptor fields are used in the implementation of some operators and must be marked
-	// explicitly to keep them from being dead-code-eliminated.
-	def readDescriptorField(op: SsaApplyOp, raType: RaType, context: IrSpec) {
-		if (!descriptorExtensions || !RaClass.?(raType)) return;
-		var rc = RaClass.!(raType);
-		if (rc.orig == null || !rc.orig.flags.C_HAS_DESCRIPTOR) return;
-		var f = rc.orig.descriptorField();
-		if (f != null) {
-			var rf = makeField3(rc.oldType, f, context);
-			getField(rf);
-			rf.raFacts |= RaFact.RF_RETAIN;
-		}
-	}
 	def makeField(op: SsaApplyOp, f: IrField, context: IrSpec) -> RaField {
 		var rf = f.raField;
 		if (rf != null) return rf;
@@ -760,12 +771,11 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 	}
 	def newRaClass(oldType: Type, ic: IrClass, parent: RaClass) -> RaClass {
 		var rc = RaClass.new(oldType, ic, parent);
-		// if (CLOptions.PRINT_RA.val) {
-		// 	Terminal.put1("newRaClass %q",	oldType.render);
-		// 	if (parent != null) Terminal.put1(" parent=%q", parent.oldType.render);
-		// 	Terminal.ln();
-		// 	Terminal.put1("  root: %q\n", rc.root().render);
-		// }
+		if (forceDescriptorExtensions && parent == null && ic != null) {
+			// Brand every hierarchy; retention is deferred until the class is registered.
+			if (ic.flags.C_IS_DESCRIPTOR) rc.raFacts |= RaFact.RC_DESC_SLOTS;
+			if (ic.flags.C_HAS_DESCRIPTOR) queue.add(useDescriptorHeader, rc);
+		}
 		classes.put(rc);
 		return rc;
 	}
@@ -776,8 +786,7 @@ class ReachabilityAnalyzer(compilation: Compilation) {
 // Base class which contains facts for all types of entities during analysis
 class RaItem {
 	var raFacts: RaFact.set;
-	// sets the given fact bit; returns true if the fact was already set
-	def setFact(fact: RaFact.set) -> bool {
+	def setFact(fact: RaFact.set) -> bool { // return true if the fact was already set
 		if ((raFacts & fact) == NONE) {
 			raFacts = raFacts | fact;
 			return false;

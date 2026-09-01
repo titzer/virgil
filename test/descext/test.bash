@@ -2,11 +2,15 @@
 
 . ../common.bash descext
 
+V3C_OPTS="$V3C_OPTS -lang:descriptors"
+
+# "CiRuntime" is only installed by a target, so the semantic tests need one.
+SEMAN_TARGET=x86-64-linux
+
 if [ $# -gt 0 ]; then
     TEST_LIST="$@"
 else
-    # TODO: CiRuntime not available in seman tests
-    # do_seman_tests
+    do_seman_tests $SEMAN_TARGET
     TEST_LIST=*.v3
 fi
 
@@ -18,7 +22,7 @@ function compile_gc_target_tests() {
     
     mkdir -p $OUT/$target
     print_compiling $target "(gc)"
-    run_v3c "" $V3C_OPTS -lang:descriptors -output=$OUT/$target -target=$target-test -set-exec=false \
+    run_v3c "" $V3C_OPTS -output=$OUT/$target -target=$target-test -set-exec=false \
 	    -rt.gc -rt.gctables -rt.sttables -shadow-stack-size=4k \
 	    "-rt.files=$RT_FILES" -multiple $TESTS \
 	| tee $OUT/$target/compile-gc.out | $PROGRESS
