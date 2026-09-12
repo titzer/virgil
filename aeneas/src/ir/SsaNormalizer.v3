@@ -896,11 +896,17 @@ class SsaRaNormalizer extends SsaRebuilder {
 		for (i < vn.fields.length) {
 			var f = vn.fields[i];
 			for (j < f.indexes.length) {
-				var idx = f.indexes[j];
+				var idx = f.indexes[j], st = vn.sub[idx], ft = f.tn.at(j);
 				var cmp: SsaInstr, a = refs[idx], b = refs[idx + vn.size];
-				a = genVariantScalarView(vn.sub[idx], f.tn.at(j), a);
-				b = genVariantScalarView(vn.sub[idx], f.tn.at(j), b);
-				cmp = normEqual1(i_old, f.tn.at(j), a, b);
+				if (f.isPacked() && (IntType.?(st) || (AnyRefType.?(st) && vn.fixedBits != null))) {
+					// extract the packed field from the scalar before comparing
+					a = genExtractInterval(a, f.intervals[j], st, ft);
+					b = genExtractInterval(b, f.intervals[j], st, ft);
+				} else {
+					a = genVariantScalarView(st, ft, a);
+					b = genVariantScalarView(st, ft, b);
+				}
+				cmp = normEqual1(i_old, ft, a, b);
 				if (expr == null) expr = cmp;
 				else expr = join(expr, cmp);
 			}
@@ -1764,11 +1770,19 @@ class SsaRaNormalizer extends SsaRebuilder {
 			// Variant is unboxed.
 			var result = Array<SsaInstr>.new(vn.size);
 			for (i < result.length) result[i] = newGraph.nullConst(vn.at(i));
+			// For tagged reference scalars, accumulate the non-reference bits and the reference separately
+			var bits: Array<SsaInstr>, refs: Array<SsaInstr>;
+			if (vn.fixedBits != null) {
+				bits = Array<SsaInstr>.new(vn.size);
+				refs = Array<SsaInstr>.new(vn.size);
+				for (i < vn.size) if (AnyRefType.?(vn.at(i))) bits[i] = taggedRefConst(vn.fixedBits[i]);
+			}
 
 			if (vn.hasExplicitTag()) {
-				var tagIdx = vn.tag.indexes[0];
-				if (IntRepType.?(vn.at(tagIdx))) result[tagIdx] = genSetInterval(result[tagIdx], newGraph.intConst(vn.tagValue), vn.tag.intervals[0], vn.tag.tn.newType, IntRepType.!(vn.at(tagIdx)));
-				else result[tagIdx] = newGraph.intConst(vn.tagValue);
+				var tagIdx = vn.tag.indexes[0], tagVal = newGraph.intConst(vn.tagValue);
+				if (bits != null && bits[tagIdx] != null) bits[tagIdx] = genSetInterval(bits[tagIdx], tagVal, vn.tag.intervals[0], vn.tag.tn.newType, taggedRefIntType());
+				else if (IntRepType.?(vn.at(tagIdx))) result[tagIdx] = genSetInterval(result[tagIdx], tagVal, vn.tag.intervals[0], vn.tag.tn.newType, IntRepType.!(vn.at(tagIdx)));
+				else result[tagIdx] = tagVal;
 			}
 			// Pack the fields into the correct scalars
 			for (i < vn.fields.length) {
@@ -1776,16 +1790,65 @@ class SsaRaNormalizer extends SsaRebuilder {
 				if (f.rf == null) continue;
 				var os = f.rf.origIndices.0;
 				for (j < f.indexes.length) {
-					var idx = f.indexes[j];
-					if (IntRepType.?(vn.at(idx)) && f.intervals != null) result[idx] = genSetInterval(result[idx], ai_inputs[os + j], f.intervals[j], f.tn.at(j), IntRepType.!(vn.at(idx)));
-					else result[idx] = genVariantScalarView(f.tn.at(j), vn.at(idx), ai_inputs[os + j]);
+					var idx = f.indexes[j], ft = f.tn.at(j), value = ai_inputs[os + j];
+					if (bits != null && bits[idx] != null) {
+						if (PrimType.?(ft)) bits[idx] = genSetInterval(bits[idx], value, f.intervals[j], ft, taggedRefIntType());
+						else refs[idx] = genRefToInt(ft, value);
+					}
+					else if (IntRepType.?(vn.at(idx)) && f.intervals != null) result[idx] = genSetInterval(result[idx], value, f.intervals[j], ft, IntRepType.!(vn.at(idx)));
+					else result[idx] = genVariantScalarView(ft, vn.at(idx), value);
+				}
+			}
+			if (bits != null) {
+				// Combine the reference (if any) with the non-reference bits into a tagged reference
+				for (i < vn.size) {
+					if (bits[i] == null) continue;
+					var v = bits[i];
+					if (refs[i] != null) v = curBlock.pure(taggedRefIntType().opOr(), [refs[i], v]);
+					result[i] = genIntToRef(v, vn.at(i));
 				}
 			}
 			return mapN(i_old, result);
 		}
 	}
+	// Returns the integer type used to manipulate the bits of a tagged reference.
+	def taggedRefIntType() -> IntType {
+		return Int.getType(false, norm.config.MaxScalarWidth);
+	}
+	// Returns a constant of the tagged reference integer type with the given bits.
+	def taggedRefConst(bits: u64) -> SsaInstr {
+		var it = taggedRefIntType();
+		if (it.width > 32) return newGraph.valConst(it, Long.box(long.view(bits)));
+		return newGraph.valConst(it, Int.box(int.view(bits)));
+	}
+	// Converts a reference of type {objType} to its (unsigned) integer bits.
+	def genRefToInt(objType: Type, i_ref: SsaInstr) -> SsaInstr {
+		var ptrType = MachModule.getPtrType(context.prog);
+		var opcache = Pointer_TypeCon.!(ptrType.typeCon).opcache();
+		var i_ptr = curBlock.pure(V3Op.newPtrAtObject(objType, ptrType), [i_ref]);
+		var i_int = curBlock.pure(opcache.opSub, [i_ptr, newGraph.nullConst(ptrType)]);
+		return curBlock.opIntView(opcache.it, taggedRefIntType(), i_int);
+	}
+	// Converts (unsigned) integer bits to a reference of type {refType}.
+	def genIntToRef(i_int: SsaInstr, refType: Type) -> SsaInstr {
+		var ptrType = MachModule.getPtrType(context.prog);
+		var opcache = Pointer_TypeCon.!(ptrType.typeCon).opcache();
+		var i_sint = curBlock.opIntView(taggedRefIntType(), opcache.it, i_int);
+		// The result must have a reference type so that it is treated as a reference by the GC
+		return curBlock.pure(V3Op.newPtrAdd(refType, opcache.it), [newGraph.nullConst(refType), i_sint]);
+	}
 	// Extracts an interval from a scalar
 	def genExtractInterval(scalar: SsaInstr, interval: Interval, ft: Type, tt: Type) -> SsaInstr {
+		// Case: Scalar is a tagged reference
+		if (AnyRefType.?(ft)) {
+			var it = taggedRefIntType();
+			if (PrimType.?(tt)) return genExtractInterval(genRefToInt(ft, scalar), interval, it, tt);
+			// Extract the reference itself by clearing the bits outside its interval
+			if (interval.size() >= it.width) return scalar;
+			var mask = taggedRefConst(((1uL << interval.size()) - 1) << interval.start);
+			var i_int = curBlock.pure(it.opAnd(), [genRefToInt(ft, scalar), mask]);
+			return genIntToRef(i_int, tt);
+		}
 		// Case: Scalar is FloatType
 		if (FloatType.?(ft)) {
 			def fft: FloatType = FloatType.!(ft);
@@ -1833,7 +1896,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		return null;
 	}
-	def genSetInterval(scalar: SsaInstr, value: SsaInstr, interval: Interval, ft: Type, tt: IntRepType) -> SsaInstr {
+	def genSetInterval(scalar: SsaInstr, value: SsaInstr, interval: Interval, ft: Type, tt: IntType) -> SsaInstr {
 		var intRep = genVariantScalarView(ft, tt, value);
 		var width = interval.size();
 		if (width < tt.width && isSignedRep(ft)) {
@@ -1868,6 +1931,8 @@ class SsaRaNormalizer extends SsaRebuilder {
 					def scalarIdx = field.indexes[i];
 					def interval = field.intervals[i];
 					def scalar = ninputs[scalarIdx];
+					def st = rc.variantNorm.at(scalarIdx);
+					if (AnyRefType.?(st) && rc.variantNorm.fixedBits != null) { vals[i] = genExtractInterval(scalar, interval, st, field.tn.at(i)); continue; }
 					if (!IntType.?(scalar.getType())) { vals[i] = scalar; continue; }
 					vals[i] = genExtractInterval(scalar, interval, scalar.getType(), field.tn.at(i));
 				}

@@ -41,8 +41,8 @@ function compile_gc_shard() {
     while [ $i -le $# ]; do
 	local args=${@:$i:$SHARDING}
         echo "TESTS=$args" > $T/compile-shard.$i
-        echo CMD=$AENEAS_TEST -symbols -output=$T -target=$target-test -tr -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=$sstack -heap-size=10k "$RT_OPT" -multiple >> $T/compile-shard.$i
-	run_v3c "" -symbols -output=$T -target=$target-test -tr -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=$sstack -heap-size=10k "$RT_OPT" -multiple $args
+        echo CMD=$AENEAS_TEST -symbols -output=$T -target=$target-test -rt.tagged-refs -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=$sstack -heap-size=10k "$RT_OPT" -multiple >> $T/compile-shard.$i
+	run_v3c "" -symbols -output=$T -target=$target-test -rt.tagged-refs -rt.gc -rt.gctables -rt.test-gc -rt.sttables -set-exec=false -shadow-stack-size=$sstack -heap-size=10k "$RT_OPT" -multiple $args
 	i=$(($i + $SHARDING))
     done
 }
