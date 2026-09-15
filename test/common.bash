@@ -150,9 +150,11 @@ function do_parser_tests() {
 
 # Runs tests in ./seman/*.v3
 function do_seman_tests() {
+    # An optional target makes target-provided components (e.g. "CiRuntime") resolve.
+    local target=$1
     cd seman
     print_status Semantic ""
-    run_v3c "" -test -expect=failures.txt *.v3 | tee $OUT/out | $PROGRESS
+    run_v3c "" -test ${target:+-target=$target} -expect=failures.txt *.v3 | tee $OUT/out | $PROGRESS
     # TODO: accumulate errors and continue?
     fail_fast
     cd ..
@@ -511,7 +513,7 @@ function get_rt_files() {
 	    echo $RT_LOC/$target/*.v3 $N/*.v3
 	    ;;
 	wasm)
-	    echo $RT_LOC/wasm-test/*.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3
+	    echo $RT_LOC/wasm-test/*.v3 $N/NativeGlobalsScanner.v3 $N/NativeFileStream.v3 $RT_LOC/wasm-wave/ShadowStackScanner.v3
 	    ;;
     esac
 }
