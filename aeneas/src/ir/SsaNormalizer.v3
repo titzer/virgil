@@ -724,113 +724,47 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	// normalize an equality operator
 	def normEqualOp(i_old: SsaApplyOp, op: Operator) {
-		var tn = normTypeArg(op, 0);
-		var refs = genRefs(i_old.inputs);
+		var tn = normTypeArg(op, 0), refs = genRefs(i_old.inputs);
+		map1(i_old, genEqual(i_old, tn, refs[0 ... tn.size], refs[tn.size ...]));
+	}
+	// Compare two values of normalized type {tn}, given as their scalars.
+	def genEqual(i_old: SsaApplyOp, tn: TypeNorm, xs: Range<SsaInstr>, ys: Range<SsaInstr>) -> SsaInstr {
 		match (tn) {
 			x: VariantNorm => {
-				if (!norm.ra.getClass(x.oldType).raFacts.RC_ENUM) return map1(i_old, normUnboxedVariantEqual(i_old, x, refs));
-				if (hasUnequalCase(x.oldType)) return map1(i_old, normEnumVariantEqual(i_old, x, refs));
+				if (norm.ra.getClass(x.oldType).raFacts.RC_ENUM) return genEnumVariantEqual(x, xs, ys);
+				return genUnboxedVariantEqual(i_old, x, xs, ys);
 			}
-			_ => if (V3.isVariant(tn.newType)) return map1(i_old, normVariantEqual(i_old, tn.newType, refs[0], refs[1]));
+			x: TupleNorm => {
+				var expr: SsaInstr;
+				for (i < x.nested.length) {
+					var n = x.nested[i], start = x.offsets[i], end = start + n.size;
+					expr = opAnd(expr, genEqual(i_old, n, xs[start ... end], ys[start ... end]));
+				}
+				return if(expr == null, newGraph.trueConst(), expr);
+			}
+			_ => ;
 		}
-		map1(i_old, normEqual(i_old, tn, refs));
+		if (tn.size == 1) return genScalarEqual(i_old, tn.newType, xs[0], ys[0]);
+		var expr: SsaInstr;
+		for (i < tn.size) expr = opAnd(expr, genScalarEqual(i_old, tn.sub[i], xs[i], ys[i]));
+		return if(expr == null, newGraph.trueConst(), expr);
 	}
-	def normEqual1(i_old: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
+	// Compare two scalars of type {t}.
+	def genScalarEqual(i_old: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		if (V3.isVariant(t)) return normVariantEqual(i_old, t, x, y);
-		if (t.typeCon.kind == Kind.FUNCREF) return normSimpleEqualOp0(i_old, null, t, x, y);
+		if (t.typeCon.kind == Kind.FUNCREF && norm.config.WrapFuncTypeSubsume) {
+			return norm.ra.prog.wrappers.opEqual(curBlock, norm.context.method, t, x, y);
+		}
 		return curBlock.opEqual(t, x, y);
 	}
-	def normEqual(i_old: SsaApplyOp, tn: TypeNorm, refs: Array<SsaInstr>) -> SsaInstr {
-		if (tn.size == 0) return newGraph.trueConst();
-		if (tn.size == 1) return normEqual1(i_old, tn.newType, refs[0], refs[1]);
-
-		var expr: SsaInstr;
-		for (i < tn.size) {
-			var cmp = normEqual1(i_old, tn.sub[i], refs[i], refs[i + tn.size]);
-			expr = if(expr == null, cmp, opBoolAnd(expr, cmp));
-		}
-		return expr;
-	}
-	private def getWrappee(x: SsaInstr, val: Val) -> SsaInstr {
-		if (FuncVal.?(val)) {
-			var spec = FuncVal.!(val).memberRef;
-			if (spec.asMethod().flags.M_WRAPPER) {
-				var wrappee = spec;
-				while (norm.ra.prog.wrappers.wrappeeForWrapper.has(wrappee))
-					wrappee = norm.ra.prog.wrappers.wrappeeForWrapper[wrappee];
-				if (CLOptions.PRINT_WRAP.get()) {
-					FunctionWrapping.printWrap().put3("substituting wrappee %q{%d/%d}", wrappee.render,
-							 wrappee.asMethod().index, wrappee.asMethod().uid)
-						   .put3(" for %q{%d/%d}", spec.render, spec.asMethod().index, spec.asMethod().uid).outln();
-				}
-				return funcRef(wrappee);
-			}
-		}
-		return x;
-	}
-	def normSimpleEqualOp0(i_old: SsaApplyOp, op: Operator, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
-		if (norm.config.WrapFuncTypeSubsume &&
-		    t.typeCon.kind == Kind.FUNCREF &&
-		    (norm.context.method.flags & IrUtil.M_MAP_UNMAP) == IrUtil.NO_FLAGS) {
-			if (CLOptions.PRINT_WRAP.get()) {
-				FunctionWrapping.printWrap().put1("normalizing function comparison @%d", i_old.uid).outln();
-				SsaPrinter.new().printInstrLn(x).printInstrLn(y).buf.outln();
-			}
-			// unmap any constant arguments
-			var xconst = SsaConst.?(x);
-			var xval = if(xconst, SsaConst.!(x).val, null);
-			var xnull = xconst && xval == null;
-
-			var yconst = SsaConst.?(y);
-			var yval = if(yconst, SsaConst.!(y).val, null);
-			var ynull = yconst && yval == null;
-
-			if (xconst && !xnull) x = getWrappee(x, xval);
-			if (yconst && !ynull) y = getWrappee(y, yval);
-
-			var unmapper: IrSpec;
-			// Two known functions do not need a run-time unmapper
-			if (xconst && yconst) {
-				if (CLOptions.PRINT_WRAP.get()) {
-					FunctionWrapping.printWrap().puts("Comparing two known functions, no unmapper needed");
-				}
-			}
-			// Comparison with null does not require unmapping
-			else if (xnull || ynull) {
-				if (CLOptions.PRINT_WRAP.get()) {
-					FunctionWrapping.printWrap().puts("Comparing with null, no unmapper needed");
-				}
-			}
-			else if ((unmapper = norm.ra.prog.wrappers.getUnmapper(t)) != null) {
-				// insert unmapping for non-const argument(s)
-				// (if unmapper is null, unmapping is not needed for this type)
-				if (!xconst) {
-					if (CLOptions.PRINT_WRAP.get()) {
-						FunctionWrapping.printWrap().puts("first comparand needs unmapping");
-					}
-					var op = V3Op.newCallMethod(unmapper);
-					var args = [curBlock.graph.nullReceiver(), x];
-					x = curBlock.addApply(null, op, args);
-				}
-				if (!yconst) {
-					if (CLOptions.PRINT_WRAP.get()) {
-						FunctionWrapping.printWrap().puts("second comparand needs unmapping");
-					}
-					var op = V3Op.newCallMethod(unmapper);
-					var args = [curBlock.graph.nullReceiver(), y];
-					y = curBlock.addApply(null, op, args);
-				}
-				return curBlock.opEqualOf(V3Op.newRefEq(AnyFunction.TYPE), x, y);
-			}
-		}
-		if (op == null) op = V3Op.newEqual(t);
-		return curBlock.opEqualOf(op, x, y);
-	}
+	// Normalize IntEq or RefEq, which compare a single scalar and are never structural.
 	def normSimpleEqualOp(i_old: SsaApplyOp, op: Operator) {
-		var refs = genRefs(i_old.inputs);
-		var tn = normTypeArg(op, 0);
-		var i_new = normSimpleEqualOp0(i_old, op, tn.newType, refs[0], refs[tn.size]);
-		return map1(i_old, i_new);
+		var tn = normTypeArg(op, 0), refs = genRefs(i_old.inputs);
+		var t = tn.newType, x = refs[0], y = refs[tn.size];
+		if (t.typeCon.kind == Kind.FUNCREF && norm.config.WrapFuncTypeSubsume) {
+			return map1(i_old, norm.ra.prog.wrappers.opEqual(curBlock, norm.context.method, t, x, y));
+		}
+		map1(i_old, curBlock.opEqualOf(op, x, y));
 	}
 	def normVariantEqual(i_old: SsaApplyOp, t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		var rc = norm.ra.getClass(t);
@@ -875,29 +809,106 @@ class SsaRaNormalizer extends SsaRebuilder {
 		for (l = rc.subtypes; l != null; l = l.tail) if (isUnequalCase(l.head.oldType)) return true;
 		return isUnequalCase(t);
 	}
-	// Normalize equality of a variant represented by only its tag. The tags must match, and
-	// the case must not be one that is never equal to itself.
-	def normEnumVariantEqual(i_old: SsaApplyOp, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
-		var expr = normEqual(i_old, vn, refs);
+	// Returns true if values of type {tn} compare correctly as raw bits/references: no float, boxed
+	// variant or wrapped function inside. Nested variants are checked by field, since scalars unify types.
+	def canCompareBitwise(tn: TypeNorm) -> bool {
+		match (tn) {
+			x: VariantNorm => {
+				for (l = liveCaseNorms(x); l != null; l = l.tail) {
+					for (f in l.head.fields) if (f.indexes.length > 0 && !canCompareBitwise(f.tn)) return false;
+				}
+				return true;
+			}
+			x: TupleNorm => {
+				for (n in x.nested) if (!canCompareBitwise(n)) return false;
+				return true;
+			}
+			_ => ;
+		}
+		for (j < tn.size) {
+			var t = tn.at(j);
+			match (t.typeCon.kind) {
+				FLOAT => return false;
+				VARIANT => if (!norm.ra.prog.ir.isEnum(t)) return false;
+				FUNCREF => if (norm.config.WrapFuncTypeSubsume) return false;
+				_ => ;
+			}
+		}
+		return true;
+	}
+	// The live case norms of {vn}: itself if it is a case, otherwise its live subtypes.
+	def liveCaseNorms(vn: VariantNorm) -> List<VariantNorm> {
+		var rc = norm.ra.getClass(vn.oldType);
+		if (vn.fields.length > 0 || ClassType.!(vn.oldType).superType != null) return List.new(vn, null);
+		var list: List<VariantNorm>;
+		for (l = rc.subtypes; l != null; l = l.tail) {
+			if (l.head != rc && l.head.variantNorm != null) list = List.new(l.head.variantNorm, list);
+		}
+		return list;
+	}
+	// Compare two enum-represented variants; a case that folded a NaN is never equal to itself.
+	def genEnumVariantEqual(vn: VariantNorm, xs: Range<SsaInstr>, ys: Range<SsaInstr>) -> SsaInstr {
+		var expr = curBlock.opEqual(vn.tagType(), xs[0], ys[0]);
 		var rc = norm.ra.getClass(vn.oldType);
 		for (l = rc.subtypes; l != null; l = l.tail) {
 			var c = l.head;
 			if (!isUnequalCase(c.oldType)) continue;
 			var tag = newGraph.intConst(c.normClass.getRepTag());
-			expr = opBoolAnd(expr, curBlock.opBoolNot(curBlock.opEqual(vn.tagType(), refs[0], tag)));
+			expr = opBoolAnd(expr, curBlock.opBoolNot(curBlock.opEqual(vn.tagType(), xs[0], tag)));
 		}
 		return expr;
 	}
-	// Normalize equality between two unboxed variants of the same case (e.g. x: T.A == y: T.A)
-	def normUnboxedVariantCaseEqual(i_old: SsaApplyOp, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
-		if (isUnequalCase(vn.oldType)) return newGraph.falseConst();
-		var join = opBoolAnd;
+	// Compare two unboxed variants. Unused scalars and bits are zero, so bitwise scalars are compared
+	// whole; only scalars holding a structural field need a tag dispatch and per-field comparison.
+	def genUnboxedVariantEqual(i_old: SsaApplyOp, vn: VariantNorm, xs: Range<SsaInstr>, ys: Range<SsaInstr>) -> SsaInstr {
+		var cases = liveCaseNorms(vn);
+		var structural = Array<bool>.new(vn.size), any = false;
+		for (l = cases; l != null; l = l.tail) {
+			for (f in l.head.fields) {
+				if (f.indexes.length == 0 || canCompareBitwise(f.tn)) continue;
+				for (idx in f.indexes) structural[idx] = true; // the whole field is compared as a unit
+				any = true;
+			}
+		}
 		var expr: SsaInstr;
-		for (i < vn.fields.length) {
-			var f = vn.fields[i];
-			for (j < f.indexes.length) {
+		for (i < vn.size) {
+			if (structural[i]) continue;
+			expr = opAnd(expr, curBlock.opEqual(vn.at(i), xs[i], ys[i]));
+		}
+		// a case that folded a NaN is never equal to itself
+		for (l = cases; l != null; l = l.tail) {
+			if (!isUnequalCase(l.head.oldType)) continue;
+			if (vn.hasNoTag()) return newGraph.falseConst();
+			var xTag = normVariantGetRepTag(vn, xs), tag = newGraph.intConst(norm.ra.getClass(l.head.oldType).tagValue());
+			expr = opAnd(expr, curBlock.opBoolNot(curBlock.opEqual(vn.tagType(), xTag, tag)));
+		}
+		if (!any) return if(expr == null, newGraph.trueConst(), expr);
+
+		if (cases.tail == null) return opAnd(expr, genCaseFieldsEqual(i_old, cases.head, structural, xs, ys));
+		var xTag = normVariantGetRepTag(vn, xs), yTag = normVariantGetRepTag(vn, ys);
+		var ifc = curBlock.splitForIfCascade(Bool.TYPE);
+		ifc.addNotCase(curBlock.opEqual(vn.tagType(), xTag, yTag));
+		ifc.endCase(newGraph.falseConst());
+		for (l = cases; l != null; l = l.tail) {
+			var cn = l.head, tag = norm.ra.getClass(cn.oldType).tagValue();
+			ifc.addCase(curBlock.opEqual(vn.tagType(), xTag, newGraph.intConst(tag)));
+			ifc.endCase(genCaseFieldsEqual(i_old, cn, structural, xs, ys));
+		}
+		ifc.addElse();
+		ifc.endCase(newGraph.falseConst());
+		return opAnd(expr, ifc.finish());
+	}
+	// Compare the fields of case {vn} that occupy {structural} scalars.
+	def genCaseFieldsEqual(i_old: SsaApplyOp, vn: VariantNorm, structural: Array<bool>, xs: Range<SsaInstr>, ys: Range<SsaInstr>) -> SsaInstr {
+		var expr: SsaInstr;
+		for (f in vn.fields) {
+			var n = f.indexes.length, needed = false;
+			for (idx in f.indexes) if (structural[idx]) needed = true;
+			if (!needed) continue;
+			var fx = Array<SsaInstr>.new(n), fy = Array<SsaInstr>.new(n);
+			for (j < n) {
 				var idx = f.indexes[j], st = vn.sub[idx], ft = f.tn.at(j);
-				var cmp: SsaInstr, a = refs[idx], b = refs[idx + vn.size];
+				var a = xs[idx], b = ys[idx];
 				if (f.isPacked() && (IntType.?(st) || (AnyRefType.?(st) && vn.fixedBits != null))) {
 					// extract the packed field from the scalar before comparing
 					a = genExtractInterval(a, f.intervals[j], st, ft);
@@ -906,46 +917,12 @@ class SsaRaNormalizer extends SsaRebuilder {
 					a = genVariantScalarView(st, ft, a);
 					b = genVariantScalarView(st, ft, b);
 				}
-				cmp = normEqual1(i_old, ft, a, b);
-				if (expr == null) expr = cmp;
-				else expr = join(expr, cmp);
+				fx[j] = a;
+				fy[j] = b;
 			}
+			expr = opAnd(expr, genEqual(i_old, f.tn, fx, fy));
 		}
-		return if(expr != null, expr, newGraph.trueConst());
-	}
-	// Normalize equality between two unboxed variants of unknown case (e.g. x: T == y: T)
-	def normUnboxedVariantEqual(i_old: SsaApplyOp, vn: VariantNorm, refs: Array<SsaInstr>) -> SsaInstr {
-		// XXX: compare scalars, not individual fields.
-		if (vn.hasNoTag()) {
-			if (hasUnequalCase(vn.oldType)) return newGraph.falseConst();	// a dropped constant is never equal
-			return normEqual(i_old, vn, refs); // we can always do a scalar-by-scalar comparison if no boxes are involved.
-		}
-		if (isUnequalCase(vn.oldType)) return newGraph.falseConst();
-		var ct = ClassType.!(vn.oldType);
-		if (ct.superType != null) return normUnboxedVariantCaseEqual(i_old, vn, refs);
-
-		var xTag = normVariantGetRepTag(vn, refs[0 ... vn.size]);
-		var yTag = normVariantGetRepTag(vn, refs[vn.size ...]);
-
-		var tagsEqual = curBlock.opEqual(vn.tagType(), xTag, yTag);
-		var ifc = curBlock.splitForIfCascade(Bool.TYPE);
-
-		ifc.addNotCase(tagsEqual);
-		ifc.endCase(newGraph.falseConst());
-
-		var rc = norm.ra.getClass(vn.oldType);
-		for (l = rc.subtypes; l != null; l = l.tail) {
-			var ic = l.head;
-			if (ic == rc) continue;
-			var tag = ic.normClass.getRepTag();
-			ifc.addCase(curBlock.opEqual(vn.tagType(), xTag, newGraph.intConst(tag)));
-			var result = normUnboxedVariantCaseEqual(i_old, ic.variantNorm, refs);
-			ifc.endCase(result);
-		}
-
-		ifc.addElse();
-		ifc.endCase(newGraph.falseConst());
-		return ifc.finish();
+		return if(expr == null, newGraph.trueConst(), expr);
 	}
 	def normVariantGetRepTag(vn: VariantNorm, args: Range<SsaInstr>) -> SsaInstr {
 		if (vn == null) return null;
