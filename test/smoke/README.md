@@ -119,6 +119,11 @@ native x86 run is the check that matters most; treat any disagreement there as
 a compiler bug to report rather than a value to record. None of the eleven is
 listed in `test/gc/smoke.gc` yet.
 
+`work03` currently fails at `-O2` on x86-64 (input 8, assertion 422): the global
+register allocator breaks a phi-move cycle through spill slots with the scratch
+register that stack-to-stack moves also use. The bug is isolated in
+`test/core/parmove_spill*.v3.fail`.
+
 ## Known non-portable constructs (deliberately avoided here)
 
 Each is excluded at the use site with a comment, and distilled into a `*.v3.fail`
