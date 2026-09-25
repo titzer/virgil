@@ -16,7 +16,7 @@ Each file is standalone (the harness compiles every test separately with
 `-multiple`, so there is no shared helper file) and follows this shape:
 
 ```
-//@execute 0=<crc>; 1=<crc>; ... N=<crc>
+//@execute 1=<crc>; 2=<crc>; 4=<crc>; ... 2^(N-1)=<crc>; 2^N-1=<crc>
 //@heap-size=<bytes>
 
 var crc: int;
@@ -30,9 +30,10 @@ def fail_assert(id: int) { if (failed == 0) failed = id; }
 def sectionOne() { ... }                 // one section per feature group
 
 def run(a: int) {
-	crc = a;                         // seed is just the section number
+	crc = a;                         // seed is just the input bitmask
 	failed = 0;
-	if (a == 0 || a == 1) sectionOne();
+	if ((a & 1) != 0) sectionOne();  // bit k-1 selects section k
+	if ((a & 2) != 0) sectionTwo();
 	...
 }
 def main(a: int) -> int {
@@ -59,9 +60,15 @@ cannot: a CRC records whatever the compiler did. A folding bug shows up as
 
 ### Rules
 
-**Input 0 runs every section** in a single method body — a much larger SSA graph
-than any individual section, which pressures register allocation and spilling.
-Inputs 1..N select one section each, so a failure narrows immediately.
+**The input is a bitmask of sections.** Bit `k-1` selects section `k`, so the
+inputs `1, 2, 4, ...` run one section each and a failure narrows immediately.
+The all-bits input (`2^N-1`) runs every section in a single method body — a much
+larger SSA graph than any individual section, which pressures register
+allocation and spilling. It goes **last** in the directive: when a section is
+broken, the harness reports the first failing input, and seeing the isolated
+section fail before the combined run is what makes the failure debuggable. Any
+other combination can be tried by hand when a failure only reproduces with
+several sections live in one body.
 
 **Sections must not depend on each other.** The harness may run several inputs in
 one process (`v3i -test`) or one process per input (compiled targets). Any
@@ -99,23 +106,23 @@ raising it trades a little GC stress there for a green wasm build.
 If a construct turns out not to be portable across backends, leave a comment
 saying so at the site rather than silently deleting the check.
 
-## Currently disabled tests
+## Recently re-enabled tests
 
-These carry a `.v3.fail` extension, so the `*.v3` glob in `test.bash` skips them
-and they are also left out of `test/gc/smoke.gc`:
+Eleven tests were committed as `.v3.fail` and have since been renamed back to
+`.v3`. `double02`, `float02`, `fsi02`, `fsi03`, `func02` and `layout01` carried
+real directives and pass as-is. `gc01`, `gc03`, `work01`, `work03` and `work04`
+carried a placeholder directive and were blessed only now, against v3i (all
+three modes), jvm, wasm and wasm-gc; three of them needed a larger
+`//@heap-size` for the GC-free wasm run (`gc01` and `work04` 8MB, `work03`
+32MB). Since those five are allocation-churn tests aimed at GC root tracking, a
+native x86 run is the check that matters most; treat any disagreement there as
+a compiler bug to report rather than a value to record. None of the eleven is
+listed in `test/gc/smoke.gc` yet.
 
-- `gc01`, `gc03`, `work01`, `work03`, `work04`
-
-They were committed with a placeholder `//@execute 0=0` and never blessed. Their
-values do agree across v3i, wasm-gc and a GC-free wasm-linear run
-(`gc01=-1315312563`, `gc03=1729852229`, `work01=-1465536795`,
-`work03=1541062172`, `work04=-648465453`), but that is only three execution
-models that share the property of *not* using a shadow stack for GC roots; the
-native x86 targets that CI actually runs were not verified. Since these are
-allocation-churn tests aimed squarely at GC root tracking, blessing them from
-the interpreter alone risks encoding a wrong answer. Re-enabling them means
-following the blessing procedure above against a native target, and treating any
-disagreement as a compiler bug to report rather than a value to record.
+`work03` currently fails at `-O2` on x86-64 (input 8, assertion 422): the global
+register allocator breaks a phi-move cycle through spill slots with the scratch
+register that stack-to-stack moves also use. The bug is isolated in
+`test/core/parmove_spill*.v3.fail`.
 
 ## Known non-portable constructs (deliberately avoided here)
 
