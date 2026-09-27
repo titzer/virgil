@@ -11,11 +11,11 @@
 3. Start a new branch that will become the stable version PR.
    This branch and PR will have multiple commits that should not be squashed when being merged back into the main/master branch.
 
-4. Bump the major version number (i.e. III-11.7001 to III-12.7001) without changing the minor version number and set Debug.UNSTABLE = false;
+4. Bump the major version number (i.e. III-11.7001 to III-12.7001) without changing the minor version number and set Version.UNSTABLE = false;
    This fixes the source code changes and version number that will be stable.
    Verify CI is green for all CI platforms.
    Since this new stable compiler does not support *unstable* platforms, any CI for those should not be run.
-   Commit these changes. (C2: major version bump and Debug.UNSTABLE = false)
+   Commit these changes. (C2: major version bump and Version.UNSTABLE = false)
 
 5. Bootstrap the compiler for all supported stable targets, including newly-stable targets, i.e. (aeneas bootstrap <stable-host> <stable-target*>).
    This produces new binaries in bin/current/target/ for each target.
@@ -31,7 +31,7 @@
    Verify CI is green for all CI platforms, including newly stable ones.
    Commit these changes. (C3: stable binaries overwritten with new versions and CI for new stable platforms enabled)
 
-8. Bump the major *and* minor version numbers (i.e. III-12.7001 to III-13.7002) and set Debug.UNSTABLE = true.
+8. Bump the major *and* minor version numbers (i.e. III-12.7001 to III-13.7002) and set Version.UNSTABLE = true.
    This brings the source tree back into "development" mode, supporting unstable features.
    Verify CI is green for all CI platforms.
    Commit these changes. (C4: compiler versions updated and back to development mode)
