@@ -134,6 +134,27 @@ var x: E;
 var y = foo(x);     // E value is automatically promoted to E.set
 ```
 
+## Viewing integers as enum sets
+
+Since an enum set is represented as a bitmask, Virgil III exposes the representation directly with the `view` operator.
+`E.set.view(x)` reinterprets the low bits of the integer `x` as a set: bit `i` of `x` is set exactly when the enum value with tag `i` is in the result.
+Higher-order bits of the integer are ignored.
+Going the other way, `int.view(s)` (or any other integer type's `view`) yields the bitmask of the set `s`.
+
+```
+enum Flag { READ, WRITE, EXECUTE }
+
+def fromMode(mode: int) -> Flag.set {
+    return Flag.set.view(mode);     // only the low 3 bits of {mode} are used
+}
+def toMode(flags: Flag.set) -> int {
+    return int.view(flags);         // e.g. {Flag.READ | Flag.EXECUTE} == 5
+}
+```
+
+The integer argument may be of any integer type; narrow signed integers are sign-extended before being viewed, so `E.set.view(-1)` is always `E.set.all`.
+Only integer types can be viewed as enum sets; viewing floats, booleans, or values of other enum set types is a type error.
+
 ## Implementation limits
 
 In the current implementation of Virgil in this repository, enum set types are available for all enum declarations with 64 or fewer values.
