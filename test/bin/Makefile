@@ -10,6 +10,9 @@ x86-64-darwin: progress-x86-64-darwin test-x86-64-darwin
 
 OPTS=-static -O2
 
+# Darwin has no static libc; target the oldest system that might run the tests.
+X86_64_DARWIN_OPTS=-arch x86_64 -mmacosx-version-min=10.13 -O2
+
 progress-x86-darwin: src/progress.*
 	cc -m32 ${OPTS} -o $@ -Isrc src/progress.c
 	strip $@
@@ -19,7 +22,7 @@ progress-x86-linux: src/progress.*
 	strip $@
 
 progress-x86-64-darwin: src/progress.*
-	cc -m64 ${OPTS} -o $@  -Isrc src/progress.c
+	cc ${X86_64_DARWIN_OPTS} -o $@  -Isrc src/progress.c
 	strip $@
 
 progress-arm64-darwin: src/progress.*
@@ -35,7 +38,7 @@ test-x86-darwin: src/execute-arch-posix.c
 	strip $@
 
 test-x86-64-darwin: src/execute-arch-posix.c
-	cc -m64 ${OPTS} -o $@ src/execute-arch-posix.c
+	cc ${X86_64_DARWIN_OPTS} -o $@ src/execute-arch-posix.c
 	strip $@
 
 test-x86-linux: src/execute-arch-posix.c
