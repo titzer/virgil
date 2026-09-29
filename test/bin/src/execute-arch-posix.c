@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <time.h>
 
 #define STDOUT_BUF_SIZE 100
 #define STDERR_BUF_SIZE 1024
@@ -45,8 +46,11 @@ typedef struct {
 } v3_test;
 
 volatile int tests_running;
-volatile int test_timeout;
-volatile int test_pid;
+
+// The test process being timed and its deadline, shared with the timeout thread.
+pthread_mutex_t timeout_lock = PTHREAD_MUTEX_INITIALIZER;
+int test_pid;			// pid of the running test process, or 0 if none
+long test_deadline;		// time in milliseconds at which to kill it
 
 int tests_total;
 int tests_done;
@@ -63,6 +67,8 @@ void begin_test(v3_test *test);
 void end_test(v3_test *test, int result);
 int run_test(v3_test *test);
 void* timeout_thread(void *ptr);
+void begin_timeout(int pid);
+void end_timeout();
 
 int main(int argc, char **argv) {
   int i;
@@ -370,9 +376,9 @@ int execute_test(v3_test *test) {
       close(result.pipe_stderr[1]);
 
       // wait for signal / exit
-      test_timeout = TIMEOUT;
-      test_pid = pid;
+      begin_timeout(pid);
       waitpid(pid, &result.status, 0);
+      end_timeout();
 
       // read stdout into buffer
       result.len_stdout = read(result.pipe_stdout[0], result.data_stdout, STDOUT_BUF_SIZE);
@@ -394,12 +400,36 @@ int execute_test(v3_test *test) {
   return 1;
 }
 
+long now_ms() {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec * 1000L + t.tv_nsec / 1000000;
+}
+
+void begin_timeout(int pid) {
+  pthread_mutex_lock(&timeout_lock);
+  test_deadline = now_ms() + TIMEOUT * 1000;
+  test_pid = pid;
+  pthread_mutex_unlock(&timeout_lock);
+}
+
+void end_timeout() {
+  pthread_mutex_lock(&timeout_lock);
+  test_pid = 0;
+  pthread_mutex_unlock(&timeout_lock);
+}
+
+// Kills the running test process, if any, when it passes its deadline. The
+// deadline is absolute because sleep() can return early, e.g. whenever this
+// process forks under Rosetta on Linux.
 void* timeout_thread(void *ptr) {
   while (tests_running) {
-    if (test_timeout-- < 0) {
-      test_timeout = 0;
+    pthread_mutex_lock(&timeout_lock);
+    if (test_pid > 0 && now_ms() > test_deadline) {
       kill(test_pid, 9);
+      test_pid = 0;
     }
+    pthread_mutex_unlock(&timeout_lock);
     sleep(1);
   }
   return NULL;

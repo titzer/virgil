@@ -76,7 +76,7 @@ function do_compiled() {
                 if [ "$short" = "run-wasm-gc-wasi1@node" ]; then
 	            $CONFIG/node --no-warnings --experimental-wasi-unstable-preview1 ../../rt/wasm-wasi1-common/wasi.node.mjs $OUT/$target/main.wasm $TESTS | tee $R | $PROGRESS
                 else
-	            $OUT/$target/main $FATAL $TESTS | tee $R | $PROGRESS
+	            $runner $OUT/$target main $FATAL $TESTS | tee $R | $PROGRESS
                 fi
             else
 	        printf "${YELLOW}skipped${NORM}\n"
