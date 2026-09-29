@@ -95,6 +95,20 @@ function check_target_tests() {
 	done | tee $C | $PROGRESS
 }
 
+# Choose the C compiler and the runner for the target: the host's own if it can
+# run the target's programs natively, otherwise ones that use docker, if any.
+function set_cc_and_runner() {
+	target=$1
+	RUNNER=$(get_io_runners $target | cut -d' ' -f1)
+	if [ -n "$CC" ]; then
+		return
+	elif [ -x $CONFIG/test-$target ]; then
+		CC=cc
+	elif [ -x $CONFIG/cc-$target@docker ]; then
+		CC=$CONFIG/cc-$target@docker
+	fi
+}
+
 function compile_target_c_files() {
 	target=$1
 	print_status "C files" $target
@@ -108,7 +122,6 @@ function compile_target_c_files() {
 		MODEL=-m64
 	fi
 	if [ -z "$MODEL" ]; then continue; fi
-	export CC=${CC:=cc}
 	for t in $TESTS; do
 		cfile="${t/.v3/_.c}"
 		if [ -r "$cfile" ]; then
@@ -136,7 +149,6 @@ function link_target_tests() {
 		MODEL=-m64
 	fi
 	if [ -z "$MODEL" ]; then continue; fi
-	export CC=${CC:=cc}
 	LD_SCRIPT="${LD_SCRIPT:=virgil-ld-script}"
 	for t in $TESTS; do
 		obj=$OUT/$target/"${t/.v3/.o}"
@@ -190,7 +202,6 @@ function execute_target_tests() {
 		for tt in $TO_RUN; do
 			echo "##>1"   # for progress
 			echo "##+$tt" # for progress
-			exe=$OUT/$target/"${tt/.v3/}"
 			runcount=0
 			runs="$(grep "^//@run " $tt)"
 			runs="${runs#//@run }"
@@ -202,7 +213,7 @@ function execute_target_tests() {
 				runargs="${arun%%=*}"
 				runargs="${runargs# }"
 				runexpect="${arun##*=}"
-				rungot="$($exe $runargs)"
+				rungot="$($RUNNER $OUT/$target $tt $runargs)"
 				if [ "-x$rungot" != "-x$runexpect" ]; then
 					echo "##-fail: Run $runcount expected $runexpect but got $rungot"
 					fail=1
@@ -219,6 +230,12 @@ for target in $TEST_TARGETS; do
 	if [ "$target" = "x86-64-linux" ]; then
 		(compile_target_tests $target) || exit $?
 		(check_target_tests $target) || exit $?
+		set_cc_and_runner $target
+		if [[ -z "$CC" || -z "$RUNNER" ]]; then
+			print_status Linking $target
+			echo "${YELLOW}skipped${NORM}"
+			continue
+		fi
 		(compile_target_c_files $target) || exit $?
 		(link_target_tests $target) || exit $?
 		(execute_target_tests $target) || exit $?
