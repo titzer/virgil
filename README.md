@@ -69,6 +69,11 @@ You can learn more in the [Implementation Guide](doc/impl/README.md).
 The most up-to-date documentation is, as always, this repository!
 Learn how to [get started](start/README.md) using Virgil and browse the [tutorial](doc/tutorial/Overview.md), where many [example](doc/tutorial/examples) programs exist.
 
+### Editor Support
+
+A Visual Studio Code extension with syntax highlighting, semantic highlighting, and debugging lives in the
+[virgil-vscode](https://github.com/titzer/virgil-vscode) repository.
+
 ### Research Papers
 
 Six research papers have been published on Virgil.
