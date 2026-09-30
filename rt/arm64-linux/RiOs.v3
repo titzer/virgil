@@ -1,0 +1,97 @@
+// Copyright 2024 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Callbacks for RiRuntime to do arm64-linux logic for handling signals and walking
+// stack frames.
+//
+// ARM64 Linux ucontext layout:
+//   offset 0:   uc_flags (8 bytes)
+//   offset 8:   uc_link (8 bytes)
+//   offset 16:  uc_stack (24 bytes: ss_sp, ss_flags, ss_size)
+//   offset 40:  uc_sigmask (8 bytes) + __unused (120 bytes) = 128 bytes total
+//   offset 168: (8 bytes padding for 16-byte alignment of sigcontext)
+//   offset 176: uc_mcontext (struct sigcontext):
+//     offset 176: fault_address (8 bytes)
+//     offset 184: regs[0..30] (31 * 8 = 248 bytes; regs[29]=fp, regs[30]=lr)
+//     offset 432: sp (8 bytes)
+//     offset 440: pc (8 bytes)
+//     offset 448: pstate (8 bytes)
+//
+// ARM64 sigaction struct (no sa_restorer on ARM64):
+//   offset 0:  sa_handler (8 bytes)
+//   offset 8:  sa_flags (8 bytes)
+//   offset 16: sa_mask (8 bytes)
+component RiOs {
+	private def kernelbuf = Array<long>.new(4);
+
+	// Install the {CiRuntime.signalStub}, which calls an RiRuntime routine, for {signum}.
+	def installHandler(signum: int) {
+		kernelbuf[0] = CiRuntime.signalStub - Pointer.NULL;		// sa_handler
+		kernelbuf[1] = 0x08000004; 					// sa_flags = SA_ONSTACK | SA_SIGINFO
+		kernelbuf[2] = 0;						// sa_mask
+		Linux.syscall(LinuxConst.SYS_rt_sigaction, (signum, Pointer.atContents(kernelbuf), 0, 8));
+	}
+	// Get the instruction pointer (PC) from a ucontext.
+	def getIp(ucontext: Pointer) -> Pointer {
+		return (ucontext + 440).load<Pointer>();
+	}
+	// Get the stack pointer from a ucontext.
+	def getSp(ucontext: Pointer) -> Pointer {
+		return (ucontext + 432).load<Pointer>();
+	}
+	// Get the frame pointer (X29) from a ucontext.
+	def getFp(ucontext: Pointer) -> Pointer {
+		return (ucontext + 416).load<Pointer>(); // regs[29]
+	}
+	// Get the link register (X30) from a ucontext.
+	def getLr(ucontext: Pointer) -> Pointer {
+		return (ucontext + 424).load<Pointer>(); // regs[30]
+	}
+	// Get the access address from a siginfo/ucontext.
+	// On ARM64, the fault address is in sigcontext.fault_address at ucontext+176.
+	def getAccessAddress(siginfo: Pointer, ucontext: Pointer) -> Pointer {
+		return (ucontext + 176).load<Pointer>();
+	}
+	// On ARM64, BLR puts the return address in LR (not on the stack),
+	// so recover the caller IP from LR and leave SP unchanged.
+	def callerOfNullCall(ucontext: Pointer, ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
+		return (getLr(ucontext) + -1, sp);
+	}
+	// Advance the instruction pointer and stack pointer from the current frame to the caller's frame.
+	// ARM64 frame layout: [spill slots | extra slot | saved LR] with 16-byte alignment.
+	// frameSize = align((frameWords + 2) * 8, 16) where +1 for extra slot and +1 for LR.
+	def callerFrame(ip: Pointer, sp: Pointer, frameWords: int) -> (Pointer, Pointer) {
+		var size = (frameWords + 2) * Pointer.SIZE;
+		if ((frameWords & 1) != 0) size = size + Pointer.SIZE; // align to 16
+		sp = sp + size;
+		ip = (sp + (0 - Pointer.SIZE)).load<Pointer>() + -1;
+		return (ip, sp);
+	}
+	// Exit with the given return code.
+	def exit(code: int) {
+	        Linux.syscall(LinuxConst.SYS_exit, code);
+	}
+	// initialize stack red zone for handling stack overflow
+	def initStackRedZone(start: Pointer, end: Pointer) -> (Pointer, Pointer) {
+		// arm64 Linux uses 16K pages. The mmap'd stack base is page-aligned and
+		// ALT_SIZE is a multiple of PAGE_SIZE, so the red zone start is 16K-aligned.
+		def PAGE_SIZE = 16 * 1024;
+		def ALT_SIZE = 2 * PAGE_SIZE;	// alternate signal stack below the red zone
+		// | alt stack | red zone |     usable stack   |
+		// ^ start                                     ^end
+		var red_start = start + ALT_SIZE;
+		var red_end = red_start + PAGE_SIZE;
+		if ((end - red_end) < PAGE_SIZE) return (Pointer.NULL, Pointer.NULL); // not enough usable stack
+		// mprotect the guard PROT_NONE; if it fails, install no red zone rather
+		// than record a range that is not actually protected.
+		var r = Linux.syscall(LinuxConst.SYS_mprotect, (red_start, PAGE_SIZE, LinuxConst.PROT_NONE));
+		if (r.0 < 0) return (Pointer.NULL, Pointer.NULL);
+
+		// set up alternate signal stack in [start, red_start)
+		kernelbuf[0] = start - Pointer.NULL;	// ss_sp = start
+		kernelbuf[1] = 0;			// ss_flags
+		kernelbuf[2] = ALT_SIZE;		// ss_size (space below the red zone)
+		Linux.syscall(LinuxConst.SYS_sigaltstack, (Pointer.atContents(kernelbuf), Pointer.NULL));
+		return (red_start, red_end);
+	}
+}
