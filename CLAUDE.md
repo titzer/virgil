@@ -43,7 +43,7 @@ v3i apps/HelloWorld/HelloWorld.v3
 # Compile to native (use platform-specific script)
 v3c-x86-64-linux apps/HelloWorld/HelloWorld.v3
 
-# Compile to other targets, with runtime system and GC: v3c-x86-linux, v3c-x86-64-darwin, v3c-arm64-linux, v3c-jar, v3c-wasm
+# Compile to other targets, with runtime system and GC: v3c-x86-linux, v3c-x86-64-darwin, v3c-arm64-linux, v3c-riscv64-linux, v3c-jar, v3c-wasm
 # Compile to other targets, without runtime: v3c -target=x86-linux, v3c -target=x86-linux-test, 
 
 # Run the current compiler on the stable compiler's interpreter, which skips a build step

@@ -1,0 +1,234 @@
+// Copyright 2026 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def Regs: RiscV64Regs;
+def MRegs: RiscV64RegSet;
+
+component RiscV64Common {
+	def LOWERING = makeMachLoweringConfig();
+	def makeMachLoweringConfig() -> MachLoweringConfig {
+		var config = MachLoweringConfig.new();
+		config.Int32Arith = true;
+		config.Int64Arith = true;
+		config.ExplicitDivChecks = true;
+		config.ExplicitModChecks = true;
+		config.IntConvertFUnsigned = true;
+		config.IntConvertFMapsNanToZero = false;	// fcvt maps NaN to the maximum integer
+		config.IntConvertFPosSaturates = true;
+		config.IntConvertFNegSaturates = true;
+		config.FloatConvertIUnsigned = true;
+		config.ExEntrySize = 8;
+		return config;
+	}
+
+	def KERNEL_PARAM_REGS = [
+		RiscV64RegSet.A7,	// syscall number
+		RiscV64RegSet.A0,	// param 0
+		RiscV64RegSet.A1,	// param 1
+		RiscV64RegSet.A2,	// param 2
+		RiscV64RegSet.A3,	// param 3
+		RiscV64RegSet.A4,	// param 4
+		RiscV64RegSet.A5	// param 5
+	];
+	def KERNEL_RETURN_REGS = [
+		RiscV64RegSet.A0,	// return value 0
+		RiscV64RegSet.A1	// return value 1
+	];
+}
+
+class RiscV64Backend extends MachBackend {
+	def test: bool;
+	var asm: RiscV64Assembler;
+	var codegen: SsaRiscV64Gen;
+	var allocateRegs: void -> void;
+	var allocateRegsGlobal: void -> void;
+
+	// memory allocator configuration
+	var objReg: RiscV64Gpr;
+	var sizeReg: RiscV64Gpr;
+	var ipReg: RiscV64Gpr;
+	var spReg: RiscV64Gpr;
+
+	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, dwarf: Dwarf, test)
+		super(compiler, prog, mach, w) {
+
+		if (ri_gc != null) {
+			// call the RiRuntime.gc() method
+			var frame = computeFrameSize(getFrame(ri_gc.ssa)), c = frame.conv;
+			objReg = MRegs.toGpr(c.calleeRet(0));
+			sizeReg = MRegs.toGpr(c.calleeParam(1));
+			ipReg = MRegs.toGpr(c.calleeParam(2));
+			spReg = MRegs.toGpr(c.calleeParam(3));
+		} else {
+			// there is no appropriate RiRuntime.gc() method
+			objReg = Regs.A0;
+			sizeReg = Regs.A1;
+		}
+		asm = RiscV64Assembler.new(w);
+		codegen = SsaRiscV64Gen.new(context, mach, asm, w, dwarf);
+
+		if (mach.stackAlign < 16) mach.stackAlign = 16;
+
+		if (compiler.useGlobalRegAllocMatcher != VstMatcher.None) allocateRegsGlobal = GlobalRegAlloc.new(MRegs.SET, codegen).allocate;
+		if (compiler.LocalRegAlloc) allocateRegs = LocalRegAlloc.new(MRegs.SET, codegen).allocate;
+		else allocateRegs = SimpleRegAlloc.new(MRegs.SET, codegen).allocate;
+	}
+
+	def genEntryStub() {
+		def mainSpec = prog.getMain();
+		if (mainSpec == null) return;
+		def main = mainSpec.asMethod();
+		def frame = computeFrameSize(getFrame(main.ssa));
+		genMainInit(frame);
+		if (test) genTestInputs(main, frame);
+		// Switch to compiler-provided stack before calling main.
+		if (CLOptions.STACK_SIZE.get() > 0) {
+			codegen.emitLoadAddr(Regs.T4, CiRuntimeModule.STACK_END);
+			asm.mv(Regs.SP, Regs.T4);
+		}
+		codegen.emitCallAddr(mach.addrOfMethod(main));
+
+		if (test) genTestOutput(main, frame);
+		if (test || main.sig.returnTypes.length == 0) asm_exit_code(0);
+		else asm_exit_r(loc_gpr(frame, frame.conv.callerRet(0)));
+		codegen.flushPool();
+	}
+	def genCodeFromSsa() {
+		var frame = getFrame(context.method.ssa);
+		var rtsrc = mach.runtime.src;
+		if (rtsrc != null) rtsrc.curFrame = frame;
+		codegen.generate(context.method, frame);
+		if (context.shouldUseGlobalRegAlloc()) allocateRegsGlobal();
+		else allocateRegs();
+		computeFrameSize(frame);
+		if (rtsrc != null) rtsrc.recordMethodStart(w.endOffset(), context.method.source, frame);
+		codegen.assembleInstrs();
+		if (rtsrc != null) rtsrc.recordFrameEnd(w.endOffset());
+	}
+	def genSignalHandlerStub() {
+		unimplemented();
+	}
+	def genFatalStub(ex: string, addr: Addr) {
+		unimplemented();
+	}
+	def getFrame(ssa: SsaGraph) -> MachFrame {
+		return MachFrame.new(RiscV64VirgilCallConv.getForGraph(mach, ssa), mach.data.addrAlign, mach.refSize);
+	}
+	// Frame layout: [spill slots | extra slot | saved ra], 16-byte aligned; {RiOs.callerFrame} matches.
+	def computeFrameSize(frame: MachFrame) -> MachFrame {
+		frame.frameSize = mach.alignTo((frame.slots() + 1) * mach.refSize + mach.code.addressSize, mach.stackAlign);
+		return frame;
+	}
+	def genMainInit(frame: MachFrame) {
+		if (mach.runtime.ri_init >= 0) return genRiInit();
+		if (test) return genSigInstalls();
+	}
+	def genRiInit() {
+		// Call RiRuntime.init(this=null, argc @ [sp], argv, envp=null) -> Array<string>
+		var init_meth = mach.runtime.getRiInit();
+		var conv = getFrame(init_meth.ssa).conv;
+		asm.mv(MRegs.toGpr(conv.calleeParam(0)), Regs.ZERO);
+		asm.ld(MRegs.toGpr(conv.calleeParam(1)), Regs.SP, 0);
+		var argvReg = MRegs.toGpr(conv.calleeParam(2));
+		if (test) asm.mv(argvReg, Regs.ZERO);
+		else asm.addi(argvReg, Regs.SP, i12.view(mach.data.addressSize));
+		asm.mv(MRegs.toGpr(conv.calleeParam(3)), Regs.ZERO);
+		codegen.emitCallAddr(mach.addrOfMethod(init_meth));
+		// move the return value to main's param register
+		if (!test) {
+			var retReg = MRegs.toGpr(conv.calleeRet(0));
+			var dest = MRegs.toGpr(conv.callerParam(1));
+			if (retReg != dest) asm.mv(dest, retReg);
+		}
+	}
+	def genSigInstalls() {
+		genSigHandlerInstall(8, mach.runtime.getFatalAddress(V3Exception.DivideByZero));
+		genSigHandlerInstall(10, mach.runtime.getFatalAddress(V3Exception.NullCheck));
+		genSigHandlerInstall(11, mach.runtime.getFatalAddress(V3Exception.NullCheck));
+	}
+	def genAllocStub() {
+		if (alwaysGc) return jumpRiGc();
+		// Bump-pointer allocator: sizeReg = size input, objReg = result
+		codegen.emitLoadAddr(Regs.T4, CiRuntimeModule.HEAP_CUR_LOC);
+		asm.ld(objReg, Regs.T4, 0);
+		asm.add(sizeReg, objReg, sizeReg);		// sizeReg = cur + size
+		codegen.emitLoadAddr(Regs.T5, CiRuntimeModule.HEAP_END_LOC);
+		asm.ld(Regs.T5, Regs.T5, 0);
+		asm.bltu(Regs.T5, sizeReg, 12);			// end < new: slow path
+		asm.sd(sizeReg, Regs.T4, 0);
+		asm.ret();
+		if (ri_gc == null) {
+			codegen.emitJumpAddr(mach.runtime.getFatalAddress(V3Exception.HeapOverflow));
+		} else {
+			asm.sub(sizeReg, sizeReg, objReg);	// recover the size: new - cur
+			jumpRiGc();
+		}
+		codegen.flushPool();
+	}
+	def genGcStub() {
+		// force a collection by calling RiRuntime.gc() with a size of 0
+		asm.mv(sizeReg, Regs.ZERO);
+		jumpRiGc();
+		codegen.flushPool();
+	}
+	def jumpRiGc() {
+		// Tail-call RiRuntime.gc(this=null, size, ip, sp); sizeReg already holds the size
+		if (ipReg != Regs.RA) asm.mv(ipReg, Regs.RA);
+		asm.mv(spReg, Regs.SP);
+		asm.mv(objReg, Regs.ZERO);
+		codegen.emitJumpAddr(mach.addrOfMethod(ri_gc));
+	}
+	def unimplemented() {
+		mach.fail("unimplemented");
+	}
+	def genTestInputs(main: IrMethod, frame: MachFrame) {
+		asm.lw(Regs.T4, Regs.SP, 0); // argc
+		def params = main.ssa.params, conv = frame.conv;
+		if (conv.overflow > 0) {
+			// allocate space for overflow arguments
+			def overflowSpace = mach.alignTo(conv.overflow * mach.data.addressSize, mach.stackAlign);
+			codegen.emitAddImm(Regs.SP, Regs.SP, 0 - overflowSpace);
+		}
+
+		def vals = mach.runtime.parseTestInputs(prog, prog.ERROR, params.length - 1);
+
+		asm.mv(MRegs.toGpr(conv.callerParam(0)), Regs.ZERO); // this = null
+
+		for (i = 1; i < conv.paramLocs.length; i++) {
+			def loc = conv.callerParam(i), dest = MRegs.toGpr(loc);
+			// load the value at index argc from the table that follows
+			def tableRef = Addr.new(mach.codeRegion, null, 0);
+			asm.auipc(Regs.T5, 0);
+			asm.addi(Regs.T5, Regs.T5, 0);
+			w.recordPatch(PatchKind.RISCV_PCREL_HI20_LO12, tableRef, w.pos - 8);
+			asm.slli(Regs.T6, Regs.T4, 2);
+			asm.add(Regs.T5, Regs.T5, Regs.T6);
+
+			if (dest == null) {
+				// stack destination: write the whole slot, which the callee reloads at full width
+				def offset = mach.data.addressSize * (loc - frame.conv.regSet.callerStart);
+				asm.lw(Regs.T6, Regs.T5, 0);
+				codegen.emitStoreSlot(Regs.T6, offset);
+			} else {
+				asm.lw(dest, Regs.T5, 0);
+			}
+
+			def endAddr = Addr.new(mach.codeRegion, null, 0);
+			asm.jal(Regs.ZERO, 0);
+			w.recordPatch(PatchKind.RISCV_JAL, endAddr, w.pos - 4);
+			tableRef.absolute = w.addr() - 4; // argc = 1 adjustment
+			for (v in vals) w.put_b32(V3.unboxI32(v[i - 1]));
+			w.bind(endAddr);
+		}
+	}
+	def loc_gpr(frame: MachFrame, loc: int) -> RiscV64Gpr {
+		var r = MRegs.toGpr(loc);
+		if (r == null) return V3.fail(Strings.format1("expected GPR, but got %s", frame.conv.regSet.identify(loc)));
+		return r;
+	}
+	//=={ OS-specific routines }==============================================================
+	def genSigHandlerInstall(signo: int, handler: Addr);
+	def asm_exit_r(r: RiscV64Gpr);
+	def asm_exit_code(code: int);
+	def genTestOutput(main: IrMethod, frame: MachFrame);
+}

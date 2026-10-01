@@ -1,0 +1,112 @@
+// Copyright 2026 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def SPACE = AddressSpace.new("mem", false, 64, 8, Alignment.new(4096), Alignment.new(8));
+def KERNEL_CALL_RETURN = Tuple.newType(Lists.cons2(Long.TYPE, Long.TYPE));
+def target_ = LinuxTarget.new("riscv64-linux", SPACE, IntNormalizers.I64LE, RiscV64Common.LOWERING,
+		RiscV64LinuxBackend.new(_, _, _, _, _, false), null, ElfConst.EM_RISCV, KERNEL_CALL_RETURN);
+def test_target_ = LinuxTarget.new("riscv64-linux-test", SPACE, IntNormalizers.I64LE, RiscV64Common.LOWERING,
+		RiscV64LinuxBackend.new(_, _, _, _, _, true), null, ElfConst.EM_RISCV, KERNEL_CALL_RETURN);
+def X_ = if(Version.UNSTABLE, (Aeneas.registerTarget(target_), Aeneas.registerTarget(test_target_)));
+
+def Regs: RiscV64Regs;
+
+// Provides the riscv64-specific logic for generating a Linux binary.
+class RiscV64LinuxBackend extends RiscV64Backend {
+	def SYSNUM = Regs.A7;
+	def PARAM0 = Regs.A0;
+	def PARAM1 = Regs.A1;
+	def PARAM2 = Regs.A2;
+	def PARAM3 = Regs.A3;
+	def SYS_write = 64;
+	def SYS_exit_group = 94;
+	def SYS_rt_sigaction = 134;
+	def SYS_rt_sigreturn = 139;
+
+	new(compiler: Compiler, prog: Program, mach: MachProgram, w: MachDataWriter, dwarf: Dwarf,
+		test: bool) super(compiler, prog, mach, w, dwarf, test) { }
+
+	// Override RiscV64Backend
+	def genSignalHandlerStub() {
+		var handler_meth = mach.runtime.getRiSignal();
+		if (handler_meth == null) return;
+		var frame = getFrame(handler_meth.ssa);
+		mach.runtime.bindAddr(CiRuntimeModule.SIGNAL_STUB, w);
+
+		asm.addi(Regs.SP, Regs.SP, -16);
+		asm.sd(Regs.RA, Regs.SP, 8);
+		asm.sd(Regs.S0, Regs.SP, 0);
+
+		// Call RiRuntime.signal(this=null, signum, siginfo, ucontext), shifting the args up
+		asm.mv(Regs.A3, Regs.A2);
+		asm.mv(Regs.A2, Regs.A1);
+		asm.mv(Regs.A1, Regs.A0);
+		asm.mv(Regs.A0, Regs.ZERO);
+		codegen.emitCallAddr(mach.addrOfMethod(handler_meth));
+
+		// Return to the kernel's rt_sigreturn trampoline in ra
+		asm.ld(Regs.RA, Regs.SP, 8);
+		asm.ld(Regs.S0, Regs.SP, 0);
+		asm.addi(Regs.SP, Regs.SP, 16);
+		asm.ret();
+
+		// Not used (riscv64 returns from signals through a VDSO trampoline), but bound anyway
+		mach.runtime.bindAddr(CiRuntimeModule.SIGNAL_RESTORER, w);
+		asm.li32(SYSNUM, SYS_rt_sigreturn);
+		asm.ecall();
+	}
+	def genSigHandlerInstall(signo: int, handler: Addr) {
+		// Construct the kernel sigaction struct {sa_handler, sa_flags, sa_mask} on the stack
+		asm.addi(Regs.SP, Regs.SP, -32);
+		codegen.emitLoadAddr(Regs.T4, handler);
+		asm.sd(Regs.T4, Regs.SP, 0);		// sa_handler
+		asm.li32(Regs.T4, 4);
+		asm.sd(Regs.T4, Regs.SP, 8);		// sa_flags = SA_SIGINFO
+		asm.sd(Regs.ZERO, Regs.SP, 16);		// sa_mask = 0
+
+		// rt_sigaction(signo, &sigaction, NULL, sigsetsize=8)
+		asm.li32(SYSNUM, SYS_rt_sigaction);
+		asm.li32(PARAM0, signo);
+		asm.mv(PARAM1, Regs.SP);
+		asm.mv(PARAM2, Regs.ZERO);
+		asm.li32(PARAM3, 8);
+		asm.ecall();
+
+		asm.addi(Regs.SP, Regs.SP, 32);
+	}
+	def asm_exit_r(r: RiscV64Gpr) {
+		asm.li32(SYSNUM, SYS_exit_group);
+		if (r != PARAM0) asm.mv(PARAM0, r);
+		asm.ecall();
+	}
+	def asm_exit_code(code: int) {
+		asm.li32(SYSNUM, SYS_exit_group);
+		asm.li32(PARAM0, code);
+		asm.ecall();
+	}
+	def genFatalStub(ex: string, addr: Addr) {
+		w.bind(addr);
+		// write(stderr, msg, len); exit_group(-1); the message follows the code
+		var msgAddr = Addr.new(mach.codeRegion, null, 0);
+		asm.li32(SYSNUM, SYS_write);
+		asm.li32(PARAM0, 2);
+		codegen.emitLoadAddr(PARAM1, msgAddr);
+		asm.li32(PARAM2, ex.length + 1);
+		asm.ecall();
+		asm_exit_code(-1);
+		w.bind(msgAddr);
+		w.putb('!');
+		w.puta(ex);
+		w.atEnd();
+	}
+	def genTestOutput(main: IrMethod, frame: MachFrame) {
+		// write(stdout, &result, 4), staging the result on the stack
+		var gpr = loc_gpr(frame, frame.conv.callerRet(0));
+		asm.sw(gpr, Regs.SP, 0);
+		asm.li32(SYSNUM, SYS_write);
+		asm.li32(PARAM0, 1);
+		asm.mv(PARAM1, Regs.SP);
+		asm.li32(PARAM2, 4);
+		asm.ecall();
+	}
+}

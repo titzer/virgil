@@ -17,7 +17,11 @@
 #define STDERR_BUF_SIZE 1024
 #define SPEC_BUF_SIZE 16384
 
+// Seconds a test may run before it is killed; emulated targets build the runner
+// with a larger value (-DTIMEOUT=...).
+#ifndef TIMEOUT
 #define TIMEOUT 5
+#endif
 
 typedef struct run {
   int num;
