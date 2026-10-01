@@ -1,0 +1,507 @@
+// Copyright 2026 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Unit tester for the RISC-V 64 assembler. Run it via test.bash, not alone.
+//
+// For many permutations of operands of each instruction, this program writes one
+// line of assembly text to {asmPath} and the 32-bit encoding that RiscV64Assembler
+// produced to {hexPath}, one 8-digit lowercase hex word per line. The test script
+// then assembles the text with the GNU assembler, extracts the raw .text bytes, and
+// diffs the two word lists; line N of either file is instruction N.
+
+def R: RiscV64Regs;
+def data = DataWriter.new();
+def asm = RiscV64Assembler.new(data);
+def buf = StringBuilder.new();
+var asmFd = 0;
+var hexFd = 0;
+var args: Array<string>;
+var count = 0;
+
+def main(a: Array<string>) -> int {
+	if (a.length < 2) {
+		System.error("TestGenError", "usage: <asm path> <hex path> [instruction prefix...]");
+		return -1;
+	}
+	args = a;
+	asmFd = System.fileOpen(a[0], false);
+	hexFd = System.fileOpen(a[1], false);
+	GPRS = R.GPRS;
+	FPRS = R.FPRS;
+	GPR_FEW = [R.ZERO, R.RA, R.SP, R.S0, R.A0, R.A7, R.T6];
+	FPR_FEW = [R.FT0, R.FS0, R.FA0, R.FA7, R.FT11];
+
+	test_r();
+	test_i();
+	test_shifts();
+	test_loads_stores();
+	test_branches();
+	test_jumps();
+	test_u();
+	test_system();
+	test_csr();
+	test_amo();
+	test_fp_ldst();
+	test_fp_r4();
+	test_fp_arith();
+	test_fp_misc();
+	test_fp_cvt();
+	test_pseudo();
+
+	buf.puts("# ;;passed\n");
+	flushTo(asmFd);
+	return 0;
+}
+
+// Returns true if this instruction is excluded by the prefix filters on the command line.
+def skip(mnemonic: string) -> bool {
+	if (args.length == 2) return false;
+	for (i = 2; i < args.length; i++) {
+		if (Strings.startsWith(mnemonic, args[i])) return false;
+	}
+	return true;
+}
+def flushTo(fd: int) {
+	buf.send(System.write(fd, _));
+	buf.reset();
+}
+// Finish the current line: {buf} holds the assembly text, {data} the encoding.
+def line() {
+	if (data.pos != 4) {
+		System.error("TestGenError", Strings.format2("instruction %d (%s) did not encode to 4 bytes", count, buf.toString()));
+	}
+	buf.ln();
+	flushTo(asmFd);
+	def word = u32.view(data.data[0]) | (u32.view(data.data[1]) << 8)
+		| (u32.view(data.data[2]) << 16) | (u32.view(data.data[3]) << 24);
+	def hex = "0123456789abcdef";
+	for (i < 8) buf.putc(hex[(word >> u5.view(28 - i * 4)) & 0xF]);
+	buf.ln();
+	flushTo(hexFd);
+	data.at(0);
+	count++;
+}
+def pcrel(imm: int) {
+	if (imm < 0) buf.puts(". - ").putd(0 - imm);
+	else buf.puts(". + ").putd(imm);
+}
+def rm(m: RiscV64Rm) {
+	if (m != RiscV64Rm.DYN) buf.puts(", ").puts(m.str);
+}
+def aqrl(aq: bool, rl: bool) {
+	if (aq && rl) buf.puts(".aqrl");
+	else if (aq) buf.puts(".aq");
+	else if (rl) buf.puts(".rl");
+}
+
+// Operand pools. The full register files are swept one operand at a time; the small
+// pools are combined in cross products.
+// (Initialized in {main}: this file's component may be initialized before {RiscV64Regs}.)
+var GPRS: Array<RiscV64Gpr>;
+var FPRS: Array<RiscV64Fpr>;
+var GPR_FEW: Array<RiscV64Gpr>;
+var FPR_FEW: Array<RiscV64Fpr>;
+def RMS = [RiscV64Rm.DYN, RiscV64Rm.RNE, RiscV64Rm.RTZ, RiscV64Rm.RDN, RiscV64Rm.RUP, RiscV64Rm.RMM];
+def IMM12 = i12s([0, 1, -1, 2, -2, 7, 42, -42, 255, -256, 256, 1023, -1024, 1024, 2047, -2047, -2048]);
+def IMM13 = i13s([0, 2, -2, 4, 8, -8, 126, 1024, -1024, 2046, -2048, 4094, -4094, -4096]);
+def IMM21 = i21s([0, 2, -2, 4, 8, -8, 2046, 2048, -2048, 4096, 65534, -65536, 1048574, -1048574, -1048576]);
+def IMM20 = u20s([0, 1, 2, 0x7FF, 0x800, 0xFFF, 0x1000, 0x12345, 0x7FFFF, 0x80000, 0xABCDE, 0xFFFFF]);
+def CSRS = u12s([0x001, 0x002, 0x003, 0x7FF, 0x800, 0xC00, 0xC01, 0xC02, 0xFFF]);
+def UIMM5 = u5s([0, 1, 7, 8, 15, 16, 31]);
+def SHAMT6 = u6s([0, 1, 2, 7, 8, 15, 16, 31, 32, 33, 62, 63]);
+def SHAMT5 = u5s([0, 1, 2, 7, 8, 15, 16, 30, 31]);
+def FENCES = [RiscV64Fence.I, RiscV64Fence.O, RiscV64Fence.R, RiscV64Fence.W, RiscV64Fence.RW, RiscV64Fence.IORW];
+def BOOLS = [false, true];
+
+def i12s(a: Array<int>) -> Array<i12> { return Arrays.map(a, i12.view<int>); }
+def i13s(a: Array<int>) -> Array<i13> { return Arrays.map(a, i13.view<int>); }
+def i21s(a: Array<int>) -> Array<i21> { return Arrays.map(a, i21.view<int>); }
+def u20s(a: Array<int>) -> Array<u20> { return Arrays.map(a, u20.view<int>); }
+def u12s(a: Array<int>) -> Array<u12> { return Arrays.map(a, u12.view<int>); }
+def u6s(a: Array<int>) -> Array<u6> { return Arrays.map(a, u6.view<int>); }
+def u5s(a: Array<int>) -> Array<u5> { return Arrays.map(a, u5.view<int>); }
+
+//=={ Generic drivers, one per operand shape }=====================================
+// name rd, rs1, rs2
+def gen_rrr(name: string, f: (RiscV64Gpr, RiscV64Gpr, RiscV64Gpr) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	def one = gen_rrr1(name, f, _, _, _);
+	for (rd in GPRS) one(rd, R.A1, R.A2);
+	for (rs1 in GPRS) one(R.A0, rs1, R.A2);
+	for (rs2 in GPRS) one(R.A0, R.A1, rs2);
+	for (rd in GPR_FEW) for (rs1 in GPR_FEW) for (rs2 in GPR_FEW) one(rd, rs1, rs2);
+}
+def gen_rrr1(name: string, f: (RiscV64Gpr, RiscV64Gpr, RiscV64Gpr) -> RiscV64Assembler, rd: RiscV64Gpr, rs1: RiscV64Gpr, rs2: RiscV64Gpr) {
+	f(rd, rs1, rs2);
+	buf.puts(name).puts(" ").puts(rd.name).puts(", ").puts(rs1.name).puts(", ").puts(rs2.name);
+	line();
+}
+// name rd, rs1, imm
+def gen_rri<I>(name: string, f: (RiscV64Gpr, RiscV64Gpr, I) -> RiscV64Assembler, imms: Array<I>, render: I -> void) {
+	if (skip(name)) return;
+	def one = gen_rri1(name, f, render, _, _, _);
+	for (rd in GPRS) one(rd, R.A1, imms[0]);
+	for (rs1 in GPRS) one(R.A0, rs1, imms[1]);
+	for (rd in GPR_FEW) for (rs1 in GPR_FEW) for (imm in imms) one(rd, rs1, imm);
+}
+def gen_rri1<I>(name: string, f: (RiscV64Gpr, RiscV64Gpr, I) -> RiscV64Assembler, render: I -> void, rd: RiscV64Gpr, rs1: RiscV64Gpr, imm: I) {
+	f(rd, rs1, imm);
+	buf.puts(name).puts(" ").puts(rd.name).puts(", ").puts(rs1.name).puts(", ");
+	render(imm);
+	line();
+}
+// name rd, imm(rs1)  (loads of either register class)
+def gen_mem<T>(name: string, f: (T, RiscV64Gpr, i12) -> RiscV64Assembler, regs: Array<T>, few: Array<T>, nameOf: T -> string) {
+	if (skip(name)) return;
+	def one = gen_mem1(name, f, nameOf, _, _, _);
+	for (r in regs) one(r, R.A1, IMM12[0]);
+	for (rs1 in GPRS) one(regs[10], rs1, IMM12[1]);
+	for (r in few) for (rs1 in GPR_FEW) for (imm in IMM12) one(r, rs1, imm);
+}
+def gen_mem1<T>(name: string, f: (T, RiscV64Gpr, i12) -> RiscV64Assembler, nameOf: T -> string, r: T, rs1: RiscV64Gpr, imm: i12) {
+	f(r, rs1, imm);
+	buf.puts(name).puts(" ").puts(nameOf(r)).puts(", ").putd(int.view(imm)).puts("(").puts(rs1.name).puts(")");
+	line();
+}
+// name rs1, rs2, . +- imm
+def gen_branch(name: string, f: (RiscV64Gpr, RiscV64Gpr, i13) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	def one = gen_branch1(name, f, _, _, _);
+	for (rs1 in GPRS) one(rs1, R.A1, IMM13[1]);
+	for (rs2 in GPRS) one(R.A0, rs2, IMM13[2]);
+	for (rs1 in GPR_FEW) for (rs2 in GPR_FEW) for (imm in IMM13) one(rs1, rs2, imm);
+}
+def gen_branch1(name: string, f: (RiscV64Gpr, RiscV64Gpr, i13) -> RiscV64Assembler, rs1: RiscV64Gpr, rs2: RiscV64Gpr, imm: i13) {
+	f(rs1, rs2, imm);
+	buf.puts(name).puts(" ").puts(rs1.name).puts(", ").puts(rs2.name).puts(", ");
+	pcrel(int.view(imm));
+	line();
+}
+// name rd, rs  (any register classes)
+def gen_xy<X, Y>(name: string, f: (X, Y) -> RiscV64Assembler, xs: Array<X>, ys: Array<Y>, nx: X -> string, ny: Y -> string) {
+	if (skip(name)) return;
+	def one = gen_xy1(name, f, nx, ny, _, _);
+	for (x in xs) one(x, ys[11]);
+	for (y in ys) one(xs[10], y);
+}
+def gen_xy1<X, Y>(name: string, f: (X, Y) -> RiscV64Assembler, nx: X -> string, ny: Y -> string, x: X, y: Y) {
+	f(x, y);
+	buf.puts(name).puts(" ").puts(nx(x)).puts(", ").puts(ny(y));
+	line();
+}
+// name rd, rs, rm  (any register classes)
+def gen_xy_rm<X, Y>(name: string, f: (X, Y, RiscV64Rm) -> RiscV64Assembler, xs: Array<X>, ys: Array<Y>, nx: X -> string, ny: Y -> string) {
+	if (skip(name)) return;
+	def one = gen_xy_rm1(name, f, nx, ny, _, _, _);
+	for (x in xs) one(x, ys[11], RiscV64Rm.DYN);
+	for (y in ys) one(xs[10], y, RiscV64Rm.DYN);
+	for (m in RMS) one(xs[3], ys[4], m);
+}
+def gen_xy_rm1<X, Y>(name: string, f: (X, Y, RiscV64Rm) -> RiscV64Assembler, nx: X -> string, ny: Y -> string, x: X, y: Y, m: RiscV64Rm) {
+	f(x, y, m);
+	buf.puts(name).puts(" ").puts(nx(x)).puts(", ").puts(ny(y));
+	rm(m);
+	line();
+}
+// name rd, rs1, rs2  (FP registers, with or without a rounding mode)
+def gen_fff(name: string, f: (RiscV64Fpr, RiscV64Fpr, RiscV64Fpr) -> RiscV64Assembler) {
+	gen_fff_rm(name, drop_rm(f, _, _, _, _), [RiscV64Rm.DYN]);
+}
+def drop_rm(f: (RiscV64Fpr, RiscV64Fpr, RiscV64Fpr) -> RiscV64Assembler, a: RiscV64Fpr, b: RiscV64Fpr, c: RiscV64Fpr, m: RiscV64Rm) -> RiscV64Assembler {
+	return f(a, b, c);
+}
+def gen_fff_rm(name: string, f: (RiscV64Fpr, RiscV64Fpr, RiscV64Fpr, RiscV64Rm) -> RiscV64Assembler, rms: Array<RiscV64Rm>) {
+	if (skip(name)) return;
+	def one = gen_fff_rm1(name, f, _, _, _, _);
+	for (rd in FPRS) one(rd, R.FA1, R.FA2, RiscV64Rm.DYN);
+	for (rs1 in FPRS) one(R.FA0, rs1, R.FA2, RiscV64Rm.DYN);
+	for (rs2 in FPRS) one(R.FA0, R.FA1, rs2, RiscV64Rm.DYN);
+	for (rd in FPR_FEW) for (rs1 in FPR_FEW) for (rs2 in FPR_FEW) for (m in rms) one(rd, rs1, rs2, m);
+}
+def gen_fff_rm1(name: string, f: (RiscV64Fpr, RiscV64Fpr, RiscV64Fpr, RiscV64Rm) -> RiscV64Assembler, rd: RiscV64Fpr, rs1: RiscV64Fpr, rs2: RiscV64Fpr, m: RiscV64Rm) {
+	f(rd, rs1, rs2, m);
+	buf.puts(name).puts(" ").puts(rd.name).puts(", ").puts(rs1.name).puts(", ").puts(rs2.name);
+	rm(m);
+	line();
+}
+// name rd, rs1, rs2  (GPR destination, FP sources)
+def gen_gff(name: string, f: (RiscV64Gpr, RiscV64Fpr, RiscV64Fpr) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	def one = gen_gff1(name, f, _, _, _);
+	for (rd in GPRS) one(rd, R.FA1, R.FA2);
+	for (rs1 in FPRS) one(R.A0, rs1, R.FA2);
+	for (rs2 in FPRS) one(R.A0, R.FA1, rs2);
+	for (rd in GPR_FEW) for (rs1 in FPR_FEW) for (rs2 in FPR_FEW) one(rd, rs1, rs2);
+}
+def gen_gff1(name: string, f: (RiscV64Gpr, RiscV64Fpr, RiscV64Fpr) -> RiscV64Assembler, rd: RiscV64Gpr, rs1: RiscV64Fpr, rs2: RiscV64Fpr) {
+	f(rd, rs1, rs2);
+	buf.puts(name).puts(" ").puts(rd.name).puts(", ").puts(rs1.name).puts(", ").puts(rs2.name);
+	line();
+}
+// name rd, rs1, rs2, rs3, rm
+def gen_ffff_rm(name: string, f: (RiscV64Fpr, RiscV64Fpr, RiscV64Fpr, RiscV64Fpr, RiscV64Rm) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	def one = gen_ffff_rm1(name, f, _, _, _, _, _);
+	for (rd in FPRS) one(rd, R.FA1, R.FA2, R.FA3, RiscV64Rm.DYN);
+	for (rs1 in FPRS) one(R.FA0, rs1, R.FA2, R.FA3, RiscV64Rm.DYN);
+	for (rs2 in FPRS) one(R.FA0, R.FA1, rs2, R.FA3, RiscV64Rm.DYN);
+	for (rs3 in FPRS) one(R.FA0, R.FA1, R.FA2, rs3, RiscV64Rm.DYN);
+	for (m in RMS) one(R.FT1, R.FS1, R.FA1, R.FT8, m);
+}
+def gen_ffff_rm1(name: string, f: (RiscV64Fpr, RiscV64Fpr, RiscV64Fpr, RiscV64Fpr, RiscV64Rm) -> RiscV64Assembler, rd: RiscV64Fpr, rs1: RiscV64Fpr, rs2: RiscV64Fpr, rs3: RiscV64Fpr, m: RiscV64Rm) {
+	f(rd, rs1, rs2, rs3, m);
+	buf.puts(name).puts(" ").puts(rd.name).puts(", ").puts(rs1.name).puts(", ").puts(rs2.name).puts(", ").puts(rs3.name);
+	rm(m);
+	line();
+}
+def gprName(r: RiscV64Gpr) -> string { return r.name; }
+def fprName(r: RiscV64Fpr) -> string { return r.name; }
+def putImm<I>(imm: I) { buf.putd(imm); }
+
+//=={ Tests for each instruction group }===========================================
+def test_r() {
+	gen_rrr("add", asm.add);	gen_rrr("sub", asm.sub);
+	gen_rrr("sll", asm.sll);	gen_rrr("slt", asm.slt);	gen_rrr("sltu", asm.sltu);
+	gen_rrr("xor", asm.xor);	gen_rrr("srl", asm.srl);	gen_rrr("sra", asm.sra);
+	gen_rrr("or", asm.or);		gen_rrr("and", asm.and);
+	gen_rrr("addw", asm.addw);	gen_rrr("subw", asm.subw);
+	gen_rrr("sllw", asm.sllw);	gen_rrr("srlw", asm.srlw);	gen_rrr("sraw", asm.sraw);
+	gen_rrr("mul", asm.mul);	gen_rrr("mulh", asm.mulh);
+	gen_rrr("mulhsu", asm.mulhsu);	gen_rrr("mulhu", asm.mulhu);
+	gen_rrr("div", asm.div);	gen_rrr("divu", asm.divu);
+	gen_rrr("rem", asm.rem);	gen_rrr("remu", asm.remu);
+	gen_rrr("mulw", asm.mulw);	gen_rrr("divw", asm.divw);	gen_rrr("divuw", asm.divuw);
+	gen_rrr("remw", asm.remw);	gen_rrr("remuw", asm.remuw);
+}
+def test_i() {
+	gen_rri("addi", asm.addi, IMM12, putImm<i12>);
+	gen_rri("slti", asm.slti, IMM12, putImm<i12>);
+	gen_rri("sltiu", asm.sltiu, IMM12, putImm<i12>);
+	gen_rri("xori", asm.xori, IMM12, putImm<i12>);
+	gen_rri("ori", asm.ori, IMM12, putImm<i12>);
+	gen_rri("andi", asm.andi, IMM12, putImm<i12>);
+	gen_rri("addiw", asm.addiw, IMM12, putImm<i12>);
+	gen_rri("jalr", asm.jalr, IMM12, putImm<i12>);
+}
+def test_shifts() {
+	gen_rri("slli", asm.slli, SHAMT6, putImm<u6>);
+	gen_rri("srli", asm.srli, SHAMT6, putImm<u6>);
+	gen_rri("srai", asm.srai, SHAMT6, putImm<u6>);
+	gen_rri("slliw", asm.slliw, SHAMT5, putImm<u5>);
+	gen_rri("srliw", asm.srliw, SHAMT5, putImm<u5>);
+	gen_rri("sraiw", asm.sraiw, SHAMT5, putImm<u5>);
+}
+def test_loads_stores() {
+	gen_mem("lb", asm.lb, GPRS, GPR_FEW, gprName);
+	gen_mem("lh", asm.lh, GPRS, GPR_FEW, gprName);
+	gen_mem("lw", asm.lw, GPRS, GPR_FEW, gprName);
+	gen_mem("ld", asm.ld, GPRS, GPR_FEW, gprName);
+	gen_mem("lbu", asm.lbu, GPRS, GPR_FEW, gprName);
+	gen_mem("lhu", asm.lhu, GPRS, GPR_FEW, gprName);
+	gen_mem("lwu", asm.lwu, GPRS, GPR_FEW, gprName);
+	gen_mem("sb", asm.sb, GPRS, GPR_FEW, gprName);
+	gen_mem("sh", asm.sh, GPRS, GPR_FEW, gprName);
+	gen_mem("sw", asm.sw, GPRS, GPR_FEW, gprName);
+	gen_mem("sd", asm.sd, GPRS, GPR_FEW, gprName);
+}
+def test_branches() {
+	gen_branch("beq", asm.beq);	gen_branch("bne", asm.bne);
+	gen_branch("blt", asm.blt);	gen_branch("bge", asm.bge);
+	gen_branch("bltu", asm.bltu);	gen_branch("bgeu", asm.bgeu);
+	// bcond covers the swapped-operand pseudo-conditions too.
+	for (c in RiscV64Conds.all) {
+		gen_branch(Strings.format1("b%s", c.name), asm.bcond(c, _, _, _));
+	}
+}
+def test_jumps() {
+	if (skip("jal")) return;
+	for (rd in GPRS) { asm.jal(rd, IMM21[1]); buf.puts("jal ").puts(rd.name).puts(", "); pcrel(int.view(IMM21[1])); line(); }
+	for (imm in IMM21) { asm.jal(R.RA, imm); buf.puts("jal ra, "); pcrel(int.view(imm)); line(); }
+}
+def test_u() {
+	gen_ri("lui", asm.lui);
+	gen_ri("auipc", asm.auipc);
+}
+def gen_ri(name: string, f: (RiscV64Gpr, u20) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	for (rd in GPRS) { f(rd, IMM20[8]); buf.puts(name).puts(" ").puts(rd.name).puts(", ").putd(IMM20[8]); line(); }
+	for (imm in IMM20) { f(R.A0, imm); buf.puts(name).puts(" a0, ").putd(imm); line(); }
+}
+def test_system() {
+	if (!skip("ecall")) { asm.ecall(); buf.puts("ecall"); line(); }
+	if (!skip("ebreak")) { asm.ebreak(); buf.puts("ebreak"); line(); }
+	if (!skip("fence.i")) { asm.fence_i(); buf.puts("fence.i"); line(); }
+	if (!skip("fence.tso")) { asm.fence_tso(); buf.puts("fence.tso"); line(); }
+	if (!skip("fence")) {
+		for (p in FENCES) for (s in FENCES) {
+			asm.fence(p, s);
+			buf.puts("fence ").puts(p.str).puts(", ").puts(s.str);
+			line();
+		}
+	}
+}
+def test_csr() {
+	gen_csr("csrrw", asm.csrrw);
+	gen_csr("csrrs", asm.csrrs);
+	gen_csr("csrrc", asm.csrrc);
+	gen_csri("csrrwi", asm.csrrwi);
+	gen_csri("csrrsi", asm.csrrsi);
+	gen_csri("csrrci", asm.csrrci);
+}
+def gen_csr(name: string, f: (RiscV64Gpr, u12, RiscV64Gpr) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	def one = gen_csr1(name, f, _, _, _);
+	for (rd in GPRS) one(rd, CSRS[2], R.A1);
+	for (rs1 in GPRS) one(R.A0, CSRS[2], rs1);
+	for (csr in CSRS) one(R.A0, csr, R.A1);
+}
+def gen_csr1(name: string, f: (RiscV64Gpr, u12, RiscV64Gpr) -> RiscV64Assembler, rd: RiscV64Gpr, csr: u12, rs1: RiscV64Gpr) {
+	f(rd, csr, rs1);
+	buf.puts(name).puts(" ").puts(rd.name).puts(", ").putd(csr).puts(", ").puts(rs1.name);
+	line();
+}
+def gen_csri(name: string, f: (RiscV64Gpr, u12, u5) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	def one = gen_csri1(name, f, _, _, _);
+	for (rd in GPRS) one(rd, CSRS[2], UIMM5[2]);
+	for (csr in CSRS) one(R.A0, csr, UIMM5[3]);
+	for (imm in UIMM5) one(R.A0, CSRS[0], imm);
+}
+def gen_csri1(name: string, f: (RiscV64Gpr, u12, u5) -> RiscV64Assembler, rd: RiscV64Gpr, csr: u12, imm: u5) {
+	f(rd, csr, imm);
+	buf.puts(name).puts(" ").puts(rd.name).puts(", ").putd(csr).puts(", ").putd(imm);
+	line();
+}
+def test_amo() {
+	gen_lr("lr.w", asm.lr_w);	gen_lr("lr.d", asm.lr_d);
+	gen_amo("sc.w", asm.sc_w);	gen_amo("sc.d", asm.sc_d);
+	gen_amo("amoswap.w", asm.amoswap_w);	gen_amo("amoswap.d", asm.amoswap_d);
+	gen_amo("amoadd.w", asm.amoadd_w);	gen_amo("amoadd.d", asm.amoadd_d);
+	gen_amo("amoxor.w", asm.amoxor_w);	gen_amo("amoxor.d", asm.amoxor_d);
+	gen_amo("amoand.w", asm.amoand_w);	gen_amo("amoand.d", asm.amoand_d);
+	gen_amo("amoor.w", asm.amoor_w);	gen_amo("amoor.d", asm.amoor_d);
+	gen_amo("amomin.w", asm.amomin_w);	gen_amo("amomin.d", asm.amomin_d);
+	gen_amo("amomax.w", asm.amomax_w);	gen_amo("amomax.d", asm.amomax_d);
+	gen_amo("amominu.w", asm.amominu_w);	gen_amo("amominu.d", asm.amominu_d);
+	gen_amo("amomaxu.w", asm.amomaxu_w);	gen_amo("amomaxu.d", asm.amomaxu_d);
+}
+def gen_lr(name: string, f: (RiscV64Gpr, RiscV64Gpr, bool, bool) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	def one = gen_lr1(name, f, _, _, _, _);
+	for (rd in GPRS) one(rd, R.A1, false, false);
+	for (rs1 in GPRS) one(R.A0, rs1, false, false);
+	for (rd in GPR_FEW) for (rs1 in GPR_FEW) for (aq in BOOLS) for (rl in BOOLS) one(rd, rs1, aq, rl);
+}
+def gen_lr1(name: string, f: (RiscV64Gpr, RiscV64Gpr, bool, bool) -> RiscV64Assembler, rd: RiscV64Gpr, rs1: RiscV64Gpr, aq: bool, rl: bool) {
+	f(rd, rs1, aq, rl);
+	buf.puts(name);
+	aqrl(aq, rl);
+	buf.puts(" ").puts(rd.name).puts(", (").puts(rs1.name).puts(")");
+	line();
+}
+def gen_amo(name: string, f: (RiscV64Gpr, RiscV64Gpr, RiscV64Gpr, bool, bool) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	def one = gen_amo1(name, f, _, _, _, _, _);
+	for (rd in GPRS) one(rd, R.A2, R.A1, false, false);
+	for (rs2 in GPRS) one(R.A0, rs2, R.A1, false, false);
+	for (rs1 in GPRS) one(R.A0, R.A2, rs1, false, false);
+	for (rd in GPR_FEW) for (rs2 in GPR_FEW) for (rs1 in GPR_FEW) for (aq in BOOLS) for (rl in BOOLS) one(rd, rs2, rs1, aq, rl);
+}
+def gen_amo1(name: string, f: (RiscV64Gpr, RiscV64Gpr, RiscV64Gpr, bool, bool) -> RiscV64Assembler, rd: RiscV64Gpr, rs2: RiscV64Gpr, rs1: RiscV64Gpr, aq: bool, rl: bool) {
+	f(rd, rs2, rs1, aq, rl);
+	buf.puts(name);
+	aqrl(aq, rl);
+	buf.puts(" ").puts(rd.name).puts(", ").puts(rs2.name).puts(", (").puts(rs1.name).puts(")");
+	line();
+}
+def test_fp_ldst() {
+	gen_mem("flw", asm.flw, FPRS, FPR_FEW, fprName);
+	gen_mem("fld", asm.fld, FPRS, FPR_FEW, fprName);
+	gen_mem("fsw", asm.fsw, FPRS, FPR_FEW, fprName);
+	gen_mem("fsd", asm.fsd, FPRS, FPR_FEW, fprName);
+}
+def test_fp_r4() {
+	gen_ffff_rm("fmadd.s", asm.fmadd_s);	gen_ffff_rm("fmadd.d", asm.fmadd_d);
+	gen_ffff_rm("fmsub.s", asm.fmsub_s);	gen_ffff_rm("fmsub.d", asm.fmsub_d);
+	gen_ffff_rm("fnmsub.s", asm.fnmsub_s);	gen_ffff_rm("fnmsub.d", asm.fnmsub_d);
+	gen_ffff_rm("fnmadd.s", asm.fnmadd_s);	gen_ffff_rm("fnmadd.d", asm.fnmadd_d);
+}
+def test_fp_arith() {
+	gen_fff_rm("fadd.s", asm.fadd_s, RMS);	gen_fff_rm("fadd.d", asm.fadd_d, RMS);
+	gen_fff_rm("fsub.s", asm.fsub_s, RMS);	gen_fff_rm("fsub.d", asm.fsub_d, RMS);
+	gen_fff_rm("fmul.s", asm.fmul_s, RMS);	gen_fff_rm("fmul.d", asm.fmul_d, RMS);
+	gen_fff_rm("fdiv.s", asm.fdiv_s, RMS);	gen_fff_rm("fdiv.d", asm.fdiv_d, RMS);
+	gen_xy_rm("fsqrt.s", asm.fsqrt_s, FPRS, FPRS, fprName, fprName);
+	gen_xy_rm("fsqrt.d", asm.fsqrt_d, FPRS, FPRS, fprName, fprName);
+	gen_fff("fsgnj.s", asm.fsgnj_s);	gen_fff("fsgnj.d", asm.fsgnj_d);
+	gen_fff("fsgnjn.s", asm.fsgnjn_s);	gen_fff("fsgnjn.d", asm.fsgnjn_d);
+	gen_fff("fsgnjx.s", asm.fsgnjx_s);	gen_fff("fsgnjx.d", asm.fsgnjx_d);
+	gen_fff("fmin.s", asm.fmin_s);		gen_fff("fmin.d", asm.fmin_d);
+	gen_fff("fmax.s", asm.fmax_s);		gen_fff("fmax.d", asm.fmax_d);
+}
+def test_fp_misc() {
+	gen_gff("feq.s", asm.feq_s);	gen_gff("feq.d", asm.feq_d);
+	gen_gff("flt.s", asm.flt_s);	gen_gff("flt.d", asm.flt_d);
+	gen_gff("fle.s", asm.fle_s);	gen_gff("fle.d", asm.fle_d);
+	gen_xy("fclass.s", asm.fclass_s, GPRS, FPRS, gprName, fprName);
+	gen_xy("fclass.d", asm.fclass_d, GPRS, FPRS, gprName, fprName);
+	gen_xy("fmv.x.w", asm.fmv_x_w, GPRS, FPRS, gprName, fprName);
+	gen_xy("fmv.x.d", asm.fmv_x_d, GPRS, FPRS, gprName, fprName);
+	gen_xy("fmv.w.x", asm.fmv_w_x, FPRS, GPRS, fprName, gprName);
+	gen_xy("fmv.d.x", asm.fmv_d_x, FPRS, GPRS, fprName, gprName);
+}
+def test_fp_cvt() {
+	gen_xy_rm("fcvt.s.d", asm.fcvt_s_d, FPRS, FPRS, fprName, fprName);
+	gen_xy("fcvt.d.s", asm.fcvt_d_s, FPRS, FPRS, fprName, fprName);
+	gen_xy_rm("fcvt.w.s", asm.fcvt_w_s, GPRS, FPRS, gprName, fprName);
+	gen_xy_rm("fcvt.wu.s", asm.fcvt_wu_s, GPRS, FPRS, gprName, fprName);
+	gen_xy_rm("fcvt.l.s", asm.fcvt_l_s, GPRS, FPRS, gprName, fprName);
+	gen_xy_rm("fcvt.lu.s", asm.fcvt_lu_s, GPRS, FPRS, gprName, fprName);
+	gen_xy_rm("fcvt.w.d", asm.fcvt_w_d, GPRS, FPRS, gprName, fprName);
+	gen_xy_rm("fcvt.wu.d", asm.fcvt_wu_d, GPRS, FPRS, gprName, fprName);
+	gen_xy_rm("fcvt.l.d", asm.fcvt_l_d, GPRS, FPRS, gprName, fprName);
+	gen_xy_rm("fcvt.lu.d", asm.fcvt_lu_d, GPRS, FPRS, gprName, fprName);
+	gen_xy_rm("fcvt.s.w", asm.fcvt_s_w, FPRS, GPRS, fprName, gprName);
+	gen_xy_rm("fcvt.s.wu", asm.fcvt_s_wu, FPRS, GPRS, fprName, gprName);
+	gen_xy_rm("fcvt.s.l", asm.fcvt_s_l, FPRS, GPRS, fprName, gprName);
+	gen_xy_rm("fcvt.s.lu", asm.fcvt_s_lu, FPRS, GPRS, fprName, gprName);
+	gen_xy("fcvt.d.w", asm.fcvt_d_w, FPRS, GPRS, fprName, gprName);
+	gen_xy("fcvt.d.wu", asm.fcvt_d_wu, FPRS, GPRS, fprName, gprName);
+	gen_xy_rm("fcvt.d.l", asm.fcvt_d_l, FPRS, GPRS, fprName, gprName);
+	gen_xy_rm("fcvt.d.lu", asm.fcvt_d_lu, FPRS, GPRS, fprName, gprName);
+}
+def test_pseudo() {
+	gen_xy("mv", asm.mv, GPRS, GPRS, gprName, gprName);
+	gen_xy("not", asm.not, GPRS, GPRS, gprName, gprName);
+	gen_xy("neg", asm.neg, GPRS, GPRS, gprName, gprName);
+	gen_xy("negw", asm.negw, GPRS, GPRS, gprName, gprName);
+	gen_xy("sext.w", asm.sext_w, GPRS, GPRS, gprName, gprName);
+	gen_xy("seqz", asm.seqz, GPRS, GPRS, gprName, gprName);
+	gen_xy("snez", asm.snez, GPRS, GPRS, gprName, gprName);
+	gen_xy("sltz", asm.sltz, GPRS, GPRS, gprName, gprName);
+	gen_xy("sgtz", asm.sgtz, GPRS, GPRS, gprName, gprName);
+	gen_xy("fmv.s", asm.fmv_s, FPRS, FPRS, fprName, fprName);
+	gen_xy("fmv.d", asm.fmv_d, FPRS, FPRS, fprName, fprName);
+	gen_xy("fneg.s", asm.fneg_s, FPRS, FPRS, fprName, fprName);
+	gen_xy("fneg.d", asm.fneg_d, FPRS, FPRS, fprName, fprName);
+	gen_xy("fabs.s", asm.fabs_s, FPRS, FPRS, fprName, fprName);
+	gen_xy("fabs.d", asm.fabs_d, FPRS, FPRS, fprName, fprName);
+	gen_bz("beqz", asm.beqz);	gen_bz("bnez", asm.bnez);
+	gen_bz("blez", asm.blez);	gen_bz("bgez", asm.bgez);
+	gen_bz("bltz", asm.bltz);	gen_bz("bgtz", asm.bgtz);
+	if (!skip("j")) for (imm in IMM21) { asm.j(imm); buf.puts("j "); pcrel(int.view(imm)); line(); }
+	if (!skip("jr")) for (rs in GPRS) { asm.jr(rs); buf.puts("jr ").puts(rs.name); line(); }
+	if (!skip("ret")) { asm.ret(); buf.puts("ret"); line(); }
+	if (!skip("nop")) { asm.nop(); buf.puts("nop"); line(); }
+	gen_r1("frflags", asm.frflags);	gen_r1("fsflags", asm.fsflags);
+	gen_r1("frrm", asm.frrm);	gen_r1("fsrm", asm.fsrm);
+}
+def gen_bz(name: string, f: (RiscV64Gpr, i13) -> RiscV64Assembler) {
+	if (skip(name)) return;
+	for (rs in GPRS) { f(rs, IMM13[1]); buf.puts(name).puts(" ").puts(rs.name).puts(", "); pcrel(int.view(IMM13[1])); line(); }
+	for (imm in IMM13) { f(R.A0, imm); buf.puts(name).puts(" a0, "); pcrel(int.view(imm)); line(); }
+}
+def gen_r1(name: string, f: RiscV64Gpr -> RiscV64Assembler) {
+	if (skip(name)) return;
+	for (r in GPRS) { f(r); buf.puts(name).puts(" ").puts(r.name); line(); }
+}
