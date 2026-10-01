@@ -479,7 +479,7 @@ function get_io_targets() {
 
 function is_gc_target() {
     case $target in
-	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux)
+	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux|riscv64-linux)
 	    return 0
 	    ;;
 	wasm)
@@ -494,7 +494,7 @@ function get_vm_addr_width() {
 	x86-darwin|x86-linux|wasm)
 	    echo 32
 	    ;;
-	x86-64-darwin|x86-64-linux|arm64-linux)
+	x86-64-darwin|x86-64-linux|arm64-linux|riscv64-linux)
 	    echo 48
 	    ;;
     esac
@@ -505,7 +505,7 @@ function get_addr_width() {
 	x86-darwin|x86-linux|wasm)
 	    echo 32
 	    ;;
-	x86-64-darwin|x86-64-linux|arm64-linux)
+	x86-64-darwin|x86-64-linux|arm64-linux|riscv64-linux)
 	    echo 64
 	    ;;
     esac
@@ -516,7 +516,7 @@ function get_rt_files() {
     N="$RT_LOC/native/"
 
     case $target in
-	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux)
+	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux|riscv64-linux)
 	    echo $RT_LOC/$target/*.v3 $N/*.v3
 	    ;;
 	wasm)
@@ -530,7 +530,7 @@ function get_gc_files() {
     GC_SOURCES="${GC_LOC}/*.v3"
 
     case $target in
-	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux|wasm)
+	x86-darwin|x86-64-darwin|x86-linux|x86-64-linux|arm64-linux|riscv64-linux|wasm)
 	    echo $GC_SOURCES
 	    ;;
     esac
