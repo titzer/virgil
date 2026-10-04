@@ -268,7 +268,7 @@ HintArgs ::= '<' TypeRef,* '>'          // type hint:  #label<T>
            | '(' Expr,* ')'             // expr hint:  #label(e)
            | PackingExpr                 // packing:    #packing(...)
 
-// Known hints: boxed, unboxed, packed, big-endian, inline, no-inline, packing(...)
+// Known hints: boxed, unboxed, packed, big-endian, inline, no-inline, inline-into, packing(...)
 ```
 
 ---
