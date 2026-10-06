@@ -1,0 +1,287 @@
+//@execute 0=42
+// Multi-part weak reference test: aliasing, retargeting, nesting, static referents, user scanners, finalizers, and allocation-triggered GCs.
+def BASE = 2000;
+
+class C(x: int) {
+	def data = [x, x + 1, x + 2];
+	def check(v: int) -> bool {
+		return x == v && data.length == 3 && data[0] == v && data[1] == v + 1 && data[2] == v + 2;
+	}
+}
+
+// A compile-time initialized object lives outside the GC heap and is never cleared.
+def STATIC = C.new(BASE - 1);
+
+var global: C;
+var sink: Array<int>; // keeps garbage allocations from being optimized away
+
+// Several weak references to the same object agree and are cleared together.
+def test_alias() -> int {
+	def N = 5;
+	global = C.new(BASE);
+	var a = Array<WeakRef<C>>.new(N);
+	for (i < N) a[i] = WeakRef<C>.new().set(global);
+	for (k < 3) {
+		RiGc.forceGC();
+		for (i < N) {
+			if (a[i].get() != global) return -100 - i;
+		}
+		if (!global.check(BASE)) return -200;
+	}
+	global = null;
+	RiGc.forceGC();
+	for (i < N) {
+		if (a[i].get() != null) return -300 - i;
+	}
+	return 42;
+}
+
+// A weak reference can be retargeted and explicitly cleared.
+def test_retarget() -> int {
+	var w = WeakRef<C>.new();
+	if (w.get() != null) return -100;
+	RiGc.forceGC();
+	if (w.get() != null) return -101;
+
+	global = C.new(BASE + 1);
+	w.set(global);
+	w.set(C.new(BASE + 2)); // retarget to an unreachable object
+	RiGc.forceGC();
+	if (w.get() != null) return -102;
+	if (!global.check(BASE + 1)) return -103;
+
+	w.set(global);
+	RiGc.forceGC();
+	if (w.get() != global) return -104;
+	w.set(null);
+	RiGc.forceGC();
+	if (w.get() != null) return -105;
+	if (!global.check(BASE + 1)) return -106;
+	global = null;
+	return 42;
+}
+
+// A weak reference to a weak reference.
+def makeNested(c: C) -> WeakRef<WeakRef<C>> #no-inline {
+	return WeakRef<WeakRef<C>>.new().set(WeakRef<C>.new().set(c));
+}
+def test_nested() -> int {
+	// Inner weak reference only weakly reachable: outer is cleared.
+	global = C.new(BASE + 3);
+	var outer = makeNested(global);
+	RiGc.forceGC();
+	if (outer.get() != null) return -100;
+	if (!global.check(BASE + 3)) return -101;
+
+	// Inner weak reference strongly held, referent dropped: only inner is cleared.
+	var inner = WeakRef<C>.new().set(global);
+	outer.set(inner);
+	RiGc.forceGC();
+	if (outer.get() != inner) return -102;
+	if (inner.get() != global) return -103;
+	global = null;
+	RiGc.forceGC();
+	if (outer.get() != inner) return -104;
+	if (inner.get() != null) return -105;
+	return 42;
+}
+
+// Weak references to objects outside the GC heap are never cleared.
+def test_static() -> int {
+	var w = WeakRef<C>.new().set(STATIC);
+	for (k < 3) {
+		RiGc.forceGC();
+		if (w.get() != STATIC) return -100 - k;
+	}
+	var s = WeakRef<string>.new().set("static string");
+	RiGc.forceGC();
+	if (s.get() == null) return -200;
+	if (s.get().length != 13) return -201;
+	return 42;
+}
+
+// Weak references to arrays, and weak references held strongly by the referent itself.
+class Node(x: int) {
+	var next: Node;
+	def self = WeakRef<Node>.new();
+}
+def makeList(n: int) -> Node #no-inline {
+	var head: Node;
+	for (i < n) {
+		var x = Node.new(n - 1 - i);
+		x.next = head;
+		x.self.set(x);
+		head = x;
+	}
+	return head;
+}
+def test_cycle() -> int {
+	def N = 10;
+	var head = makeList(N);
+	var refs = Array<WeakRef<Node>>.new(N);
+	var i = 0;
+	for (x = head; x != null; x = x.next) refs[i++] = x.self;
+	var arr = WeakRef<Array<WeakRef<Node>>>.new().set(refs);
+	RiGc.forceGC();
+	i = 0;
+	for (x = head; x != null; x = x.next) {
+		if (x.self.get() != x) return -100 - i;
+		if (x.x != i) return -200 - i;
+		i++;
+	}
+	if (arr.get() != refs) return -300;
+	// Truncate the list in half; the second half's self references die with them.
+	var mid = head;
+	for (j < N / 2 - 1) mid = mid.next;
+	mid.next = null;
+	RiGc.forceGC();
+	for (j < N) {
+		var expect = j < N / 2;
+		if ((refs[j].get() != null) != expect) return -400 - j;
+	}
+	i = 0;
+	for (x = head; x != null; x = x.next) i++;
+	if (i != N / 2) return -401;
+	head = mid = null;
+	RiGc.forceGC();
+	for (j < N) {
+		if (refs[j].get() != null) return -450 - j;
+	}
+	refs = null;
+	RiGc.forceGC();
+	if (arr.get() != null) return -500;
+	return 42;
+}
+
+// A referent reachable only through a user scanner's hidden pointer is not cleared.
+class Hidden {
+	var pointer: Pointer;
+	new() { RiGc.registerScanner(this, Hidden.scan); }
+	def scan() { RiGc.scanRoot(Pointer.atField(this.pointer)); }
+	def hide(c: C) -> this { pointer = Pointer.atObject(c); }
+	def reveal() -> C { return Pointer.atField(pointer).load<C>(); }
+}
+def makeHidden(h: Hidden, v: int) -> WeakRef<C> #no-inline {
+	var c = C.new(v);
+	h.hide(c);
+	return WeakRef<C>.new().set(c);
+}
+def test_scanner() -> int {
+	// Register the weak reference both before and after the scanner that keeps the referent alive.
+	var h1 = Hidden.new();
+	var w1 = makeHidden(h1, BASE + 4);
+	var w2 = WeakRef<C>.new();
+	var h2 = Hidden.new();
+	w2.set(makeHidden(h2, BASE + 5).get());
+	for (k < 4) {
+		RiGc.forceGC();
+		if (w1.get() == null) return -100 - k;
+		if (w1.get() != h1.reveal()) return -200 - k;
+		if (!w1.get().check(BASE + 4)) return -300 - k;
+		if (w2.get() == null) return -400 - k;
+		if (w2.get() != h2.reveal()) return -500 - k;
+		if (!w2.get().check(BASE + 5)) return -600 - k;
+	}
+	h1 = null;
+	h2.hide(null);
+	RiGc.forceGC();
+	if (w1.get() != null) return -700;
+	if (w2.get() != null) return -701;
+	return 42;
+}
+
+// Weak references are cleared before finalizers run.
+var finalized = 0;
+var finalizedSawNull = 0;
+def finalize(w: WeakRef<C>, v: void) {
+	finalized++;
+	if (w.get() == null) finalizedSawNull++;
+}
+def install(v: int) -> WeakRef<C> #no-inline {
+	var c = C.new(v);
+	var w = WeakRef<C>.new().set(c);
+	RiGc.registerFinalizer(c, finalize(w, _));
+	return w;
+}
+def test_finalizer() -> int {
+	def N = 4;
+	finalized = finalizedSawNull = 0;
+	var a = Array<WeakRef<C>>.new(N);
+	for (i < N) a[i] = install(BASE + 10 + i);
+	RiGc.forceGC();
+	if (finalized != N) return -100 - finalized;
+	if (finalizedSawNull != N) return -200 - finalizedSawNull;
+	for (i < N) {
+		if (a[i].get() != null) return -300 - i;
+	}
+	return 42;
+}
+
+// Many weak references survive GCs triggered by allocation, and dead weak references are dropped.
+def test_alloc() -> int {
+	def N = 100, ROUNDS = 20;
+	var live = Array<C>.new(N);
+	var refs = Array<WeakRef<C>>.new(N);
+	for (i < N) {
+		live[i] = C.new(BASE + 100 + i);
+		refs[i] = WeakRef<C>.new().set(live[i]);
+	}
+	var sum = 0, gcs = GcStats.gc_count;
+	for (r < ROUNDS) {
+		// Garbage, including garbage weak references to garbage objects.
+		for (j < 1000) {
+			var g = WeakRef<C>.new().set(C.new(j));
+			sink = Array<int>.new(100);
+			sink[j % 100] = j;
+			sum += sink.length;
+			var c = g.get(); // may already be cleared by an allocation-triggered GC
+			if (c != null && !c.check(j)) return -500 - j;
+		}
+		// Drop every other surviving object halfway through.
+		if (r == ROUNDS / 2) {
+			for (i = 0; i < N; i += 2) live[i] = null;
+		}
+		for (i < N) {
+			if (live[i] == null) continue; // may or may not have been collected yet
+			var c = refs[i].get();
+			if (c != live[i]) return -100 - i;
+			if (!c.check(BASE + 100 + i)) return -200 - i;
+		}
+	}
+	gcs = GcStats.gc_count - gcs;
+	if (gcs < 4) return -1000 - gcs; // expected allocation to trigger GCs
+	RiGc.forceGC();
+	for (i < N) {
+		var c = refs[i].get();
+		if (c != live[i]) return -300 - i;
+	}
+	if (sum <= 0) return -400;
+	return 42;
+}
+
+def main() -> int {
+	var tests = [
+		("alias", test_alias),
+		("retarget", test_retarget),
+		("nested", test_nested),
+		("static", test_static),
+		("cycle", test_cycle),
+		("scanner", test_scanner),
+		("finalizer", test_finalizer),
+		("alloc", test_alloc)
+	];
+	for (t in tests) {
+		System.puts("##+");
+		System.puts(t.0);
+		System.ln();
+		var r = t.1();
+		if (r == 42) {
+			System.puts("##-ok\n");
+		} else {
+			System.puts("##-fail: ");
+			System.puti(r);
+			System.ln();
+		}
+	}
+	return 42;
+}
