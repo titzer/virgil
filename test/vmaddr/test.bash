@@ -28,7 +28,7 @@ HEAP_SIZES_32=${HEAP_SIZES_32:="1m 1000m 1900m"}
 HEAP_SIZES_WASM=${HEAP_SIZES_WASM:="1m 1000m 1800m"}
 HEAP_SIZES_48=${HEAP_SIZES_48:="1m 3g 5g 12g 17000m"}
 # Start addresses to combine with the heap sizes above.
-HEAP_ADDRS_32=${HEAP_ADDRS_32:="0x00300000"}
+HEAP_ADDRS_32=${HEAP_ADDRS_32:="0x00300000 0x7FFF0000"}
 HEAP_ADDRS_48=${HEAP_ADDRS_48:="0x00300000 0x100000000"}
 
 # Rosetta, which emulates x86-64 in docker on an arm64 host, touches every page of
