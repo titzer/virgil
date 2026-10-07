@@ -17,6 +17,10 @@ function compile_target_tests_with_flags() {
         if [ -f $test.flags ]; then
             FLAGS=$(cat $test.flags)
         fi
+        width_flags=$test.flags-$(get_addr_width)
+        if [ -f $width_flags ]; then
+            FLAGS="$FLAGS $(cat $width_flags)"
+        fi
         grep -sq 'def\ TARGET_' $test > /dev/null
         if [ $? = 0 ]; then
             target_field="TARGET_${target//-/_}"
