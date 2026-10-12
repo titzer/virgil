@@ -2,33 +2,40 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Supported commands
-enum DbgCommand(cmdName: string, alias: string, help: string) {
-	Help("help", "h", "Print help text"),
-	Run("run", "r", "Begin program"),
-	Start("start", "start", "Set a temporary breakpoint on main() and begin program")
-	Continue("continue", "c", "Continue program"),
-	Step("step", "s", "Step program until it reaches a different source line"),
-	Stepi("stepi", "si", "Step program by one instruction"),
-	Next("next", "n", "Step program, over calls"),
-	Nexti("nexti", "ni", "Step one instruction, over calls"),
-	Finish("finish", "fin", "Execute until selected stack frame returns"),
-	Info("info", "info", "Show breakpoints or locals. Type \"help info\" for more help"),
-	Breakpoint("break", "b", "Set a breakpoint at <fileName> <line>"),
-	DisableBreakpoint("disable", "disable", "Disable breakpoint at <index>"),
-	EnableBreakpoint("enable", "enable", "Enable breakpoint at <index>"),
-	Backtrace("backtrace", "bt", "Print a backtrace"),
-	Source("source", "source", "Print source with execution result along with a <line number>"),
-	Display("display", "display", "Print information while stepping program. Type \"help display\" for more help"),
-	Undisplay("undisplay", "undisplay", "Don't print information while stepping program"),
-	List("list", "l", "List files in the program"),
-	Quit("quit", "q", "Quit the debugger"),
-	Unknown("unknown", "unknown", ""),
+enum DbgCommand(cmdName: string, alias: string, usage: string, help: string) {
+	Help("help", "h", "[command]", "Print help for all commands or for one command"),
+	Run("run", "r", "", "Run the program from the beginning"),
+	Start("start", "start", "", "Run the program and stop at the first line of main()"),
+	Continue("continue", "c", "", "Continue until a breakpoint or the end of the program"),
+	Step("step", "s", "[count]", "Step to the next source line, entering calls"),
+	Stepi("stepi", "si", "[count]", "Step one instruction, entering calls"),
+	Next("next", "n", "[count]", "Step to the next source line, stepping over calls"),
+	Nexti("nexti", "ni", "[count]", "Step one instruction, stepping over calls"),
+	Finish("finish", "fin", "", "Run until the selected function returns"),
+	Info("info", "i", "<topic>", "Show breakpoints, locals, files, ...; see \"help info\""),
+	Breakpoint("break", "b", "[location]", "Set a breakpoint; see \"help break\" for locations"),
+	TempBreakpoint("tbreak", "tb", "<location>", "Set a breakpoint that is deleted when hit"),
+	DeleteBreakpoint("delete", "d", "[num...]", "Delete breakpoints, or all breakpoints"),
+	DisableBreakpoint("disable", "disable", "<num...>", "Disable breakpoints"),
+	EnableBreakpoint("enable", "enable", "<num...>", "Enable breakpoints"),
+	Backtrace("backtrace", "bt", "", "Print the call stack"),
+	Frame("frame", "f", "[num]", "Select a stack frame, or describe the selected frame"),
+	Up("up", "up", "[count]", "Select the frame of the caller"),
+	Down("down", "down", "[count]", "Select the frame of the callee"),
+	Print("print", "p", "<expr>", "Print a variable; see \"help print\""),
+	List("list", "l", "[location]", "List source lines around a location or the current line"),
+	Source("source", "source", "[count]", "Print source with execution results for the last <count> lines"),
+	Display("display", "display", "<what>", "Print information while stepping; see \"help display\""),
+	Undisplay("undisplay", "undisplay", "<what>", "Stop printing information while stepping"),
+	Quit("quit", "q", "", "Quit the debugger"),
+	Unknown("unknown", "unknown", "", ""),
 }
 enum DbgInfo(cmdName: string, alias: string, help: string) {
 	Breakpoints("breakpoints", "b", "Print information about breakpoints"),
-	Locals("locals", "l", "Print information about nonSsa-locals when next instr is a Checkpoint"),
+	Locals("locals", "l", "Print the local variables of the selected frame"),
 	Inputs("inputs", "i", "Print information about inputs of next instruction"),
 	Variable("variable", "v", "Print detail information about a variable <index>(es) separated by space"),
+	Files("files", "f", "List the files in the program"),
 	Invalid("invalid", "invalid", "")
 }
 enum DbgDisplay(cmdName: string, alias: string, help: string) {
@@ -39,6 +46,25 @@ enum DbgDisplay(cmdName: string, alias: string, help: string) {
 }
 
 def PRINT_LIMIT = 30;
+def STRING_LIMIT = 200;
+def LIST_LINES = 10;
+def PROMPT = "(debug) ";
+
+def HELP_BREAK = [
+	"A location is one of:",
+	"  <line>             a line in the current file",
+	"  <file>:<line>      a line in a file; <file> may be a path, a path suffix,",
+	"  <file> <line>        or a file name with or without .v3",
+	"  <function>         the first line of a function, e.g. main, Point.sum, Point.new",
+	"A breakpoint on a line without code moves to the next line with code.",
+	"Without a location, \"break\" sets a breakpoint at the current line."
+];
+def HELP_PRINT = [
+	"An expression is a local variable, parameter, field of \"this\", component, or",
+	"global variable, followed by any number of selectors:",
+	"  .field  .0  .length  [index]",
+	"For example: p.x, args[0].length, t.1, Util.count"
+];
 
 enum DbgExecuteOpt(stopFunc: (SsaInstr, SsaIntFrame, SsaIntFrame) -> bool) {
 	Continue(stopExecuteUntilBreak),
@@ -78,76 +104,133 @@ enum DbgStopReason {
 	stopOnStep,
 	stopOnEntry,
 	end,
+	exception,
 }
 
 type Variables(name: string, t: Type, index: int, instr: SsaInstr) #unboxed { }
 
+// The result of resolving a location typed by the user.
+class DbgLocation {
+	var file: VstFile;
+	var line: int;
+	var requestedLine: int;
+	var function: string;		// set if the location named a function
+	def checkpoints = Vector<SsaCheckpoint>.new();
+	var error: string;
+}
+
 // Implement a GDB-like interface debugger based on SsaInterpreter
 class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaInterpreter) {
-	def parser = DebuggerParser.new();
-	def bps = Vector<Breakpoint>.new();
+	def ext = CLOptions.DEBUG_EXTENSION.get();
+	def parser = DebuggerParser.new(CLOptions.DEBUG_TTY.get() && !ext);
+	def bps = Vector<DbgBreakpoint>.new();
 	def printer = SsaPrinter.new();
 	def srcPrinter = SrcPrinter.new(prog.vst.files, interp);
+	def out = TerminalBuffer.new();
 	var startDel: Closure;
 	var startArgs: Array<Val>;
 	var running: bool;
 	var stopReason: DbgStopReason;
 	var ip: SsaInstr;
+	var selected: int;		// index of the selected frame, 0 = innermost
+	var lastCommand: string;	// repeated by an empty line
+	var lastStopSpec: IrSpec;	// function and depth of the last stop, to print
+	var lastStopDepth: int;		// a location header only when they change
+	var listFile: VstFile;		// file and line where "list" continues
+	var listLine: int;
 
 	def invoke(del: Closure, args: Array<Val>) -> Result {
 		startDel = del;
 		startArgs = args;
-		if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put("For help, type \"help\".\n");
+		parser.editor.completer = complete;
+		if (!ext) Terminal.put("For help, type \"help\".\n");
 		var readCommand = true;
 		while (readCommand) {
-			var result = parser.parseCommand(parser.getCommand());
+			var line = parser.getCommand(if(ext, null, PROMPT));
+			if (line == null) break;
+			if (!ext) {
+				line = Strings.strip(line);
+				if (line.length == 0) {
+					if (lastCommand == null) continue;
+					line = lastCommand;
+				}
+				lastCommand = if(isRepeatable(line), line);
+			}
+			var result = parser.parseCommand(line);
 			readCommand = handleCommand(result);
 		}
 		return null;
+	}
+	def isRepeatable(line: string) -> bool {
+		match (parser.parseCommand(line).0) {
+			Step, Stepi, Next, Nexti, Continue, List, Up, Down => return true;
+			_ => return false;
+		}
 	}
 	def handleCommand(command: DbgCommand, args: string) -> bool {
 		match (command) {
 			Help => printHelp(args);
 			Run => {
 				start(false);
-				execute(DbgExecuteOpt.Continue);
+				if (!ext && SsaCheckpoint.?(ip) && SsaCheckpoint.!(ip).breakpoint) {
+					// Stop at a breakpoint on the first line.
+					stopReason = DbgStopReason.stopOnBreakpoint;
+					hitBreakpoints();
+					printExecuteResult();
+				} else {
+					execute(DbgExecuteOpt.Continue, 1);
+				}
 			}
 			Start => {
 				start(true);
 			}
-			Continue => execute(DbgExecuteOpt.Continue);
-			Step => execute(DbgExecuteOpt.Step);
-			Stepi => execute(DbgExecuteOpt.Stepi);
-			Next => execute(DbgExecuteOpt.Next);
-			Nexti => execute(DbgExecuteOpt.Nexti);
-			Finish => execute(DbgExecuteOpt.Finish);
+			Continue => execute(DbgExecuteOpt.Continue, 1);
+			Step => execute(DbgExecuteOpt.Step, parseCount(args));
+			Stepi => execute(DbgExecuteOpt.Stepi, parseCount(args));
+			Next => execute(DbgExecuteOpt.Next, parseCount(args));
+			Nexti => execute(DbgExecuteOpt.Nexti, parseCount(args));
+			Finish => execute(DbgExecuteOpt.Finish, 1);
 			Info => {
 				var info = parser.parseInfo(args);
 				match (info.0) {
 					Breakpoints => {
-						for (i < bps.length) Terminal.put2("%d: %q\n", i, bps[i].render);
+						if (ext) {
+							for (i < bps.length) Terminal.put2("%d: %q\n", i, bps[i].render);
+						} else {
+							infoBreakpoints();
+						}
 					}
-					Locals => infoLocals();
+					Locals => if (ext) infoLocalsExt(); else infoLocals();
 					Inputs => infoInputs();
 					Variable => {
 						if (running) {
 							var res = infoVal(info.1);
-							if (!res && !CLOptions.DEBUG_EXTENSION.get()) Terminal.put("Nothing to show\n");
+							if (!res && !ext) Terminal.put("Nothing to show\n");
 						}
-						if (CLOptions.DEBUG_EXTENSION.get()) Terminal.put("variableDone\n");
+						if (ext) Terminal.put("variableDone\n");
 					}
+					Files => listFiles();
 					Invalid => Terminal.put1("Invalid info args: %s\n", args);
 				}
 			}
 			Breakpoint => {
-				var result = parser.parseBreakpoint(args);
-				var idx = -1, source: Source;
-				if (result.0.length > 0 && insertBreakpoint(result)) {
-					idx = bps.length-1;
-					source = bps[idx].ssa.source;
+				if (ext) {
+					var result = parser.parseBreakpoint(args);
+					var idx = -1, source: Source;
+					if (result.0.length > 0) {
+						var cp = findBreakpointExt(result.0, result.1);
+						if (cp != null) {
+							idx = addBreakpoint([cp], false).num;
+							source = cp.source;
+						}
+					}
+					putBreakpoint(args, idx, source);
+				} else {
+					setBreakpoint(args, false);
 				}
-				putBreakpoint(args, idx, source);
 			}
+			TempBreakpoint => if (ext) Terminal.put("Unknown command\n"); else setBreakpoint(args, true);
+			DeleteBreakpoint => if (ext) Terminal.put("Unknown command\n"); else deleteBreakpoints(args);
 			DisableBreakpoint => {
 				handleBreakpoint(args, false);
 			}
@@ -155,17 +238,28 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 				handleBreakpoint(args, true);
 			}
 			Backtrace => {
-				if (running) {
-					var source: Source;
-					if (SsaCheckpoint.?(ip)) source = SsaCheckpoint.!(ip).source;
-					var trace = interp.getStackTrace(source);
-					for (list = trace; list != null; list = list.tail) {
-						for (s = list.head; s != null; s = s.tail) {
-							putBacktrace(s);
+				if (ext) {
+					if (running) {
+						var source: Source;
+						if (SsaCheckpoint.?(ip)) source = SsaCheckpoint.!(ip).source;
+						var trace = interp.getStackTrace(source);
+						for (list = trace; list != null; list = list.tail) {
+							for (s = list.head; s != null; s = s.tail) {
+								putBacktrace(s);
+							}
 						}
 					}
+				} else {
+					backtrace();
 				}
 			}
+			Frame => {
+				var index = if(args.length == 0, selected, parseNum(args, int.min));
+				if (index != int.min) selectFrame(index);
+			}
+			Up => selectFrame(selected + parseCount(args));
+			Down => selectFrame(selected - parseCount(args));
+			Print => printExpr(args);
 			Source => {
 				var result = parser.parseSource(args);
 				if (result == INVALID) Terminal.put1("Invalid source args: %s\n", args);
@@ -177,7 +271,7 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 					Trace => interp.setTrace(true);
 					Source => srcPrinter.set(true);
 					CalleeSource => srcPrinter.traceCallee = true;
-					Invalid => {}
+					Invalid => if (!ext) Terminal.put1("Invalid display args: %s\n", args);
 				}
 			}
 			Undisplay => {
@@ -190,12 +284,12 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 				}
 			}
 			Unknown => {
-				Terminal.put("Unknown command\n");
+				if (ext) Terminal.put("Unknown command\n");
+				else Terminal.put1("Unknown command \"%s\". Try \"help\".\n", args);
 			}
 			List => {
-				for (s in prog.files) {
-					Terminal.put1(" %s\n", s);
-				}
+				if (ext) listFiles();
+				else listSource(args);
 			}
 			Quit => {
 				return false;
@@ -207,7 +301,7 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 	def start(stopOnEntry: bool) {
 		interp.reset();
 		srcPrinter.reset();
-		if (!CLOptions.DEBUG_EXTENSION.get()) {
+		if (!ext) {
 			Terminal.put2("Starting program: %s with method %q\n", interp.prog.name(), startDel.memberRef.render);
 			if (startArgs != null) {
 				for (i < startArgs.length) Terminal.put2("args %d: %s\n", i, V3.renderVal(startArgs[i]));
@@ -215,7 +309,10 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		}
 		interp.pushFrame(startDel.memberRef, startDel.val, startArgs);
 		ip = interp.frame.ip;
+		updateLocals();
 		running = true;
+		selected = 0;
+		lastStopSpec = null;
 		if (stopOnEntry) {
 			stopReason = DbgStopReason.stopOnEntry;
 			var targetFrame = interp.frame;
@@ -223,33 +320,67 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 				step(targetFrame);
 				if (!running) break;
 			}
+			hitBreakpoints();
 			printExecuteResult();
 		}
 	}
 	// Step debugged program and stop depending on condition
-	def execute(opt: DbgExecuteOpt) {
-		if (!running) return;
-		stopReason = DbgStopReason.stopOnStep;
-		var targetFrame = interp.frame;
-		step(targetFrame);
-		while (running && !stopExecute(ip, opt, targetFrame)) {
-			step(targetFrame);
+	def execute(opt: DbgExecuteOpt, count: int) {
+		if (!running) {
+			if (!ext) Terminal.put("The program is not being run.\n");
+			return;
 		}
+		var callInstr: SsaInstr, returnFrame: SsaIntFrame;
+		for (n < count) {
+			stopReason = DbgStopReason.stopOnStep;
+			var targetFrame = interp.frame;
+			if (opt == DbgExecuteOpt.Finish && !ext) {
+				targetFrame = frameAt(selected);
+				returnFrame = targetFrame.prev;
+				if (returnFrame == null) {
+					Terminal.put("\"finish\" not meaningful in the outermost frame.\n");
+					return;
+				}
+				if (returnFrame != null) callInstr = returnFrame.ip;
+				putFinish(targetFrame);
+			}
+			step(targetFrame);
+			while (running && !stopExecute(ip, opt, targetFrame)) {
+				step(targetFrame);
+			}
+			if (!running || stopReason == DbgStopReason.stopOnBreakpoint) break;
+		}
+		selected = 0;
 		if (srcPrinter.on) srcPrinter.out();
+		hitBreakpoints();
+		if (callInstr != null && running && interp.frame == returnFrame && stopReason == DbgStopReason.stopOnStep) {
+			var t = callInstr.getType();
+			if (!VoidType.?(t)) {
+				renderValue(out.puts("Value returned: "), interp.getFrameVal(returnFrame, callInstr), t, 1);
+				out.outln();
+			}
+		}
 		printExecuteResult();
 	}
 	def step(targetFrame: SsaIntFrame) {
-		var prev = ip;
+		var prev = ip, frame = interp.frame;
+		if (SsaCheckpoint.?(prev)) frame.checkpoint = SsaCheckpoint.!(prev);
 		var n = interp.step(prev);
 		if (interp.frame == null) {
-			stopReason = DbgStopReason.end;
 			running = false;
+			if (interp.exception != null && !ext) {
+				// Keep the frames of the failed program so that they can be inspected.
+				interp.frame = frame;
+				stopReason = DbgStopReason.exception;
+			} else {
+				stopReason = DbgStopReason.end;
+			}
 			return;
 		}
 		srcPrinter.putData(prev, targetFrame);
 		interp.frame.ip = n;
-		updateLocals();
 		ip = interp.frame.ip;
+		updateLocals();
 	}
 	// Decide whether to stop execution or not
 	def stopExecute(instr: SsaInstr, opt: DbgExecuteOpt, targetFrame: SsaIntFrame) -> bool {
@@ -266,94 +397,706 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 	}
 	// Update local variables information
 	def updateLocals() {
+		var l = interp.frame.localVars;
 		match (ip) {
 			x: SsaNewVar => {
-				var instr: SsaInstr = if (x.index == -1, x.inputs[0].dest); // Store instr if is SsaVar
-				interp.frame.localVars.put(Variables(x.name, x.vtype, x.index, instr));
+				l.put(Variables(x.name, x.vtype, x.index, firstInput(x)));
 			}
 			x: SsaDeleteVar => {
-				var resizeTo = interp.frame.localVars.length - x.n;
-				interp.frame.localVars.resize(resizeTo);
+				var resizeTo = l.length - x.n;
+				l.resize(if(resizeTo < 0, 0, resizeTo));
 			}
 			x: SsaUpdateVar => {
-				var l = interp.frame.localVars;
-				for (i < l.length) {
+				for (i = l.length - 1; i >= 0; i--) {
 					var v = l[i];
 					if (v.index == x.index) {
-						var instr: SsaInstr = if (x.index == -1, x.inputs[0].dest); // Store instr if is SsaVar
-						l[i] = Variables(v.name, v.t, v.index, instr);
+						l[i] = Variables(v.name, v.t, v.index, firstInput(x));
 						break;
 					}
 				}
 			}
 		}
 	}
+	def firstInput(i: SsaInstr) -> SsaInstr {
+		return if(i.inputs.length > 0, i.inputs[0].dest);
+	}
+	// Count the hits of the breakpoints at a stop, deleting temporary ones.
+	def hitBreakpoints() {
+		if (stopReason != DbgStopReason.stopOnBreakpoint) return;
+		var changed = false, first = true;
+		for (i < bps.length) {
+			var bp = bps[i];
+			if (bp == null || !bp.enabled || !bp.contains(ip)) continue;
+			bp.hits++;
+			if (first && !ext) out.put2("%s %d, ", if(bp.temporary, "Temporary breakpoint", "Breakpoint"), bp.num);
+			first = false;
+			if (bp.temporary) {
+				deleteBreakpoint(i);
+				changed = true;
+			}
+		}
+		if (changed) updateBreakpointFlags();
+	}
 	// Print next instruction or the final result of the debugger program
 	def printExecuteResult() {
-		if (CLOptions.DEBUG_EXTENSION.get()) {
+		if (ext) {
 			Terminal.put1("stop|%s\n", stopReason.name);
 			if (interp.frame == null) printProgramResult();
 			return;
 		}
-		if (interp.frame != null) {
+		match (stopReason) {
+			end => {
+				out.outt();
+				printProgramResult();
+				lastStopSpec = null;
+				return;
+			}
+			exception => {
+				out.outt();
+				printProgramResult();
+				putFrameHeader(0, true);
+				return;
+			}
+			_ => ;
+		}
+		var depth = 0;
+		for (f = interp.frame; f != null; f = f.prev) depth++;
+		var newFunction = interp.frame.spec != lastStopSpec || depth != lastStopDepth;
+		lastStopSpec = interp.frame.spec;
+		lastStopDepth = depth;
+		if (SsaCheckpoint.?(ip)) {
+			var source = SsaCheckpoint.!(ip).source;
+			if (newFunction || stopReason != DbgStopReason.stopOnStep || out.length > 0) putLocation(source).ln();
+			putSourceLine(source);
+		} else {
+			// Stopped in the middle of a line, e.g. after "stepi" or "finish".
+			var source = frameSource(interp.frame, true);
+			if (out.length > 0 || newFunction) {
+				if (source != null) putLocation(source).ln();
+				out.outt();
+			}
 			for (t = interp.frame; t != null; t = t.prev) printer.buf.puts("  ");
 			printer.buf.blue().puts("=>").end();
 			printer.printInstr(ip, false, true, false, false);
 			printer.outln();
-		} else {
-			printProgramResult();
 		}
+		listFile = null;
 	}
 	def printProgramResult() {
 		var result = if (interp.exception == null, interp.retVal, interp.exception);
 		var rettype = interp.prog.getMain().getReturnType();
-		if (CLOptions.DEBUG_EXTENSION.get()) printer.buf.puts("result|");
+		if (ext) printer.buf.puts("result|");
+		else if (interp.exception != null) printer.buf.puts("Program threw exception: ");
 		else printer.buf.puts("Program exited: ");
-		V3.renderResult(result, rettype, printer.buf);
+		if (interp.exception != null && !ext) {
+			var ex = interp.exception;
+			printer.buf.put1("!%s", ex.error);
+			if (ex.msg != null) printer.buf.put1(": %s", ex.msg);
+		} else {
+			V3.renderResult(result, rettype, printer.buf);
+		}
 		printer.outln();
 	}
+	def putFinish(f: SsaIntFrame) {
+		out.puts("Run till exit from ");
+		var source = frameSource(f, f == interp.frame);
+		if (source != null) putLocation(source);
+		else f.spec.render(out);
+		out.outln();
+	}
+	//======================================================================
+	// Frames
+	//======================================================================
+	def frameAt(index: int) -> SsaIntFrame {
+		var f = interp.frame;
+		for (i < index) {
+			if (f == null) break;
+			f = f.prev;
+		}
+		return f;
+	}
+	def numFrames() -> int {
+		var count = 0;
+		for (f = interp.frame; f != null; f = f.prev) count++;
+		return count;
+	}
+	// Get the source position of a frame: the line about to execute in the innermost
+	// frame, and the line of the call in the other frames.
+	def frameSource(f: SsaIntFrame, innermost: bool) -> Source {
+		if (innermost && SsaCheckpoint.?(f.ip)) return SsaCheckpoint.!(f.ip).source;
+		var source: Source;
+		match (f.ip) {
+			x: SsaApplyOp => source = x.source;
+			x: SsaThrow => source = x.source;
+		}
+		if (source != null) return source;
+		if (f.checkpoint != null) return f.checkpoint.source;
+		return null;
+	}
+	// Get the checkpoint whose inputs give the values of non-SSA variables in a frame.
+	def frameCheckpoint(f: SsaIntFrame) -> SsaCheckpoint {
+		if (f == interp.frame && SsaCheckpoint.?(f.ip)) return SsaCheckpoint.!(f.ip);
+		return f.checkpoint;
+	}
+	// Get the receiver of a method on an object, unless it is already a local variable.
+	def frameThis(f: SsaIntFrame) -> SsaParam {
+		if (f.ssa == null || f.ssa.params.length == 0) return null;
+		var p = f.ssa.params[0];
+		if (!ClassType.?(p.getType())) return null;
+		for (i < f.localVars.length) if (Strings.equal(f.localVars[i].name, "this")) return null;
+		return p;
+	}
+	def frameVar(f: SsaIntFrame, cp: SsaCheckpoint, v: Variables) -> Val {
+		var instr: SsaInstr;
+		if (v.index >= 0 && cp != null) instr = cp.varInput(v.index);
+		if (instr == null) instr = v.instr;
+		return if(instr != null, interp.getFrameVal(f, instr));
+	}
+	def hasStack() -> bool {
+		if (interp.frame != null) return true;
+		Terminal.put("No stack.\n");
+		return false;
+	}
+	def backtrace() {
+		if (!hasStack()) return;
+		var i = 0;
+		for (f = interp.frame; f != null; f = f.prev) {
+			putFrame(i, f);
+			out.outln();
+			i++;
+		}
+	}
+	def putFrame(index: int, f: SsaIntFrame) {
+		out.put1("#%d  ", index);
+		var source = frameSource(f, index == 0);
+		if (source == null) {
+			f.spec.render(out).puts("()");
+			return;
+		}
+		putLocation(source);
+		// Also print the positions of inlined calls, if any.
+		for (s = source.tail; s != null; s = s.tail) {
+			out.ln().puts("    inlined into ");
+			putLocation(s);
+		}
+	}
+	def selectFrame(index: int) {
+		if (!hasStack()) return;
+		var count = numFrames();
+		if (index < 0 || index >= count) {
+			if (index < 0 && selected == 0) Terminal.put("Bottom (innermost) frame selected; you cannot go down.\n");
+			else if (index >= count && selected == count - 1) Terminal.put("Initial frame selected; you cannot go up.\n");
+			else Terminal.put1("No frame at level %d.\n", index);
+			return;
+		}
+		selected = index;
+		listFile = null;
+		putFrameHeader(selected, false);
+	}
+	def putFrameHeader(index: int, location: bool) {
+		var f = frameAt(index);
+		if (location) {
+			var source = frameSource(f, index == 0);
+			if (source != null) {
+				out.puts("  in ");
+				putLocation(source);
+			}
+		} else {
+			putFrame(index, f);
+		}
+		out.outln();
+		var source = frameSource(f, index == 0);
+		if (source != null) putSourceLine(source);
+	}
+	//======================================================================
+	// Source lines and locations
+	//======================================================================
+	def putLocation(source: Source) -> TerminalBuffer {
+		source.mdecl.renderLong(out).puts("()");
+		if (source.line > 0) out.put2(" at %s:%d", source.mdecl.token.fileName, source.line);
+		return out;
+	}
+	def putSourceLine(source: Source) {
+		var file = findVstFile(source.mdecl.token.fileName);
+		if (file == null || source.line <= 0) return;
+		out.put1("%d\t", source.line).puts(getLine(file, source.line)).outln();
+	}
+	def getLine(file: VstFile, line: int) -> string {
+		var text = file.extractLine(line);
+		if (text == null) return "";
+		if (text.length > 0 && text[text.length - 1] == '\r') text = Arrays.range(text, 0, text.length - 1);
+		return text;
+	}
+	def numLines(file: VstFile) -> int {
+		var input = file.input, count = 0;
+		if (input == null) return 0;
+		for (b in input) if (b == '\n') count++;
+		if (input.length > 0 && input[input.length - 1] != '\n') count++;
+		return count;
+	}
+	def findVstFile(fileName: string) -> VstFile {
+		for (f in prog.vst.files) if (Strings.equal(f.fileName, fileName)) return f;
+		return null;
+	}
+	// The file of the selected frame, else the last listed file, else the file of main().
+	def currentFile() -> VstFile {
+		var f = frameAt(selected);
+		if (f != null) {
+			var source = frameSource(f, selected == 0);
+			if (source != null) return findVstFile(source.mdecl.token.fileName);
+		}
+		if (listFile != null) return listFile;
+		var meth = startDel.memberRef.asMethod();
+		if (meth.source != null) return findVstFile(meth.source.token.fileName);
+		return if(prog.vst.files.length > 0, prog.vst.files[0]);
+	}
+	def listFiles() {
+		for (s in prog.files) {
+			Terminal.put1(" %s\n", s);
+		}
+	}
+	def listSource(args: string) {
+		var file: VstFile, first: int;
+		if (args.length == 0 && listFile != null) {
+			// Continue from where the last listing stopped.
+			file = listFile;
+			first = listLine;
+		} else {
+			var center: int;
+			if (args.length == 0) {
+				var f = frameAt(selected), source = if(f != null, frameSource(f, selected == 0));
+				if (source != null) {
+					file = findVstFile(source.mdecl.token.fileName);
+					center = source.line;
+				} else {
+					file = currentFile();
+					var meth = startDel.memberRef.asMethod();
+					center = if(meth.source != null, meth.source.token.beginLine, 1);
+				}
+			} else {
+				var loc = parseLocation(args, false);
+				if (loc.error != null) return void(Terminal.put1("%s\n", loc.error));
+				file = loc.file;
+				center = loc.line;
+			}
+			if (file == null) return void(Terminal.put("No source file.\n"));
+			first = center - LIST_LINES / 2;
+			if (first < 1) first = 1;
+		}
+		var last = numLines(file);
+		if (first > last) return void(Terminal.put1("Line number %d out of range.\n", first));
+		var current = 0, f = frameAt(selected);
+		if (f != null) {
+			var source = frameSource(f, selected == 0);
+			if (source != null && Strings.equal(source.mdecl.token.fileName, file.fileName)) current = source.line;
+		}
+		var end = first + LIST_LINES;
+		if (end > last + 1) end = last + 1;
+		for (line = first; line < end; line++) {
+			var marker = if(line == current, "=>", if(hasBreakpointAt(file, line), " *", "  "));
+			out.puts(marker);
+			var start = out.length;
+			out.putd(line).rjustify(' ', out.length - start, 5).tab().puts(getLine(file, line)).outln();
+		}
+		listFile = file;
+		listLine = end;
+	}
+	// Parse a location, i.e. one of <line>, <file>:<line>, <file> <line>, or <function>.
+	// For a breakpoint, also finds the checkpoints, moving forward to a line with code.
+	def parseLocation(args: string, forBreak: bool) -> DbgLocation {
+		var loc = DbgLocation.new();
+		var fileName: string, lineStr: string;
+		var colon = lastIndexOf(args, ':'), space = lastIndexOf(args, ' ');
+		if (colon > 0) {
+			fileName = Arrays.range(args, 0, colon);
+			lineStr = Strings.strip(Arrays.range(args, colon + 1, args.length));
+		} else if (space > 0) {
+			fileName = Strings.strip(Arrays.range(args, 0, space));
+			lineStr = Arrays.range(args, space + 1, args.length);
+		} else if (isNumber(args)) {
+			lineStr = args;
+		} else {
+			// A function name.
+			resolveFunction(loc, args, forBreak);
+			if (loc.error != null && findFiles(args).length > 0) {
+				loc.error = Strings.format2("Specify a line, e.g. \"%s:%d\".", args, 1);
+			}
+			return loc;
+		}
+		if (!isNumber(lineStr)) {
+			loc.error = Strings.format1("Invalid line number \"%s\".", lineStr);
+			return loc;
+		}
+		loc.line = loc.requestedLine = Ints.parseDecimal(lineStr, 0).1;
+		if (fileName != null) {
+			var files = findFiles(fileName);
+			if (files.length == 0) {
+				loc.error = Strings.format1("No source file named \"%s\".", fileName);
+				return loc;
+			}
+			if (files.length > 1) {
+				var buf = StringBuilder.new().put1("Ambiguous file name \"%s\":", fileName);
+				for (f in files) buf.put1(" %s", f.fileName);
+				loc.error = buf.toString();
+				return loc;
+			}
+			loc.file = files[0];
+		} else {
+			loc.file = currentFile();
+			if (loc.file == null) {
+				loc.error = "No source file.";
+				return loc;
+			}
+		}
+		if (loc.line <= 0 || loc.line > numLines(loc.file)) {
+			loc.error = Strings.format2("Line %d is out of range for \"%s\".", loc.line, loc.file.fileName);
+			return loc;
+		}
+		if (forBreak) resolveLine(loc);
+		return loc;
+	}
+	// Find the files that match a name given by the user. In order of preference, the
+	// name may be a path as given on the command line, a suffix of such a path (or vice
+	// versa), or a file name, each with or without the ".v3" extension.
+	def findFiles(name: string) -> Array<VstFile> {
+		var names = [name];
+		if (!Strings.endsWith(name, ".v3")) names = [name, Strings.format1("%s.v3", name)];
+		var files = prog.vst.files;
+		var result = Vector<VstFile>.new();
+		// exact match
+		for (n in names) for (f in files) if (Strings.equal(f.fileName, n)) result.put(f);
+		if (result.length > 0) return result.extract();
+		// path suffix match, in either direction
+		for (n in names) {
+			var a = stripDotSlash(n);
+			for (f in files) {
+				var b = stripDotSlash(f.fileName);
+				if (isPathSuffix(a, b) || isPathSuffix(b, a)) result.put(f);
+			}
+			if (result.length > 0) return result.extract();
+		}
+		// file name match
+		var base = Paths.baseName(name);
+		for (f in files) if (Strings.equal(Paths.baseName(f.fileName), base)) result.put(f);
+		return result.extract();
+	}
+	def stripDotSlash(path: string) -> string {
+		var start = 0;
+		while (start + 1 < path.length && path[start] == '.' && path[start + 1] == '/') start += 2;
+		while (start + 2 < path.length && path[start] == '.' && path[start + 1] == '.' && path[start + 2] == '/') start += 3;
+		return Arrays.range(path, start, path.length);
+	}
+	// Returns {true} if {suffix} is a suffix of {path} that starts at a path separator.
+	def isPathSuffix(suffix: string, path: string) -> bool {
+		if (suffix.length == 0 || !Strings.endsWith(path, suffix)) return false;
+		var start = path.length - suffix.length;
+		return start == 0 || path[start - 1] == '/';
+	}
+	// All methods declared in a file, including constructors and function expressions.
+	def methodsInFile(file: VstFile) -> Array<VstMethod> {
+		var result = Vector<VstMethod>.new();
+		for (i < file.classes.length) addMethods(file.classes[i], result);
+		for (i < file.components.length) addMethods(file.components[i], result);
+		return result.extract();
+	}
+	def addMethods(c: VstCompound, result: Vector<VstMethod>) {
+		for (l = c.members; l != null; l = l.tail) {
+			if (VstMethod.?(l.head)) result.put(VstMethod.!(l.head));
+		}
+	}
+	def bodyRange(m: VstMethod) -> FileRange {
+		if (m.func == null || m.func.body == null) return null;
+		return m.func.body.range();
+	}
+	def getSsa(m: VstMethod) -> SsaGraph {
+		if (m.receiver == null || m.index < 0) return null;
+		var ic = prog.ir.makeIrClass(m.receiver.getDeclaredType());
+		if (ic == null || m.index >= ic.methods.length || ic.methods[m.index] == null) return null;
+		var spec = prog.ir.fromVstMember(m);
+		var meth = spec.asMethod();
+		if (meth.ssa == null) meth.ssa = genSsa(spec, 0);
+		return meth.ssa;
+	}
+	// Apply {f} to each checkpoint in the code of {m}.
+	def forCheckpoints(m: VstMethod, f: SsaCheckpoint -> void) {
+		var ssa = getSsa(m);
+		if (ssa == null) return;
+		for (b in ssa.bfBlocks(null)) {
+			for (i = b.next; i != null && i != b; i = i.next) {
+				if (SsaCheckpoint.?(i)) f(SsaCheckpoint.!(i));
+			}
+		}
+	}
+	// Find the checkpoints for {loc.line}, or for the next line that has code.
+	def resolveLine(loc: DbgLocation) {
+		var line = loc.line, methods = methodsInFile(loc.file);
+		var finder = DbgLineFinder.new(loc.file.fileName, line);
+		// First look in the methods whose body contains the line.
+		var inBody: VstMethod;
+		for (m in methods) {
+			var r = bodyRange(m);
+			if (r == null || line < r.beginLine || line > r.endLine) continue;
+			if (inBody == null || r.beginLine >= bodyRange(inBody).beginLine) inBody = m;
+			finder.limit = r.endLine;
+			forCheckpoints(m, finder.visit);
+		}
+		if (finder.best == int.max) {
+			// Code attributed to this line outside of a method body, e.g. a field initializer.
+			finder.limit = line;
+			for (m in methods) forCheckpoints(m, finder.visit);
+		}
+		if (finder.best == int.max && inBody == null) {
+			// Between methods: move forward to the next line with code.
+			finder.limit = int.max;
+			for (m in methods) forCheckpoints(m, finder.visit);
+		}
+		if (finder.best == int.max) {
+			if (inBody != null) {
+				loc.error = Strings.format2("No code at or after line %d in %q().", line, inBody.renderLong);
+			} else {
+				loc.error = Strings.format2("No code at or after line %d in \"%s\".", line, loc.file.fileName);
+			}
+			return;
+		}
+		loc.line = finder.best;
+		loc.checkpoints.putv(finder.found);
+	}
+	// Find the methods matching {name}, which is a method name optionally qualified
+	// with the name of a class, component, variant case, or file.
+	def findMethods(name: string) -> Array<VstMethod> {
+		var result = Vector<VstMethod>.new();
+		var dot = lastIndexOf(name, '.');
+		var qual = if(dot > 0, Arrays.range(name, 0, dot));
+		var mname = Arrays.range(name, dot + 1, name.length);
+		for (file in prog.vst.files) {
+			for (m in methodsInFile(file)) {
+				if ((m.isSynthetic && !VstNew.?(m)) || !Strings.equal(m.name(), mname)) continue;
+				if (qual != null) {
+					var c = m.receiver;
+					if (c == null) continue;
+					var ok = Strings.equal(qual, c.fullName) || Strings.equal(qual, c.name());
+					if (c.isFileScope) ok = Strings.equal(qual, Paths.baseName(file.fileName));
+					if (!ok) continue;
+				}
+				result.put(m);
+			}
+		}
+		return result.extract();
+	}
+	def resolveFunction(loc: DbgLocation, name: string, forBreak: bool) {
+		var methods = findMethods(name);
+		if (methods.length == 0) {
+			loc.error = Strings.format1("Function \"%s\" not defined.", name);
+			return;
+		}
+		var first = methods[0];
+		loc.function = name;
+		loc.file = findVstFile(first.token.fileName);
+		loc.line = first.token.beginLine;
+		if (!forBreak) return;
+		// Stop at the first line of code of each method.
+		var finder = DbgEntryFinder.new();
+		for (m in methods) {
+			finder.entry = null;
+			forCheckpoints(m, finder.visit);
+			if (finder.entry != null) loc.checkpoints.put(finder.entry);
+		}
+		if (loc.checkpoints.length == 0) {
+			loc.error = Strings.format1("Function \"%s\" has no code.", name);
+			return;
+		}
+		loc.line = loc.checkpoints[0].source.line;
+	}
+	//======================================================================
+	// Breakpoints
+	//======================================================================
+	def setBreakpoint(args: string, temporary: bool) {
+		var loc: DbgLocation;
+		if (args.length == 0) {
+			var f = frameAt(selected), source = if(f != null, frameSource(f, selected == 0));
+			if (source == null) return void(Terminal.put("No default breakpoint location; the program is not being run.\n"));
+			loc = DbgLocation.new();
+			loc.file = findVstFile(source.mdecl.token.fileName);
+			loc.line = loc.requestedLine = source.line;
+			resolveLine(loc);
+		} else {
+			loc = parseLocation(args, true);
+		}
+		if (loc.error != null) return void(Terminal.put1("%s\n", loc.error));
+		var bp = addBreakpoint(loc.checkpoints.extract(), temporary);
+		out.put2("%s %d: ", if(temporary, "Temporary breakpoint", "Breakpoint"), bp.num);
+		if (bp.locs.length == 1) {
+			putLocation(bp.locs[0].source);
+		} else {
+			out.put2("%s:%d", loc.file.fileName, loc.line);
+			if (loc.function != null) out.put1(" (%d locations)", bp.locs.length);
+		}
+		if (loc.function == null && loc.line != loc.requestedLine) out.put1(" (moved from line %d)", loc.requestedLine);
+		out.outln();
+	}
+	def addBreakpoint(locs: Array<SsaCheckpoint>, temporary: bool) -> DbgBreakpoint {
+		var bp = DbgBreakpoint.new(bps.length, locs, temporary);
+		bps.put(bp);
+		updateBreakpointFlags();
+		return bp;
+	}
+	// Recompute the breakpoint flags of all checkpoints, which can be shared by breakpoints.
+	def updateBreakpointFlags() {
+		for (i < bps.length) {
+			var bp = bps[i];
+			if (bp != null) for (cp in bp.locs) cp.breakpoint = false;
+		}
+		for (i < bps.length) {
+			var bp = bps[i];
+			if (bp != null && bp.enabled) for (cp in bp.locs) cp.breakpoint = true;
+		}
+	}
+	def hasBreakpointAt(file: VstFile, line: int) -> bool {
+		for (i < bps.length) {
+			var bp = bps[i];
+			if (bp == null || !bp.enabled) continue;
+			for (cp in bp.locs) {
+				if (cp.source.line == line && Strings.equal(cp.source.mdecl.token.fileName, file.fileName)) return true;
+			}
+		}
+		return false;
+	}
+	def infoBreakpoints() {
+		var count = 0;
+		for (i < bps.length) if (bps[i] != null) count++;
+		if (count == 0) return void(Terminal.put("No breakpoints.\n"));
+		out.puts("Num  Enb  Hits  Location").outln();
+		for (i < bps.length) {
+			var bp = bps[i];
+			if (bp == null) continue;
+			out.put1("%d", bp.num).pad(' ', 5);
+			out.puts(if(bp.enabled, "y", "n")).pad(' ', 10);
+			out.putd(bp.hits).pad(' ', 16);
+			if (bp.locs.length == 1) putLocation(bp.locs[0].source);
+			else out.put1("<%d locations>", bp.locs.length);
+			if (bp.temporary) out.puts(" (temporary)");
+			out.outln();
+			if (bp.locs.length > 1) {
+				for (cp in bp.locs) {
+					out.pad(' ', 16);
+					putLocation(cp.source).outln();
+				}
+			}
+		}
+	}
+	def deleteBreakpoints(args: string) {
+		if (args.length == 0) {
+			for (i < bps.length) if (bps[i] != null) deleteBreakpoint(i);
+		} else {
+			for (index in parseNums(args)) {
+				if (index >= 0 && index < bps.length && bps[index] != null) deleteBreakpoint(index);
+				else Terminal.put1("No breakpoint number %d.\n", index);
+			}
+		}
+		updateBreakpointFlags();
+	}
+	def deleteBreakpoint(index: int) {
+		for (cp in bps[index].locs) cp.breakpoint = false;
+		bps[index] = null;
+	}
+	// Enable/Disable a breakpoint
+	def handleBreakpoint(args: string, on: bool) {
+		if (!ext) {
+			for (index in parseNums(args)) {
+				if (index >= 0 && index < bps.length && bps[index] != null) bps[index].enabled = on;
+				else Terminal.put1("No breakpoint number %d.\n", index);
+			}
+			if (args.length == 0) Terminal.put("Argument required (breakpoint number).\n");
+			updateBreakpointFlags();
+			return;
+		}
+		var result = Ints.parseDecimal(args, 0);
+		if (args.length == 0 || result.0 != args.length) {
+			Terminal.put1("Invalid breakpoint: %s\n", args);
+		} else {
+			var index = result.1;
+			if (index < bps.length) {
+				bps[index].enabled = on;
+				updateBreakpointFlags();
+			} else Terminal.put1("Invalid breakpoint: %d\n", index);
+		}
+	}
+	// The original breakpoint resolution of the extension protocol: the first checkpoint
+	// for exactly {line} in the first method of a class or component containing it.
+	def findBreakpointExt(fileName: string, line: int) -> SsaCheckpoint {
+		var files = findFiles(fileName);
+		if (files.length != 1) return null;
+		var vstFile = files[0];
+		if (line > vstFile.lineEnds.length + 1) return null;
+		for (i < vstFile.classes.length) {
+			var cp = findBreakpointVst(vstFile.classes[i], line);
+			if (cp != null) return cp;
+		}
+		for (i < vstFile.components.length) {
+			var cp = findBreakpointVst(vstFile.components[i], line);
+			if (cp != null) return cp;
+		}
+		return null;
+	}
+	def findBreakpointVst(vstCompound: VstCompound, line: int) -> SsaCheckpoint {
+		for (l = vstCompound.members; l != null; l = l.tail) {
+			// Find potential method contains target line (constructor might share same line with another method)
+			if (!VstMethod.?(l.head)) continue;
+			var m = VstMethod.!(l.head), r = bodyRange(m);
+			if (r == null || !r.contains(line, 0)) continue;
+			var finder = DbgLineFinder.new(m.token.fileName, line);
+			finder.limit = line;
+			forCheckpoints(m, finder.visitFirst);
+			if (finder.found.length > 0) return finder.found[0];
+		}
+		return null;
+	}
+	//======================================================================
+	// Variables
+	//======================================================================
 	def infoLocals() {
+		if (!hasStack()) return;
+		var f = frameAt(selected), cp = frameCheckpoint(f);
+		var recv = frameThis(f);
+		if (recv != null) {
+			renderValue(recv.getType().render(out.puts("this: ")).puts(" = "), interp.getFrameVal(f, recv), recv.getType(), 0);
+			out.outln();
+		} else if (f.localVars.length == 0) {
+			return void(Terminal.put("No locals.\n"));
+		}
+		for (i < f.localVars.length) {
+			var v = f.localVars[i];
+			out.puts(v.name);
+			if (v.t != null) v.t.render(out.puts(": "));
+			renderValue(out.puts(" = "), frameVar(f, cp, v), v.t, 0);
+			out.outln();
+		}
+	}
+	def infoLocalsExt() {
 		if (!running || !SsaCheckpoint.?(ip)) return;
-		var inputs = ip.inputs;
-		var more = false;
+		var cp = SsaCheckpoint.!(ip);
 		for (i < interp.frame.localVars.length) {
 			var v = interp.frame.localVars[i];
-			var instr = if (v.index >= 0, inputs[v.index].dest, v.instr);
-			var val = interp.getVal(instr);
+			var val = frameVar(interp.frame, cp, v);
 			putVal(i, v.name, val, v.t);
-			if (Record.?(val)) more = true;
 		}
-		moreInfo(more);
 	}
 	def infoInputs() {
 		if (!running) return;
 		var inputs = ip.inputs;
 		var vtypes = if (SsaApplyOp.?(ip), SsaApplyOp.!(ip).op.typeArgs);
-		var more = false;
 		for (i < inputs.length) {
 			var instr = inputs[i].dest;
 			var vtype = if(vtypes != null && i < vtypes.length, vtypes[i]);
 			vtype = if(vtype == null && SsaConst.?(instr), SsaConst.!(instr).vtype, vtype);
 			var val = interp.getVal(instr);
 			putVal(i, null, val, vtype);
-			if (Record.?(val)) more = true;
-		}
-		moreInfo(more);
-	}
-	// Get more info for a object/array variable
-	def moreInfo(more: bool) {
-		if (more && !CLOptions.DEBUG_EXTENSION.get()) {
-			Terminal.put("More info? (index): ");
-			var result = parser.getInt();
-			if (result.0) {
-				var res = infoVal([result.1]);
-				if (!res) Terminal.put("Nothing to show\n");
-			}
 		}
 	}
 	// Get a object/array var info by traversing levels of variables.
 	// Return false if {infoIdx} out of bound or target var is either an object or array.
 	def infoVal(infoIdx: Array<int>) -> bool {
+		if (infoIdx == null || infoIdx.length == 0) return false;
 		var instr: SsaInstr;
 		var inputs = ip.inputs;
 		// First level
@@ -366,7 +1109,8 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 			x: SsaCheckpoint => {
 				if (infoIdx[0] < interp.frame.localVars.length) {
 					var v = interp.frame.localVars[infoIdx[0]];
-					instr = if (v.index >= 0, inputs[v.index].dest, v.instr);
+					instr = if(v.index >= 0, x.varInput(v.index));
+					if (instr == null) instr = v.instr;
 				}
 			}
 		}
@@ -378,14 +1122,10 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 			else return false;
 		}
 		if (!Record.?(val)) return false;
-		var r = Record.!(val), line = r.values.length;
-		if (!CLOptions.DEBUG_EXTENSION.get() && line > PRINT_LIMIT) {
-			Terminal.put1("Do you wish to see all output (%d lines)? ", line);
-			if (!parser.getBool()) return true;
-		}
+		var r = Record.!(val);
 		match(r.rtype) {
 			x: ClassType => {
-				var irclass = prog.ir.getIrClass(r.rtype);
+				var irclass = prog.ir.makeIrClass(r.rtype);
 				for (i < r.values.length) {
 					var name = irclass.fields[i].render(StringBuilder.new()).toString();
 					putVal(i, name, r.values[i], irclass.fields[i].fieldType);
@@ -400,115 +1140,331 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		}
 		return true;
 	}
-	def insertBreakpoint(fileName: string, line: int) -> bool {
-		for (i < prog.files.length) {
-			if (Strings.equal(prog.files[i], fileName)) {
-				if (line <= prog.vst.files[i].lineEnds.length + 1) {
-					var vstFile = prog.vst.files[i];
-					for (i < vstFile.classes.length) {
-						if (insertBreakpointVst(vstFile.classes[i], line)) return true;
+	def printExpr(args: string) {
+		if (args.length == 0) return void(Terminal.put("Argument required (expression to print).\n"));
+		var r = evalExpr(args);
+		if (r.2 != null) return void(Terminal.put1("%s\n", r.2));
+		out.put1("%s = ", args);
+		renderValue(out, r.0, r.1, 1);
+		out.outln();
+	}
+	// Evaluate a variable, followed by selectors, in the selected frame.
+	def evalExpr(expr: string) -> (Val, Type, /*error*/string) {
+		var p = DbgExprParser.new(expr);
+		var name = p.ident();
+		if (name == null) return (null, null, Strings.format1("Invalid expression \"%s\".", expr));
+		var r = lookupName(name);
+		if (r.2 != null) return r;
+		var val = r.0, t = r.1;
+		while (!p.done()) {
+			if (p.opt('.')) {
+				var sel = p.ident();
+				if (sel == null) {
+					var num = p.number();
+					if (num < 0) return (null, null, Strings.format1("Invalid expression \"%s\".", expr));
+					if (!BoxVal.?(val) || t == null || num >= Lists.length(t.nested)) {
+						return (null, null, Strings.format1("No tuple element .%d.", num));
 					}
-					for (i < vstFile.components.length) {
-						if (insertBreakpointVst(vstFile.components[i], line)) return true;
-					}
+					val = BoxVal.!(val).values[num];
+					t = Lists.get(t.nested, num);
+					continue;
 				}
-				return false;
+				var f = selectField(val, t, sel);
+				if (f.2 != null) return f;
+				val = f.0;
+				t = f.1;
+			} else if (p.opt('[')) {
+				var num = p.number();
+				if (num < 0 || !p.opt(']')) return (null, null, Strings.format1("Invalid expression \"%s\".", expr));
+				if (!V3.isArray(t)) return (null, null, Strings.format1("Cannot index a value of type %q.", renderType(t)));
+				if (val == null) return (null, null, "Cannot index a null array.");
+				var r = Record.!(val);
+				if (num >= r.values.length) {
+					return (null, null, Strings.format2("Index %d is out of bounds for length %d.", num, r.values.length));
+				}
+				val = r.values[num];
+				t = ArrayType.!(t).elementType();
+			} else {
+				return (null, null, Strings.format1("Invalid expression \"%s\".", expr));
 			}
 		}
-		return false;
+		return (val, t, null);
 	}
-	def insertBreakpointVst(vstCompound: VstCompound, line: int) -> bool {
-		var vstMethods = Vector<VstMethod>.new();
-		var members = vstCompound.members;
-		for (l = members; l != null; l = l.tail) {
-			// Find potential method contains target line (constructor might share same line with another method)
-			if (VstMethod.?(l.head) && VstMethod.!(l.head).func.body.range().contains(line, 0)) {
-				vstMethods.put(VstMethod.!(l.head));
+	def renderType(t: Type) -> StringBuilder -> StringBuilder {
+		return if(t == null, Strings.puts("?"), t.render);
+	}
+	def lookupName(name: string) -> (Val, Type, string) {
+		if (interp.frame != null) {
+			var f = frameAt(selected), cp = frameCheckpoint(f);
+			for (i = f.localVars.length - 1; i >= 0; i--) {
+				var v = f.localVars[i];
+				if (Strings.equal(v.name, name)) return (frameVar(f, cp, v), v.t, null);
 			}
-		}
-		for (i < vstMethods.length) {
-			if (insertBreakpointM(vstCompound, vstMethods[i], line)) return true;
-		}
-		return false;
-	}
-	def insertBreakpointM(vstCompound: VstCompound, vstMethod: VstMethod, line: int) -> bool {
-		var ctype = vstCompound.getDeclaredType();
-		var irClass = prog.ir.getIrClass(ctype);
-		var irMethod: IrMethod;
-		for (m in irClass.methods) {
-			if (m != null && m.source == vstMethod) {
-				irMethod = m;
+			// Look for "this" or a field of it.
+			var recv = frameThis(f);
+			if (recv != null) {
+				var val = interp.getFrameVal(f, recv), t = recv.getType();
+				if (Strings.equal(name, "this")) return (val, t, null);
+				var r = selectField(val, t, name);
+				if (r.2 == null) return r;
+			}
+			for (i = f.localVars.length - 1; i >= 0; i--) {
+				var v = f.localVars[i];
+				if (!Strings.equal(v.name, "this")) continue;
+				var r = selectField(frameVar(f, cp, v), v.t, name);
+				if (r.2 == null) return r;
 				break;
 			}
 		}
-		if (irMethod == null) return false;
-		// Generate ssa if haven't
-		if (irMethod.ssa == null) {
-			var spec = prog.ir.fromVstMember(vstMethod);
-			irMethod.ssa = genSsa(spec, 0);
-		}
-		// Iterate ssa to find SsaCheckpoint pointing to line
-		var blocks = irMethod.ssa.bfBlocks(null);
-		for (b in blocks) {
-			for (i = b.next; i != null && i != b; i = i.next) {
-				match(i) {
-					x: SsaCheckpoint => {
-						if (x.source.line == line) {
-							bps.put(Breakpoint.new(x));
-							return true;
-						}
-					}
-				}
+		// Look for a component.
+		var comps = prog.vst.components;
+		for (i < comps.length) {
+			var c = comps[i];
+			if (Strings.equal(c.name(), name)) {
+				return (prog.getComponentRecord(c), c.getDeclaredType(), null);
 			}
 		}
-		return false;
+		// Look for a global variable, preferring the current file.
+		var file = currentFile();
+		if (file != null && file.synthetic != null) {
+			var r = componentField(file.synthetic, name);
+			if (r.2 == null) return r;
+		}
+		for (f in prog.vst.files) {
+			if (f.synthetic == null) continue;
+			var r = componentField(f.synthetic, name);
+			if (r.2 == null) return r;
+		}
+		return (null, null, Strings.format1("No symbol \"%s\" in current context.", name));
 	}
-	// Enable/Disable a breakpoint
-	def handleBreakpoint(args: string, on: bool) {
-		var result = Ints.parseDecimal(args, 0);
-		if (args.length == 0 || result.0 != args.length) {
-			Terminal.put1("Invalid breakpoint: %s\n", args);
-		} else {
-			var index = result.1;
-			if (index < bps.length) {
-				if (on) bps[index].enable();
-				else bps[index].disable();
-			} else Terminal.put1("Invalid breakpoint: %d\n", index);
+	def componentField(c: VstComponent, name: string) -> (Val, Type, string) {
+		return selectField(prog.getComponentRecord(c), c.getDeclaredType(), name);
+	}
+	def selectField(val: Val, t: Type, name: string) -> (Val, Type, string) {
+		if (V3.isArrayOrRange(t) && Strings.equal(name, "length")) {
+			match (val) {
+				null => return (null, null, "Cannot get the length of a null array.");
+				x: Record => return (Int.box(x.values.length), Int.TYPE, null);
+				x: ArrayRangeVal => return (Int.box(x.length), Int.TYPE, null);
+			}
+		}
+		if (t == null || !(ClassType.?(t) || V3.isComponent(t))) {
+			return (null, null, Strings.format2("There is no member named \"%s\" in a value of type %q.", name, renderType(t)));
+		}
+		var rtype = t;
+		if (Record.?(val)) rtype = Record.!(val).rtype;
+		var ic = prog.ir.makeIrClass(rtype);
+		if (ic != null) {
+			for (i < ic.fields.length) {
+				var f = ic.fields[i];
+				if (f.source == null || !Strings.equal(f.source.name(), name)) continue;
+				if (val == null) return (null, null, Strings.format1("Cannot get field \"%s\" of null.", name));
+				var r = Record.!(val);
+				return (if(i < r.values.length, r.values[i]), f.fieldType, null);
+			}
+		}
+		return (null, null, Strings.format2("There is no member named \"%s\" in %q.", name, renderType(rtype)));
+	}
+	// Render a value for the user. Objects and arrays are expanded up to {depth} levels.
+	def renderValue(buf: StringBuilder, val: Val, t: Type, depth: int) -> StringBuilder {
+		if (EnumType.?(t) && (val == null || Box<int>.?(val))) {
+			var decl = EnumType.!(t).enumDecl, tag = Int.unbox(val);
+			if (tag >= 0 && tag < decl.cases.length) return buf.put2("%s.%s", decl.name(), decl.cases[tag].name());
+		}
+		match (val) {
+			x: Record => {
+				var rtype = x.rtype;
+				if (V3.isString(rtype)) return renderString(buf, x);
+				if (V3.isVariant(rtype)) return renderFields(buf.puts(renderTypeString(rtype)), x, depth, true);
+				buf.put2("#%d:%q", x.id, rtype.render);
+				if (depth <= 0) return buf;
+				if (ArrayType.?(rtype)) {
+					var et = ArrayType.!(rtype).elementType();
+					buf.puts(" [");
+					for (i < x.values.length) {
+						if (i > 0) buf.csp();
+						if (i >= PRINT_LIMIT) {
+							buf.put1("... (%d elements)", x.values.length);
+							break;
+						}
+						renderValue(buf, x.values[i], et, depth - 1);
+					}
+					return buf.putc(']');
+				}
+				return renderFields(buf.sp(), x, depth, false);
+			}
+			x: BoxVal => {
+				var list = if(t != null, t.nested);
+				buf.putc('(');
+				for (i < x.values.length) {
+					if (i > 0) buf.csp();
+					renderValue(buf, x.values[i], if(list != null, list.head), depth);
+					if (list != null) list = list.tail;
+				}
+				return buf.putc(')');
+			}
+		}
+		return V3.renderResult(val, t, buf);
+	}
+	def renderTypeString(t: Type) -> string {
+		return t.render(StringBuilder.new()).toString();
+	}
+	def renderFields(buf: StringBuilder, r: Record, depth: int, variant: bool) -> StringBuilder {
+		var ic = prog.ir.makeIrClass(r.rtype);
+		if (ic == null) return buf;
+		if (variant && ic.fields.length == 0) return buf;
+		if (variant && depth < 0) return buf.puts("(...)");
+		buf.putc(if(variant, '(', '{'));
+		for (i < ic.fields.length) {
+			if (i >= r.values.length) break;
+			if (i > 0) buf.csp();
+			var f = ic.fields[i];
+			if (f.source != null) buf.put1("%s: ", f.source.name());
+			renderValue(buf, r.values[i], f.fieldType, depth - 1);
+		}
+		return buf.putc(if(variant, ')', '}'));
+	}
+	def renderString(buf: StringBuilder, r: Record) -> StringBuilder {
+		buf.putc('\"');
+		for (i < r.values.length) {
+			if (i >= STRING_LIMIT) {
+				buf.puts("\"...");
+				return buf;
+			}
+			Char.renderEscaped(Byte.unbox(r.values[i]), buf);
+		}
+		return buf.putc('\"');
+	}
+	//======================================================================
+	// Tab completion
+	//======================================================================
+	def complete(line: string, cursor: int) -> DbgCompletion {
+		var start = cursor;
+		while (start > 0 && line[start - 1] != ' ') start--;
+		var word = Arrays.range(line, start, cursor);
+		var words = splitWords(Arrays.range(line, 0, start));
+		var c = DbgCompleter.new(word);
+		if (words.length == 0) {
+			for (cmd in DbgCommand) if (cmd != DbgCommand.Unknown) c.add(cmd.cmdName, " ");
+			return DbgCompletion(start, c.result());
+		}
+		if (words.length > 1) return DbgCompletion(start, null);
+		match (parser.parseCommand(words[0]).0) {
+			Help => for (x in DbgCommand) if (x != DbgCommand.Unknown) c.add(x.cmdName, "");
+			Info => for (x in DbgInfo) if (x != DbgInfo.Invalid) c.add(x.cmdName, "");
+			Display, Undisplay => for (x in DbgDisplay) if (x != DbgDisplay.Invalid) c.add(x.cmdName, "");
+			Breakpoint, TempBreakpoint, List => completeLocation(c);
+			Print => completeExpr(c, word);
+			_ => ;
+		}
+		return DbgCompletion(start, c.result());
+	}
+	def completeLocation(c: DbgCompleter) {
+		var files = prog.vst.files;
+		for (f in files) {
+			var name = fileName(f.fileName);
+			var unique = true;
+			for (g in files) if (g != f && Strings.equal(fileName(g.fileName), name)) unique = false;
+			c.add(if(unique, name, f.fileName), ":");
+		}
+		for (file in files) {
+			for (m in methodsInFile(file)) {
+				// Function expressions and the constructors of components cannot be named.
+				if (m.isSynthetic && (!VstNew.?(m) || VstComponent.?(m.receiver))) continue;
+				var buf = StringBuilder.new();
+				var r = m.receiver;
+				if (r != null && !r.isFileScope) buf.puts(r.fullName).putc('.');
+				c.add(buf.puts(m.name()).toString(), "");
+			}
 		}
 	}
+	def completeExpr(c: DbgCompleter, word: string) {
+		var dot = lastIndexOf(word, '.');
+		if (dot < 0) {
+			var f = frameAt(selected);
+			if (f != null) {
+				for (i < f.localVars.length) c.add(f.localVars[i].name, "");
+				var recv = frameThis(f);
+				if (recv != null) {
+					c.add("this", "");
+					var ic = prog.ir.makeIrClass(recv.getType());
+					if (ic != null) for (fd in ic.fields) if (fd.source != null) c.add(fd.source.name(), "");
+				}
+			}
+			var comps = prog.vst.components;
+			for (i < comps.length) if (!comps[i].isFileScope) c.add(comps[i].name(), "");
+			return;
+		}
+		var prefix = Arrays.range(word, 0, dot);
+		var r = evalExpr(prefix);
+		if (r.2 != null) return;
+		if (V3.isArrayOrRange(r.1)) c.add(Strings.format1("%s.length", prefix), "");
+		if (r.1 == null || !(ClassType.?(r.1) || V3.isComponent(r.1))) return;
+		var rtype = r.1;
+		if (Record.?(r.0)) rtype = Record.!(r.0).rtype;
+		var ic = prog.ir.makeIrClass(rtype);
+		if (ic == null) return;
+		for (f in ic.fields) {
+			if (f.source != null) c.add(Strings.format2("%s.%s", prefix, f.source.name()), "");
+		}
+	}
+	def fileName(path: string) -> string {
+		var i = lastIndexOf(path, '/');
+		return Arrays.range(path, i + 1, path.length);
+	}
+	//======================================================================
+	// Help and output
+	//======================================================================
 	def printHelp(args: string) {
-		var id: int;
 		if (args.length == 0) {
-			for (cmd in DbgCommand) printHelpCmd(cmd.cmdName, cmd.alias, cmd.help);
-		} else if (Strings.equal(args, "info")) {
-			for (cmd in DbgInfo) printHelpCmd(cmd.cmdName, cmd.alias, cmd.help);
-		} else if (Strings.equal(args, "display")) {
-			for (cmd in DbgDisplay) printHelpCmd(cmd.cmdName, cmd.alias, cmd.help);
+			for (cmd in DbgCommand) {
+				if (cmd != DbgCommand.Unknown) printHelpCmd(cmd.cmdName, cmd.alias, cmd.help);
+			}
+			if (!ext) Terminal.put("Press <enter> to repeat step, next, continue, or list. Type \"help <command>\" for more.\n");
+			return;
+		}
+		var cmd = parser.parseCommand(args).0;
+		match (cmd) {
+			Info => for (x in DbgInfo) if (x != DbgInfo.Invalid) printHelpCmd(x.cmdName, x.alias, x.help);
+			Display, Undisplay => for (x in DbgDisplay) if (x != DbgDisplay.Invalid) printHelpCmd(x.cmdName, x.alias, x.help);
+			Unknown => Terminal.put1("Unknown command \"%s\". Try \"help\".\n", args);
+			_ => {
+				out.puts(cmd.cmdName);
+				if (cmd.usage.length > 0) out.sp().puts(cmd.usage);
+				if (!Strings.equal(cmd.cmdName, cmd.alias)) out.put1("  (alias: %s)", cmd.alias);
+				out.ln().puts("  ").puts(cmd.help).outln();
+				match (cmd) {
+					Breakpoint, TempBreakpoint, List => for (l in HELP_BREAK) Terminal.put1("%s\n", l);
+					Print => for (l in HELP_PRINT) Terminal.put1("%s\n", l);
+					_ => ;
+				}
+			}
 		}
 	}
 	def printHelpCmd(cmdName: string, alias: string, help: string) {
 		if (Strings.equal(cmdName, alias)) printer.buf.puts(cmdName);
 		else printer.buf.put2("%s/%s", cmdName, alias);
 		printer.buf.pad(' ', 16);
+		if (printer.buf.length >= 16 && !ext) printer.buf.sp();
 		printer.buf.puts(help).outln();
 	}
 	def putBreakpoint(args: string, idx: int, source: Source) {
-		if (CLOptions.DEBUG_EXTENSION.get()) Terminal.put2("breakpoint|%s|%d\n", args, idx);
+		if (ext) Terminal.put2("breakpoint|%s|%d\n", args, idx);
 		else {
 			if (idx == -1) Terminal.put1("Invalid breakpoint args: %s\n", args);
 			else Terminal.put2("Breakpoint %d %q\n", idx, source.render);
 		}
 	}
 	def putVal(i: int, name: string, val: Val, vtype: Type) {
-		if (CLOptions.DEBUG_EXTENSION.get()) {
+		if (ext) {
 			if (name == null) name = Strings.format1("%d", i);
 			extPutVariable(i, name, val, vtype);
 		} else {
-			printer.buf.put1("%d. ", i);
-			if (name != null) printer.buf.put1("%s: ", name);
-			printer.buf.puthashv(val, vtype).end();
-			printer.printColonType(vtype);
-			printer.outln();
+			out.put1("%d. ", i);
+			if (name != null) out.put1("%s: ", name);
+			renderValue(out, val, vtype, 0);
+			if (vtype != null) vtype.render(out.puts(" : "));
+			out.outln();
 		}
 	}
 	def extPutVariable(idx: int, name: string, val: Val, vtype: Type) {
@@ -521,30 +1477,140 @@ class SsaDebugger(prog: Program, genSsa: (IrSpec, int) -> SsaGraph, interp: SsaI
 		printer.outln();
 	}
 	def putBacktrace(s: Source) {
-		if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put1("\t%q\n", s.render);
-		else Terminal.put3("bt|%q|%s|%d\n", s.mdecl.renderLong, s.mdecl.token.fileName, s.line);
+		Terminal.put3("bt|%q|%s|%d\n", s.mdecl.renderLong, s.mdecl.token.fileName, s.line);
+	}
+	def parseCount(args: string) -> int {
+		if (args.length == 0) return 1;
+		var n = parseNum(args, 0);
+		return if(n < 0, 0, n);
+	}
+	def parseNum(args: string, default: int) -> int {
+		var r = Ints.parseDecimal(args, 0);
+		if (r.0 == 0 || r.0 != args.length) {
+			Terminal.put1("Invalid number \"%s\".\n", args);
+			return default;
+		}
+		return r.1;
+	}
+	def parseNums(args: string) -> Array<int> {
+		var result = Vector<int>.new();
+		for (s in splitWords(args)) {
+			var r = Ints.parseDecimal(s, 0);
+			if (r.0 == 0 || r.0 != s.length) Terminal.put1("Invalid breakpoint number \"%s\".\n", s);
+			else result.put(r.1);
+		}
+		return result.extract();
+	}
+}
+def splitWords(s: string) -> Array<string> {
+	var result = Vector<string>.new();
+	var i = 0;
+	while (i < s.length) {
+		while (i < s.length && s[i] == ' ') i++;
+		var start = i;
+		while (i < s.length && s[i] != ' ') i++;
+		if (i > start) result.put(Arrays.range(s, start, i));
+	}
+	return result.extract();
+}
+def isNumber(s: string) -> bool {
+	if (s == null || s.length == 0) return false;
+	for (c in s) if (c < '0' || c > '9') return false;
+	return true;
+}
+def lastIndexOf(s: string, c: byte) -> int {
+	for (i = s.length - 1; i >= 0; i--) if (s[i] == c) return i;
+	return -1;
+}
+// Finds the checkpoints for the first line with code at or after {line}, up to {limit}.
+class DbgLineFinder(fileName: string, line: int) {
+	def found = Vector<SsaCheckpoint>.new();
+	var best = int.max;
+	var limit = int.max;
+	def visit(cp: SsaCheckpoint) {
+		var l = cp.source.line;
+		if (l < line || l > limit || l > best) return;
+		if (!Strings.equal(cp.source.mdecl.token.fileName, fileName)) return;
+		if (l < best) {
+			best = l;
+			found.resize(0);
+		}
+		found.put(cp);
+	}
+	def visitFirst(cp: SsaCheckpoint) {
+		if (found.length == 0 && cp.source.line == line) found.put(cp);
+	}
+}
+class DbgEntryFinder {
+	var entry: SsaCheckpoint;
+	def visit(cp: SsaCheckpoint) {
+		if (entry == null) entry = cp;
+	}
+}
+// Collects the completion candidates that start with {word}.
+class DbgCompleter(word: string) {
+	def candidates = Vector<string>.new();
+	def add(name: string, suffix: string) {
+		if (!Strings.startsWith(name, word)) return;
+		var c = if(suffix.length > 0, Strings.format2("%s%s", name, suffix), name);
+		for (i < candidates.length) if (Strings.equal(candidates[i], c)) return;
+		candidates.put(c);
+	}
+	def result() -> Array<string> {
+		var r = candidates.extract();
+		return Arrays.sort(r, 0, r.length, Strings.asciiLt);
+	}
+}
+// Parses the selectors of an expression for the "print" command.
+class DbgExprParser(expr: string) {
+	var pos: int;
+	def done() -> bool {
+		skipSpace();
+		return pos >= expr.length;
+	}
+	def skipSpace() {
+		while (pos < expr.length && expr[pos] == ' ') pos++;
+	}
+	def opt(c: byte) -> bool {
+		skipSpace();
+		if (pos < expr.length && expr[pos] == c) {
+			pos++;
+			return true;
+		}
+		return false;
+	}
+	def ident() -> string {
+		skipSpace();
+		var start = pos;
+		while (pos < expr.length) {
+			var c = expr[pos];
+			if (c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (pos > start && c >= '0' && c <= '9')) pos++;
+			else break;
+		}
+		return if(pos > start, Arrays.range(expr, start, pos));
+	}
+	def number() -> int {
+		skipSpace();
+		var r = Ints.parseDecimal(expr, pos);
+		if (r.0 <= 0) return -1;
+		pos += r.0;
+		return r.1;
 	}
 }
 
 def INVALID = -1;
+def dbgReadStdin() -> int {
+	return System.fileRead(0);
+}
 // Support class to read command from stdin
-class DebuggerParser {
+class DebuggerParser(tty: bool) {
 	def STDIN = 0;
+	def editor = DbgLineEditor.new(tty, dbgReadStdin, System.puts);
 
-	def getCommand() -> string {
-		var sb = StringBuilder.new();
-		if (!CLOptions.DEBUG_EXTENSION.get()) Terminal.put("(debug) ");
-		while (true) {
-			var i = System.fileRead(STDIN);
-			if (i < 0) {
-				System.ln();
-				return "quit";
-			}
-			var ch = byte.!(i);
-			if (ch == '\n') break;
-			sb.putc(ch);
-		}
-		return sb.extract();
+	def getCommand(prompt: string) -> string {
+		var line = editor.readLine(prompt);
+		if (line == null && !tty) System.ln();
+		return line;
 	}
 	def parseCommand(command: string) -> (DbgCommand, /*args*/string) {
 		var name: string;
@@ -558,12 +1624,21 @@ class DebuggerParser {
 			if (i == command.length - 1) name = command;
 		}
 		if (name == null) return (DbgCommand.Unknown, command);
+		var ext = CLOptions.DEBUG_EXTENSION.get();
 		for (cmd in DbgCommand) {
 			if (Strings.equal(name, cmd.cmdName) || Strings.equal(name, cmd.alias)) {
-				return (cmd, args);
+				return (cmd, if(ext, args, Strings.strip(args)));
 			}
 		}
-		return (DbgCommand.Unknown, command);
+		if (ext) return (DbgCommand.Unknown, command);
+		// Accept a unique prefix of a command name.
+		var found = DbgCommand.Unknown;
+		for (cmd in DbgCommand) {
+			if (cmd == DbgCommand.Unknown || !Strings.startsWith(cmd.cmdName, name)) continue;
+			if (found != DbgCommand.Unknown) return (DbgCommand.Unknown, command);
+			found = cmd;
+		}
+		return (found, if(found == DbgCommand.Unknown, command, Strings.strip(args)));
 	}
 	def parseInfo(args: string) -> (DbgInfo, Array<int>) {
 		if (args.length == 0) return (DbgInfo.Invalid, null);
@@ -592,9 +1667,6 @@ class DebuggerParser {
 		for (i < args.length) {
 			if (args[i] == ' ') {
 				var fileName = Arrays.range(args, 0, i);
-				if (!Strings.endsWith(fileName, ".v3")) {
-					fileName = Strings.format1("%s.v3", fileName);
-				}
 				var result = Ints.parseDecimal(args, i+1);
 				if (result.0 + i + 1 == args.length) {
 					return (fileName, result.1);
@@ -616,41 +1688,17 @@ class DebuggerParser {
 		if (result.0 == args.length) return result.1;
 		else return INVALID;
 	}
-	def getInt() -> (bool, int) {
-		var sb = StringBuilder.new();
-		var ch = byte.!(System.fileRead(STDIN));
-		while (ch != '\n') {
-			sb.putc(ch);
-			ch = byte.!(System.fileRead(STDIN));
-		}
-		var input = sb.extract();
-		if (input.length == 0) return (false, 0);
-		var result = Ints.parseDecimal(input, 0);
-		if (result.0 == input.length) return (true, result.1);
-		else return (false, 0);
-	}
-	def getBool() -> bool {
-		var sb = StringBuilder.new();
-		var ch = byte.!(System.fileRead(STDIN));
-		while (ch != '\n') {
-			sb.putc(ch);
-			ch = byte.!(System.fileRead(STDIN));
-		}
-		var input = sb.extract();
-		if (input[0] == 'y' || input[0] == 'Y') return true;
-		else return false;
-	}
 }
-class Breakpoint {
-	def ssa: SsaCheckpoint;
-	new(ssa) {
-		ssa.breakpoint = true;
+class DbgBreakpoint(num: int, locs: Array<SsaCheckpoint>, temporary: bool) {
+	var enabled = true;
+	var hits: int;
+	def contains(cp: SsaInstr) -> bool {
+		for (l in locs) if (l == cp) return true;
+		return false;
 	}
-	def render(out: StringBuilder) -> StringBuilder { 
-		return out.put2("%q (%z)", ssa.source.render, ssa.breakpoint);
+	def render(out: StringBuilder) -> StringBuilder {
+		return out.put2("%q (%z)", locs[0].source.render, enabled);
 	}
-	def disable() { ssa.breakpoint = false; }
-	def enable() { ssa.breakpoint = true; }
 }
 
 def storeLimit = 50;
