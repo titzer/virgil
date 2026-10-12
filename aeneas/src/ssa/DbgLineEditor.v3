@@ -1,0 +1,252 @@
+// Copyright 2026 Virgil Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Completes the word ending at {cursor} in {line}. Returns the start of that word and
+// the candidates that may replace it. A candidate can end in a space or other separator
+// that is inserted when it is the only candidate.
+type DbgCompletion(start: int, candidates: Array<string>) #unboxed { }
+
+def CTRL_A: byte = 0x01;
+def CTRL_B: byte = 0x02;
+def CTRL_D: byte = 0x04;
+def CTRL_E: byte = 0x05;
+def CTRL_F: byte = 0x06;
+def CTRL_H: byte = 0x08;
+def CTRL_K: byte = 0x0B;
+def CTRL_L: byte = 0x0C;
+def CTRL_N: byte = 0x0E;
+def CTRL_P: byte = 0x10;
+def CTRL_U: byte = 0x15;
+def CTRL_W: byte = 0x17;
+def ESC: byte = 0x1B;
+def DEL: byte = 0x7F;
+def COMPLETION_WIDTH = 80;
+
+// Reads command lines for the debugger. In {tty} mode, the terminal must be in
+// non-canonical mode without echo (see bin/v3db), and this class echoes input and
+// supports cursor movement, history, and tab completion. Otherwise it reads
+// whole lines that the terminal or a pipe has already assembled.
+class DbgLineEditor(tty: bool, read: void -> int, write: string -> void) {
+	def history = Vector<string>.new();
+	var completer: (string, int) -> DbgCompletion;
+	private def buf = StringBuilder.new();
+	private var cursor: int;
+	private var prompt: string;
+	private var historyPos: int;
+	private var savedLine: string;	// line being edited before moving into history
+	private var lastWasTab: bool;
+
+	// Reads a line, returning {null} at end of input.
+	def readLine(prompt: string) -> string {
+		this.prompt = prompt;
+		if (prompt != null) write(prompt);
+		buf.reset();
+		if (!tty) return readCooked();
+		cursor = 0;
+		historyPos = history.length;
+		savedLine = null;
+		lastWasTab = false;
+		while (true) {
+			var ch = read();
+			if (ch < 0) {
+				if (buf.length == 0) return null;
+				return accept();
+			}
+			var b = byte.view(ch), wasTab = lastWasTab;
+			lastWasTab = false;
+			match (b) {
+				'\r', '\n' => return accept();
+				'\t' => complete(wasTab);
+				CTRL_A => moveTo(0);
+				CTRL_E => moveTo(buf.length);
+				CTRL_B => moveTo(cursor - 1);
+				CTRL_F => moveTo(cursor + 1);
+				CTRL_H, DEL => {
+					if (cursor > 0) deleteRange(cursor - 1, cursor);
+				}
+				CTRL_D => {
+					if (buf.length == 0) {
+						write("\n");
+						return null;
+					}
+					if (cursor < buf.length) deleteRange(cursor, cursor + 1);
+				}
+				CTRL_K => deleteRange(cursor, buf.length);
+				CTRL_U => deleteRange(0, cursor);
+				CTRL_W => deleteRange(wordStart(cursor), cursor);
+				CTRL_L => {
+					write("\x1B[H\x1B[2J");
+					redraw();
+				}
+				CTRL_P => historyMove(-1);
+				CTRL_N => historyMove(1);
+				ESC => escape();
+				_ => if (b >= ' ') insert(b);
+			}
+		}
+		return null;
+	}
+	private def readCooked() -> string {
+		while (true) {
+			var ch = read();
+			if (ch < 0) {
+				if (buf.length == 0) return null;
+				break;
+			}
+			if (ch == '\n') break;
+			if (ch != '\r') buf.putc(byte.view(ch));
+		}
+		return buf.extract();
+	}
+	private def accept() -> string {
+		write("\n");
+		var line = buf.extract();
+		if (line.length > 0 && (history.length == 0 || !Strings.equal(line, history[history.length - 1]))) {
+			history.put(line);
+		}
+		return line;
+	}
+	// Handles an escape sequence for cursor keys, home/end, delete, and word motion.
+	private def escape() {
+		var ch = read();
+		if (ch == 'b') return moveTo(wordStart(cursor));
+		if (ch == 'f') return moveTo(wordEnd(cursor));
+		if (ch != '[' && ch != 'O') return;
+		var num = 0;
+		while (true) {
+			ch = read();
+			if (ch < '0' || ch > '9') break;
+			num = num * 10 + ch - '0';
+		}
+		match (ch) {
+			'A' => historyMove(-1);
+			'B' => historyMove(1);
+			'C' => moveTo(cursor + 1);
+			'D' => moveTo(cursor - 1);
+			'H' => moveTo(0);
+			'F' => moveTo(buf.length);
+			'~' => match (num) {
+				1, 7 => moveTo(0);
+				4, 8 => moveTo(buf.length);
+				3 => if (cursor < buf.length) deleteRange(cursor, cursor + 1);
+				_ => ;
+			}
+			_ => ;
+		}
+	}
+	private def insert(b: byte) {
+		if (cursor == buf.length) {
+			buf.putc(b);
+			cursor++;
+			write([b]);
+			return;
+		}
+		var tail = Arrays.range(buf.buf, cursor, buf.length);
+		buf.resize(cursor).putc(b).puts(tail);
+		cursor++;
+		redraw();
+	}
+	private def insertString(s: string) {
+		var tail = Arrays.range(buf.buf, cursor, buf.length);
+		buf.resize(cursor).puts(s).puts(tail);
+		cursor += s.length;
+		redraw();
+	}
+	private def deleteRange(start: int, end: int) {
+		if (start >= end) return;
+		var tail = Arrays.range(buf.buf, end, buf.length);
+		buf.resize(start).puts(tail);
+		cursor = start;
+		redraw();
+	}
+	private def moveTo(pos: int) {
+		if (pos < 0) pos = 0;
+		if (pos > buf.length) pos = buf.length;
+		if (pos == cursor) return;
+		if (pos < cursor) write(Strings.format1("\x1B[%dD", cursor - pos));
+		else write(Strings.format1("\x1B[%dC", pos - cursor));
+		cursor = pos;
+	}
+	private def wordStart(pos: int) -> int {
+		while (pos > 0 && buf.buf[pos - 1] == ' ') pos--;
+		while (pos > 0 && buf.buf[pos - 1] != ' ') pos--;
+		return pos;
+	}
+	private def wordEnd(pos: int) -> int {
+		while (pos < buf.length && buf.buf[pos] == ' ') pos++;
+		while (pos < buf.length && buf.buf[pos] != ' ') pos++;
+		return pos;
+	}
+	private def historyMove(delta: int) {
+		var pos = historyPos + delta;
+		if (pos < 0 || pos > history.length) return;
+		if (historyPos == history.length) savedLine = current();
+		historyPos = pos;
+		var line = if(pos == history.length, savedLine, history[pos]);
+		buf.reset().puts(line);
+		cursor = buf.length;
+		redraw();
+	}
+	// Returns a copy of the line being edited, leaving it in place.
+	private def current() -> string {
+		return if(buf.length == 0, "", Arrays.range(buf.buf, 0, buf.length));
+	}
+	// Rewrites the prompt and line, then places the cursor.
+	private def redraw() {
+		var out = StringBuilder.new().putc('\r');
+		if (prompt != null) out.puts(prompt);
+		out.putk(buf.buf, 0, buf.length).puts("\x1B[K");
+		if (cursor < buf.length) out.put1("\x1B[%dD", buf.length - cursor);
+		write(out.toString());
+	}
+	private def complete(listAll: bool) {
+		if (completer == null) return;
+		var line = current();
+		var c = completer(line, cursor);
+		var candidates = c.candidates;
+		if (candidates == null || candidates.length == 0) return;
+		var word = Arrays.range(line, c.start, cursor);
+		if (candidates.length == 1) {
+			insertString(Arrays.range(candidates[0], word.length, candidates[0].length));
+			return;
+		}
+		var prefix = commonPrefix(candidates);
+		if (prefix > word.length) {
+			insertString(Arrays.range(candidates[0], word.length, prefix));
+			return;
+		}
+		if (!listAll) {
+			lastWasTab = true;
+			return;
+		}
+		// List the candidates on the lines below, then restore the line being edited.
+		var out = StringBuilder.new().ln();
+		var col = 0;
+		for (s in candidates) {
+			var len = s.length;
+			if (len > 0 && s[len - 1] == ' ') len--;
+			if (col > 0 && col + len + 2 > COMPLETION_WIDTH) {
+				out.ln();
+				col = 0;
+			}
+			if (col > 0) {
+				out.puts("  ");
+				col += 2;
+			}
+			out.putk(s, 0, len);
+			col += len;
+		}
+		out.ln();
+		write(out.toString());
+		redraw();
+	}
+	def commonPrefix(candidates: Array<string>) -> int {
+		var first = candidates[0], len = first.length;
+		for (s in candidates) {
+			var i = 0;
+			while (i < len && i < s.length && s[i] == first[i]) i++;
+			len = i;
+		}
+		return len;
+	}
+}

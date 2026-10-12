@@ -37,7 +37,7 @@ This repository includes compiler and runtime source code, tests, libraries, dev
      - -trace-calls
      - -fatal-calls
    - print reachability analysis
- - Virgil debugger (bin/dev/v3db)
+ - Virgil debugger (bin/v3db)
  - Using symbols on Linux and Wasm (Darwin unimplemented?)
  - Using gdb on Virgil binaries (Dwarf broken?)
  - Various print options to the compiler
