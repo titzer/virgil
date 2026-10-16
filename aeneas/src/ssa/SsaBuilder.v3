@@ -19,16 +19,21 @@ class SsaBuilder {
 	def context: SsaContext;
 	def graph: SsaGraph;
 	var block: SsaBlock;
-	var pt: SsaLink;
+	def var prev: SsaLink;	// new instructions are inserted after this; {null} if ended or unreachable
 	var source: Source;
-	var end: bool;
 
-	new(context, graph, block) { }
+	new(context, graph, block: SsaBlock) {
+		set(block);
+	}
 
+	// Returns {true} if the block has ended (or is unreachable), i.e. no more instructions are inserted.
+	def end() -> bool {
+		return prev == null;
+	}
 	// General methods.
 	def addApply(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
 		if (Debug.PARANOID) { checkNoTypeVarsInOp(op); checkInputs(args); }
-		if (end) return unreachable(op.sig.returnType());
+		if (end()) return unreachable(op.sig.returnType());
 		var opcode = op.opcode;
 		if (Opcode.VstSugar.?(opcode)) {
 			return at(source).addApplyVst(source, op, Opcode.VstSugar.!(opcode).op, args);
@@ -40,7 +45,7 @@ class SsaBuilder {
 	}
 	def addApplyF(op: Operator, args: Array<SsaInstr>, facts: Fact.set) -> SsaInstr {
 		if (Debug.PARANOID) { checkNoTypeVarsInOp(op); checkInputs(args); }
-		if (end) return unreachable(op.sig.returnType());
+		if (end()) return unreachable(op.sig.returnType());
 		var opcode = op.opcode;
 		if (Opcode.VstSugar.?(opcode)) {
 			return at(source).addApplyVst(source, op, Opcode.VstSugar.!(opcode).op, args);
@@ -366,56 +371,50 @@ class SsaBuilder {
 	def split() -> SsaBuilder {
 		var mergeBuilder = SsaBuilder.new(context, graph, SsaBlock.new());
 		mergeBuilder.source = this.source;
-		var start = this.block, end = start.prev;
-		var last = pt;
-		if (last == null && SsaEnd.?(end))  last = end.prev;
-
-		if (last != null) {
-			var first = last.next;
-			last.next = start;
-			start.prev = last;
-			var nb = mergeBuilder.block;
-			first.prev = nb;
-			nb.next = first;
-			mergeBuilder.pt = first;
-			this.end = false;
-			end.next = nb;
-			nb.prev = end;
-			this.pt = null;
-		}
-
+		splitInto(mergeBuilder.block);
 		return mergeBuilder;
+	}
+	// Moves all instructions after {prev} into the (empty) block {nb}.
+	def splitInto(nb: SsaBlock) {
+		if (prev == null) return; // ended
+		var start = this.block, last = prev, first = last.next;
+		if (first == start) return; // nothing to move
+		var end = start.prev;
+		last.next = start;
+		start.prev = last;
+		first.prev = nb;
+		nb.next = first;
+		end.next = nb;
+		nb.prev = end;
 	}
 	def splitForIfCascade(t: Type) -> SsaIfCascade {
 		var merge = split();
-		// {merge.pt} is the first instruction that moved over from the split
-		// block. The cascade has to resume in front of it, not at the end of the
+		// {merge.prev} is in front of the instructions that moved over from the
+		// split block. The cascade has to resume there, not at the end of the
 		// merge block, or its own tail is emitted after the instructions that
 		// use it.
-		return SsaIfCascade.new(this, t, merge.block, merge.pt);
+		return SsaIfCascade.new(this, t, merge.block, merge.prev);
 	}
 	def addThrow(source: Source, ex: string) -> SsaInstr {
-		if (end) return block.end();
-		end = true;
+		if (end()) return block.end();
 		var t = SsaThrow.new(source, ex);
-		block.append(t);
+		appendEnd(t);
 		return t;
 	}
 	def addGoto(target: SsaBlock) {
-		if (end) return;
-		end = true;
-		block.append(SsaGoto.new(target));
+		if (end()) return;
+		appendEnd(SsaGoto.new(target));
 	}
 	def addReturn(vals: Array<SsaInstr>) {
 		if (Debug.PARANOID) { checkInputs(vals); }
-		if (end) return;
-		end = true;
-		block.append(SsaReturn.new(vals));
+		if (end()) return;
+		appendEnd(SsaReturn.new(vals));
 	}
 	def addPhi(t: Type, vals: Array<SsaInstr>) -> SsaInstr {
 		if (Debug.PARANOID) { checkInputs(vals); }
 		var phi = SsaPhi.new(t, block, vals);
 		block.prepend(phi);
+		if (prev == block) prev = phi; // keep subsequent instructions after the phis
 		return phi;
 	}
 	def addCheckpoint(source: Source, vals: Array<SsaInstr>) {
@@ -423,7 +422,7 @@ class SsaBuilder {
 		var nulls = 0;
 		for (v in vals) if (v == null) nulls++;
 		if (nulls == 0) {
-			block.append(SsaCheckpoint.new(source, null, vals));
+			appendCheckpoint(SsaCheckpoint.new(source, null, vals));
 			return;
 		}
 		// Strip nulls, recording where each variable's value went.
@@ -438,40 +437,70 @@ class SsaBuilder {
 				r[j++] = v;
 			}
 		}
-		block.append(SsaCheckpoint.new(source, varMap, r));
+		appendCheckpoint(SsaCheckpoint.new(source, varMap, r));
+	}
+	private def appendCheckpoint(i: SsaCheckpoint) {
+		// XXX: checkpoints in dead code are inserted before the block end
+		if (end()) block.append(i);
+		else append(i);
 	}
 	def addNewVar(name: string, vtype: Type, index: int, vals: Array<SsaInstr>) -> SsaInstr {
 		if (Debug.PARANOID) { checkInputs(vals); }
-		if (end || !context.compiler.DebugVars) return null;
+		if (end() || !context.compiler.DebugVars) return null;
 		var instr = SsaNewVar.new(name, vtype, index, vals);
-		block.append(instr);
+		append(instr);
 		return instr;
 	}
 	def addDeleteVar(n: int) -> SsaInstr {
-		if (end || !context.compiler.DebugVars || n == 0) return null;
+		if (end() || !context.compiler.DebugVars || n == 0) return null;
 		var instr = SsaDeleteVar.new(n);
-		block.append(instr);
+		append(instr);
 		return instr;
 	}
 	def addUpdateVar(index: int, vals: Array<SsaInstr>) -> SsaInstr {
-		if (end || !context.compiler.DebugVars) return null;
+		if (end() || !context.compiler.DebugVars) return null;
 		var instr = SsaUpdateVar.new(index, vals);
-		block.append(instr);
+		append(instr);
 		return instr;
 	}
 	def addDefaultValue(t: Type) -> SsaInstr {
-		if (end || context.prog.hasTrivialDefaultValue(t)) return graph.nullConst(t);
+		if (end() || context.prog.hasTrivialDefaultValue(t)) return graph.nullConst(t);
 		if (!t.open()) return graph.valConst(t, context.prog.getDefaultValue(t));
 		return add(V3Op.newDefaultValue(t), Ssa.NO_INSTRS, Fact.O_PURE);
 	}
+	// Inserts {i} after {prev} and advances {prev} to {i}.
 	def append(i: SsaInstr) {
-		if (pt != null) i.insertBefore(pt);
-		else block.append(i);
+		insert(i);
+		prev = i;
 	}
+	// Inserts the block end {i} after {prev}, ending the block.
+	def appendEnd(i: SsaEnd) {
+		insert(i);
+		prev = null;
+	}
+	private def insert(i: SsaInstr) {
+		var p = prev, n = p.next;
+		p.next = i;
+		i.prev = p;
+		i.next = n;
+		n.prev = i;
+	}
+	// Sets the builder to insert after {p}, skipping any phis if {p} is the block itself.
+	// A {null} point means the block has ended or is unreachable.
+	def setPrev(p: SsaLink) -> this {
+		if (p == block) while (SsaPhi.?(p.next)) p = p.next;
+		this.prev = p;
+	}
+	// Sets the builder to insert at the end of {block}, but before its end, if any.
+	// A {null} block is unreachable.
 	def set(block: SsaBlock) -> this {
-		this.end = false;
 		this.block = block;
-		this.pt = null;
+		if (block == null) {
+			this.prev = null;
+		} else {
+			var last = block.prev;
+			prev = if(SsaEnd.?(last), last.prev, last);
+		}
 	}
 
 	// sets the source position that will apply to subsequent instructions
@@ -480,7 +509,7 @@ class SsaBuilder {
 	}
 	def addIf(cond: SsaInstr, tblock: SsaBlock, fblock: SsaBlock) {
 		if (Debug.PARANOID) { checkInputs([cond]); }
-		if (end) return;
+		if (end()) return;
 		if (SsaConst.?(cond)) {
 			// fold if(#k)
 			return addGoto(if(cond.unbox<bool>(), tblock, fblock));
@@ -490,13 +519,12 @@ class SsaBuilder {
 			if (SsaApplyOp.!(cond).op.opcode == Opcode.BoolNot) return addIf(cond.input0(), fblock, tblock);
 			// XXX: optimize if(x == true|false) and if(x != true|false)
 		}
-		end = true;
 		var i = SsaIf.new(cond, tblock, fblock);
-		append(i);
+		appendEnd(i);
 	}
 	def addSelect(t: Type, cond: SsaInstr, tval: SsaInstr, fval: SsaInstr) -> SsaInstr {
 		if (Debug.PARANOID) { checkInputs([cond, tval, fval]); }
-		if (end) return graph.nullConst(t);
+		if (end()) return graph.nullConst(t);
 		if (SsaConst.?(cond)) {
 			// fold if(#k)
 			return if(cond.unbox<bool>(), tval, fval);
@@ -510,15 +538,16 @@ class SsaBuilder {
 		var tblock = context.newBuilder(), fblock = context.newBuilder();
 		tblock.source = fblock.source = source;
 		var i = SsaIf.new(cond, tblock.block, fblock.block);
-		append(i);
+		appendEnd(i);
 		tblock.addGoto(merge.block);
 		fblock.addGoto(merge.block);
 		var phi = merge.addPhi(t, [tval, fval]);
 		block = merge.block;
+		prev = merge.prev;
 		return phi;
 	}
 	def addIfNull(x: SsaInstr, tblock: SsaBlock, fblock: SsaBlock) {
-		if (end) return;
+		if (end()) return;
 		var t = x.getType();
 		return addIf(pure2(V3Op.newRefEq(t), x, graph.nullConst(t)), tblock, fblock);
 	}
@@ -919,7 +948,7 @@ class SsaBuilder {
 	def add(op: Operator, args: Array<SsaInstr>, facts: Fact.set) -> SsaApplyOp {
 		if (Opcode.VstSugar.?(op.opcode)) return V3.fail("unexpected sugar");
 		var i = SsaApplyOp.new(source, op, args).setFact(facts | Opcodes.facts(op.opcode));
-		if (!end) append(i);
+		if (!end()) append(i);
 		return i;
 	}
 	// add() specialized to 1 input.
@@ -930,7 +959,7 @@ class SsaBuilder {
 //			if (r.0) return r.1;
 //		}
 		var i = SsaApplyOp.new(source, op, [x]).setFact(facts);
-		if (!end) append(i);
+		if (!end()) append(i);
 		return i;
 	}
 	def pure1(op: Operator, x: SsaInstr) -> SsaInstr {
@@ -944,7 +973,7 @@ class SsaBuilder {
 //			if (r.0) return r.1;
 //		}
 		var i = SsaApplyOp.new(source, op, [x, y]).setFact(facts);
-		if (!end) append(i);
+		if (!end()) append(i);
 		return i;
 	}
 	def pure2(op: Operator, x: SsaInstr, y: SsaInstr) -> SsaInstr {
@@ -966,34 +995,9 @@ class SsaBlockSplit {
 	private var mergeBuilder = context.newBuilder();
 
 	new(context, curBlock) {
-		// perform block surgery to split in one of three ways
-		var start = curBlock.block, end = start.prev;
-		var pt = curBlock.pt;
-		if (pt != null) {
-			// split after pt:   start ... last={pt} | | (new block) first ... end
-			doSplit(start, pt, end);
-		} else if (SsaEnd.?(end)) {
-			// split before end: start ... last={end.prev} | | (new block) end
-			doSplit(start, end.prev, end);
-		} else {
-			// split after last: start ... last={pt} | | (new block)
-			// nothing to do
-		}
+		// split after prev: start ... last={pt} | | (new block) first ... end
+		curBlock.splitInto(mergeBuilder.block);
 		mergeBuilder.source = curBlock.source;
-	}
-	private def doSplit(start: SsaBlock, last: SsaLink, end: SsaLink) {
-		var first = last.next;
-		last.next = start;
-		start.prev = last;
-		var nb = mergeBuilder.block;
-		first.prev = nb;
-		nb.next = first;
-		mergeBuilder.pt = first;
-		curBlock.end = false;
-		end.next = nb;
-		nb.prev = end;
-		curBlock.pt = null;
-		curBlock.end = false;
 	}
 	def addIf(cond: SsaInstr) -> SsaBuilder {
 		if (falseBlock != null) System.error("SsaBlockSplitError", "cannot add if to true block");
@@ -1028,7 +1032,7 @@ class SsaBlockSplit {
 		if (falseBlock != null) System.error("SsaBlockSplitError", "cannot finish in true block");
 		curBlock.addGoto(mergeBuilder.block);
 		context.block = mergeBuilder.block;
-		mergeBuilder.pt = null;
+		mergeBuilder.set(mergeBuilder.block);
 		return mergeBuilder;
 	}
 }
@@ -1039,7 +1043,7 @@ class SsaIfCascade {
 	def ssa: SsaBuilder;
 	def merge: SsaBlock;
 	// Insertion point in {merge} at which to resume, i.e. in front of whatever
-	// the split moved over. {null} means append at the end.
+	// the split moved over.
 	def mergePt: SsaLink;
 	private var fblock: SsaBlock;
 	private def phiInputs = if(varType != null, Vector<SsaInstr>.new().grow(2));
@@ -1057,7 +1061,7 @@ class SsaIfCascade {
 		fblock = null;
 	}
 	def endCase(val: SsaInstr) {
-		if (!ssa.end) {
+		if (!ssa.end()) {
 			if (varType != null) {
 				if (val == null) ssa.context.fail("SsaIfCascade variable must be non-null on this path");
 				phiInputs.put(val);
@@ -1067,7 +1071,7 @@ class SsaIfCascade {
 		at(fblock);
 	}
 	private def addIf0(cond: SsaInstr, not: bool) {
-		if (ssa.end) return;
+		if (ssa.end()) return;
 		var tb = SsaBlock.new(), fb = SsaBlock.new();
 		if (not) ssa.addIf(cond, fb, tb);
 		else ssa.addIf(cond, tb, fb);
@@ -1078,20 +1082,15 @@ class SsaIfCascade {
 		if (fblock != null) ssa.context.fail("SsaIfCascade: ended before else clause");
 		at(merge);
 		// Everything the caller emits from here on goes in front of the
-		// instructions the split moved over (addPhi prepends regardless).
-		ssa.pt = mergePt;
+		// instructions the split moved over.
+		if (!ssa.end()) ssa.setPrev(mergePt);
 		if (varType == null) return null;
 		if (phiInputs.length != merge.preds.length) ssa.context.fail("SsaIfCascade: mismatch in phi input count");
 		return ssa.addPhi(varType, phiInputs.extract());
 	}
 	private def at(b: SsaBlock) {
-		if (b == null) {
-			ssa.block = SsaBlock.new(); // XXX: not reachable, collects junk
-			ssa.end = true;
-		} else {
-			ssa.block = b;
-			ssa.end = b.preds.length == 0;
-		}
-		ssa.pt = null;
+		if (b == null) ssa.set(SsaBlock.new()).setPrev(null); // XXX: not reachable, collects junk
+		else if (b.preds.length == 0) ssa.set(b).setPrev(null);
+		else ssa.set(b);
 	}
 }
