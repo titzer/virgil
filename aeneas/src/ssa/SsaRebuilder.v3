@@ -3,7 +3,7 @@
 
 // Shared functionality for building new SSA code from old SSA code, e.g.
 // during normalization or lowering.
-class SsaRebuilder(context: SsaContext) {
+class SsaRebuilder(context: SsaContext) extends SsaInstrVisitor {
 	def instrMap: SsaMap = SsaMap.new();
 	var newGraph: SsaGraph;
 	var blockStartMap: PartialMap<SsaBlock, SsaBlock>;
@@ -39,29 +39,9 @@ class SsaRebuilder(context: SsaContext) {
 		context.block = b_old;
 		ssa.set(b_new);
 		blocks++;
-		genInstrs(b_old);
+		visitBlock(b_old);
 		var newEndBlock = ssa.block;
 		if (newEndBlock != b_new && blockEndMap != null) blockEndMap[b_old] = newEndBlock;
-	}
-	def genInstrs(b_old: SsaBlock) {
-		for (i = b_old.next; i != b_old && !ssa.end(); i = i.next) {
-			// translate each instruction in the block
-			match (i) {
-				x: SsaApplyOp => genApplyOp(x);
-				x: SsaPhi => ;  // XXX: processing of phis necessary?
-				x: SsaReturn => genReturn(x);
-				x: SsaIf => genIf(b_old, x);
-				x: SsaGoto => genGoto(x);
-				x: SsaSwitch => genSwitch(b_old, x);
-				x: SsaThrow => genThrow(x);
-				x: SsaCheckpoint => genCheckpoint(x);
-				x: SsaNewVar => genNewVar(x);
-				x: SsaDeleteVar => genDeleteVar(x);
-				x: SsaUpdateVar => genUpdateVar(x);
-				x: SsaProbe => ssa.append(x.dup());
-				_ => context.fail1("unexpected block end @%d", i.uid);
-			}
-		}
 	}
 	private def finishPhi(i_old: SsaPhi) {
 		// XXX: if only one predecessor, replace phi with its (one) input
@@ -145,60 +125,6 @@ class SsaRebuilder(context: SsaContext) {
 		edgeMapMap[b_new] = map;
 		return map;
 	}
-
-	def genIf(b_old: SsaBlock, i_old: SsaIf) {
-		var key = genRef1(i_old.inputs[0]), succ = b_old.succs();
-		if (SsaConst.?(key)) {
-			// fold the branch
-			var succ = mapEdge(succ[if(key.unbox<bool>(), 0, 1)]);
-			return ssa.addGoto(succ);
-		}
-		ssa.addIf(key, mapEdge(succ[0]), mapEdge(succ[1]));
-	}
-	def genSwitch(b_old: SsaBlock, i_old: SsaSwitch) {
-		if (ssa.end()) return;
-		var key = genRef1(i_old.inputs[0]);
-		if (SsaConst.?(key)) {
-			// fold the switch
-			var succ = mapEdge(i_old.findSucc(SsaConst.!(key).val));
-			return ssa.addGoto(succ);
-		}
-		var sw = SsaSwitch.new(i_old.keyType, i_old.maxValue, key);
-		ssa.appendEnd(sw);
-		var osuccs = b_old.succs();
-		var succ = Array<SsaCfEdge>.new(osuccs.length);
-		for (i < succ.length) {
-			succ[i] = SsaCfEdge.new(sw, mapEdge(osuccs[i]));
-		}
-		sw.succs = succ;
-	}
-	def genReturn(i_old: SsaReturn) {
-		ssa.addReturn(genRefs(i_old.inputs));
-	}
-	def genThrow(i_old: SsaThrow) {
-		ssa.addThrow(i_old.source, i_old.exception);
-	}
-	def genGoto(i_old: SsaGoto) {
-		ssa.addGoto(mapBlockStart(i_old.target()));
-	}
-	def genCheckpoint(i_old: SsaCheckpoint) {
-		ssa.addCheckpoint(i_old.source, genRefs(i_old.inputs));
-	}
-	def genNewVar(i_old: SsaNewVar) {
-		var tn = normType(i_old.vtype);
-		var t = if(tn != null, tn.newType, i_old.vtype);
-		// Enums normalize to a plain integer of the same size. Keep the declared
-		// type, which is only used to describe the variable in debug info.
-		if (EnumType.?(i_old.vtype)) t = i_old.vtype;
-		ssa.addNewVar(i_old.name, t, i_old.index, genRefs(i_old.inputs));
-	}
-	def genDeleteVar(i_old: SsaDeleteVar) {
-		ssa.addDeleteVar(i_old.n);
-	}
-	def genUpdateVar(i_old: SsaUpdateVar) {
-		ssa.addUpdateVar(i_old.index, genRefs(i_old.inputs));
-	}
-
 	def mapBlockStart(b_old: SsaBlock) -> SsaBlock {
 		var b_new = blockStartMap[b_old];
 		if (b_new == null) {
@@ -329,7 +255,15 @@ class SsaRebuilder(context: SsaContext) {
 		context.fail("unexpected instruction");
 		return i_old;
 	}
-	def genPhi(i_old: SsaPhi) {
+	def mapNorm(i_old: SsaInstr, ni: SsaInstr, tn: TypeNorm) {
+		if (tn == null || tn.size == 1) return map1(i_old, ni);
+		if (tn.size == 0) return map0(i_old);
+		ssa.at(null);
+		var values = Array<SsaInstr>.new(tn.size);
+		for (i < tn.size) values[i] = ssa.opTupleGetElem(tn.newType, i, ni);
+		mapN(i_old, values);
+	}
+	def genPhi(i_old: SsaPhi ) {
 		var tn = normType(i_old.vtype);
 		var newBlock = mapBlockStart(i_old.block);
 		if (tn == null) {    // no normalization
@@ -353,14 +287,70 @@ class SsaRebuilder(context: SsaContext) {
 		}
 		mapN(i_old, ai_new);
 	}
-	def mapNorm(i_old: SsaInstr, ni: SsaInstr, tn: TypeNorm) {
-		if (tn == null || tn.size == 1) return map1(i_old, ni);
-		if (tn.size == 0) return map0(i_old);
-		ssa.at(null);
-		var values = Array<SsaInstr>.new(tn.size);
-		for (i < tn.size) values[i] = ssa.opTupleGetElem(tn.newType, i, ni);
-		mapN(i_old, values);
+	// --------------- Visitor interface --------
+	def visitBlock(b_old: SsaBlock) {
+		// stop translating once the new code has ended, e.g. in a throw
+		for (i = b_old.next; i != b_old && !ssa.end(); i = i.next) visit(SsaInstr.!(i));
 	}
+	def visitPhi(i_old: SsaPhi) {
+		// phis are recreated on demand
+	}
+	def visitIf(i_old: SsaIf) {
+		var key = genRef1(i_old.inputs[0]), succ = context.block.succs();
+		if (SsaConst.?(key)) {
+			// fold the branch
+			var succ = mapEdge(succ[if(key.unbox<bool>(), 0, 1)]);
+			return ssa.addGoto(succ);
+		}
+		ssa.addIf(key, mapEdge(succ[0]), mapEdge(succ[1]));
+	}
+	def visitSwitch(i_old: SsaSwitch) {
+		if (ssa.end()) return;
+		var key = genRef1(i_old.inputs[0]);
+		if (SsaConst.?(key)) {
+			// fold the switch
+			var succ = mapEdge(i_old.findSucc(SsaConst.!(key).val));
+			return ssa.addGoto(succ);
+		}
+		var sw = SsaSwitch.new(i_old.keyType, i_old.maxValue, key);
+		ssa.appendEnd(sw);
+		var osuccs = context.block.succs();
+		var succ = Array<SsaCfEdge>.new(osuccs.length);
+		for (i < succ.length) {
+			succ[i] = SsaCfEdge.new(sw, mapEdge(osuccs[i]));
+		}
+		sw.succs = succ;
+	}
+	def visitReturn(i_old: SsaReturn) {
+		ssa.addReturn(genRefs(i_old.inputs));
+	}
+	def visitThrow(i_old: SsaThrow) {
+		ssa.addThrow(i_old.source, i_old.exception);
+	}
+	def visitGoto(i_old: SsaGoto) {
+		ssa.addGoto(mapBlockStart(i_old.target()));
+	}
+	def visitCheckpoint(i_old: SsaCheckpoint) {
+		ssa.addCheckpoint(i_old.source, genRefs(i_old.inputs));
+	}
+	def visitNewVar(i_old: SsaNewVar) {
+		var tn = normType(i_old.vtype);
+		var t = if(tn != null, tn.newType, i_old.vtype);
+		// Enums normalize to a plain integer of the same size. Keep the declared
+		// type, which is only used to describe the variable in debug info.
+		if (EnumType.?(i_old.vtype)) t = i_old.vtype;
+		ssa.addNewVar(i_old.name, t, i_old.index, genRefs(i_old.inputs));
+	}
+	def visitDeleteVar(i_old: SsaDeleteVar) {
+		ssa.addDeleteVar(i_old.n);
+	}
+	def visitUpdateVar(i_old: SsaUpdateVar) {
+		ssa.addUpdateVar(i_old.index, genRefs(i_old.inputs));
+	}
+	def visitProbe(i: SsaProbe) {
+		ssa.append(i.dup());
+	}
+	
 	// XXX: reduce duplication with MachLowering
 	// Must be implemented by subclass
 	def normType(t: Type) -> TypeNorm;
