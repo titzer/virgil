@@ -21,6 +21,7 @@ class SsaBuilder {
 	var block: SsaBlock;
 	def var prev: SsaLink;	// new instructions are inserted after this; {null} if ended or unreachable
 	var source: Source;
+	var opt: SsaOptimizer;		// if non-null, optimizes each apply instruction as it is added
 
 	new(context, graph, block: SsaBlock) {
 		set(block);
@@ -40,8 +41,7 @@ class SsaBuilder {
 		}
 		var i = SsaApplyOp.new(source, op, args);
 		i.setFact(Opcodes.facts(op.opcode));
-		append(i);
-		return i;
+		return appendApply(i);
 	}
 	def addApplyF(op: Operator, args: Array<SsaInstr>, facts: Fact.set) -> SsaInstr {
 		if (Debug.PARANOID) { checkNoTypeVarsInOp(op); checkInputs(args); }
@@ -52,8 +52,7 @@ class SsaBuilder {
 		}
 		var i = SsaApplyOp.new(source, op, args);
 		i.setFact(Opcodes.facts(op.opcode) | facts);
-		append(i);
-		return i;
+		return appendApply(i);
 	}
 	def addApplyVst(source: Source, op: Operator, vst: VstOperator, args: Array<SsaInstr>) -> SsaInstr {
 		var pt = op.sig.paramTypes;
@@ -371,6 +370,7 @@ class SsaBuilder {
 	def split() -> SsaBuilder {
 		var mergeBuilder = SsaBuilder.new(context, graph, SsaBlock.new());
 		mergeBuilder.source = this.source;
+		mergeBuilder.opt = this.opt;
 		splitInto(mergeBuilder.block);
 		return mergeBuilder;
 	}
@@ -395,11 +395,30 @@ class SsaBuilder {
 		// use it.
 		return SsaIfCascade.new(this, t, merge.block, merge.prev);
 	}
+	// Ends the block with a throw at the insertion point, killing any instructions after it.
 	def addThrow(source: Source, ex: string) -> SsaInstr {
 		if (end()) return block.end();
 		var t = SsaThrow.new(source, ex);
 		appendEnd(t);
+		killAfter(t);
 		return t;
+	}
+	// Kills the instructions after the new end {t}, including any previous end of the block.
+	// The optimizer, if any, kills the previous end's successors.
+	private def killAfter(t: SsaEnd) {
+		for (p = t.next; !SsaBlock.?(p); ()) {
+			var n = p.next;
+			p.remove();
+			if (SsaEnd.?(p)) {
+				var end = SsaEnd.!(p);
+				if (opt != null) opt.killSuccs(end.succs);
+				else Ssa.killSuccs(end.succs);
+				Ssa.killInstr(end);
+				break;
+			}
+			if (SsaInstr.?(p)) Ssa.killInstr(SsaInstr.!(p));
+			p = n;
+		}
 	}
 	def addGoto(target: SsaBlock) {
 		if (end()) return;
@@ -465,6 +484,12 @@ class SsaBuilder {
 		if (end() || context.prog.hasTrivialDefaultValue(t)) return graph.nullConst(t);
 		if (!t.open()) return graph.valConst(t, context.prog.getDefaultValue(t));
 		return add(V3Op.newDefaultValue(t), Ssa.NO_INSTRS, Fact.O_PURE);
+	}
+	// Appends the apply {i} and then, if this builder has an optimizer, optimizes it.
+	// Returns the instruction that computes the value of {i}.
+	def appendApply(i: SsaApplyOp) -> SsaInstr {
+		append(i);
+		return if(opt == null, i, opt.optAppended(this, i));
 	}
 	// Inserts {i} after {prev} and advances {prev} to {i}.
 	def append(i: SsaInstr) {
@@ -784,7 +809,7 @@ class SsaBuilder {
 	private def tryElimBoundsCheck(x: SsaInstr, y: SsaInstr) -> Fact.set {
 		if (SsaConst.?(y)) {
 			var yk = SsaConst.!(y).val;
-			if (SsaConst.?(x)) {
+			if (SsaConst.?(x) && Record.?(SsaConst.!(x).val)) {
 				var r = Record.!(SsaConst.!(x).val);
 				if (r != null && (yk == null || Box<int>.?(yk))) {
 					var i = V3.unboxI32(yk);
@@ -939,14 +964,13 @@ class SsaBuilder {
 		}
 		return val;
 	}
-	def pure(op: Operator, args: Array<SsaInstr>) -> SsaApplyOp {
+	def pure(op: Operator, args: Array<SsaInstr>) -> SsaInstr {
 		return add(op, args, Fact.O_PURE);
 	}
-	def add(op: Operator, args: Array<SsaInstr>, facts: Fact.set) -> SsaApplyOp {
+	def add(op: Operator, args: Array<SsaInstr>, facts: Fact.set) -> SsaInstr {
 		if (Opcode.VstSugar.?(op.opcode)) return V3.fail("unexpected sugar");
 		var i = SsaApplyOp.new(source, op, args).setFact(facts | Opcodes.facts(op.opcode));
-		if (!end()) append(i);
-		return i;
+		return if(end(), i, appendApply(i));
 	}
 	// add() specialized to 1 input.
 	def add1(op: Operator, x: SsaInstr, facts: Fact.set) -> SsaInstr {
@@ -956,8 +980,7 @@ class SsaBuilder {
 //			if (r.0) return r.1;
 //		}
 		var i = SsaApplyOp.new(source, op, [x]).setFact(facts);
-		if (!end()) append(i);
-		return i;
+		return if(end(), i, appendApply(i));
 	}
 	def pure1(op: Operator, x: SsaInstr) -> SsaInstr {
 		return add1(op, x, Fact.O_PURE); // XXX: can skip an operator fact lookup for tryEval
@@ -970,8 +993,7 @@ class SsaBuilder {
 //			if (r.0) return r.1;
 //		}
 		var i = SsaApplyOp.new(source, op, [x, y]).setFact(facts);
-		if (!end()) append(i);
-		return i;
+		return if(end(), i, appendApply(i));
 	}
 	def pure2(op: Operator, x: SsaInstr, y: SsaInstr) -> SsaInstr {
 		return add2(op, x, y, Fact.O_PURE); // XXX: can skip an operator fact lookup for tryEval

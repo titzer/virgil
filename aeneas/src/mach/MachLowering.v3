@@ -73,9 +73,9 @@ class MachLoweringConfig {
 class SsaGraphNormalizer(context: SsaContext) extends SsaInstrVisitor {
 	def buffer = Vector<SsaInstr>.new();  // reusable input buffer
 	def replacements = Vector<Array<SsaInstr>>.new();
-	var cfopt: SsaCfOptimizer;
 	var singleMark: int;
 	var ssa: SsaBuilder;
+	var opt: SsaOptimizer;	// if non-null, optimizes instructions as they are added
 	var phis: List<SsaPhi>;
 
 	// Map {i_old} to multiple instructions in {i_new}.
@@ -133,6 +133,7 @@ class SsaGraphNormalizer(context: SsaContext) extends SsaInstrVisitor {
 		replacements.clear();
 		buffer.clear();
 		ssa = SsaBuilder.new(context, graph, null);
+		ssa.opt = opt;
 	}
 	// Get the replacements for a given instruction, if it is not a 1-1 mapping.
 	// Returns {null} if there is a 1-1 mapping.
@@ -280,7 +281,12 @@ class SsaGraphNormalizer(context: SsaContext) extends SsaInstrVisitor {
 // with loads and stores. Introduces truncations and wrapping for integer operations
 // according to the {config}.
 class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringConfig) extends SsaGraphNormalizer {
-	new() super(SsaContext.new(compiler, mach.prog)) { }
+	new() super(SsaContext.new(compiler, mach.prog)) {
+		if (compiler.MachBuildOpt) {
+			opt = SsaOptimizer.new(context);
+			opt.remove_pure_ops = false; // instructions have no uses yet when added
+		}
+	}
 	var maybeDead: List<SsaInstr>;
 	def doMethod(method: IrMethod) {
 		context.enterMethod(method);
@@ -893,6 +899,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	def visitPtrAtObject(opcode: Opcode.PtrAtObject, t: Type)	{ mapOrId(app, normRef1(app.inputs[0])); }
 	def visitPtrAtArrayElem(opcode: Opcode.PtrAtArrayElem, at: ArrayType, it: IntType) {
 		genBoundsCheck(app, Fact.O_NO_NULL_CHECK); // XXX: propagate nullity
+		if (ssa.end()) return;
 		var i_array = normRef1(app.inputs[0]);
 		var i_index = normRef1(app.inputs[1]);
 		var hsize = mach.getArrayElemOffset(at, 0), scale = mach.getArrayElemScale(at);
@@ -1152,8 +1159,9 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 
 				var tv: SsaInstr, zero = context.graph.nullConst(tt);
 				if (Opcode.IntDiv.?(i_old.op.opcode)) {
-					var apply = ssa.add(tt.opSub(), [zero, x], Facts.NONE);
-					tv = genTruncateInPlace(apply, tt);  // XXX: weird to apply this to new instructions.
+					var neg = ssa.add(tt.opSub(), [zero, x], Facts.NONE);
+					// XXX: weird to apply this to new instructions.
+					tv = if(SsaApplyOp.?(neg), genTruncateInPlace(SsaApplyOp.!(neg), tt), neg);
 				} else {
 					tv = zero;  // x % -1 == #0
 				}
@@ -1943,6 +1951,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var oarr = i_old.inputs[0];
 		// XXX: CSE the array length if possible
 		var len = refLoad(nullity, Int.TYPE, i_old, oarr, narr, mach.getArrayLengthOffset(i_old.op.typeArgs[0]));
+		if (ssa.end()) return (len, nullity | Fact.O_NO_NULL_CHECK); // the load threw, killing {i_old}
 		var index = normRef1(i_old.inputs[1]);
 		var throwOp = V3Op.newConditionalThrow(V3Exception.BoundsCheck);
 		var op = Int.getType(false, 32).opLtEq();
@@ -1967,12 +1976,14 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def genCallClassSelector(i_old: SsaApplyOp, selector: IrSelector) {
 		var func = genClassGetSelector(i_old, selector);
+		if (ssa.end()) return;
 		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
 		var args = Arrays.prepend(func, normRefs(i_old.inputs));
 		call(i_old, mach.funcRep(methodRef), args);
 	}
 	def genCallVariantSelector(i_old: SsaApplyOp, selector: IrSelector) {
 		var func = genVariantGetSelector(i_old, selector);
+		if (ssa.end()) return;
 		var methodRef = V3Op.extractIrSpec(i_old.op, selector);
 		var args = Arrays.prepend(func, normRefs(i_old.inputs));
 		call(i_old, mach.funcRep(methodRef), args);
@@ -2225,10 +2236,8 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 	}
 	def addThrow(exception: string) -> SsaInstr {
 		if (ssa.end()) return null;
-		if (cfopt == null) cfopt = SsaCfOptimizer.new(context);
-		var r = cfopt.insertThrow(ssa.prev.next, ssa.source, exception, null);
-		ssa.setPrev(null);
-		return r;
+		ssa.addThrow(ssa.source, exception);
+		return context.graph.nop();
 	}
 
 	def genAllocMethod(size: IntType) -> IrMethod {
