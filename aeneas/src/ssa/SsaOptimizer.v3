@@ -1,14 +1,31 @@
 // Copyright 2015 Google Inc. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Coordinates optimizations of SSA graphs, blocks, and individual instructions.
-// Provides a facade to the outside that hides details of reduction, analysis, etc.
-class SsaOptimizer(context: SsaContext) {
+// Optimizes SSA graphs, blocks, and individual instructions, performing such optimizations
+// as const folding, strength reduction, load elimination, bounds check elimination, and
+// control flow optimizations. Individual instructions can be optimized either in a pass over
+// a graph or as an {SsaBuilder} adds them.
+class SsaOptimizer(context: SsaContext) extends SsaInstrVisitor {
+	var optimize_loads = true;		// activates load elimination
+	var optimize_nullchecks = true;		// activates null check elimination
+	var optimize_inits = false;		// activates init elimination
+	var optimize_bounds = true;
+	var remove_pure_ops = true;
+	var fold_pure_ops = true;
+	var fold_foldable_ops = true;
+	var graph: SsaGraph;
+	var ssa: SsaBuilder;			// inserts new instructions before the current instruction
+	var graphBuilder: SsaBuilder;		// builder for passes over a graph
+	var state: SsaBlockState;		// flow-sensitive state, managed by the user; {null} if none
+	var foldingArgs: FoldingArguments;
+	var result: SsaInstr;			// replacement for the current instruction
+	var m: SsaInstrMatcher;			// matcher for reductions, allocated on demand
 	var marker = SsaInternalMarker.new();
-	def iopt = SsaInstrReducer.new(context);
+	var mark: int;				// mark for control flow optimization
+	def queue = Vector<SsaBlock>.new();	// queue for control flow optimization
 
 	def reset(graph: SsaGraph) {
-		iopt.graph = graph;
+		useGraph(graph);
 		marker.reset(graph);
 		context.graph = graph;
 		context.block = null;
@@ -20,17 +37,17 @@ class SsaOptimizer(context: SsaContext) {
 		var mark = marker.allocMark(context.graph.startBlock);
 		for (i < queue.length) {
 			var t = queue[i], block = t.0;
-			iopt.state = t.1;
+			state = t.1;
 			if (block.facts.O_KILLED) continue;
-			iopt.reduceBlock(block);
+			reduceBlock(block);
 			var succs = block.succs();
 			for (s in succs) {
 				var d = s.dest;
 				if (marker.getMark(d) < 0) {
-					var state: SsaBlockState;
-					if (succs.length == 1) state = if(s.dest.preds.length == 1, iopt.state, iopt.state.clear());
-					else state = if(s.dest.preds.length == 1, iopt.state.copy(), SsaBlockState.new());
-					queue.put(d, state);
+					var dstate: SsaBlockState;
+					if (succs.length == 1) dstate = if(s.dest.preds.length == 1, state, state.clear());
+					else dstate = if(s.dest.preds.length == 1, state.copy(), SsaBlockState.new());
+					queue.put(d, dstate);
 					marker.setMark(d, mark);
 				}
 			}
@@ -41,27 +58,6 @@ class SsaOptimizer(context: SsaContext) {
 			def l = SsaLoopOptimizer.new(context.graph, null, null, null, context);
 			l.licm(); 
 		}
-	}
-	def optLoop(header: SsaBlock, loopBody: SsaBlock, loopEnd: SsaBlock) {
-	}
-	def optBlock(block: SsaBlock) {
-	}
-	def reduceIf(state: SsaBlockState, i: SsaIf) {
-		iopt.state = state;
-		iopt.prev = i.prev;
-		iopt.reduceIf(i);
-		iopt.state = null;
-	}
-	def reduceApply(state: SsaBlockState, app: SsaApplyOp) -> SsaInstr {
-		iopt.state = state;
-		iopt.prev = app.prev;
-		var res = iopt.reduceApplyOp(app);
-		if (res != app) {
-			app.replace(res);
-			app.remove();
-		}
-		iopt.state = null;
-		return res;
 	}
 	def checkAndPruneGraph() -> bool {
 		var changed = false, print = context.shouldPrintOpt();
@@ -95,7 +91,6 @@ class SsaOptimizer(context: SsaContext) {
 			}
 		}
 		// Prune off unreachable predecessors and uses.
-		var cfopt = SsaCfOptimizer.new(context);
 		for (i < reachable.length) {
 			var block = reachable[i], j = 0;
 			while (j < block.preds.length) {
@@ -110,306 +105,54 @@ class SsaOptimizer(context: SsaContext) {
 		}
 		return changed;
 	}
-}
-
-
-def ARRAY_LENGTH_FIELD = IrField.new(V3.stringType, Int.TYPE).setFlag(IrFlag.F_VALUE);
-
-// Matches various patterns of SSA instructions, recording the state of the match
-// in the exposed fields.
-class SsaInstrMatcher extends SsaInstrVisitor {
-	var x: SsaInstr;	// First input
-	var y: SsaInstr;	// Second input
-	var xconst: bool;	// true if {x} is a constant
-	var yconst: bool;	// true if {y} is a constant
-	var fold: bool;		// true if all inputs are constants
-	var wide: bool;		// true if this is a long int operation
-	var xval: Val;		// if {x} is a constant, then its value
-	var yval: Val;		// if {y} is a constant, then its value
-	var xint: int;		// if {x} is an int constant, then its value
-	var yint: int;		// if {y} is an int constant, then its value
-	var xlong: long;	// if {x} is a long constant, then its value
-	var ylong: long;	// if {y} is a long constant, then its value
-	var yzero: bool;        // true if {y} is zero
-	var inttype: IntType;	// if this is an integer operation, the result type
-
-	// Resets this matcher
-	def clear() {
-		x = y = null;
-		xval = yval = null;
-		inttype = null;
-		xconst = yconst = yzero = fold = wide = false;
-		xint = yint = 0;
-		xlong = ylong = 0;
-	}
-	// Initializes the match state for a binary operation and returns {yval}.
-	def binop(i: SsaApplyOp) -> Val {
-		x = i.input0();
-		y = i.input1();
-		yzero = y.facts.V_ZERO;
-		fold = false;
-		if (xconst = SsaConst.?(x)) {
-			xval = SsaConst.!(x).val;
-			if (yconst = SsaConst.?(y)) {
-				fold = true;
-				return yval = SsaConst.!(y).val;
-			} else if (i.facts.O_COMMUTATIVE) {
-				i.inputs[0].update(y);
-				i.inputs[1].update(x);
-				xconst = false;
-				yconst = true;
-				var t = x;
-				x = y;
-				y = t;
-				yval = xval;
-				xval = null;
-				yzero = y.facts.V_ZERO;
-				return yval;
-			} else {
-				return yval = null;
-			}
+	// Uses an internal builder for insertions during a pass over {g}.
+	def useGraph(g: SsaGraph) {
+		graph = g;
+		if (graphBuilder == null || graphBuilder.graph != g) {
+			graphBuilder = SsaBuilder.new(context, g, null);
+			graphBuilder.opt = this;
 		}
-		return yval = if(yconst = SsaConst.?(y), SsaConst.!(y).val);
+		ssa = graphBuilder;
 	}
-	// Initializes the match state for an integer binary operation and returns {yint}.
-	def intbinop(i: SsaApplyOp) -> int {
-		binop(i);
-		inttype = IntType.!(i.op.sig.paramTypes[0]);
-		if (inttype.width <= 32) {
-			wide = false;
-			if (xconst) xint = V3.unboxI32(xval);
-			if (yconst) {
-				yint = V3.unboxI32(yval);
-				yzero = yint == 0;
-			}
-		} else {
-			wide = true;
-			if (xconst) xlong = Long.unboxSU(xval, inttype.signed);
-			if (yconst) {
-				ylong = Long.unboxSU(yval, inttype.signed);
-				yzero = ylong == 0;
-			}
-		}
-		return yint;
-	}
-	// Initializes the match state for an integer binary operation and returns {yint}.
-	def boolbinop(i: SsaApplyOp) -> int {
-		binop(i);
-		inttype = null;
-		if (xconst) xint = if(Bool.unbox(xval), 1);
-		if (yconst) {
-			yint = if(Bool.unbox(yval), 1);
-			yzero = yint == 0;
-		}
-		return yint;
-	}
-	// Initializes the match state for a unary operation and returns {xval}.
-	def unop(i: SsaApplyOp) -> Val {
-		x = i.input0();
-		return xval = if(fold = xconst = SsaConst.?(x), SsaConst.!(x).val);
-	}
-	// Initializes the match state for an n-ary operation and returns {xval}.
-	def n_op(i: SsaApplyOp) -> Val {
-		fold = true;
-		var max = i.inputs.length;
-		for (j < max) {
-			if (!SsaConst.?(i.inputs[j].dest)) return (fold = false, null).last;
-		}
-		if (max >= 1) {
-			x = i.input0();
-			xconst = true;
-			xval = SsaConst.!(x).val;
-		}
-		if (max >= 2) {
-			y = i.input1();
-			yconst = true;
-			yval = SsaConst.!(y).val;
-		}
-		return xval;
-	}
-	def yis(val: int) -> bool {
-		return yconst && if(wide, ylong == val, yint == val);
-	}
-	def yrange(min: int, max: int) -> bool {
-		if (Debug.PARANOID && !yconst) return V3.fail("not const");
-		if (wide) return min <= ylong && ylong <= max;
-		else return min <= yint && yint <= max;
-	}
-	def yisPowerOf2() -> bool {
-		return yconst && if(wide, (ylong & (ylong - 1)) == 0, (yint & (yint - 1)) == 0);
-	}
-	def ylog2() -> int {
-		if (Debug.PARANOID && !yconst) return V3.fail("not const");
-		return if(wide, Longs.log(u64.view(ylong)), Ints.log(u32.view(yint)));
-	}
-}
-
-// Flow-sensitive state for local optimizations.
-class SsaBlockState {
-	var end: bool;
-	var inbounds: List<(SsaInstr, SsaInstr)>;
-	var nonnull: List<SsaInstr>;
-	var inits: List<IrMethod>;
-	def pure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
-	def impure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
-	def ptr_loads = Vector<(SsaInstr, Type, SsaInstr)>.new();
-
-	def clear() -> this {
-		nonnull = null;
-		inits = null;
-		inbounds = null;
-		end = false;
-		pure_loads.resize(0);
-		impure_loads.resize(0);
-		ptr_loads.resize(0);
-	}
-	def kill() -> this {
-		impure_loads.resize(0);
-		ptr_loads.resize(0);
-	}
-	def load(obj: SsaInstr, m: IrMember, apply: SsaApplyOp) -> SsaInstr {
-//TODO:dce	if (apply.useList == null && apply.facts.O_NO_NULL_CHECK) {
-//			apply.replace(null);
-//			return context.graph.zeroConst();  // XXX: recursively delete dead code
-//		}
-		var val = find(obj, m);
-		if (val != null) return val;
-		if (m.isConst() || IrMethod.?(m) && !m.flags.F_POINTED_AT) pure_loads.put(obj, m, apply);
-		else impure_loads.put(obj, m, apply);
-		return apply;
-	}
-	def loadPtr(ptr: SsaInstr, loadType: Type, apply: SsaApplyOp) -> SsaInstr {
-		var prev = find0(ptr_loads, ptr, loadType);
-		if (prev != null) return prev;
-		ptr_loads.put(ptr, loadType, apply);
-		return apply;
-	}
-	def store(obj: SsaInstr, field: IrField, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
-		var prev = find(obj, field);
-		if (prev == val) { // redundant store of previous value to field
-			apply.remove();
-			apply.kill();
-			return null;
-		}
-		killField(field);
-		impure_loads.put(obj, field, val);
-		return apply;
-	}
-	def storePtr(ptr: SsaInstr, storeType: Type, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
-		var prev = find0(ptr_loads, ptr, storeType);
-		if (prev == val) { // redundant store of previous value to field
-			apply.remove();
-			apply.kill();
-			return null;
-		}
-		ptr_loads.resize(0); // XXX: improve pointer alias analysis, distinguish initializing stores
-		if (!isNarrowingStore(storeType, val)) ptr_loads.put(ptr, storeType, val); // XXX: cache narrowing stores properly
-		return apply;
-	}
-	def isNarrowingStore(storeType: Type, val: SsaInstr) -> bool {
-		match (storeType) {
-			x: PrimType => match (val.getType()) {
-				y: PrimType => return x.width != y.width;
-			}
-		}
-		return false;
-	}
-	def init(obj: SsaInstr, f: IrField, val: SsaInstr) {
-		if (f.isConst() && !f.flags.F_POINTED_AT) pure_loads.put(obj, f, val);
-		else impure_loads.put(obj, f, val);
-	}
-	def copy() -> SsaBlockState {
-		var that = SsaBlockState.new();
-		that.end = this.end;
-		that.inbounds = this.inbounds;
-		that.nonnull = this.nonnull;
-		that.inits = this.inits;
-		that.pure_loads.putv(this.pure_loads);
-		that.impure_loads.putv(this.impure_loads);
-		that.ptr_loads.putv(this.ptr_loads);
-		return that;
-	}
-	def find(obj: SsaInstr, m: IrMember) -> SsaInstr {
-		var r = find0(pure_loads, obj, m);
-		if (r == null) r = find0(impure_loads, obj, m);
-		return r;
-	}
-	def find0<T>(v: Vector<(SsaInstr, T, SsaInstr)>, obj: SsaInstr, m: T) -> SsaInstr {
-		for (i < v.length) {
-			var t = v[i];
-			if (t.0 == obj && t.1 == m) return t.2;
-		}
-		return null;
-	}
-	def killField(f: IrField) {
-		var v = impure_loads, i = 0;
-		for (j < v.length) {
-			var t = v[i];
-			if (t.1 != f) {
-				if (i != j) v[i] = t;
-				i++;
-			}
-		}
-		v.resize(i);
-	}
-	def killPointedAt() {
-		var v = impure_loads, i = 0;
-		for (j < v.length) {
-			var t = v[i];
-			if (!t.1.flags.F_POINTED_AT) {
-				if (i != j) v[i] = t;
-				i++;
-			}
-		}
-		v.resize(i);
-	}
-	def killArrayElems() {
-		ptr_loads.resize(0); // assume pointer loads could alias array elements.
-	}
-}
-
-// Optimizes SSA instructions one at a time, performing such optimizations
-// as const folding, strength reduction, load elimination, and bounds check elimination.
-class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
-	var optimize_loads = true;		// activates load elimination
-	var optimize_nullchecks = true;		// activates null check elimination
-	var optimize_inits = false;		// activates init elimination
-	var optimize_bounds = true;
-	var remove_pure_ops = true;
-	var fold_pure_ops = true;
-	var fold_foldable_ops = true;
-	var graph: SsaGraph;
-	var prev: SsaLink;  			// instruction before the current instruction
-	var next: SsaLink;			// instruction after the current instruction
-	var state = SsaBlockState.new();	// flow sensitive state
-	var foldingArgs: FoldingArguments;
-	var result: SsaInstr;			// replacement for the current instruction
-	
-	def reset(graph: SsaGraph, block: SsaBlock, prev: SsaLink) {
-		this.context.graph = graph;
-		this.context.block = block;
-		this.graph = graph;
-		this.prev = prev;
-		this.state.clear();
+	// Returns {true} if a reduction has ended the current block with a throw.
+	def end() -> bool {
+		return ssa.end();
 	}
 	def reduceBlock(block: SsaBlock) {
-		graph = context.graph;
+		useGraph(context.graph);
 		context.block = block;
+		ssa.block = block;
 		for (i = block.next; SsaInstr.?(i); ()) {
-			next = i.next;
+			var n = i.next;
 			reduceInstr(SsaInstr.!(i));
-			if (state.end) break;
-			i = next;
+			if (end()) break;
+			// Optimizing a block end may have merged a successor block into this one.
+			i = if(SsaEnd.?(i) && i.next == null, ssa.prev.next, n);
 		}
 	}
 	def reduceInstr(i: SsaInstr) -> SsaInstr {
-		prev = i.prev;
+		ssa.setPrev(i.prev);
 		result = i;
 		visit(i);
 		return result;
 	}
+	// Optimizes {i}, which {b} has just appended, and leaves {b} positioned after the result.
+	def optAppended(b: SsaBuilder, i: SsaApplyOp) -> SsaInstr {
+		ssa = b;
+		graph = b.graph;
+		b.setPrev(i.prev); // insert any new instructions before {i}
+		var res = tryOptInstr(i);
+		if (b.end()) return b.unreachable(i.getType()); // a throw killed {i}
+		if (res == i && i.prev != null) {
+			b.setPrev(i);
+		} else { // replaced or killed
+			i.remove();
+			if (res == null) res = graph.nop(); // e.g. a redundant Init
+		}
+		return res;
+	}
 	def visitApplyOp(i: SsaApplyOp) {
-		var res = reduceApplyOp(i);
+		var res = tryOptInstr(i);
 		if (res != i) {
 			i.replace(res);
 			i.remove();
@@ -422,24 +165,21 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def visitIf(i: SsaIf)	{ result = reduceIf(i); }
 	def visitGoto(i: SsaGoto) {
-		var cfopt = SsaCfOptimizer.new(context), block = i.block();
-		if (cfopt.optEdge(block.succ(0))) next = prev.next;
+		optEdge(i.block().succ(0));
 	}
 	def visitSwitch(i: SsaSwitch) {
 		var val = i.input0();
 		if (SsaConst.?(val)) {
-			var cfopt = SsaCfOptimizer.new(context), block = i.block();
-			var succ = i.findSucc(SsaConst.!(val).val);
-			cfopt.replaceWithGoto(block, i, succ);
-			if (cfopt.optEdge(block.succ(0))) next = prev.next;
+			var block = i.block(), succ = i.findSucc(SsaConst.!(val).val);
+			replaceWithGoto(block, i, succ);
+			optEdge(block.succ(0));
 		}
 	}
 	def reduceIf(ifi: SsaIf) -> SsaInstr {
 		var cond = ifi.input0(), block = ifi.block();
 		if (SsaConst.?(cond)) {
-			var cfopt = SsaCfOptimizer.new(context);
-			cfopt.replaceWithGoto(block, ifi, block.succ(if(cond.unbox<bool>(), 0, 1)));
-			if (cfopt.optEdge(block.succ(0))) next = prev.next;
+			replaceWithGoto(block, ifi, block.succ(if(cond.unbox<bool>(), 0, 1)));
+			optEdge(block.succ(0));
 		} else if (SsaApplyOp.?(cond)) {
 			if (SsaApplyOp.!(cond).op.opcode == Opcode.BoolNot) {
 				var cc = cond.input0();
@@ -451,220 +191,231 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		}
 		return ifi;
 	}
-	def reduceApplyOp(i: SsaApplyOp) -> SsaInstr {
+	// Tries to optimize {i}, first by constant folding, then by reduction, and then by CSE.
+	// Returns {i} or the instruction that replaces it.
+	def tryOptInstr(i: SsaApplyOp) -> SsaInstr {
+		var r = tryFold(i);
+		if (r != null) return r;
+		if (remove_pure_ops && i.facts.O_PURE && !i.hasNonDebugUses()) return killUnused(i);
+		r = tryReduce(i);
+		if (r != i) return r;
+		return tryCSE(i);
+	}
+	// Tries to evaluate {i} if its inputs are constants. Returns {null} on failure.
+	def tryFold(i: SsaApplyOp) -> SsaInstr {
 		if (i.facts.O_PURE) {
-			if (fold_pure_ops) {
-				var folded = tryEval(i);
-				if (folded != null) return folded;
-			}
-			if (remove_pure_ops && !i.hasNonDebugUses()) {
-				return killUnused(i);
-			}
+			if (fold_pure_ops) return tryEval(i);
 		} else if (i.facts.O_FOLDABLE) {
-			if (fold_foldable_ops) {
-				var folded = tryEval(i);
-				if (folded != null) return folded;
-			}
+			if (fold_foldable_ops) return tryEval(i);
 		}
+		return null;
+	}
+	// Tries to reduce {i} to a simpler form through its opcode's visit method.
+	def tryReduce(i: SsaApplyOp) -> SsaInstr {
+		if (m == null) m = SsaInstrMatcher.new();
 		result = app = i;
 		visitOp(i.op);
 		return result;
+	}
+	// Tries to replace {i} with an equivalent instruction that dominates it.
+	def tryCSE(i: SsaApplyOp) -> SsaInstr {
+		return i; // TODO: common subexpression elimination
 	}
 	// Replaces the current instruction with {i}.
 	def reduceTo(i: SsaInstr) { result = i; }
 	def visitBoolEq(opcode: Opcode.BoolEq)	{ reduceEq(); }
 	def visitBoolAnd(opcode: Opcode.BoolAnd) {
 		norm_binop(app);
-		if (fold) return reduceTo(graph.boolConst(Bool.unbox(xval) && Bool.unbox(yval))); // K && K => K
-		if (yconst) return reduceTo(if(Bool.unbox(yval), x, graph.falseConst())); // x && K => x
+		if (m.fold) return reduceTo(graph.boolConst(Bool.unbox(m.xval) && Bool.unbox(m.yval))); // K && K => K
+		if (m.yconst) return reduceTo(if(Bool.unbox(m.yval), m.x, graph.falseConst())); // x && K => x
 	}
 	def visitBoolOr(opcode: Opcode.BoolOr) {
 		norm_binop(app);
-		if (fold) return reduceTo(graph.boolConst(Bool.unbox(xval) || Bool.unbox(yval))); // K || K => K
-		if (yconst) return reduceTo(if(Bool.unbox(yval), graph.trueConst(), x));  // x || K => x
+		if (m.fold) return reduceTo(graph.boolConst(Bool.unbox(m.xval) || Bool.unbox(m.yval))); // K || K => K
+		if (m.yconst) return reduceTo(if(Bool.unbox(m.yval), graph.trueConst(), m.x));  // x || K => x
 	}
 	def visitBoolNot(opcode: Opcode.BoolNot) {
-		var xval = unop(app);
-		if (xconst) return reduceTo(graph.boolConst(!Bool.unbox(xval)));  // !K  => K
-		if (x.optag() == Opcode.BoolNot.tag) return reduceTo(x.input0());  // !!x => x
+		var xval = m.unop(app);
+		if (m.xconst) return reduceTo(graph.boolConst(!Bool.unbox(xval)));  // !K  => K
+		if (m.x.optag() == Opcode.BoolNot.tag) return reduceTo(m.x.input0());  // !!x => x
 	}
 	def visitIntEq(opcode: Opcode.IntEq, t: Type)	{ reduceEq(); }
 	def visitIntAdd(opcode: Opcode.IntAdd, it: IntType) {
 		var yint = norm_intbinop(app);
-		if (fold) return reduceTo(fold2i(int.+, long.+)); // K + K == K
-		if (yzero) return reduceTo(x);                    // x + 0 == x
+		if (m.fold) return reduceTo(fold2i(int.+, long.+)); // K + K == K
+		if (m.yzero) return reduceTo(m.x);                    // x + 0 == x
 	}
 	def visitIntSub(opcode: Opcode.IntSub, it: IntType) {
 		var yint = norm_intbinop(app);
-		if (fold) return reduceTo(fold2i(int.-, long.-)); // K - K == K
-		if (yzero) return reduceTo(x);                    // x - 0 == x
+		if (m.fold) return reduceTo(fold2i(int.-, long.-)); // K - K == K
+		if (m.yzero) return reduceTo(m.x);                    // x - 0 == x
 	}
 	def visitIntMul(opcode: Opcode.IntMul, it: IntType) {
 		var yint = norm_intbinop(app);
-		if (yzero) return reduceTo(y);                    // x * 0 == 0
-		if (fold) return reduceTo(fold2i(int.*, long.*)); // K * K == K
-		if (yconst) {
-			if (yis(1)) return reduceTo(x);           // x * 1 == 1
-			if (yis(-1)) return reduceTo(addBinop(inttype.opSub(), graph.nullConst(inttype), x));  // x * -1 == 0 - x
-			if (yis(2)) return reduceTo(addBinop(inttype.opAdd(), x, x));
-			if (yisPowerOf2()) {
+		if (m.yzero) return reduceTo(m.y);                    // x * 0 == 0
+		if (m.fold) return reduceTo(fold2i(int.*, long.*)); // K * K == K
+		if (m.yconst) {
+			if (m.yis(1)) return reduceTo(m.x);           // x * 1 == 1
+			if (m.yis(-1)) return reduceTo(addBinop(m.inttype.opSub(), graph.nullConst(m.inttype), m.x));  // x * -1 == 0 - x
+			if (m.yis(2)) return reduceTo(addBinop(m.inttype.opAdd(), m.x, m.x));
+			if (m.yisPowerOf2()) {
 				// x * 2^k == x << k
-				return reduceTo(addBinop(inttype.opShl(), x, graph.intConst(ylog2())).setFact(Fact.O_NO_SHIFT_CHECK));
+				return reduceTo(addBinop(m.inttype.opShl(), m.x, graph.intConst(m.ylog2())).setFact(Fact.O_NO_SHIFT_CHECK));
 			}
 		}
 	}
 	def visitIntDiv(opcode: Opcode.IntDiv, it: IntType) {
 		var yint = norm_intbinop(app);
-		if (yzero) return reduceTo(addThrow(app.source, V3Exception.DivideByZero)); // fold x / 0
-		if (fold) return reduceTo(fold4i(int./, u32./, long./, u64./));
-		if (yconst) {
+		if (m.yzero) return reduceTo(addThrow(app.source, V3Exception.DivideByZero)); // fold x / 0
+		if (m.fold) return reduceTo(fold4i(int./, u32./, long./, u64./));
+		if (m.yconst) {
 			app.facts |= Facts.O_SAFE_DIVIDE;
-			if (yis(1)) return reduceTo(x);           // x / 1 == x
-			if (yis(-1) && inttype.signed) return reduceTo(addBinop(inttype.opSub(), graph.nullConst(inttype), x)); // x / -1 == 0 - x
-			if (yisPowerOf2() && x.facts.V_NON_NEGATIVE) {
+			if (m.yis(1)) return reduceTo(m.x);           // x / 1 == x
+			if (m.yis(-1) && m.inttype.signed) return reduceTo(addBinop(m.inttype.opSub(), graph.nullConst(m.inttype), m.x)); // x / -1 == 0 - x
+			if (m.yisPowerOf2() && m.x.facts.V_NON_NEGATIVE) {
 				// x / 2^k == x >> k
-				return reduceTo(addBinop(inttype.opShr(), x, graph.intConst(ylog2())).setFact(Fact.O_NO_SHIFT_CHECK));
+				return reduceTo(addBinop(m.inttype.opShr(), m.x, graph.intConst(m.ylog2())).setFact(Fact.O_NO_SHIFT_CHECK));
 			}
 		}
 	}
 	def visitIntMod(opcode: Opcode.IntMod, it: IntType) {
 		var yint = norm_intbinop(app);
-		if (yzero) return reduceTo(addThrow(app.source, V3Exception.DivideByZero)); // fold x % 0
-		if (fold) return reduceTo(fold4i(int.%, u32.%, long.%, u64.%));
-		if (yconst) {
+		if (m.yzero) return reduceTo(addThrow(app.source, V3Exception.DivideByZero)); // fold x % 0
+		if (m.fold) return reduceTo(fold4i(int.%, u32.%, long.%, u64.%));
+		if (m.yconst) {
 			app.facts |= Facts.O_SAFE_DIVIDE;
-			if (yis(1) || (yis(-1) && inttype.signed)) {
+			if (m.yis(1) || (m.yis(-1) && m.inttype.signed)) {
 				// x % +/-1 == 0
-				return reduceTo(if(wide, l_const(0), i_const(0)));
+				return reduceTo(if(m.wide, l_const(0), i_const(0)));
 			}
-			if (yisPowerOf2() && x.facts.V_NON_NEGATIVE) {
+			if (m.yisPowerOf2() && m.x.facts.V_NON_NEGATIVE) {
 				// x % 2^k == x & (2^k - 1)
-				var mask = if(wide, l_const(ylong - 1), i_const(yint - 1));
-				return reduceTo(addBinop(inttype.opAnd(), x, mask).setFact(Fact.V_NON_NEGATIVE));
+				var mask = if(m.wide, l_const(m.ylong - 1), i_const(yint - 1));
+				return reduceTo(addBinop(m.inttype.opAnd(), m.x, mask).setFact(Fact.V_NON_NEGATIVE));
 			}
 		}
-		if ((x.facts & y.facts & Fact.V_NON_NEGATIVE) == Fact.V_NON_NEGATIVE) app.facts |= Fact.V_NON_NEGATIVE;
+		if ((m.x.facts & m.y.facts & Fact.V_NON_NEGATIVE) == Fact.V_NON_NEGATIVE) app.facts |= Fact.V_NON_NEGATIVE;
 	}
 	def visitIntAnd(opcode: Opcode.IntAnd, it: IntType) {
 		norm_intbinop(app);
-		if (yzero) return reduceTo(y);                    // x & 0 == 0
-		if (fold) return reduceTo(fold2i(int.&, long.&)); // K & K == K
-		if (yconst && yis(-1)) return reduceTo(x);        // x & -1 == x
+		if (m.yzero) return reduceTo(m.y);                    // x & 0 == 0
+		if (m.fold) return reduceTo(fold2i(int.&, long.&)); // K & K == K
+		if (m.yconst && m.yis(-1)) return reduceTo(m.x);        // x & -1 == x
 		// (nonneg & x) => nonneg
-		app.facts |= ((x.facts | y.facts) & Fact.V_NON_NEGATIVE);
+		app.facts |= ((m.x.facts | m.y.facts) & Fact.V_NON_NEGATIVE);
 	}
 	def visitIntOr(opcode: Opcode.IntOr, it: IntType) {
 		norm_intbinop(app);
-		if (yzero) return reduceTo(x);                    // x | 0 == x
-		if (fold) return reduceTo(fold2i(int.|, long.|)); // K | K == K
-		if (yconst && yis(-1)) return reduceTo(y);        // x | -1 == -1
+		if (m.yzero) return reduceTo(m.x);                    // x | 0 == x
+		if (m.fold) return reduceTo(fold2i(int.|, long.|)); // K | K == K
+		if (m.yconst && m.yis(-1)) return reduceTo(m.y);        // x | -1 == -1
 		// (neg | x) => neg, (nonzero | x) => nonzero
-		app.facts |= ((x.facts | y.facts) & (Fact.V_BELOW_ZERO | Fact.V_NON_ZERO));
+		app.facts |= ((m.x.facts | m.y.facts) & (Fact.V_BELOW_ZERO | Fact.V_NON_ZERO));
 	}
 	def visitIntXor(opcode: Opcode.IntXor, it: IntType) {
 		norm_intbinop(app);
-		if (yzero) return reduceTo(x);                     // x ^ 0 == x
-		if (x == y) return reduceTo(graph.nullConst(inttype));    // x ^ x == 0
-		if (fold) return reduceTo(fold2i(int.^, long.^));  // K ^ K == K
-		app.facts |= (x.facts & y.facts & Fact.V_NON_NEGATIVE);  // (nonneg ^ nonneg) => nonneg
-		if ((x.facts & y.facts & Fact.V_BELOW_ZERO) == Fact.V_NON_NEGATIVE) app.facts |= Fact.V_NON_NEGATIVE;
+		if (m.yzero) return reduceTo(m.x);                     // x ^ 0 == x
+		if (m.x == m.y) return reduceTo(graph.nullConst(m.inttype));    // x ^ x == 0
+		if (m.fold) return reduceTo(fold2i(int.^, long.^));  // K ^ K == K
+		app.facts |= (m.x.facts & m.y.facts & Fact.V_NON_NEGATIVE);  // (nonneg ^ nonneg) => nonneg
+		if ((m.x.facts & m.y.facts & Fact.V_BELOW_ZERO) == Fact.V_NON_NEGATIVE) app.facts |= Fact.V_NON_NEGATIVE;
 	}
 	// XXX: optimize x << (y & 0x1F) if target automatically masks shiftor values
 	def visitIntShl(opcode: Opcode.IntShl, it: IntType) {
 		var yint = norm_intbinop(app);
-		if (yzero) return reduceTo(x); // x << 0 == x
-		if (fold) {          // K << K == K
-			if (wide) {
-				var y6 = u6.view(ylong);
-				return reduceTo(if(ylong == y6, l_const(xlong << y6), graph.nullConst(inttype)));
+		if (m.yzero) return reduceTo(m.x); // x << 0 == x
+		if (m.fold) {          // K << K == K
+			if (m.wide) {
+				var y6 = u6.view(m.ylong);
+				return reduceTo(if(m.ylong == y6, l_const(m.xlong << y6), graph.nullConst(m.inttype)));
 			} else {
 				var y5 = u5.view(yint);
-				return reduceTo(if(yint == y5, i_const(xint << y5), graph.nullConst(inttype)));
+				return reduceTo(if(yint == y5, i_const(m.xint << y5), graph.nullConst(m.inttype)));
 			}
 		}
-		if (yconst) {
-			if (yrange(0, inttype.width - 1)) app.facts |= Fact.O_NO_SHIFT_CHECK;
-			else return reduceTo(graph.nullConst(inttype));
+		if (m.yconst) {
+			if (m.yrange(0, m.inttype.width - 1)) app.facts |= Fact.O_NO_SHIFT_CHECK;
+			else return reduceTo(graph.nullConst(m.inttype));
 		} else {
-			shiftcheck(app, y);
+			shiftcheck(app, m.y);
 		}
 	}
 	// XXX: optimize x >> (y & 0x1F) if target automatically masks shiftor values
 	def visitIntSar(opcode: Opcode.IntSar, it: IntType) {
 		var yint = norm_intbinop(app);
-		if (yzero) return reduceTo(x);  // x >> 0 == x
-		if (fold) {           // K >> K == K
-			if (wide) {
-				var y6 = u6.view(if(u64.view(ylong) > 63, 63, ylong));
-				return reduceTo(l_const(xlong >> y6));
+		if (m.yzero) return reduceTo(m.x);  // x >> 0 == x
+		if (m.fold) {           // K >> K == K
+			if (m.wide) {
+				var y6 = u6.view(if(u64.view(m.ylong) > 63, 63, m.ylong));
+				return reduceTo(l_const(m.xlong >> y6));
 			} else {
 				var y5 = u5.view(if(u32.view(yint) > 31, 31, yint));
-				return reduceTo(i_const(xint >> y5));
+				return reduceTo(i_const(m.xint >> y5));
 			}
 		}
-		if (yconst) {
-			if (!yrange(0, inttype.width - 1)) {
-				if (x.facts.V_NON_NEGATIVE) return reduceTo(graph.nullConst(inttype));
-				if (x.facts.V_BELOW_ZERO) return reduceTo(graph.intConst(-1));
-				app.inputs[1].update(graph.intConst(inttype.width - 1));
+		if (m.yconst) {
+			if (!m.yrange(0, m.inttype.width - 1)) {
+				if (m.x.facts.V_NON_NEGATIVE) return reduceTo(graph.nullConst(m.inttype));
+				if (m.x.facts.V_BELOW_ZERO) return reduceTo(graph.intConst(-1));
+				app.inputs[1].update(graph.intConst(m.inttype.width - 1));
 			}
 			app.facts |= Fact.O_NO_SHIFT_CHECK;
 		} else {
-			shiftcheck(app, y);
+			shiftcheck(app, m.y);
 		}
 	}
 	// XXX: optimize x >>> (y & 0x1F) if target automatically masks shiftor values
 	def visitIntShr(opcode: Opcode.IntShr, it: IntType) {
 		var yint = norm_intbinop(app);
-		if (yzero) return reduceTo(x); // x >>> 0 = x
-		if (fold) {          // K >>> K = K
-			if (wide) {
-				var y6 = u6.view(ylong);
-				if (ylong == y6) return reduceTo(l_const(Eval.doIntTruncU64(inttype, xlong) >>> y6));
-				return reduceTo(graph.nullConst(inttype));
+		if (m.yzero) return reduceTo(m.x); // x >>> 0 = x
+		if (m.fold) {          // K >>> K = K
+			if (m.wide) {
+				var y6 = u6.view(m.ylong);
+				if (m.ylong == y6) return reduceTo(l_const(Eval.doIntTruncU64(m.inttype, m.xlong) >>> y6));
+				return reduceTo(graph.nullConst(m.inttype));
 			} else {
 				var y5 = u5.view(yint);
-				if (yint == y5) return reduceTo(i_const(Eval.doIntTruncU32(inttype, xint) >>> y5));
-				return reduceTo(graph.nullConst(inttype));
+				if (yint == y5) return reduceTo(i_const(Eval.doIntTruncU32(m.inttype, m.xint) >>> y5));
+				return reduceTo(graph.nullConst(m.inttype));
 			}
 		}
-		if (yconst) {
-			if (yrange(0, inttype.width - 1)) app.facts |= Fact.O_NO_SHIFT_CHECK;
-			else return reduceTo(graph.nullConst(inttype));
+		if (m.yconst) {
+			if (m.yrange(0, m.inttype.width - 1)) app.facts |= Fact.O_NO_SHIFT_CHECK;
+			else return reduceTo(graph.nullConst(m.inttype));
 		} else {
-			shiftcheck(app, y);
+			shiftcheck(app, m.y);
 		}
-		if (y.facts.V_NON_ZERO) app.facts |= Fact.V_NON_NEGATIVE;
+		if (m.y.facts.V_NON_ZERO) app.facts |= Fact.V_NON_NEGATIVE;
 	}
 	def visitIntLt(opcode: Opcode.IntLt, it: IntType) {
 		norm_intbinop(app);
 		// XXX: range analysis for comparisons against constants, particularly 0
-		if (fold) return reduceTo(fold4b(int.<, u32.<, long.<, u64.<));
+		if (m.fold) return reduceTo(fold4b(int.<, u32.<, long.<, u64.<));
 	}
 	def visitIntLteq(opcode: Opcode.IntLteq, it: IntType) {
 		norm_intbinop(app);
 		// XXX: range analysis for comparisons against constants, particularly 0
-		if (fold) return reduceTo(fold4b(int.<=, u32.<=, long.<=, u64.<=));
+		if (m.fold) return reduceTo(fold4b(int.<=, u32.<=, long.<=, u64.<=));
 	}
 	def visitFloatEq(opcode: Opcode.FloatEq, ft: FloatType) {
 		norm_binop(app);
-		if (xconst && Float.isNan(xval)) return reduceTo(graph.falseConst()); // nan == y == false
-		if (yconst && Float.isNan(yval)) return reduceTo(graph.falseConst()); // x == nan == false
+		if (m.xconst && Float.isNan(m.xval)) return reduceTo(graph.falseConst()); // nan == y == false
+		if (m.yconst && Float.isNan(m.yval)) return reduceTo(graph.falseConst()); // x == nan == false
 	}
 	def visitFloatNe(opcode: Opcode.FloatNe, ft: FloatType) {
 		norm_binop(app);
-		if (xconst && Float.isNan(xval)) return reduceTo(graph.trueConst()); // nan != y == true
-		if (yconst && Float.isNan(yval)) return reduceTo(graph.trueConst()); // x != nan == true
+		if (m.xconst && Float.isNan(m.xval)) return reduceTo(graph.trueConst()); // nan != y == true
+		if (m.yconst && Float.isNan(m.yval)) return reduceTo(graph.trueConst()); // x != nan == true
 	}
 	def visitIntViewI(opcode: Opcode.IntViewI, ft: IntType, tt: IntType) {
-		var xval = unop(app);
-		if (xconst) return reduceTo(graph.valConst(tt, Eval.doIntView(ft, tt, xval)));
+		var xval = m.unop(app);
+		if (m.xconst) return reduceTo(graph.valConst(tt, Eval.doIntView(ft, tt, xval)));
 	}
 	def visitRefEq(opcode: Opcode.RefEq, t: Type)	{ reduceEq(); }
 	def visitTupleCreate(opcode: Opcode.TupleCreate, tt: TupleType) {
 		if (op.isPolymorphic()) return;
-		n_op(app);
-		if (!fold) return;
+		m.n_op(app);
+		if (!m.fold) return;
 		// (K, ..., K) => K
 		var inputs = app.inputs;
 		var vals = Array<Val>.new(inputs.length);
@@ -672,15 +423,15 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return reduceTo(graph.valConst(op.sig.returnType(), BoxVal.new(vals)));
 	}
 	def visitTupleGetElem(opcode: Opcode.TupleGetElem, tt: TupleType) {
-		var xval = unop(app);
-		if (xconst) {
+		var xval = m.unop(app);
+		if (m.xconst) {
 			// fold K.N
 			var val = BoxVal.!(xval), t = Lists.get(tt.nested, opcode.index);
 			return reduceTo(graph.valConst(t, if(val != null, val.values[opcode.index], null)));
 		}
-		if (x.optag() == Opcode.TupleCreate.tag) {
+		if (m.x.optag() == Opcode.TupleCreate.tag) {
 			// TupleGetElem[n](x:TupleCreate(...)) => x[n]
-			return reduceTo(SsaApplyOp.!(x).inputs[opcode.index].dest);
+			return reduceTo(SsaApplyOp.!(m.x).inputs[opcode.index].dest);
 		}
 	}
 	def visitArrayAlloc(opcode: Opcode.ArrayAlloc, at: ArrayType) {
@@ -694,42 +445,42 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			}
 			return reduceTo(killUnused(app));
 		}
-		state.init(app, ARRAY_LENGTH_FIELD, app.input0());
+		if (state != null) state.init(app, ARRAY_LENGTH_FIELD, app.input0());
 	}
 	def visitArrayInit(opcode: Opcode.ArrayInit, at: ArrayType) {
 		if (op.isPolymorphic()) return;
-		n_op(app);
+		m.n_op(app);
 		if (remove_pure_ops && app.useList == null) return reduceTo(killUnused(app)); // unused empty array init
-		if (true || !fold) return; // TODO: can fold array init if identity not observed
+		if (true || !m.fold) return; // TODO: can fold array init if identity not observed
 		var record = context.prog.newRecord(at, app.inputs.length);
 		for (j < app.inputs.length) record.values[j] = SsaConst.!(app.inputs[j].dest).val;
 		return reduceTo(graph.recordConst(record));
 	}
 	def visitArrayGetElem(opcode: Opcode.ArrayGetElem, at: ArrayType, it: IntType) {
 		var receiver = boundscheck(app);
-		if (state.end) return reduceTo(receiver);
+		if (end()) return reduceTo(receiver);
 		if (!app.facts.O_PURE) return;
 		var yval = norm_binop(app);
 		// ArrayGetElem(#array, #index) => K
 		var values: Array<Val>;
-		match (xval) {
+		match (m.xval) {
 			x: Record => values = x.values;
 			x: Address<Record> => values = x.val.values;
 			_ => ;
 		}
-		if (fold) return reduceTo(graph.valConst(app.getType(), values[V3.unboxI32(yval)]));
+		if (m.fold) return reduceTo(graph.valConst(app.getType(), values[V3.unboxI32(yval)]));
 	}
 	def visitArraySetElem(opcode: Opcode.ArraySetElem, at: ArrayType, it: IntType, et: Type) {
 		var receiver = boundscheck(app);
-		if (state.end) return reduceTo(receiver);
-		if (optimize_loads) state.killArrayElems();
+		if (end()) return reduceTo(receiver);
+		if (optimize_loads && state != null) state.killArrayElems();
 	}
-	def visitArraySetElemElem(opcode: Opcode.ArraySetElemElem, at: ArrayType, it: IntType, et: Type)	{ if (optimize_loads) state.killArrayElems(); }
+	def visitArraySetElemElem(opcode: Opcode.ArraySetElemElem, at: ArrayType, it: IntType, et: Type)	{ if (optimize_loads && state != null) state.killArrayElems(); }
 	def visitArrayGetLength(opcode: Opcode.ArrayGetLength, at: ArrayType) {
 		var receiver = nullcheck(app);
-		if (state.end) return reduceTo(receiver);
-		var xval = unop(app);
-		if (xconst) return reduceTo(graph.intConst(Record.!(xval).values.length));
+		if (end()) return reduceTo(receiver);
+		var xval = m.unop(app);
+		if (m.xconst) return reduceTo(graph.intConst(Record.!(xval).values.length));
 		if (receiver.optag() == Opcode.ArrayInit.tag) {
 			// ArrayGetLength(ArrayInit(...)) => |...|
 			return reduceTo(graph.intConst(receiver.inputs.length));
@@ -738,13 +489,13 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			// ArrayGetLength(ArrayAlloc(x)) => x
 			return reduceTo(receiver.input0());
 		}
-		if (optimize_loads) return reduceTo(state.load(receiver, ARRAY_LENGTH_FIELD, app));
+		if (optimize_loads && state != null) return reduceTo(state.load(receiver, ARRAY_LENGTH_FIELD, app));
 	}
-	def visitRangeSetElem(opcode: Opcode.RangeSetElem, rt: RangeType, it: IntType, et: Type)	{ if (optimize_loads) state.killArrayElems(); }
-	def visitNormRangeSetElem(opcode: Opcode.NormRangeSetElem, at: ArrayType, it: IntType)		{ if (optimize_loads) state.killArrayElems(); }
-	def visitNormRangeSetElemElem(opcode: Opcode.NormRangeSetElemElem, at: ArrayType, it: IntType)	{ if (optimize_loads) state.killArrayElems(); }
+	def visitRangeSetElem(opcode: Opcode.RangeSetElem, rt: RangeType, it: IntType, et: Type)	{ if (optimize_loads && state != null) state.killArrayElems(); }
+	def visitNormRangeSetElem(opcode: Opcode.NormRangeSetElem, at: ArrayType, it: IntType)		{ if (optimize_loads && state != null) state.killArrayElems(); }
+	def visitNormRangeSetElemElem(opcode: Opcode.NormRangeSetElemElem, at: ArrayType, it: IntType)	{ if (optimize_loads && state != null) state.killArrayElems(); }
 	def visitInit(opcode: Opcode.Init) {
-		if (!optimize_inits) return;
+		if (!optimize_inits || state == null) return;
 		for (l = state.inits; l != null; l = l.tail) {
 			if (l.head == opcode.method) return reduceTo(null);  // init[m]; init[m] => init[m]
 		}
@@ -759,21 +510,21 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				return reduceTo(if(lit.exactType != opcode.field.fieldType, convert(const, opcode.field.fieldType), const));
 			}
 		}
-		if (optimize_loads) return reduceTo(state.load(null, opcode.field, app));
+		if (optimize_loads && state != null) return reduceTo(state.load(null, opcode.field, app));
 	}
 	def visitComponentSetField(opcode: Opcode.ComponentSetField, ct: ComponentType) {
-		if (optimize_loads) state.store(null, opcode.field, app, app.input1());  // forward stores
+		if (optimize_loads && state != null) state.store(null, opcode.field, app, app.input1());  // forward stores
 	}
 	def visitClassAlloc(opcode: Opcode.ClassAlloc, ct: ClassType) {
 		if (remove_pure_ops && app.useList == null) return reduceTo(killUnused(app)); // unused empty alloc
 	}
 	def visitClassNew(opcode: Opcode.ClassNew, ct: ClassType) {
-		if (!app.facts.O_PURE) state.kill(); // XXX: Fact.O_NO_SIDEFFECT
+		if (!app.facts.O_PURE && state != null) state.kill(); // XXX: Fact.O_NO_SIDEFFECT
 	}
 	def visitClassGetField(opcode: Opcode.ClassGetField, ct: ClassType) {
 		// XXX: optimize ClassGetField[descriptor](ClassAlloc(x, ...) => x
 		var receiver = nullcheck(app);
-		if (state.end) return reduceTo(receiver);
+		if (end()) return reduceTo(receiver);
 		if (opcode.field.isConst()) {
 			if (SsaConst.?(receiver)) {
 				// ClassGetField(#K) => #K
@@ -786,23 +537,23 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			app.facts |= Fact.O_FOLDABLE;
 			if (remove_pure_ops && app.facts.O_PURE && app.useList == null) return reduceTo(killUnused(app));
 		}
-		if (optimize_loads) return reduceTo(state.load(receiver, opcode.field, app));
+		if (optimize_loads && state != null) return reduceTo(state.load(receiver, opcode.field, app));
 	}
 	def visitClassInitField(opcode: Opcode.ClassInitField, ct: ClassType) {
 		app.facts |= Fact.O_NO_NULL_CHECK;
-		if (optimize_loads) state.init(app.input0(), opcode.field, app.input1());  // forward stores
+		if (optimize_loads && state != null) state.init(app.input0(), opcode.field, app.input1());  // forward stores
 	}
 	def visitClassSetField(opcode: Opcode.ClassSetField, ct: ClassType) {
 		var receiver = nullcheck(app);
-		if (state.end) return reduceTo(receiver);
-		if (optimize_loads) state.store(receiver, opcode.field, app, app.input1());  // forward stores
+		if (end()) return reduceTo(receiver);
+		if (optimize_loads && state != null) state.store(receiver, opcode.field, app, app.input1());  // forward stores
 	}
 	def visitClassGetMethod(opcode: Opcode.ClassGetMethod, meth: IrSpec) {
 		var receiver = nullcheck(app);
-		if (state.end) return reduceTo(receiver);
+		if (end()) return reduceTo(receiver);
 		if (op.isPolymorphic()) return;
-		var xval = unop(app);
-		if (xconst) {
+		var xval = m.unop(app);
+		if (m.xconst) {
 			// ClassGetMethod[m](#K) => (m, #K)
 			var obj = Record.!(xval);
 			return reduceTo(graph.valConst(meth.getBoundType(), Closure.new(obj, meth)));
@@ -810,11 +561,11 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def visitClassGetVirtual(opcode: Opcode.ClassGetVirtual, meth: IrSpec) {
 		var receiver = nullcheck(app);
-		if (state.end) return reduceTo(receiver);
+		if (end()) return reduceTo(receiver);
 		var dv = devirtualize(meth, receiver);
 		if (dv != null) {
-			var xval = unop(app);
-			if (xconst && !op.isPolymorphic()) {  // ClassGetVirtual[m](K) => (m, K)
+			var xval = m.unop(app);
+			if (m.xconst && !op.isPolymorphic()) {  // ClassGetVirtual[m](K) => (m, K)
 				var obj = Record.!(xval);
 				return reduceTo(graph.valConst(dv.getBoundType(), Closure.new(obj, dv)));
 			}
@@ -824,7 +575,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	// XXX: combine with ClassGetVirtual
 	def visitClassGetSelector(opcode: Opcode.ClassGetSelector, meth: IrSpec) {
 		var receiver = nullcheck(app);
-		if (state.end) return reduceTo(receiver);
+		if (end()) return reduceTo(receiver);
 		var dv = devirtualize(meth, receiver);
 		if (dv != null) {
 			var val = if(!dv.member.flags.M_UNREACHABLE, FuncVal.new(dv));
@@ -833,14 +584,14 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def visitVariantEq(opcode: Opcode.VariantEq, vt: ClassType) {
 		norm_binop(app);
-		if (fold) return reduceTo(graph.boolConst(Values.equal(xval, yval)));
+		if (m.fold) return reduceTo(graph.boolConst(Values.equal(m.xval, m.yval)));
 		// XXX: look through type casts and subsumes for VariantEq
-		var and = x.facts & y.facts, or = x.facts | y.facts;
+		var and = m.x.facts & m.y.facts, or = m.x.facts | m.y.facts;
 		if (Facts.NONE != (and & Fact.V_ZERO)) return reduceTo(graph.trueConst()); // 0 == 0 == true
 	}
 	def visitVariantGetTag(opcode: Opcode.VariantGetTag, vt: ClassType) {
-		var xval = unop(app);
-		if (fold) {
+		var xval = m.unop(app);
+		if (m.fold) {
 			// GetVariantTag(#K) => #K
 			if (Record.?(xval)) return reduceTo(graph.intConst(V3.getVariantTag(Record.!(xval).rtype)));
 			return reduceTo(graph.intConst(V3.unboxI32(xval)));
@@ -848,8 +599,8 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def visitVariantAlloc(opcode: Opcode.VariantAlloc, vt: ClassType) {
 		if (op.isPolymorphic()) return;
-		n_op(app);
-		if (!fold) return;
+		m.n_op(app);
+		if (!m.fold) return;
 		// VariantAlloc(#K, #K ..) => #K (variant)
 		var ic = context.prog.ir.getIrClass(vt);
 		if (ic == null) return;  // TODO: can occur for closure classes
@@ -876,7 +627,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def visitVariantGetField(opcode: Opcode.VariantGetField, vt: ClassType) {
 		var receiver = app.input0();
-		if (state.end) return reduceTo(receiver);
+		if (end()) return reduceTo(receiver);
 		if (SsaConst.?(receiver)) {
 			// VariantGetField(#K) => #K
 			var record = asRecord(receiver);
@@ -892,13 +643,13 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			// Ugly: avoid arity mismatch problems for tuple/void fields
 			if (ic != null && r.inputs.length == ic.fields.length) return reduceTo(r.inputs[opcode.field.index].dest);
 		}
-		if (optimize_loads) return reduceTo(state.load(receiver, opcode.field, app));
+		if (optimize_loads && state != null) return reduceTo(state.load(receiver, opcode.field, app));
 	}
 	def visitVariantGetMethod(opcode: Opcode.VariantGetMethod, meth: IrSpec) {
 		var receiver = app.input0();
 		if (op.isPolymorphic()) return;
-		var xval = unop(app);
-		if (xconst) {
+		var xval = m.unop(app);
+		if (m.xconst) {
 			// VariantGetMethod[m](#K) => (m, #K)
 			var obj = Record.!(xval);
 			var val = if(!meth.member.flags.M_UNREACHABLE, Closure.new(obj, meth));
@@ -910,8 +661,8 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		var receiver = app.input0();
 		var dv = devirtualize(meth, receiver);
 		if (dv != null) {
-			var xval = unop(app);
-			if (xconst && !op.isPolymorphic()) {  // VariantGetVirtual[m](K) => (m, K)
+			var xval = m.unop(app);
+			if (m.xconst && !op.isPolymorphic()) {  // VariantGetVirtual[m](K) => (m, K)
 				var obj = Record.!(xval);
 				var val = if(!dv.member.flags.M_UNREACHABLE, Closure.new(obj, dv));
 				return reduceTo(graph.valConst(dv.getBoundType(), val));
@@ -925,20 +676,20 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def visitBoundsCheck(opcode: Opcode.BoundsCheck, t: Type) {
 		var receiver = boundscheck(app);
-		if (state.end) return reduceTo(receiver);
+		if (end()) return reduceTo(receiver);
 		if (app.checkFact(Facts.O_SAFE_BOUNDS)) return reduceTo(Ssa.killInstr(app));
 	}
 	def visitConditionalThrow(opcode: Opcode.ConditionalThrow) {
-		var xval = unop(app);
-		if (!fold) return;
+		var xval = m.unop(app);
+		if (!m.fold) return;
 		// ConditionalThrow(#K) => throw | nop
 		if (Bool.unbox(xval)) return reduceTo(addThrow(app.source, opcode.exception));
 		else return reduceTo(Ssa.killInstr(app));
 	}
 	def visitOverloadedEq(opcode: Opcode.OverloadedEq, t: Type) {
 		norm_binop(app);
-		if (fold) return reduceTo(graph.boolConst(Values.equal(xval, yval)));
-		var and = x.facts & y.facts;
+		if (m.fold) return reduceTo(graph.boolConst(Values.equal(m.xval, m.yval)));
+		var and = m.x.facts & m.y.facts;
 		if (Facts.NONE != (and & Fact.V_ZERO)) return reduceTo(graph.trueConst()); // 0 == 0 == true
 		// XXX: look through type casts subsumes for OverloadedEq
 	}
@@ -949,15 +700,15 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
 			FunctionWrapping.printWrap()
 				.put3("SsaOptimizer TypeCast from %q  to %q  cast %s", ft.render, tt.render, cast.name)
-				.put2("  xconst %z  # inputs %d", xconst, app.inputs.length).outln();
+				.put2("  xconst %z  # inputs %d", m.xconst, app.inputs.length).outln();
 		}
 		if (app.inputs.length == 0) {
 			// special cast of casting void -> X
 			if (cast == TypeCast.THROW) return reduceTo(addThrow(app.source, V3Exception.TypeCheck)); // fold TypeCast
 			return;
 		}
-		var xval = unop(app);
-		if (xconst && cast != TypeCast.UNKNOWN_CAST) {
+		var xval = m.unop(app);
+		if (m.xconst && cast != TypeCast.UNKNOWN_CAST) {
 			var r = Eval.doCast(cast, ft, tt, xval);
 			if (r.0) return reduceTo(graph.valConst(tt, r.1));
 			else return reduceTo(addThrow(app.source, V3Exception.TypeCheck));
@@ -967,14 +718,14 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		match (cast) {
 			TRUE, SUBSUME => {
 				if (context.compiler.NormConfig.WrapFuncTypeSubsume && Function_TypeCon.?(tt.typeCon)) return;
-				return reduceTo(x); // fold TypeCast
+				return reduceTo(m.x); // fold TypeCast
 			}
 			THROW => {
 				return reduceTo(addThrow(app.source, V3Exception.TypeCheck)); // fold TypeCast
 			}
 			THROW_IF_NOT_NULL => {
 				// TypeCast -> ConditionalThrow(x != null)
-				var cmp = addNot(addEqual(ft, x, graph.nullConst(ft)));
+				var cmp = addNot(addEqual(ft, m.x, graph.nullConst(ft)));
 				addConditionalThrow(app.source, V3Exception.TypeCheck, cmp);
 				return reduceTo(graph.nullConst(tt));
 			}
@@ -982,10 +733,10 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 				return reduceTo(replaceOp(app, V3Op.newIntViewI(ft, tt)));
 			}
 			ENUM_TO_SET => {
-				return reduceTo(addEnumToSet(EnumSetType.!(tt), x));
+				return reduceTo(addEnumToSet(EnumSetType.!(tt), m.x));
 			}
 			_ => {
-				if (x.facts.V_NON_ZERO) {
+				if (m.x.facts.V_NON_ZERO) {
 					app.facts |= Fact.O_NO_NULL_CHECK | Fact.V_NON_ZERO;
 				}
 			}
@@ -999,106 +750,106 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			if (query == TypeQuery.FALSE) return reduceTo(graph.falseConst());
 			return;
 		}
-		var xval = unop(app);
-		if (xconst && query != TypeQuery.UNKNOWN_QUERY) {
+		var xval = m.unop(app);
+		if (m.xconst && query != TypeQuery.UNKNOWN_QUERY) {
 			return reduceTo(graph.boolConst(Eval.doQuery(query, ft, tt, xval)));
 		}
 		if (query == TypeQuery.TRUE) return reduceTo(graph.trueConst());
 		if (query == TypeQuery.FALSE) return reduceTo(graph.falseConst());
-		if (query == TypeQuery.TRUE_IF_NOT_NULL) return reduceTo(addNotEqual(ft, x, graph.nullConst(ft)));
-		if (x.facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
+		if (query == TypeQuery.TRUE_IF_NOT_NULL) return reduceTo(addNotEqual(ft, m.x, graph.nullConst(ft)));
+		if (m.x.facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
 	}
 	def visitTypeSubsume(opcode: Opcode.TypeSubsume, ft: Type, tt: Type) {
-		var xval = unop(app);
-		if (xconst) return reduceTo(graph.valConst(tt, xval));
-		if (ft == tt) return reduceTo(x); // fold TypeSubsume<T, T>(x)
-		if (tt == x.getType()) return reduceTo(x); // fold TypeSubsume<F, T>(x: T)
+		var xval = m.unop(app);
+		if (m.xconst) return reduceTo(graph.valConst(tt, xval));
+		if (ft == tt) return reduceTo(m.x); // fold TypeSubsume<T, T>(x)
+		if (tt == m.x.getType()) return reduceTo(m.x); // fold TypeSubsume<F, T>(x: T)
 		match (tt.typeCon.kind) {
 			CLASS, VARIANT => {
 				if (ft == Null.TYPE) return reduceTo(graph.nullConst(tt));
-				if (TypeSystem.isSubtype(ft, tt)) return reduceTo(x); // remove redundant subsume of class
+				if (TypeSystem.isSubtype(ft, tt)) return reduceTo(m.x); // remove redundant subsume of class
 			}
 			ENUM_SET => {
-				return reduceTo(addEnumToSet(EnumSetType.!(tt), x));
+				return reduceTo(addEnumToSet(EnumSetType.!(tt), m.x));
 			}
 			_ => ;
 			// XXX: int subsume and tuples
 		}
-		if (x.facts.V_NON_ZERO) {
+		if (m.x.facts.V_NON_ZERO) {
 			app.facts |= Fact.O_NO_NULL_CHECK | Fact.V_NON_ZERO;
 		}
 	}
 	def visitCallMethod(opcode: Opcode.CallMethod, spec: IrSpec) {
 		app.facts |= opcode.method.facts & Fact.O_PURE;
 		if (app.inputs.length > 0 && app.input0().facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
-		state.kill();
+		if (state != null) state.kill();
 	}
 	def visitCallClassMethod(opcode: Opcode.CallClassMethod, spec: IrSpec) {
 		app.facts |= opcode.method.facts & Fact.O_PURE;
 		var target = nullcheck(app);
-		state.kill();
-		if (SsaThrow.?(target) || state.end) return reduceTo(target);
+		if (state != null) state.kill();
+		if (SsaThrow.?(target) || end()) return reduceTo(target);
 		var x = app.input0();
-		if (x == null) Terminal.put2("@%d:CallClassMethod(0) == null, end=%z\n", app.uid, state.end);
+		if (x == null) Terminal.put2("@%d:CallClassMethod(0) == null, end=%z\n", app.uid, end());
 		if (app.inputs.length > 0 && app.input0().facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
 	}
 	def visitCallClassVirtual(opcode: Opcode.CallClassVirtual, meth: IrSpec) {
 		var receiver = app.input0();
 		receiver = nullcheck(app);
-		if (state.end) return reduceTo(receiver);
+		if (end()) return reduceTo(receiver);
 		if (app.input0().facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
 		var dv = devirtualize(meth, receiver);
-		state.kill();
+		if (state != null) state.kill();
 		if (dv != null) return reduceTo(replaceOp(app, V3Op.newCallClassMethod(dv)));  // CallClassVirtual[m](K) => CallClassMethod[m](k)
 	}
 	def visitCallVariantVirtual(opcode: Opcode.CallVariantVirtual, meth: IrSpec) {
 		var receiver = app.input0();
 		if (app.input0().facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
 		var dv = devirtualize(meth, receiver);
-		state.kill();
+		if (state != null) state.kill();
 		if (dv != null) return reduceTo(replaceOp(app, V3Op.newCallMethod(dv)));  // CallVariantVirtual[m](K) => CallMethod[m](k)
 	}
 	// XXX: optimize CallVariantSelector
-	def visitCallVariantSelector(opcode: Opcode.CallVariantSelector, spec: IrSpec)	{ state.kill(); }
+	def visitCallVariantSelector(opcode: Opcode.CallVariantSelector, spec: IrSpec)	{ if (state != null) state.kill(); }
 	def visitCallClosure(opcode: Opcode.CallClosure, ft: FuncType) {
 		var target = nullcheck(app);
-		state.kill();
-		if (SsaThrow.?(target) || state.end) return reduceTo(target);
-		var xval = unop(app), xop: Operator;
+		if (state != null) state.kill();
+		if (SsaThrow.?(target) || end()) return reduceTo(target);
+		var xval = m.unop(app), xop: Operator;
 		var i_recvr: SsaInstr, newOp: Operator, newFacts: Fact.set;
-		if (xconst) {
+		if (m.xconst) {
 			var d = Closure.!(xval);
 			if (d == null) return reduceTo(addThrow(app.source, V3Exception.NullCheck));
 			// CallClosure(K) => CallMethod[K.m]
 			i_recvr = graph.valConst(d.memberRef.getClosureReceiver(), d.val);
 			newOp = V3Op.newCallMethod(d.memberRef);
 			newFacts = Fact.O_NO_NULL_CHECK;
-		} else if (SsaApplyOp.?(x)) match ((xop = SsaApplyOp.!(x).op).opcode) {
+		} else if (SsaApplyOp.?(m.x)) match ((xop = SsaApplyOp.!(m.x).op).opcode) {
 			// XXX: look through TypeCast / TypeSubsume of functions
 			ClassGetMethod(method) => {
 				// CallClosure(GetClassMethod[m]) => CallMethod[m]
 				var spec = V3Op.extractIrSpec(xop, method);
 				newOp = V3Op.newCallMethod(spec);
-				i_recvr = x.input0();
+				i_recvr = m.x.input0();
 				newFacts = app.facts & Fact.O_NO_NULL_CHECK;
 			}
 			ClassGetVirtual(method) => {
 				// CallClosure(GetClassVirtual[m]) => CallClassVirtual[m]
 				var spec = V3Op.extractIrSpec(xop, method);
 				newOp = V3Op.newCallClassVirtual(spec);
-				i_recvr = x.input0();
+				i_recvr = m.x.input0();
 				newFacts = app.facts & Fact.O_NO_NULL_CHECK;
 			}
 			CreateClosure(method) => {
 				// CallClosure(CreateClosure[m](p), ...) => CallMethod[m](p, ...);
 				var spec = V3Op.extractIrSpec(xop, method);
 				newOp = V3Op.newCallMethod(spec);
-				i_recvr = if (V3.isComponent(spec.receiver), graph.nullReceiver(), x.input0());
+				i_recvr = if (V3.isComponent(spec.receiver), graph.nullReceiver(), m.x.input0());
 				if (V3.isComponent(spec.receiver)) newFacts |= Fact.O_NO_NULL_CHECK;
-				else newFacts |= x.facts & Fact.O_NO_NULL_CHECK;
+				else newFacts |= m.x.facts & Fact.O_NO_NULL_CHECK;
 			}
 			_ => {
-				if (!app.facts.O_PURE) state.kill();
+				if (!app.facts.O_PURE && state != null) state.kill();
 			}
 		}
 		if (newOp != null) return reduceTo(replaceWithDirectCall(app, newOp, i_recvr, app.inputs[1 ...]).setFact(newFacts));
@@ -1106,9 +857,9 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	def visitCallFunction(opcode: Opcode.CallFunction, ft: FuncType) {
 		var target = nullcheck(app);
 		if (SsaThrow.?(target)) return reduceTo(target);
-		state.kill();
-		var xval = unop(app);
-		if (xconst && FuncVal.?(xval)) {
+		if (state != null) state.kill();
+		var xval = m.unop(app);
+		if (m.xconst && FuncVal.?(xval)) {
 			var d = FuncVal.!(xval);
 			if (d == null) return reduceTo(addThrow(app.source, V3Exception.NullCheck));
 			// CallFunction(#K) => CallMethod
@@ -1119,22 +870,22 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def visitCreateClosure(opcode: Opcode.CreateClosure, spec: IrSpec) {
 		if (op.isPolymorphic()) return;
-		var xval = unop(app);
-		if (!fold) return;
+		var xval = m.unop(app);
+		if (!m.fold) return;
 		// CreateClosure(#K) => #K
 		return reduceTo(graph.valConst(spec.getBoundType(), Closure.new(xval, spec)));
 	}
-	def visitRefLayoutSetField(opcode: Opcode.RefLayoutSetField, rt: RefType, ft: Type)			{ if (optimize_loads) state.killArrayElems(); }
-	def visitRefLayoutSetRepeatedField(opcode: Opcode.RefLayoutSetRepeatedField, rt: RefType, ft: Type)	{ if (optimize_loads) state.killArrayElems(); }
-	def visitByteArraySetField(opcode: Opcode.ByteArraySetField, ft: Type, startType: Type)			{ if (optimize_loads) state.killArrayElems(); }
-	def visitSystemCall(opcode: Opcode.SystemCall)								{ state.kill(); }
+	def visitRefLayoutSetField(opcode: Opcode.RefLayoutSetField, rt: RefType, ft: Type)			{ if (optimize_loads && state != null) state.killArrayElems(); }
+	def visitRefLayoutSetRepeatedField(opcode: Opcode.RefLayoutSetRepeatedField, rt: RefType, ft: Type)	{ if (optimize_loads && state != null) state.killArrayElems(); }
+	def visitByteArraySetField(opcode: Opcode.ByteArraySetField, ft: Type, startType: Type)			{ if (optimize_loads && state != null) state.killArrayElems(); }
+	def visitSystemCall(opcode: Opcode.SystemCall)								{ if (state != null) state.kill(); }
 	def visitPtrAdd(opcode: Opcode.PtrAdd, pt: Type, it: IntType) {
-		binop(app);
-		if (yzero) return reduceTo(x);
-		if (!fold) return;
-		if (!Addr.?(xval)) return;
-		var a = Addr.!(xval);
-		match (yval) {
+		m.binop(app);
+		if (m.yzero) return reduceTo(m.x);
+		if (!m.fold) return;
+		if (!Addr.?(m.xval)) return;
+		var a = Addr.!(m.xval);
+		match (m.yval) {
 			yi: Box<int> => { // TODO(addr64)
 				var na: Addr;
 				if (a != null) {
@@ -1149,22 +900,24 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def visitPtrCmpSwp(opcode: Opcode.PtrCmpSwp, pt: PointerType, vt: Type) {
 		nullcheck(app);
-		state.kill();
+		if (state != null) state.kill();
 	}
 	// XXX: PtrAdd, PtrSub, PtrLt
 	def visitPtrLoad(opcode: Opcode.PtrLoad, pt: Type, vt: Type) {
 		var ptr = nullcheck(app);
 		// XXX: use Fact.O_FOLDABLE to indicate a load of an immutable value
-		if (optimize_loads) {
+		if (optimize_loads && state != null) {
 			return reduceTo(state.loadPtr(ptr, vt, app));
 		}
 	}
 	def visitPtrStore(opcode: Opcode.PtrStore, pt: Type, vt: Type) {
 		var ptr = nullcheck(app);
-		state.killArrayElems();
-		state.killPointedAt();
+		if (state != null) {
+			state.killArrayElems();
+			state.killPointedAt();
+		}
 		// XXX: use a fact to indicate an initializing store that cannot kill previous loads
-		if (optimize_loads) {
+		if (optimize_loads && state != null) {
 			state.storePtr(ptr, vt, app, app.input1());
 		}
 	}
@@ -1175,17 +928,17 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			if (target == null) return reduceTo(addThrow(app.source, V3Exception.NullCheck));
 			// XXX: CallAddress(#K) => CallMethod
 		}
-		state.kill();
+		if (state != null) state.kill();
 	}
-	def visitCallKernel(opcode: Opcode.CallKernel, typeArgs: Array<Type>)	{ state.kill(); }
-	def visitDefaultOp(op: Operator)					{ if (!app.facts.O_PURE) state.kill(); }
+	def visitCallKernel(opcode: Opcode.CallKernel, typeArgs: Array<Type>)	{ if (state != null) state.kill(); }
+	def visitDefaultOp(op: Operator)					{ if (!app.facts.O_PURE && state != null) state.kill(); }
 	def reduceEq() {
 		def ABOVE_BELOW_ZERO = Fact.V_NON_ZERO | Fact.V_NON_NEGATIVE | Fact.V_BELOW_ZERO;
 		norm_binop(app);
-		if (fold) return reduceTo(graph.boolConst(Values.equal(xval, yval)));
-		if (x == y) return reduceTo(graph.trueConst());
+		if (m.fold) return reduceTo(graph.boolConst(Values.equal(m.xval, m.yval)));
+		if (m.x == m.y) return reduceTo(graph.trueConst());
 		// XXX: look through type casts and subsumes for RefEq
-		var and = x.facts & y.facts, or = x.facts | y.facts;
+		var and = m.x.facts & m.y.facts, or = m.x.facts | m.y.facts;
 		if (Facts.NONE != (and & Fact.V_ZERO)) return reduceTo(graph.trueConst()); // 0 == 0 == true
 		if (ABOVE_BELOW_ZERO == (or & ABOVE_BELOW_ZERO)) return reduceTo(graph.falseConst()); // neg == pos == false
 	}
@@ -1215,11 +968,11 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def norm_binop(i: SsaApplyOp) -> Val {
 		if (i.inputs.length != 2) norm2(i);
-		return binop(i);
+		return m.binop(i);
 	}
 	def norm_intbinop(i: SsaApplyOp) -> int {
 		if (i.inputs.length != 2) norm2(i);
-		return intbinop(i);
+		return m.intbinop(i);
 	}
 	def norm2(i: SsaApplyOp) {
 		var t = i.input0();
@@ -1231,15 +984,15 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		i.setInputs([x, y]);
 	}
 	def fold4b(s: (int, int) -> bool, u: (u32, u32) -> bool, sl: (long, long) -> bool, ul: (u64, u64) -> bool) -> SsaInstr {
-		if (!wide) return graph.boolConst(if(inttype.signed, s(xint, yint), u(u32.view(xint), u32.view(yint))));
-		else return graph.boolConst(if(inttype.signed, sl(xlong, ylong), ul(u64.view(xlong), u64.view(ylong))));
+		if (!m.wide) return graph.boolConst(if(m.inttype.signed, s(m.xint, m.yint), u(u32.view(m.xint), u32.view(m.yint))));
+		else return graph.boolConst(if(m.inttype.signed, sl(m.xlong, m.ylong), ul(u64.view(m.xlong), u64.view(m.ylong))));
 	}
 	def fold4i(s: (int, int) -> int, u: (u32, u32) -> u32, sl: (long, long) -> long, ul: (u64, u64) -> u64) -> SsaInstr {
-		if (!wide) return if(inttype.signed, i_const(s(xint, yint)), u_const(u(u32.view(xint), u32.view(yint))));
-		else return if(inttype.signed, l_const(sl(xlong, ylong)), lu_const(ul(u64.view(xlong), u64.view(ylong))));
+		if (!m.wide) return if(m.inttype.signed, i_const(s(m.xint, m.yint)), u_const(u(u32.view(m.xint), u32.view(m.yint))));
+		else return if(m.inttype.signed, l_const(sl(m.xlong, m.ylong)), lu_const(ul(u64.view(m.xlong), u64.view(m.ylong))));
 	}
 	def fold2i(s: (int, int) -> int, sl: (long, long) -> long) -> SsaInstr {
-		return if(wide, l_const(sl(xlong, ylong)), i_const(s(xint, yint)));
+		return if(m.wide, l_const(sl(m.xlong, m.ylong)), i_const(s(m.xint, m.yint)));
 	}
 
 	def replaceWithDirectCall(i_old: SsaApplyOp, newOp: Operator, i_recvr: SsaInstr, ai_old: Range<SsaDfEdge>) -> SsaInstr {
@@ -1295,16 +1048,16 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 
 	def i_const(v: int) -> SsaInstr {
-		return graph.intConst(Eval.doIntTrunc32(inttype, v));
+		return graph.intConst(Eval.doIntTrunc32(m.inttype, v));
 	}
 	def u_const(v: u32) -> SsaInstr {
-		return graph.intConst(Eval.doIntTrunc32(inttype, int.view(v)));
+		return graph.intConst(Eval.doIntTrunc32(m.inttype, int.view(v)));
 	}
 	def l_const(v: long) -> SsaInstr {
-		return graph.valConst(inttype, Long.box(Eval.doIntTrunc64(inttype, v)));
+		return graph.valConst(m.inttype, Long.box(Eval.doIntTrunc64(m.inttype, v)));
 	}
 	def lu_const(v: u64) -> SsaInstr {
-		return graph.valConst(inttype, Long.box(Eval.doIntTrunc64(inttype, long.view(v))));
+		return graph.valConst(m.inttype, Long.box(Eval.doIntTrunc64(m.inttype, long.view(v))));
 	}
 	def shiftcheck(i: SsaApplyOp, y: SsaInstr) -> SsaInstr {
 		var bound = posIntBound(y);
@@ -1317,34 +1070,34 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		var receiver = nullcheck(i);
 		if (!optimize_bounds) return i;
 		// XXX: introduce partial bounds checks when length is a known constant.
-		if (state.end) return receiver;
-		if (findPriorBoundsCheck(i, receiver, i.input1())) return receiver;
+		if (end()) return receiver;
+		if (state != null && findPriorBoundsCheck(i, receiver, i.input1())) return receiver;
 		// Initialize the match state for {x} and {y}.
-		var yval = binop(i);
-		if (yconst && V3.unboxI32(yval) < 0) {
+		var yval = m.binop(i);
+		if (m.yconst && V3.unboxI32(yval) < 0) {
 			// will always throw out of bounds, but might need a null check first.
 			if (!i.facts.O_NO_NULL_CHECK) addExplicitNullCheck(i.source, receiver);
 			return addThrow(i.source, V3Exception.BoundsCheck);
 		}
 		// Compute the constant length of the array if possible.
 		var length = -1;
-		if (xconst) {
-			match (xval) {
+		if (m.xconst) {
+			match (m.xval) {
 				x: Record => length = x.values.length;
 				x: Address<Record> => length = x.val.values.length;
 				_ => return receiver;
 			}
-		} else if (x.optag() == Opcode.ArrayAlloc.tag) {
-			var l = x.inputs[0].dest;
+		} else if (m.x.optag() == Opcode.ArrayAlloc.tag) {
+			var l = m.x.inputs[0].dest;
 			if (!SsaConst.?(l)) return receiver;
 			length = l.unbox<int>();
-		} else if (x.optag() == Opcode.ArrayInit.tag) {
-			length = x.inputs.length;
+		} else if (m.x.optag() == Opcode.ArrayInit.tag) {
+			length = m.x.inputs.length;
 		} else {
 			return receiver;
 		}
 
-		if (yconst) {
+		if (m.yconst) {
 			// Array length and index are constants. Static bounds check.
 			var index = V3.unboxI32(yval);
 			if (index < length) {
@@ -1354,7 +1107,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			return addThrow(i.source, V3Exception.BoundsCheck);
 		}
 		// Array length is a constant, try range analysis of the index.
-		var bound = posIntBound(y);
+		var bound = posIntBound(m.y);
 		if (bound >= 0 && bound < length) i.facts |= Facts.O_SAFE_BOUNDS;
 		return receiver;
 	}
@@ -1442,7 +1195,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 			return receiver;
 		}
 		if (receiver.facts.V_ZERO) return addThrow(i.source, V3Exception.NullCheck);
-		if (!optimize_nullchecks) return receiver;
+		if (!optimize_nullchecks || state == null) return receiver;
 		for (l = state.nonnull; l != null; l = l.tail) {
 			if (l.head == receiver) {
 				i.facts |= Fact.O_NO_NULL_CHECK;
@@ -1488,10 +1241,9 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	// Editing helpers
 	//======================================================================
 	def addThrow(source: Source, exception: string) -> SsaInstr {
-		if (state.end) return null;
-		state.end = true;
-		var cfopt = SsaCfOptimizer.new(context);
-		return cfopt.insertThrow(prev.next, source, exception, null);
+		if (end()) return null;
+		ssa.addThrow(source, exception);
+		return graph.nop();
 	}
 	def addConditionalThrow(source: Source, exception: string, cond: SsaInstr) -> SsaInstr {
 		return add(source, V3Op.newConditionalThrow(exception), [cond]);
@@ -1512,13 +1264,13 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return graph.valConst(t, r.1);
 	}
 	def addEqual(t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
-		return if(!state.end, addBinop(V3Op.newEqual(t), x, y));
+		return if(!end(), addBinop(V3Op.newEqual(t), x, y));
 	}
 	def addNotEqual(t: Type, x: SsaInstr, y: SsaInstr) -> SsaInstr {
-		return if(!state.end, addNot(addBinop(V3Op.newEqual(t), x, y)));
+		return if(!end(), addNot(addBinop(V3Op.newEqual(t), x, y)));
 	}
 	def addNot(x: SsaInstr) -> SsaInstr {
-		return if(!state.end, add(null, V3Op.opBoolNot, [x]));
+		return if(!end(), add(null, V3Op.opBoolNot, [x]));
 	}
 	def addEnumToSet(tc: EnumSetType, x: SsaInstr) -> SsaInstr {
 		// XXX: reduce duplication with V3EnumSet_TypeCon
@@ -1527,12 +1279,12 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		i.facts |= Fact.O_NO_SHIFT_CHECK;
 		return i;
 	}
+	// Inserts a new instruction, which is not optimized again.
 	def add(source: Source, op: Operator, args: Array<SsaInstr>) -> SsaInstr {
-		if (state.end) return null;
+		if (end()) return null;
 		var i = SsaApplyOp.new(source, op, args);
-		i.insertBefore(prev.next);
 		i.facts |= Opcodes.facts(op.opcode);
-		prev = i;
+		ssa.append(i);
 		return i;
 	}
 	def killUnused(i_old: SsaInstr) -> SsaInstr {
@@ -1541,14 +1293,10 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		i_old.remove();
 		return graph.nop();
 	}
-}
-
-// Performs control flow optimizations on a completed SsaGraph.
-class SsaCfOptimizer(context: SsaContext) {
-	def mark = ++context.graph.markGen;
-	def queue = Vector<SsaBlock>.new();
-
-	def optimize() {
+	//======================================================================
+	// Control flow optimizations on a completed graph
+	//======================================================================
+	def optControlFlow() {
 		// visit all the blocks of the graph
 		// 1. reduce phis with identical inputs
 		// 2. merge straight-line blocks (may introduce critical edges)
@@ -1556,6 +1304,8 @@ class SsaCfOptimizer(context: SsaContext) {
 		// 4. XXX iteratively reduce/fold code
 		// 5. collapse if-chains into switches, esp if(T.?(e)) ...
 		// 6. XXX remove useless branches
+		mark = ++context.graph.markGen;
+		queue.resize(0);
 		queueBlock(context.graph.startBlock);
 		for (i < queue.length) optBlock(queue[i]);
 	}
@@ -1783,41 +1533,12 @@ class SsaCfOptimizer(context: SsaContext) {
 		// Replace the first if with a switch.
 		block.append(sw);
 	}
-	def killBlock(block: SsaBlock) {
-		if (block.facts.O_KILLED) return;
-		// Recursively kill this block and its successor blocks
-		block.facts |= Fact.O_KILLED;
-		var succs = block.succs();
-		var i = block.next;
-		while (i != null) {
-			// Kill all instructions in the block
-			var n = i.next;
-			i.next = null;
-			i.prev = null;
-			if (SsaInstr.?(i)) {
-				var j = SsaInstr.!(i);
-				j.kill();
-				j.facts |= Fact.O_KILLED;
-			}
-			i = n;
-		}
-		killSuccs(succs);
-	}
+	// Kills the blocks reachable only through {edges}, after removing {edges}.
 	def killSuccs(edges: Array<SsaCfEdge>) {
-		// kill the outgoing control flow edges
-		var succs = Vector<SsaBlock>.new();
-		for (s in edges) {
-			var d = s.dest;
-			if (d != null) {
-				Ssa.removeEdge(s, true);
-				succs.put(d);
-			}
-		}
-		// kill any dead successor blocks.
-		for (i < succs.length) {
-			var d = succs[i];
-			if (!d.hasPred()) killBlock(d);
-		}
+		Ssa.killSuccs(edges);
+	}
+	def killBlock(block: SsaBlock) {
+		Ssa.killBlock(block);
 	}
 	def optEdge(edge: SsaCfEdge) -> bool {
 		var src = edge.src, dest = edge.dest;
@@ -1954,23 +1675,257 @@ class SsaCfOptimizer(context: SsaContext) {
 			if (!dest.hasPred()) killBlock(dest);
 		}
 	}
-	def insertThrow(next: SsaLink, source: Source, exception: string, vt: Type) -> SsaInstr {
-		var t = SsaThrow.new(source, exception);
-		t.insertBefore(next);
-		// kill the rest of the instructions in the block
-		for (p = t.next; !SsaBlock.?(p); ()) {
-			var n = p.next;
-			p.remove();
-			if (SsaEnd.?(p)) {
-				var end = SsaEnd.!(p);
-				killSuccs(end.succs);
-				Ssa.killInstr(end);
-				break;
+}
+
+def ARRAY_LENGTH_FIELD = IrField.new(V3.stringType, Int.TYPE).setFlag(IrFlag.F_VALUE);
+
+// Matches various patterns of SSA instructions, recording the state of the match
+// in the exposed fields.
+class SsaInstrMatcher {
+	var x: SsaInstr;	// First input
+	var y: SsaInstr;	// Second input
+	var xconst: bool;	// true if {x} is a constant
+	var yconst: bool;	// true if {y} is a constant
+	var fold: bool;		// true if all inputs are constants
+	var wide: bool;		// true if this is a long int operation
+	var xval: Val;		// if {x} is a constant, then its value
+	var yval: Val;		// if {y} is a constant, then its value
+	var xint: int;		// if {x} is an int constant, then its value
+	var yint: int;		// if {y} is an int constant, then its value
+	var xlong: long;	// if {x} is a long constant, then its value
+	var ylong: long;	// if {y} is a long constant, then its value
+	var yzero: bool;        // true if {y} is zero
+	var inttype: IntType;	// if this is an integer operation, the result type
+
+	// Resets this matcher
+	def clear() {
+		x = y = null;
+		xval = yval = null;
+		inttype = null;
+		xconst = yconst = yzero = fold = wide = false;
+		xint = yint = 0;
+		xlong = ylong = 0;
+	}
+	// Initializes the match state for a binary operation and returns {yval}.
+	def binop(i: SsaApplyOp) -> Val {
+		x = i.input0();
+		y = i.input1();
+		yzero = y.facts.V_ZERO;
+		fold = false;
+		if (xconst = SsaConst.?(x)) {
+			xval = SsaConst.!(x).val;
+			if (yconst = SsaConst.?(y)) {
+				fold = true;
+				return yval = SsaConst.!(y).val;
+			} else if (i.facts.O_COMMUTATIVE) {
+				i.inputs[0].update(y);
+				i.inputs[1].update(x);
+				xconst = false;
+				yconst = true;
+				var t = x;
+				x = y;
+				y = t;
+				yval = xval;
+				xval = null;
+				yzero = y.facts.V_ZERO;
+				return yval;
+			} else {
+				return yval = null;
 			}
-			if (SsaInstr.?(p)) Ssa.killInstr(SsaInstr.!(p));
-			p = n;
 		}
-		return if(vt != null, context.graph.valConst(vt, Values.BOTTOM), context.graph.nop());
+		return yval = if(yconst = SsaConst.?(y), SsaConst.!(y).val);
+	}
+	// Initializes the match state for an integer binary operation and returns {yint}.
+	def intbinop(i: SsaApplyOp) -> int {
+		binop(i);
+		inttype = IntType.!(i.op.sig.paramTypes[0]);
+		if (inttype.width <= 32) {
+			wide = false;
+			if (xconst) xint = V3.unboxI32(xval);
+			if (yconst) {
+				yint = V3.unboxI32(yval);
+				yzero = yint == 0;
+			}
+		} else {
+			wide = true;
+			if (xconst) xlong = Long.unboxSU(xval, inttype.signed);
+			if (yconst) {
+				ylong = Long.unboxSU(yval, inttype.signed);
+				yzero = ylong == 0;
+			}
+		}
+		return yint;
+	}
+	// Initializes the match state for an integer binary operation and returns {yint}.
+	def boolbinop(i: SsaApplyOp) -> int {
+		binop(i);
+		inttype = null;
+		if (xconst) xint = if(Bool.unbox(xval), 1);
+		if (yconst) {
+			yint = if(Bool.unbox(yval), 1);
+			yzero = yint == 0;
+		}
+		return yint;
+	}
+	// Initializes the match state for a unary operation and returns {xval}.
+	def unop(i: SsaApplyOp) -> Val {
+		x = i.input0();
+		return xval = if(fold = xconst = SsaConst.?(x), SsaConst.!(x).val);
+	}
+	// Initializes the match state for an n-ary operation and returns {xval}.
+	def n_op(i: SsaApplyOp) -> Val {
+		fold = true;
+		var max = i.inputs.length;
+		for (j < max) {
+			if (!SsaConst.?(i.inputs[j].dest)) return (fold = false, null).last;
+		}
+		if (max >= 1) {
+			x = i.input0();
+			xconst = true;
+			xval = SsaConst.!(x).val;
+		}
+		if (max >= 2) {
+			y = i.input1();
+			yconst = true;
+			yval = SsaConst.!(y).val;
+		}
+		return xval;
+	}
+	def yis(val: int) -> bool {
+		return yconst && if(wide, ylong == val, yint == val);
+	}
+	def yrange(min: int, max: int) -> bool {
+		if (Debug.PARANOID && !yconst) return V3.fail("not const");
+		if (wide) return min <= ylong && ylong <= max;
+		else return min <= yint && yint <= max;
+	}
+	def yisPowerOf2() -> bool {
+		return yconst && if(wide, (ylong & (ylong - 1)) == 0, (yint & (yint - 1)) == 0);
+	}
+	def ylog2() -> int {
+		if (Debug.PARANOID && !yconst) return V3.fail("not const");
+		return if(wide, Longs.log(u64.view(ylong)), Ints.log(u32.view(yint)));
+	}
+}
+
+// Flow-sensitive state for local optimizations.
+class SsaBlockState {
+	var inbounds: List<(SsaInstr, SsaInstr)>;
+	var nonnull: List<SsaInstr>;
+	var inits: List<IrMethod>;
+	def pure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
+	def impure_loads = Vector<(SsaInstr, IrMember, SsaInstr)>.new();
+	def ptr_loads = Vector<(SsaInstr, Type, SsaInstr)>.new();
+
+	def clear() -> this {
+		nonnull = null;
+		inits = null;
+		inbounds = null;
+		pure_loads.resize(0);
+		impure_loads.resize(0);
+		ptr_loads.resize(0);
+	}
+	def kill() -> this {
+		impure_loads.resize(0);
+		ptr_loads.resize(0);
+	}
+	def load(obj: SsaInstr, m: IrMember, apply: SsaApplyOp) -> SsaInstr {
+//TODO:dce	if (apply.useList == null && apply.facts.O_NO_NULL_CHECK) {
+//			apply.replace(null);
+//			return context.graph.zeroConst();  // XXX: recursively delete dead code
+//		}
+		var val = find(obj, m);
+		if (val != null) return val;
+		if (m.isConst() || IrMethod.?(m) && !m.flags.F_POINTED_AT) pure_loads.put(obj, m, apply);
+		else impure_loads.put(obj, m, apply);
+		return apply;
+	}
+	def loadPtr(ptr: SsaInstr, loadType: Type, apply: SsaApplyOp) -> SsaInstr {
+		var prev = find0(ptr_loads, ptr, loadType);
+		if (prev != null) return prev;
+		ptr_loads.put(ptr, loadType, apply);
+		return apply;
+	}
+	def store(obj: SsaInstr, field: IrField, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
+		var prev = find(obj, field);
+		if (prev == val) { // redundant store of previous value to field
+			apply.remove();
+			apply.kill();
+			return null;
+		}
+		killField(field);
+		impure_loads.put(obj, field, val);
+		return apply;
+	}
+	def storePtr(ptr: SsaInstr, storeType: Type, apply: SsaApplyOp, val: SsaInstr) -> SsaInstr {
+		var prev = find0(ptr_loads, ptr, storeType);
+		if (prev == val) { // redundant store of previous value to field
+			apply.remove();
+			apply.kill();
+			return null;
+		}
+		ptr_loads.resize(0); // XXX: improve pointer alias analysis, distinguish initializing stores
+		if (!isNarrowingStore(storeType, val)) ptr_loads.put(ptr, storeType, val); // XXX: cache narrowing stores properly
+		return apply;
+	}
+	def isNarrowingStore(storeType: Type, val: SsaInstr) -> bool {
+		match (storeType) {
+			x: PrimType => match (val.getType()) {
+				y: PrimType => return x.width != y.width;
+			}
+		}
+		return false;
+	}
+	def init(obj: SsaInstr, f: IrField, val: SsaInstr) {
+		if (f.isConst() && !f.flags.F_POINTED_AT) pure_loads.put(obj, f, val);
+		else impure_loads.put(obj, f, val);
+	}
+	def copy() -> SsaBlockState {
+		var that = SsaBlockState.new();
+		that.inbounds = this.inbounds;
+		that.nonnull = this.nonnull;
+		that.inits = this.inits;
+		that.pure_loads.putv(this.pure_loads);
+		that.impure_loads.putv(this.impure_loads);
+		that.ptr_loads.putv(this.ptr_loads);
+		return that;
+	}
+	def find(obj: SsaInstr, m: IrMember) -> SsaInstr {
+		var r = find0(pure_loads, obj, m);
+		if (r == null) r = find0(impure_loads, obj, m);
+		return r;
+	}
+	def find0<T>(v: Vector<(SsaInstr, T, SsaInstr)>, obj: SsaInstr, m: T) -> SsaInstr {
+		for (i < v.length) {
+			var t = v[i];
+			if (t.0 == obj && t.1 == m) return t.2;
+		}
+		return null;
+	}
+	def killField(f: IrField) {
+		var v = impure_loads, i = 0;
+		for (j < v.length) {
+			var t = v[i];
+			if (t.1 != f) {
+				if (i != j) v[i] = t;
+				i++;
+			}
+		}
+		v.resize(i);
+	}
+	def killPointedAt() {
+		var v = impure_loads, i = 0;
+		for (j < v.length) {
+			var t = v[i];
+			if (!t.1.flags.F_POINTED_AT) {
+				if (i != j) v[i] = t;
+				i++;
+			}
+		}
+		v.resize(i);
+	}
+	def killArrayElems() {
+		ptr_loads.resize(0); // assume pointer loads could alias array elements.
 	}
 }
 class SwitchCmp(val: int, cmp: SsaInstr, end: SsaIf, tSucc: SsaCfEdge, fSucc: SsaCfEdge) { }
