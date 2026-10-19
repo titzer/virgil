@@ -117,7 +117,7 @@ def ARRAY_LENGTH_FIELD = IrField.new(V3.stringType, Int.TYPE).setFlag(IrFlag.F_V
 
 // Matches various patterns of SSA instructions, recording the state of the match
 // in the exposed fields.
-class SsaInstrMatcher {
+class SsaInstrMatcher extends SsaInstrVisitor {
 	var x: SsaInstr;	// First input
 	var y: SsaInstr;	// Second input
 	var xconst: bool;	// true if {x} is a constant
@@ -383,6 +383,7 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	var next: SsaLink;			// instruction after the current instruction
 	var state = SsaBlockState.new();	// flow sensitive state
 	var foldingArgs: FoldingArguments;
+	var result: SsaInstr;			// replacement for the current instruction
 	
 	def reset(graph: SsaGraph, block: SsaBlock, prev: SsaLink) {
 		this.context.graph = graph;
@@ -403,39 +404,35 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 	}
 	def reduceInstr(i: SsaInstr) -> SsaInstr {
 		prev = i.prev;
-		match (i) {
-			x: SsaApplyOp => {
-				var res = reduceApplyOp(x);
-				if (res != x) {
-					x.replace(res);
-					x.remove();
-				}
-				return res;
-			}
-			x: SsaPhi => {
-				var i0 = x.input0();
-				return if(!reducePhi(x), i0, x);
-			}
-			x: SsaIf => {
-				return reduceIf(x);
-			}
-			x: SsaGoto => {
-				var cfopt = SsaCfOptimizer.new(context), block = x.block();
-				if (cfopt.optEdge(block.succ(0))) next = prev.next;
-				return x;
-			}
-			x: SsaSwitch => {
-				var val = x.input0();
-				if (SsaConst.?(val)) {
-					var cfopt = SsaCfOptimizer.new(context), block = x.block();
-					var succ = x.findSucc(SsaConst.!(val).val);
-					cfopt.replaceWithGoto(block, x, succ);
-					if (cfopt.optEdge(block.succ(0))) next = prev.next;
-				}
-				return x;
-			}
+		result = i;
+		visit(i);
+		return result;
+	}
+	def visitApplyOp(i: SsaApplyOp) {
+		var res = reduceApplyOp(i);
+		if (res != i) {
+			i.replace(res);
+			i.remove();
 		}
-		return i;
+		result = res;
+	}
+	def visitPhi(i: SsaPhi) {
+		var i0 = i.input0();
+		if (!reducePhi(i)) result = i0;
+	}
+	def visitIf(i: SsaIf)	{ result = reduceIf(i); }
+	def visitGoto(i: SsaGoto) {
+		var cfopt = SsaCfOptimizer.new(context), block = i.block();
+		if (cfopt.optEdge(block.succ(0))) next = prev.next;
+	}
+	def visitSwitch(i: SsaSwitch) {
+		var val = i.input0();
+		if (SsaConst.?(val)) {
+			var cfopt = SsaCfOptimizer.new(context), block = i.block();
+			var succ = i.findSucc(SsaConst.!(val).val);
+			cfopt.replaceWithGoto(block, i, succ);
+			if (cfopt.optEdge(block.succ(0))) next = prev.next;
+		}
 	}
 	def reduceIf(ifi: SsaIf) -> SsaInstr {
 		var cond = ifi.input0(), block = ifi.block();
@@ -455,757 +452,742 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return ifi;
 	}
 	def reduceApplyOp(i: SsaApplyOp) -> SsaInstr {
-		def PURE_LOAD = Fact.O_NO_NULL_CHECK | Fact.O_PURE;
-		def ZERO_NON_ZERO = Fact.V_ZERO | Fact.V_NON_ZERO;
-		def ABOVE_BELOW_ZERO = Fact.V_NON_ZERO | Fact.V_NON_NEGATIVE | Fact.V_BELOW_ZERO;
 		if (i.facts.O_PURE) {
-			if (remove_pure_ops && !i.hasNonDebugUses()) {
-				// A constant keeps nothing alive, so give debug uses the folded value if possible.
-				if (fold_pure_ops && i.useList != null) {
-					var result = tryEval(i);
-					if (result != null) return result;
-				}
-				return killUnused(i);
-			}
 			if (fold_pure_ops) {
-				var result = tryEval(i);
-				if (result != null) return result;
+				var folded = tryEval(i);
+				if (folded != null) return folded;
+			}
+			if (remove_pure_ops && !i.hasNonDebugUses()) {
+				return killUnused(i);
 			}
 		} else if (i.facts.O_FOLDABLE) {
 			if (fold_foldable_ops) {
-				var result = tryEval(i);
-				if (result != null) return result;
+				var folded = tryEval(i);
+				if (folded != null) return folded;
 			}
 		}
-		match (i.op.opcode) {
-			BoolEq,
-			IntEq,
-			RefEq => {
-				norm_binop(i);
-				if (fold) return graph.boolConst(Values.equal(xval, yval));
-				if (x == y) return graph.trueConst();
-				// XXX: look through type casts and subsumes for RefEq
-				var and = x.facts & y.facts, or = x.facts | y.facts;
-				if (Facts.NONE != (and & Fact.V_ZERO)) return graph.trueConst(); // 0 == 0 == true
-				if (ABOVE_BELOW_ZERO == (or & ABOVE_BELOW_ZERO)) return graph.falseConst(); // neg == pos == false
+		result = app = i;
+		visitOp(i.op);
+		return result;
+	}
+	// Replaces the current instruction with {i}.
+	def reduceTo(i: SsaInstr) { result = i; }
+	def visitBoolEq(opcode: Opcode.BoolEq)	{ reduceEq(); }
+	def visitBoolAnd(opcode: Opcode.BoolAnd) {
+		norm_binop(app);
+		if (fold) return reduceTo(graph.boolConst(Bool.unbox(xval) && Bool.unbox(yval))); // K && K => K
+		if (yconst) return reduceTo(if(Bool.unbox(yval), x, graph.falseConst())); // x && K => x
+	}
+	def visitBoolOr(opcode: Opcode.BoolOr) {
+		norm_binop(app);
+		if (fold) return reduceTo(graph.boolConst(Bool.unbox(xval) || Bool.unbox(yval))); // K || K => K
+		if (yconst) return reduceTo(if(Bool.unbox(yval), graph.trueConst(), x));  // x || K => x
+	}
+	def visitBoolNot(opcode: Opcode.BoolNot) {
+		var xval = unop(app);
+		if (xconst) return reduceTo(graph.boolConst(!Bool.unbox(xval)));  // !K  => K
+		if (x.optag() == Opcode.BoolNot.tag) return reduceTo(x.input0());  // !!x => x
+	}
+	def visitIntEq(opcode: Opcode.IntEq, t: Type)	{ reduceEq(); }
+	def visitIntAdd(opcode: Opcode.IntAdd, it: IntType) {
+		var yint = norm_intbinop(app);
+		if (fold) return reduceTo(fold2i(int.+, long.+)); // K + K == K
+		if (yzero) return reduceTo(x);                    // x + 0 == x
+	}
+	def visitIntSub(opcode: Opcode.IntSub, it: IntType) {
+		var yint = norm_intbinop(app);
+		if (fold) return reduceTo(fold2i(int.-, long.-)); // K - K == K
+		if (yzero) return reduceTo(x);                    // x - 0 == x
+	}
+	def visitIntMul(opcode: Opcode.IntMul, it: IntType) {
+		var yint = norm_intbinop(app);
+		if (yzero) return reduceTo(y);                    // x * 0 == 0
+		if (fold) return reduceTo(fold2i(int.*, long.*)); // K * K == K
+		if (yconst) {
+			if (yis(1)) return reduceTo(x);           // x * 1 == 1
+			if (yis(-1)) return reduceTo(addBinop(inttype.opSub(), graph.nullConst(inttype), x));  // x * -1 == 0 - x
+			if (yis(2)) return reduceTo(addBinop(inttype.opAdd(), x, x));
+			if (yisPowerOf2()) {
+				// x * 2^k == x << k
+				return reduceTo(addBinop(inttype.opShl(), x, graph.intConst(ylog2())).setFact(Fact.O_NO_SHIFT_CHECK));
 			}
-			VariantEq => {
-				norm_binop(i);
-				if (fold) return graph.boolConst(Values.equal(xval, yval));
-				// XXX: look through type casts and subsumes for VariantEq
-				var and = x.facts & y.facts, or = x.facts | y.facts;
-				if (Facts.NONE != (and & Fact.V_ZERO)) return graph.trueConst(); // 0 == 0 == true
+		}
+	}
+	def visitIntDiv(opcode: Opcode.IntDiv, it: IntType) {
+		var yint = norm_intbinop(app);
+		if (yzero) return reduceTo(addThrow(app.source, V3Exception.DivideByZero)); // fold x / 0
+		if (fold) return reduceTo(fold4i(int./, u32./, long./, u64./));
+		if (yconst) {
+			app.facts |= Facts.O_SAFE_DIVIDE;
+			if (yis(1)) return reduceTo(x);           // x / 1 == x
+			if (yis(-1) && inttype.signed) return reduceTo(addBinop(inttype.opSub(), graph.nullConst(inttype), x)); // x / -1 == 0 - x
+			if (yisPowerOf2() && x.facts.V_NON_NEGATIVE) {
+				// x / 2^k == x >> k
+				return reduceTo(addBinop(inttype.opShr(), x, graph.intConst(ylog2())).setFact(Fact.O_NO_SHIFT_CHECK));
 			}
-			OverloadedEq => {
-				norm_binop(i);
-				if (fold) return graph.boolConst(Values.equal(xval, yval));
-				var and = x.facts & y.facts;
-				if (Facts.NONE != (and & Fact.V_ZERO)) return graph.trueConst(); // 0 == 0 == true
-				// XXX: look through type casts subsumes for OverloadedEq
+		}
+	}
+	def visitIntMod(opcode: Opcode.IntMod, it: IntType) {
+		var yint = norm_intbinop(app);
+		if (yzero) return reduceTo(addThrow(app.source, V3Exception.DivideByZero)); // fold x % 0
+		if (fold) return reduceTo(fold4i(int.%, u32.%, long.%, u64.%));
+		if (yconst) {
+			app.facts |= Facts.O_SAFE_DIVIDE;
+			if (yis(1) || (yis(-1) && inttype.signed)) {
+				// x % +/-1 == 0
+				return reduceTo(if(wide, l_const(0), i_const(0)));
 			}
-			FloatEq => {
-				norm_binop(i);
-				if (xconst && Float.isNan(xval)) return graph.falseConst(); // nan == y == false
-				if (yconst && Float.isNan(yval)) return graph.falseConst(); // x == nan == false
+			if (yisPowerOf2() && x.facts.V_NON_NEGATIVE) {
+				// x % 2^k == x & (2^k - 1)
+				var mask = if(wide, l_const(ylong - 1), i_const(yint - 1));
+				return reduceTo(addBinop(inttype.opAnd(), x, mask).setFact(Fact.V_NON_NEGATIVE));
 			}
-			FloatNe => {
-				norm_binop(i);
-				if (xconst && Float.isNan(xval)) return graph.trueConst(); // nan != y == true
-				if (yconst && Float.isNan(yval)) return graph.trueConst(); // x != nan == true
+		}
+		if ((x.facts & y.facts & Fact.V_NON_NEGATIVE) == Fact.V_NON_NEGATIVE) app.facts |= Fact.V_NON_NEGATIVE;
+	}
+	def visitIntAnd(opcode: Opcode.IntAnd, it: IntType) {
+		norm_intbinop(app);
+		if (yzero) return reduceTo(y);                    // x & 0 == 0
+		if (fold) return reduceTo(fold2i(int.&, long.&)); // K & K == K
+		if (yconst && yis(-1)) return reduceTo(x);        // x & -1 == x
+		// (nonneg & x) => nonneg
+		app.facts |= ((x.facts | y.facts) & Fact.V_NON_NEGATIVE);
+	}
+	def visitIntOr(opcode: Opcode.IntOr, it: IntType) {
+		norm_intbinop(app);
+		if (yzero) return reduceTo(x);                    // x | 0 == x
+		if (fold) return reduceTo(fold2i(int.|, long.|)); // K | K == K
+		if (yconst && yis(-1)) return reduceTo(y);        // x | -1 == -1
+		// (neg | x) => neg, (nonzero | x) => nonzero
+		app.facts |= ((x.facts | y.facts) & (Fact.V_BELOW_ZERO | Fact.V_NON_ZERO));
+	}
+	def visitIntXor(opcode: Opcode.IntXor, it: IntType) {
+		norm_intbinop(app);
+		if (yzero) return reduceTo(x);                     // x ^ 0 == x
+		if (x == y) return reduceTo(graph.nullConst(inttype));    // x ^ x == 0
+		if (fold) return reduceTo(fold2i(int.^, long.^));  // K ^ K == K
+		app.facts |= (x.facts & y.facts & Fact.V_NON_NEGATIVE);  // (nonneg ^ nonneg) => nonneg
+		if ((x.facts & y.facts & Fact.V_BELOW_ZERO) == Fact.V_NON_NEGATIVE) app.facts |= Fact.V_NON_NEGATIVE;
+	}
+	// XXX: optimize x << (y & 0x1F) if target automatically masks shiftor values
+	def visitIntShl(opcode: Opcode.IntShl, it: IntType) {
+		var yint = norm_intbinop(app);
+		if (yzero) return reduceTo(x); // x << 0 == x
+		if (fold) {          // K << K == K
+			if (wide) {
+				var y6 = u6.view(ylong);
+				return reduceTo(if(ylong == y6, l_const(xlong << y6), graph.nullConst(inttype)));
+			} else {
+				var y5 = u5.view(yint);
+				return reduceTo(if(yint == y5, i_const(xint << y5), graph.nullConst(inttype)));
 			}
-			IntAdd => {
-				var yint = norm_intbinop(i);
-				if (fold) return fold2i(int.+, long.+); // K + K == K
-				if (yzero) return x;                    // x + 0 == x
+		}
+		if (yconst) {
+			if (yrange(0, inttype.width - 1)) app.facts |= Fact.O_NO_SHIFT_CHECK;
+			else return reduceTo(graph.nullConst(inttype));
+		} else {
+			shiftcheck(app, y);
+		}
+	}
+	// XXX: optimize x >> (y & 0x1F) if target automatically masks shiftor values
+	def visitIntSar(opcode: Opcode.IntSar, it: IntType) {
+		var yint = norm_intbinop(app);
+		if (yzero) return reduceTo(x);  // x >> 0 == x
+		if (fold) {           // K >> K == K
+			if (wide) {
+				var y6 = u6.view(if(u64.view(ylong) > 63, 63, ylong));
+				return reduceTo(l_const(xlong >> y6));
+			} else {
+				var y5 = u5.view(if(u32.view(yint) > 31, 31, yint));
+				return reduceTo(i_const(xint >> y5));
 			}
-			IntSub => {
-				var yint = norm_intbinop(i);
-				if (fold) return fold2i(int.-, long.-); // K - K == K
-				if (yzero) return x;                    // x - 0 == x
+		}
+		if (yconst) {
+			if (!yrange(0, inttype.width - 1)) {
+				if (x.facts.V_NON_NEGATIVE) return reduceTo(graph.nullConst(inttype));
+				if (x.facts.V_BELOW_ZERO) return reduceTo(graph.intConst(-1));
+				app.inputs[1].update(graph.intConst(inttype.width - 1));
 			}
-			IntMul => {
-				var yint = norm_intbinop(i);
-				if (yzero) return y;                    // x * 0 == 0
-				if (fold) return fold2i(int.*, long.*); // K * K == K
-				if (yconst) {
-					if (yis(1)) return x;           // x * 1 == 1
-					if (yis(-1)) return addBinop(inttype.opSub(), graph.nullConst(inttype), x);  // x * -1 == 0 - x
-					if (yis(2)) return addBinop(inttype.opAdd(), x, x);
-					if (yisPowerOf2()) {
-						// x * 2^k == x << k
-						return addBinop(inttype.opShl(), x, graph.intConst(ylog2())).setFact(Fact.O_NO_SHIFT_CHECK);
-					}
+			app.facts |= Fact.O_NO_SHIFT_CHECK;
+		} else {
+			shiftcheck(app, y);
+		}
+	}
+	// XXX: optimize x >>> (y & 0x1F) if target automatically masks shiftor values
+	def visitIntShr(opcode: Opcode.IntShr, it: IntType) {
+		var yint = norm_intbinop(app);
+		if (yzero) return reduceTo(x); // x >>> 0 = x
+		if (fold) {          // K >>> K = K
+			if (wide) {
+				var y6 = u6.view(ylong);
+				if (ylong == y6) return reduceTo(l_const(Eval.doIntTruncU64(inttype, xlong) >>> y6));
+				return reduceTo(graph.nullConst(inttype));
+			} else {
+				var y5 = u5.view(yint);
+				if (yint == y5) return reduceTo(i_const(Eval.doIntTruncU32(inttype, xint) >>> y5));
+				return reduceTo(graph.nullConst(inttype));
+			}
+		}
+		if (yconst) {
+			if (yrange(0, inttype.width - 1)) app.facts |= Fact.O_NO_SHIFT_CHECK;
+			else return reduceTo(graph.nullConst(inttype));
+		} else {
+			shiftcheck(app, y);
+		}
+		if (y.facts.V_NON_ZERO) app.facts |= Fact.V_NON_NEGATIVE;
+	}
+	def visitIntLt(opcode: Opcode.IntLt, it: IntType) {
+		norm_intbinop(app);
+		// XXX: range analysis for comparisons against constants, particularly 0
+		if (fold) return reduceTo(fold4b(int.<, u32.<, long.<, u64.<));
+	}
+	def visitIntLteq(opcode: Opcode.IntLteq, it: IntType) {
+		norm_intbinop(app);
+		// XXX: range analysis for comparisons against constants, particularly 0
+		if (fold) return reduceTo(fold4b(int.<=, u32.<=, long.<=, u64.<=));
+	}
+	def visitFloatEq(opcode: Opcode.FloatEq, ft: FloatType) {
+		norm_binop(app);
+		if (xconst && Float.isNan(xval)) return reduceTo(graph.falseConst()); // nan == y == false
+		if (yconst && Float.isNan(yval)) return reduceTo(graph.falseConst()); // x == nan == false
+	}
+	def visitFloatNe(opcode: Opcode.FloatNe, ft: FloatType) {
+		norm_binop(app);
+		if (xconst && Float.isNan(xval)) return reduceTo(graph.trueConst()); // nan != y == true
+		if (yconst && Float.isNan(yval)) return reduceTo(graph.trueConst()); // x != nan == true
+	}
+	def visitIntViewI(opcode: Opcode.IntViewI, ft: IntType, tt: IntType) {
+		var xval = unop(app);
+		if (xconst) return reduceTo(graph.valConst(tt, Eval.doIntView(ft, tt, xval)));
+	}
+	def visitRefEq(opcode: Opcode.RefEq, t: Type)	{ reduceEq(); }
+	def visitTupleCreate(opcode: Opcode.TupleCreate, tt: TupleType) {
+		if (op.isPolymorphic()) return;
+		n_op(app);
+		if (!fold) return;
+		// (K, ..., K) => K
+		var inputs = app.inputs;
+		var vals = Array<Val>.new(inputs.length);
+		for (j < inputs.length) vals[j] = SsaConst.!(inputs[j].dest).val;
+		return reduceTo(graph.valConst(op.sig.returnType(), BoxVal.new(vals)));
+	}
+	def visitTupleGetElem(opcode: Opcode.TupleGetElem, tt: TupleType) {
+		var xval = unop(app);
+		if (xconst) {
+			// fold K.N
+			var val = BoxVal.!(xval), t = Lists.get(tt.nested, opcode.index);
+			return reduceTo(graph.valConst(t, if(val != null, val.values[opcode.index], null)));
+		}
+		if (x.optag() == Opcode.TupleCreate.tag) {
+			// TupleGetElem[n](x:TupleCreate(...)) => x[n]
+			return reduceTo(SsaApplyOp.!(x).inputs[opcode.index].dest);
+		}
+	}
+	def visitArrayAlloc(opcode: Opcode.ArrayAlloc, at: ArrayType) {
+		var len = app.input0();
+		if (len.facts.V_NON_NEGATIVE) app.facts |= Fact.O_NO_NEGATIVE_CHECK;
+		if (remove_pure_ops && app.useList == null) { // unused array allocation
+			if (!app.facts.O_NO_NEGATIVE_CHECK) {
+				var op = IntType.!(len.getType()).opLt();
+				var check = addBinop(op, len, graph.zeroConst());
+				return reduceTo(addConditionalThrow(app.source, V3Exception.LengthCheck, check));
+			}
+			return reduceTo(killUnused(app));
+		}
+		state.init(app, ARRAY_LENGTH_FIELD, app.input0());
+	}
+	def visitArrayInit(opcode: Opcode.ArrayInit, at: ArrayType) {
+		if (op.isPolymorphic()) return;
+		n_op(app);
+		if (remove_pure_ops && app.useList == null) return reduceTo(killUnused(app)); // unused empty array init
+		if (true || !fold) return; // TODO: can fold array init if identity not observed
+		var record = context.prog.newRecord(at, app.inputs.length);
+		for (j < app.inputs.length) record.values[j] = SsaConst.!(app.inputs[j].dest).val;
+		return reduceTo(graph.recordConst(record));
+	}
+	def visitArrayGetElem(opcode: Opcode.ArrayGetElem, at: ArrayType, it: IntType) {
+		var receiver = boundscheck(app);
+		if (state.end) return reduceTo(receiver);
+		if (!app.facts.O_PURE) return;
+		var yval = norm_binop(app);
+		// ArrayGetElem(#array, #index) => K
+		var values: Array<Val>;
+		match (xval) {
+			x: Record => values = x.values;
+			x: Address<Record> => values = x.val.values;
+			_ => ;
+		}
+		if (fold) return reduceTo(graph.valConst(app.getType(), values[V3.unboxI32(yval)]));
+	}
+	def visitArraySetElem(opcode: Opcode.ArraySetElem, at: ArrayType, it: IntType, et: Type) {
+		var receiver = boundscheck(app);
+		if (state.end) return reduceTo(receiver);
+		if (optimize_loads) state.killArrayElems();
+	}
+	def visitArraySetElemElem(opcode: Opcode.ArraySetElemElem, at: ArrayType, it: IntType, et: Type)	{ if (optimize_loads) state.killArrayElems(); }
+	def visitArrayGetLength(opcode: Opcode.ArrayGetLength, at: ArrayType) {
+		var receiver = nullcheck(app);
+		if (state.end) return reduceTo(receiver);
+		var xval = unop(app);
+		if (xconst) return reduceTo(graph.intConst(Record.!(xval).values.length));
+		if (receiver.optag() == Opcode.ArrayInit.tag) {
+			// ArrayGetLength(ArrayInit(...)) => |...|
+			return reduceTo(graph.intConst(receiver.inputs.length));
+		}
+		if (receiver.optag() == Opcode.ArrayAlloc.tag) {
+			// ArrayGetLength(ArrayAlloc(x)) => x
+			return reduceTo(receiver.input0());
+		}
+		if (optimize_loads) return reduceTo(state.load(receiver, ARRAY_LENGTH_FIELD, app));
+	}
+	def visitRangeSetElem(opcode: Opcode.RangeSetElem, rt: RangeType, it: IntType, et: Type)	{ if (optimize_loads) state.killArrayElems(); }
+	def visitNormRangeSetElem(opcode: Opcode.NormRangeSetElem, at: ArrayType, it: IntType)		{ if (optimize_loads) state.killArrayElems(); }
+	def visitNormRangeSetElemElem(opcode: Opcode.NormRangeSetElemElem, at: ArrayType, it: IntType)	{ if (optimize_loads) state.killArrayElems(); }
+	def visitInit(opcode: Opcode.Init) {
+		if (!optimize_inits) return;
+		for (l = state.inits; l != null; l = l.tail) {
+			if (l.head == opcode.method) return reduceTo(null);  // init[m]; init[m] => init[m]
+		}
+		state.inits = List.new(opcode.method, state.inits);
+	}
+	def visitComponentGetField(opcode: Opcode.ComponentGetField, ct: ComponentType) {
+		var sf = VstField.!(opcode.field.source);
+		if (sf != null && sf.writability == Writability.READ_ONLY) {
+			if (Literal.?(sf.init)) {  // C.f => K
+				var lit = Literal.!(sf.init);
+				var const = graph.valConst(lit.exactType, lit.val);
+				return reduceTo(if(lit.exactType != opcode.field.fieldType, convert(const, opcode.field.fieldType), const));
+			}
+		}
+		if (optimize_loads) return reduceTo(state.load(null, opcode.field, app));
+	}
+	def visitComponentSetField(opcode: Opcode.ComponentSetField, ct: ComponentType) {
+		if (optimize_loads) state.store(null, opcode.field, app, app.input1());  // forward stores
+	}
+	def visitClassAlloc(opcode: Opcode.ClassAlloc, ct: ClassType) {
+		if (remove_pure_ops && app.useList == null) return reduceTo(killUnused(app)); // unused empty alloc
+	}
+	def visitClassNew(opcode: Opcode.ClassNew, ct: ClassType) {
+		if (!app.facts.O_PURE) state.kill(); // XXX: Fact.O_NO_SIDEFFECT
+	}
+	def visitClassGetField(opcode: Opcode.ClassGetField, ct: ClassType) {
+		// XXX: optimize ClassGetField[descriptor](ClassAlloc(x, ...) => x
+		var receiver = nullcheck(app);
+		if (state.end) return reduceTo(receiver);
+		if (opcode.field.isConst()) {
+			if (SsaConst.?(receiver)) {
+				// ClassGetField(#K) => #K
+				var record = asRecord(receiver);
+				var ftype = opcode.field.fieldType;
+				if (ftype.open()) ftype = IrSpec.new(record.rtype, TypeUtil.NO_TYPES, opcode.field).getFieldType();
+				return reduceTo(graph.valConst(ftype, record.values[opcode.field.index]));
+			}
+			app.setFactIf(Fact.O_NO_NULL_CHECK, Fact.O_PURE);
+			app.facts |= Fact.O_FOLDABLE;
+			if (remove_pure_ops && app.facts.O_PURE && app.useList == null) return reduceTo(killUnused(app));
+		}
+		if (optimize_loads) return reduceTo(state.load(receiver, opcode.field, app));
+	}
+	def visitClassInitField(opcode: Opcode.ClassInitField, ct: ClassType) {
+		app.facts |= Fact.O_NO_NULL_CHECK;
+		if (optimize_loads) state.init(app.input0(), opcode.field, app.input1());  // forward stores
+	}
+	def visitClassSetField(opcode: Opcode.ClassSetField, ct: ClassType) {
+		var receiver = nullcheck(app);
+		if (state.end) return reduceTo(receiver);
+		if (optimize_loads) state.store(receiver, opcode.field, app, app.input1());  // forward stores
+	}
+	def visitClassGetMethod(opcode: Opcode.ClassGetMethod, meth: IrSpec) {
+		var receiver = nullcheck(app);
+		if (state.end) return reduceTo(receiver);
+		if (op.isPolymorphic()) return;
+		var xval = unop(app);
+		if (xconst) {
+			// ClassGetMethod[m](#K) => (m, #K)
+			var obj = Record.!(xval);
+			return reduceTo(graph.valConst(meth.getBoundType(), Closure.new(obj, meth)));
+		}
+	}
+	def visitClassGetVirtual(opcode: Opcode.ClassGetVirtual, meth: IrSpec) {
+		var receiver = nullcheck(app);
+		if (state.end) return reduceTo(receiver);
+		var dv = devirtualize(meth, receiver);
+		if (dv != null) {
+			var xval = unop(app);
+			if (xconst && !op.isPolymorphic()) {  // ClassGetVirtual[m](K) => (m, K)
+				var obj = Record.!(xval);
+				return reduceTo(graph.valConst(dv.getBoundType(), Closure.new(obj, dv)));
+			}
+			return reduceTo(replaceOp(app, V3Op.newClassGetMethod(dv)));  // ClassGetVirtual[m](K) => ClassGetMethod[m](K)
+		}
+	}
+	// XXX: combine with ClassGetVirtual
+	def visitClassGetSelector(opcode: Opcode.ClassGetSelector, meth: IrSpec) {
+		var receiver = nullcheck(app);
+		if (state.end) return reduceTo(receiver);
+		var dv = devirtualize(meth, receiver);
+		if (dv != null) {
+			var val = if(!dv.member.flags.M_UNREACHABLE, FuncVal.new(dv));
+			return reduceTo(graph.valConst(dv.getFuncType(), val));
+		}
+	}
+	def visitVariantEq(opcode: Opcode.VariantEq, vt: ClassType) {
+		norm_binop(app);
+		if (fold) return reduceTo(graph.boolConst(Values.equal(xval, yval)));
+		// XXX: look through type casts and subsumes for VariantEq
+		var and = x.facts & y.facts, or = x.facts | y.facts;
+		if (Facts.NONE != (and & Fact.V_ZERO)) return reduceTo(graph.trueConst()); // 0 == 0 == true
+	}
+	def visitVariantGetTag(opcode: Opcode.VariantGetTag, vt: ClassType) {
+		var xval = unop(app);
+		if (fold) {
+			// GetVariantTag(#K) => #K
+			if (Record.?(xval)) return reduceTo(graph.intConst(V3.getVariantTag(Record.!(xval).rtype)));
+			return reduceTo(graph.intConst(V3.unboxI32(xval)));
+		}
+	}
+	def visitVariantAlloc(opcode: Opcode.VariantAlloc, vt: ClassType) {
+		if (op.isPolymorphic()) return;
+		n_op(app);
+		if (!fold) return;
+		// VariantAlloc(#K, #K ..) => #K (variant)
+		var ic = context.prog.ir.getIrClass(vt);
+		if (ic == null) return;  // TODO: can occur for closure classes
+		var record = context.prog.newRecord(vt, ic.fields.length);
+		if (ic.fields.length != app.inputs.length) {
+			// Ugly, adapt for tuple arity mismatch
+			if (app.inputs.length == 1) {
+				var v = BoxVal.!(SsaConst.!(app.inputs[0].dest).val);
+				for (j < record.values.length) record.values[j] = v.values[j];
+			} else if (ic.fields.length == 1) {
+				var values = Array<Val>.new(app.inputs.length);
+				if (app.inputs.length > 0) {
+					for (j < app.inputs.length) values[j] = SsaConst.!(app.inputs[j].dest).val;
+					record.values[0] = BoxVal.new(values);
 				}
+			} else {
+				return; // TODO: arity mismatch should never happen, but conservatively don't fold.
 			}
-			IntDiv => {
-				var yint = norm_intbinop(i);
-				if (yzero) return addThrow(i.source, V3Exception.DivideByZero); // fold x / 0
-				if (fold) return fold4i(int./, u32./, long./, u64./);
-				if (yconst) {
-					i.facts |= Facts.O_SAFE_DIVIDE;
-					if (yis(1)) return x;           // x / 1 == x
-					if (yis(-1) && inttype.signed) return addBinop(inttype.opSub(), graph.nullConst(inttype), x); // x / -1 == 0 - x
-					if (yisPowerOf2() && x.facts.V_NON_NEGATIVE) {
-						// x / 2^k == x >> k
-						return addBinop(inttype.opShr(), x, graph.intConst(ylog2())).setFact(Fact.O_NO_SHIFT_CHECK);
-					}
-				}
+		} else {
+			for (j < app.inputs.length) record.values[j] = SsaConst.!(app.inputs[j].dest).val;
+		}
+		if (ic != null) ic.flags |= IrFlag.C_HEAP;
+		return reduceTo(graph.recordConst(record));
+	}
+	def visitVariantGetField(opcode: Opcode.VariantGetField, vt: ClassType) {
+		var receiver = app.input0();
+		if (state.end) return reduceTo(receiver);
+		if (SsaConst.?(receiver)) {
+			// VariantGetField(#K) => #K
+			var record = asRecord(receiver);
+			var ftype = opcode.field.fieldType;
+			if (ftype.open()) ftype = IrSpec.new(record.rtype, TypeUtil.NO_TYPES, opcode.field).getFieldType();
+			return reduceTo(graph.valConst(ftype, if(record != null, record.values[opcode.field.index])));
+		}
+		if (!opcode.field.flags.F_POINTED_AT) app.facts |= Fact.O_PURE;
+		if (receiver.optag() == Opcode.VariantAlloc.tag) {
+			// VariantGetField[n](x:VariantAlloc(...)) => x[n]
+			var r = SsaApplyOp.!(receiver);
+			var ic = context.prog.ir.getIrClass(vt);
+			// Ugly: avoid arity mismatch problems for tuple/void fields
+			if (ic != null && r.inputs.length == ic.fields.length) return reduceTo(r.inputs[opcode.field.index].dest);
+		}
+		if (optimize_loads) return reduceTo(state.load(receiver, opcode.field, app));
+	}
+	def visitVariantGetMethod(opcode: Opcode.VariantGetMethod, meth: IrSpec) {
+		var receiver = app.input0();
+		if (op.isPolymorphic()) return;
+		var xval = unop(app);
+		if (xconst) {
+			// VariantGetMethod[m](#K) => (m, #K)
+			var obj = Record.!(xval);
+			var val = if(!meth.member.flags.M_UNREACHABLE, Closure.new(obj, meth));
+			return reduceTo(graph.valConst(meth.getBoundType(), val));
+		}
+	}
+	// XXX: also optimize VariantGetSelector
+	def visitVariantGetVirtual(opcode: Opcode.VariantGetVirtual, meth: IrSpec) {
+		var receiver = app.input0();
+		var dv = devirtualize(meth, receiver);
+		if (dv != null) {
+			var xval = unop(app);
+			if (xconst && !op.isPolymorphic()) {  // VariantGetVirtual[m](K) => (m, K)
+				var obj = Record.!(xval);
+				var val = if(!dv.member.flags.M_UNREACHABLE, Closure.new(obj, dv));
+				return reduceTo(graph.valConst(dv.getBoundType(), val));
 			}
-			IntMod => {
-				var yint = norm_intbinop(i);
-				if (yzero) return addThrow(i.source, V3Exception.DivideByZero); // fold x % 0
-				if (fold) return fold4i(int.%, u32.%, long.%, u64.%);
-				if (yconst) {
-					i.facts |= Facts.O_SAFE_DIVIDE;
-					if (yis(1) || (yis(-1) && inttype.signed)) {
-						// x % +/-1 == 0
-						return if(wide, l_const(0), i_const(0));
-					}
-					if (yisPowerOf2() && x.facts.V_NON_NEGATIVE) {
-						// x % 2^k == x & (2^k - 1)
-						var mask = if(wide, l_const(ylong - 1), i_const(yint - 1));
-						return addBinop(inttype.opAnd(), x, mask).setFact(Fact.V_NON_NEGATIVE);
-					}
-				}
-				if ((x.facts & y.facts & Fact.V_NON_NEGATIVE) == Fact.V_NON_NEGATIVE) i.facts |= Fact.V_NON_NEGATIVE;
-			}
-			IntAnd => {
-				norm_intbinop(i);
-				if (yzero) return y;                    // x & 0 == 0
-				if (fold) return fold2i(int.&, long.&); // K & K == K
-				if (yconst && yis(-1)) return x;        // x & -1 == x
-				// (nonneg & x) => nonneg
-				i.facts |= ((x.facts | y.facts) & Fact.V_NON_NEGATIVE);
-			}
-			IntOr => {
-				norm_intbinop(i);
-				if (yzero) return x;                    // x | 0 == x
-				if (fold) return fold2i(int.|, long.|); // K | K == K
-				if (yconst && yis(-1)) return y;        // x | -1 == -1
-				// (neg | x) => neg, (nonzero | x) => nonzero
-				i.facts |= ((x.facts | y.facts) & (Fact.V_BELOW_ZERO | Fact.V_NON_ZERO));
-			}
-			IntXor => {
-				norm_intbinop(i);
-				if (yzero) return x;                     // x ^ 0 == x
-				if (x == y) return graph.nullConst(inttype);    // x ^ x == 0
-				if (fold) return fold2i(int.^, long.^);  // K ^ K == K
-				i.facts |= (x.facts & y.facts & Fact.V_NON_NEGATIVE);  // (nonneg ^ nonneg) => nonneg
-				if ((x.facts & y.facts & Fact.V_BELOW_ZERO) == Fact.V_NON_NEGATIVE) i.facts |= Fact.V_NON_NEGATIVE;
-			}
-			IntShl => { // XXX: optimize x << (y & 0x1F) if target automatically masks shiftor values
-				var yint = norm_intbinop(i);
-				if (yzero) return x; // x << 0 == x
-				if (fold) {          // K << K == K
-					if (wide) {
-						var y6 = u6.view(ylong);
-						return if(ylong == y6, l_const(xlong << y6), graph.nullConst(inttype));
-					} else {
-						var y5 = u5.view(yint);
-						return if(yint == y5, i_const(xint << y5), graph.nullConst(inttype));
-					}
-				}
-				if (yconst) {
-					if (yrange(0, inttype.width - 1)) i.facts |= Fact.O_NO_SHIFT_CHECK;
-					else return graph.nullConst(inttype);
-				} else {
-					shiftcheck(i, y);
-				}
-			}
-			IntSar => { // XXX: optimize x >> (y & 0x1F) if target automatically masks shiftor values
-				var yint = norm_intbinop(i);
-				if (yzero) return x;  // x >> 0 == x
-				if (fold) {           // K >> K == K
-					if (wide) {
-						var y6 = u6.view(if(u64.view(ylong) > 63, 63, ylong));
-						return l_const(xlong >> y6);
-					} else {
-						var y5 = u5.view(if(u32.view(yint) > 31, 31, yint));
-						return i_const(xint >> y5);
-					}
-				}
-				if (yconst) {
-					if (!yrange(0, inttype.width - 1)) {
-						if (x.facts.V_NON_NEGATIVE) return graph.nullConst(inttype);
-						if (x.facts.V_BELOW_ZERO) return graph.intConst(-1);
-						i.inputs[1].update(graph.intConst(inttype.width - 1));
-					}
-					i.facts |= Fact.O_NO_SHIFT_CHECK;
-				} else {
-					shiftcheck(i, y);
-				}
-			}
-			IntShr => { // XXX: optimize x >>> (y & 0x1F) if target automatically masks shiftor values
-				var yint = norm_intbinop(i);
-				if (yzero) return x; // x >>> 0 = x
-				if (fold) {          // K >>> K = K
-					if (wide) {
-						var y6 = u6.view(ylong);
-						if (ylong == y6) return l_const(Eval.doIntTruncU64(inttype, xlong) >>> y6);
-						return graph.nullConst(inttype);
-					} else {
-						var y5 = u5.view(yint);
-						if (yint == y5) return i_const(Eval.doIntTruncU32(inttype, xint) >>> y5);
-						return graph.nullConst(inttype);
-					}
-				}
-				if (yconst) {
-					if (yrange(0, inttype.width - 1)) i.facts |= Fact.O_NO_SHIFT_CHECK;
-					else return graph.nullConst(inttype);
-				} else {
-					shiftcheck(i, y);
-				}
-				if (y.facts.V_NON_ZERO) i.facts |= Fact.V_NON_NEGATIVE;
-			}
-			IntLt => {
-				norm_intbinop(i);
-				// XXX: range analysis for comparisons against constants, particularly 0
-				if (fold) return fold4b(int.<, u32.<, long.<, u64.<);
-			}
-			IntLteq => {
-				norm_intbinop(i);
-				// XXX: range analysis for comparisons against constants, particularly 0
-				if (fold) return fold4b(int.<=, u32.<=, long.<=, u64.<=);
-			}
-			IntViewI => {
-				var xval = unop(i);
-				if (xconst) {
-					var ft = i.op.sig.paramTypes[0], tt = i.op.sig.returnType();
-					return graph.valConst(tt, Eval.doIntView(IntType.!(ft), IntType.!(tt), xval));
-				}
-			}
-			BoolAnd => {
-				norm_binop(i);
-				if (fold) return graph.boolConst(Bool.unbox(xval) && Bool.unbox(yval)); // K && K => K
-				if (yconst) return if(Bool.unbox(yval), x, graph.falseConst()); // x && K => x
-			}
-			BoolOr => {
-				norm_binop(i);
-				if (fold) return graph.boolConst(Bool.unbox(xval) || Bool.unbox(yval)); // K || K => K
-				if (yconst) return if(Bool.unbox(yval), graph.trueConst(), x);  // x || K => x
-			}
-			BoolNot => {
-				var xval = unop(i);
-				if (xconst) return graph.boolConst(!Bool.unbox(xval));  // !K  => K
-				if (x.optag() == Opcode.BoolNot.tag) return x.input0();  // !!x => x
-			}
-			NullCheck => {
-				var receiver = nullcheck(i);
-				if (i.facts.O_NO_NULL_CHECK) return receiver;
-			}
-			BoundsCheck => {
-				var receiver = boundscheck(i);
-				if (state.end) return receiver;
-				if (i.checkFact(Facts.O_SAFE_BOUNDS)) return Ssa.killInstr(i);
-			}
-			TypeSubsume => {
-				var xval = unop(i);
-				var ft = i.op.typeArgs[0], tt = i.op.typeArgs[1];
-				if (xconst) return graph.valConst(tt, xval);
-				if (ft == tt) return x; // fold TypeSubsume<T, T>(x)
-				if (tt == x.getType()) return x; // fold TypeSubsume<F, T>(x: T)
-				match (tt.typeCon.kind) {
-					CLASS, VARIANT => {
-						if (ft == Null.TYPE) return graph.nullConst(tt);
-						if (TypeSystem.isSubtype(ft, tt)) return x; // remove redundant subsume of class
-					}
-					ENUM_SET => {
-						return addEnumToSet(EnumSetType.!(tt), x);
-					}
-					_ => ;
-					// XXX: int subsume and tuples
-				}
-				if (x.facts.V_NON_ZERO) {
-					i.facts |= Fact.O_NO_NULL_CHECK | Fact.V_NON_ZERO;
-				}
-			}
-			TypeCast => {
-				var ft = i.op.sig.paramTypes[0], tt = i.op.sig.returnType();
-				if (ft == tt) return i.input0();
-				var cast = TypeSystem.newTypeCast(ft, tt);
-				if (CLOptions.PRINT_WRAP_EXTRA.get()) {
-					FunctionWrapping.printWrap()
-						.put3("SsaOptimizer TypeCast from %q  to %q  cast %s", ft.render, tt.render, cast.name)
-						.put2("  xconst %z  # inputs %d", xconst, i.inputs.length).outln();
-				}
-				if (i.inputs.length == 0) {
-					// special cast of casting void -> X
-					if (cast == TypeCast.THROW) return addThrow(i.source, V3Exception.TypeCheck); // fold TypeCast
-					return i;
-				}
-				var xval = unop(i);
-				if (xconst && cast != TypeCast.UNKNOWN_CAST) {
-					var r = Eval.doCast(cast, ft, tt, xval);
-					if (r.0) return graph.valConst(tt, r.1);
-					else return addThrow(i.source, V3Exception.TypeCheck);
-				}
+			return reduceTo(replaceOp(app, V3Op.newCreateClosure(dv, op.typeArgs[0])));  // VariantGetVirtual[m](K) => CreateClosure[m](K)
+		}
+	}
+	def visitNullCheck(opcode: Opcode.NullCheck, t: Type) {
+		var receiver = nullcheck(app);
+		if (app.facts.O_NO_NULL_CHECK) return reduceTo(receiver);
+	}
+	def visitBoundsCheck(opcode: Opcode.BoundsCheck, t: Type) {
+		var receiver = boundscheck(app);
+		if (state.end) return reduceTo(receiver);
+		if (app.checkFact(Facts.O_SAFE_BOUNDS)) return reduceTo(Ssa.killInstr(app));
+	}
+	def visitConditionalThrow(opcode: Opcode.ConditionalThrow) {
+		var xval = unop(app);
+		if (!fold) return;
+		// ConditionalThrow(#K) => throw | nop
+		if (Bool.unbox(xval)) return reduceTo(addThrow(app.source, opcode.exception));
+		else return reduceTo(Ssa.killInstr(app));
+	}
+	def visitOverloadedEq(opcode: Opcode.OverloadedEq, t: Type) {
+		norm_binop(app);
+		if (fold) return reduceTo(graph.boolConst(Values.equal(xval, yval)));
+		var and = x.facts & y.facts;
+		if (Facts.NONE != (and & Fact.V_ZERO)) return reduceTo(graph.trueConst()); // 0 == 0 == true
+		// XXX: look through type casts subsumes for OverloadedEq
+	}
+	def visitTypeCast(opcode: Opcode.TypeCast, f: Type, t: Type) {
+		var ft = op.sig.paramTypes[0], tt = op.sig.returnType();
+		if (ft == tt) return reduceTo(app.input0());
+		var cast = TypeSystem.newTypeCast(ft, tt);
+		if (CLOptions.PRINT_WRAP_EXTRA.get()) {
+			FunctionWrapping.printWrap()
+				.put3("SsaOptimizer TypeCast from %q  to %q  cast %s", ft.render, tt.render, cast.name)
+				.put2("  xconst %z  # inputs %d", xconst, app.inputs.length).outln();
+		}
+		if (app.inputs.length == 0) {
+			// special cast of casting void -> X
+			if (cast == TypeCast.THROW) return reduceTo(addThrow(app.source, V3Exception.TypeCheck)); // fold TypeCast
+			return;
+		}
+		var xval = unop(app);
+		if (xconst && cast != TypeCast.UNKNOWN_CAST) {
+			var r = Eval.doCast(cast, ft, tt, xval);
+			if (r.0) return reduceTo(graph.valConst(tt, r.1));
+			else return reduceTo(addThrow(app.source, V3Exception.TypeCheck));
+		}
 
-				// TODO consider using TypeSystem.computeCast
-				match (cast) {
-					TRUE, SUBSUME => {
-						if (context.compiler.NormConfig.WrapFuncTypeSubsume && Function_TypeCon.?(tt.typeCon)) return i;
-						return x; // fold TypeCast
-					}
-					THROW => {
-						return addThrow(i.source, V3Exception.TypeCheck); // fold TypeCast
-					}
-					THROW_IF_NOT_NULL => {
-						// TypeCast -> ConditionalThrow(x != null)
-						var cmp = addNot(addEqual(ft, x, graph.nullConst(ft)));
-						addConditionalThrow(i.source, V3Exception.TypeCheck, cmp);
-						return graph.nullConst(tt);
-					}
-					INT_VIEW_I => {
-						return replaceOp(i, V3Op.newIntViewI(ft, tt));
-					}
-					ENUM_TO_SET => {
-						return addEnumToSet(EnumSetType.!(tt), x);
-					}
-					_ => {
-						if (x.facts.V_NON_ZERO) {
-							i.facts |= Fact.O_NO_NULL_CHECK | Fact.V_NON_ZERO;
-						}
-					}
+		// TODO consider using TypeSystem.computeCast
+		match (cast) {
+			TRUE, SUBSUME => {
+				if (context.compiler.NormConfig.WrapFuncTypeSubsume && Function_TypeCon.?(tt.typeCon)) return;
+				return reduceTo(x); // fold TypeCast
+			}
+			THROW => {
+				return reduceTo(addThrow(app.source, V3Exception.TypeCheck)); // fold TypeCast
+			}
+			THROW_IF_NOT_NULL => {
+				// TypeCast -> ConditionalThrow(x != null)
+				var cmp = addNot(addEqual(ft, x, graph.nullConst(ft)));
+				addConditionalThrow(app.source, V3Exception.TypeCheck, cmp);
+				return reduceTo(graph.nullConst(tt));
+			}
+			INT_VIEW_I => {
+				return reduceTo(replaceOp(app, V3Op.newIntViewI(ft, tt)));
+			}
+			ENUM_TO_SET => {
+				return reduceTo(addEnumToSet(EnumSetType.!(tt), x));
+			}
+			_ => {
+				if (x.facts.V_NON_ZERO) {
+					app.facts |= Fact.O_NO_NULL_CHECK | Fact.V_NON_ZERO;
 				}
 			}
-			TypeQuery => {
-				var ft = i.op.typeArgs[0], tt = i.op.typeArgs[1];
-				var query = TypeSystem.newTypeQuery(ft, tt);
-				if (i.inputs.length == 0) {
-					// special cast of querying void -> X
-					if (query == TypeQuery.TRUE) return graph.trueConst();
-					if (query == TypeQuery.FALSE) return graph.falseConst();
-					return i;
-				}
-				var xval = unop(i);
-				if (xconst && query != TypeQuery.UNKNOWN_QUERY) {
-					return graph.boolConst(Eval.doQuery(query, ft, tt, xval));
-				}
-				if (query == TypeQuery.TRUE) return graph.trueConst();
-				if (query == TypeQuery.FALSE) return graph.falseConst();
-				if (query == TypeQuery.TRUE_IF_NOT_NULL) return addNotEqual(ft, x, graph.nullConst(ft));
-				if (x.facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
+		}
+	}
+	def visitTypeQuery(opcode: Opcode.TypeQuery, ft: Type, tt: Type) {
+		var query = TypeSystem.newTypeQuery(ft, tt);
+		if (app.inputs.length == 0) {
+			// special cast of querying void -> X
+			if (query == TypeQuery.TRUE) return reduceTo(graph.trueConst());
+			if (query == TypeQuery.FALSE) return reduceTo(graph.falseConst());
+			return;
+		}
+		var xval = unop(app);
+		if (xconst && query != TypeQuery.UNKNOWN_QUERY) {
+			return reduceTo(graph.boolConst(Eval.doQuery(query, ft, tt, xval)));
+		}
+		if (query == TypeQuery.TRUE) return reduceTo(graph.trueConst());
+		if (query == TypeQuery.FALSE) return reduceTo(graph.falseConst());
+		if (query == TypeQuery.TRUE_IF_NOT_NULL) return reduceTo(addNotEqual(ft, x, graph.nullConst(ft)));
+		if (x.facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
+	}
+	def visitTypeSubsume(opcode: Opcode.TypeSubsume, ft: Type, tt: Type) {
+		var xval = unop(app);
+		if (xconst) return reduceTo(graph.valConst(tt, xval));
+		if (ft == tt) return reduceTo(x); // fold TypeSubsume<T, T>(x)
+		if (tt == x.getType()) return reduceTo(x); // fold TypeSubsume<F, T>(x: T)
+		match (tt.typeCon.kind) {
+			CLASS, VARIANT => {
+				if (ft == Null.TYPE) return reduceTo(graph.nullConst(tt));
+				if (TypeSystem.isSubtype(ft, tt)) return reduceTo(x); // remove redundant subsume of class
 			}
-			ArrayAlloc => {
-				var len = i.input0();
-				if (len.facts.V_NON_NEGATIVE) i.facts |= Fact.O_NO_NEGATIVE_CHECK;
-				if (remove_pure_ops && i.useList == null) { // unused array allocation
-					if (!i.facts.O_NO_NEGATIVE_CHECK) {
-						var op = IntType.!(len.getType()).opLt();
-						var check = addBinop(op, len, graph.zeroConst());
-						return addConditionalThrow(i.source, V3Exception.LengthCheck, check);
-					}
-					return killUnused(i);
-				}
-				state.init(i, ARRAY_LENGTH_FIELD, i.input0());
+			ENUM_SET => {
+				return reduceTo(addEnumToSet(EnumSetType.!(tt), x));
 			}
-			ArrayInit => {
-				if (i.op.isPolymorphic()) return i;
-				n_op(i);
-				if (remove_pure_ops && i.useList == null) return killUnused(i); // unused empty array init
-				if (true || !fold) return i; // TODO: can fold array init if identity not observed
-				var arrayType = i.op.typeArgs[0];
-				var record = context.prog.newRecord(arrayType, i.inputs.length);
-				for (j < i.inputs.length) record.values[j] = SsaConst.!(i.inputs[j].dest).val;
-				return graph.recordConst(record);
-			}
-			ArrayGetElem => {
-				var receiver = boundscheck(i);
-				if (state.end) return receiver;
-				if (!i.facts.O_PURE) return i;
-				var yval = norm_binop(i);
-				// ArrayGetElem(#array, #index) => K
-				var values: Array<Val>;
-				match (xval) {
-					x: Record => values = x.values;
-					x: Address<Record> => values = x.val.values;
-					_ => ;
-				}
-				if (fold) return graph.valConst(i.getType(), values[V3.unboxI32(yval)]);
-			}
-			ArraySetElem => {
-				var receiver = boundscheck(i);
-				if (state.end) return receiver;
-				if (optimize_loads) state.killArrayElems();
-			}
-			ArraySetElemElem, RangeSetElem, NormRangeSetElem, NormRangeSetElemElem => {
-				if (optimize_loads) state.killArrayElems();
-			}
-			ArrayGetLength => {
-				var receiver = nullcheck(i);
-				if (state.end) return receiver;
-				var xval = unop(i);
-				if (xconst) return graph.intConst(Record.!(xval).values.length);
-				if (receiver.optag() == Opcode.ArrayInit.tag) {
-					// ArrayGetLength(ArrayInit(...)) => |...|
-					return graph.intConst(receiver.inputs.length);
-				}
-				if (receiver.optag() == Opcode.ArrayAlloc.tag) {
-					// ArrayGetLength(ArrayAlloc(x)) => x
-					return receiver.input0();
-				}
-				if (optimize_loads) return state.load(receiver, ARRAY_LENGTH_FIELD, i);
-			}
-			ClassAlloc => {
-				if (remove_pure_ops && i.useList == null) return killUnused(i); // unused empty alloc
-			}
-			ClassNew(method) => {
-				if (!i.facts.O_PURE) state.kill(); // XXX: Fact.O_NO_SIDEFFECT
-			}
-			ClassGetField(field) => {
-				// XXX: optimize ClassGetField[descriptor](ClassAlloc(x, ...) => x
-				var receiver = nullcheck(i);
-				if (state.end) return receiver;
-				if (field.isConst()) {
-					if (SsaConst.?(receiver)) {
-						// ClassGetField(#K) => #K
-						var record = asRecord(receiver);
-						var ftype = field.fieldType;
-						if (ftype.open()) ftype = IrSpec.new(record.rtype, TypeUtil.NO_TYPES, field).getFieldType();
-						return graph.valConst(ftype, record.values[field.index]);
-					}
-					i.setFactIf(Fact.O_NO_NULL_CHECK, Fact.O_PURE);
-					i.facts |= Fact.O_FOLDABLE;
-					if (remove_pure_ops && i.facts.O_PURE && i.useList == null) return killUnused(i);
-				}
-				if (optimize_loads) return state.load(receiver, field, i);
-			}
-			ClassInitField(field) => {
-				i.facts |= Fact.O_NO_NULL_CHECK;
-				if (optimize_loads) state.init(i.input0(), field, i.input1());  // forward stores
-			}
-			ClassSetField(field) => {
-				var receiver = nullcheck(i);
-				if (state.end) return receiver;
-				if (optimize_loads) state.store(receiver, field, i, i.input1());  // forward stores
-			}
+			_ => ;
+			// XXX: int subsume and tuples
+		}
+		if (x.facts.V_NON_ZERO) {
+			app.facts |= Fact.O_NO_NULL_CHECK | Fact.V_NON_ZERO;
+		}
+	}
+	def visitCallMethod(opcode: Opcode.CallMethod, spec: IrSpec) {
+		app.facts |= opcode.method.facts & Fact.O_PURE;
+		if (app.inputs.length > 0 && app.input0().facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
+		state.kill();
+	}
+	def visitCallClassMethod(opcode: Opcode.CallClassMethod, spec: IrSpec) {
+		app.facts |= opcode.method.facts & Fact.O_PURE;
+		var target = nullcheck(app);
+		state.kill();
+		if (SsaThrow.?(target) || state.end) return reduceTo(target);
+		var x = app.input0();
+		if (x == null) Terminal.put2("@%d:CallClassMethod(0) == null, end=%z\n", app.uid, state.end);
+		if (app.inputs.length > 0 && app.input0().facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
+	}
+	def visitCallClassVirtual(opcode: Opcode.CallClassVirtual, meth: IrSpec) {
+		var receiver = app.input0();
+		receiver = nullcheck(app);
+		if (state.end) return reduceTo(receiver);
+		if (app.input0().facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
+		var dv = devirtualize(meth, receiver);
+		state.kill();
+		if (dv != null) return reduceTo(replaceOp(app, V3Op.newCallClassMethod(dv)));  // CallClassVirtual[m](K) => CallClassMethod[m](k)
+	}
+	def visitCallVariantVirtual(opcode: Opcode.CallVariantVirtual, meth: IrSpec) {
+		var receiver = app.input0();
+		if (app.input0().facts.V_NON_ZERO) app.facts |= Fact.O_NO_NULL_CHECK;
+		var dv = devirtualize(meth, receiver);
+		state.kill();
+		if (dv != null) return reduceTo(replaceOp(app, V3Op.newCallMethod(dv)));  // CallVariantVirtual[m](K) => CallMethod[m](k)
+	}
+	// XXX: optimize CallVariantSelector
+	def visitCallVariantSelector(opcode: Opcode.CallVariantSelector, spec: IrSpec)	{ state.kill(); }
+	def visitCallClosure(opcode: Opcode.CallClosure, ft: FuncType) {
+		var target = nullcheck(app);
+		state.kill();
+		if (SsaThrow.?(target) || state.end) return reduceTo(target);
+		var xval = unop(app), xop: Operator;
+		var i_recvr: SsaInstr, newOp: Operator, newFacts: Fact.set;
+		if (xconst) {
+			var d = Closure.!(xval);
+			if (d == null) return reduceTo(addThrow(app.source, V3Exception.NullCheck));
+			// CallClosure(K) => CallMethod[K.m]
+			i_recvr = graph.valConst(d.memberRef.getClosureReceiver(), d.val);
+			newOp = V3Op.newCallMethod(d.memberRef);
+			newFacts = Fact.O_NO_NULL_CHECK;
+		} else if (SsaApplyOp.?(x)) match ((xop = SsaApplyOp.!(x).op).opcode) {
+			// XXX: look through TypeCast / TypeSubsume of functions
 			ClassGetMethod(method) => {
-				var meth = V3Op.extractIrSpec(i.op, method);
-				var receiver = nullcheck(i);
-				if (state.end) return receiver;
-				if (i.op.isPolymorphic()) return i;
-				var xval = unop(i);
-				if (xconst) {
-					// ClassGetMethod[m](#K) => (m, #K)
-					var obj = Record.!(xval);
-					return graph.valConst(meth.getBoundType(), Closure.new(obj, meth));
-				}
+				// CallClosure(GetClassMethod[m]) => CallMethod[m]
+				var spec = V3Op.extractIrSpec(xop, method);
+				newOp = V3Op.newCallMethod(spec);
+				i_recvr = x.input0();
+				newFacts = app.facts & Fact.O_NO_NULL_CHECK;
 			}
 			ClassGetVirtual(method) => {
-				var meth = V3Op.extractIrSpec(i.op, method);
-				var receiver = nullcheck(i);
-				if (state.end) return receiver;
-				var dv = devirtualize(meth, receiver);
-				if (dv != null) {
-					var xval = unop(i);
-					if (xconst && !i.op.isPolymorphic()) {  // ClassGetVirtual[m](K) => (m, K)
-						var obj = Record.!(xval);
-						return graph.valConst(dv.getBoundType(), Closure.new(obj, dv));
-					}
-					return replaceOp(i, V3Op.newClassGetMethod(dv));  // ClassGetVirtual[m](K) => ClassGetMethod[m](K)
-				}
-			}
-			VariantAlloc => {
-				if (i.op.isPolymorphic()) return i;
-				n_op(i);
-				if (!fold) return i;
-				// VariantAlloc(#K, #K ..) => #K (variant)
-				var variantType = i.op.typeArgs[0];
-				var ic = context.prog.ir.getIrClass(variantType);
-				if (ic == null) return i;  // TODO: can occur for closure classes
-				var record = context.prog.newRecord(variantType, ic.fields.length);
-				if (ic.fields.length != i.inputs.length) {
-					// Ugly, adapt for tuple arity mismatch
-					if (i.inputs.length == 1) {
-						var v = BoxVal.!(SsaConst.!(i.inputs[0].dest).val);
-						for (i < record.values.length) record.values[i] = v.values[i];
-					} else if (ic.fields.length == 1) {
-						var values = Array<Val>.new(i.inputs.length);
-						if (i.inputs.length > 0) {
-							for (j < i.inputs.length) values[j] = SsaConst.!(i.inputs[j].dest).val;
-							record.values[0] = BoxVal.new(values);
-						}
-					} else {
-						return i; // TODO: arity mismatch should never happen, but conservatively don't fold.
-					}
-				} else {
-					for (j < i.inputs.length) record.values[j] = SsaConst.!(i.inputs[j].dest).val;
-				}
-				if (ic != null) ic.flags |= IrFlag.C_HEAP;
-				return graph.recordConst(record);
-			}
-			VariantGetField(field) => {
-				var receiver = i.input0();
-				if (state.end) return receiver;
-				if (SsaConst.?(receiver)) {
-					// VariantGetField(#K) => #K
-					var record = asRecord(receiver);
-					var ftype = field.fieldType;
-					if (ftype.open()) ftype = IrSpec.new(record.rtype, TypeUtil.NO_TYPES, field).getFieldType();
-					return graph.valConst(ftype, if(record != null, record.values[field.index]));
-				}
-				if (!field.flags.F_POINTED_AT) i.facts |= Fact.O_PURE;
-				if (receiver.optag() == Opcode.VariantAlloc.tag) {
-					// VariantGetField[n](x:VariantAlloc(...)) => x[n]
-					var r = SsaApplyOp.!(receiver);
-					var variantType = i.op.typeArgs[0];
-					var ic = context.prog.ir.getIrClass(variantType);
-					// Ugly: avoid arity mismatch problems for tuple/void fields
-					if (ic != null && r.inputs.length == ic.fields.length) return r.inputs[field.index].dest;
-				}
-				if (optimize_loads) return state.load(receiver, field, i);
-			}
-			VariantGetMethod(method) => {
-				var meth = V3Op.extractIrSpec(i.op, method);
-				var receiver = i.input0();
-				if (i.op.isPolymorphic()) return i;
-				var xval = unop(i);
-				if (xconst) {
-					// VariantGetMethod[m](#K) => (m, #K)
-					var obj = Record.!(xval);
-					var val = if(!meth.member.flags.M_UNREACHABLE, Closure.new(obj, meth));
-					return graph.valConst(meth.getBoundType(), val);
-				}
-			}
-			VariantGetVirtual(method) => { // XXX: also optimize VariantGetSelector
-				var meth = V3Op.extractIrSpec(i.op, method);
-				var receiver = i.input0();
-				var dv = devirtualize(meth, receiver);
-				if (dv != null) {
-					var xval = unop(i);
-					if (xconst && !i.op.isPolymorphic()) {  // VariantGetVirtual[m](K) => (m, K)
-						var obj = Record.!(xval);
-						var val = if(!dv.member.flags.M_UNREACHABLE, Closure.new(obj, dv));
-						return graph.valConst(dv.getBoundType(), val);
-					}
-					return replaceOp(i, V3Op.newCreateClosure(dv, i.op.typeArgs[0]));  // VariantGetVirtual[m](K) => CreateClosure[m](K)
-				}
-			}
-			ClassGetSelector(method) => { // XXX: combine with ClassGetVirtual
-				var meth = V3Op.extractIrSpec(i.op, method);
-				var receiver = nullcheck(i);
-				if (state.end) return receiver;
-				var dv = devirtualize(meth, receiver);
-				if (dv != null) {
-					var val = if(!dv.member.flags.M_UNREACHABLE, FuncVal.new(dv));
-					return graph.valConst(dv.getFuncType(), val);
-				}
-			}
-			Init(method) => {
-				if (!optimize_inits) return i;
-				for (l = state.inits; l != null; l = l.tail) {
-					if (l.head == method) return null;  // init[m]; init[m] => init[m]
-				}
-				state.inits = List.new(method, state.inits);
-			}
-			ComponentGetField(field) => {
-				var sf = VstField.!(field.source);
-				if (sf != null && sf.writability == Writability.READ_ONLY) {
-					if (Literal.?(sf.init)) {  // C.f => K
-						var lit = Literal.!(sf.init);
-						var const = graph.valConst(lit.exactType, lit.val);
-						return if(lit.exactType != field.fieldType, convert(const, field.fieldType), const);
-					}
-				}
-				if (optimize_loads) return state.load(null, field, i);
-			}
-			ComponentSetField(field) => {
-				if (optimize_loads) state.store(null, field, i, i.input1());  // forward stores
-			}
-			TupleCreate(length) => {
-				if (i.op.isPolymorphic()) return i;
-				n_op(i);
-				if (!fold) return i;
-				// (K, ..., K) => K
-				var tupleType = i.op.typeArgs[0];
-				var inputs = i.inputs;
-				var vals = Array<Val>.new(inputs.length);
-				for (j < inputs.length) vals[j] = SsaConst.!(inputs[j].dest).val;
-				return graph.valConst(i.op.sig.returnType(), BoxVal.new(vals));
-			}
-			TupleGetElem(index) => {
-				var xval = unop(i);
-				if (xconst) {
-					// fold K.N
-					var tupleType = i.op.typeArgs[0];
-					var val = BoxVal.!(xval), t = Lists.get(tupleType.nested, index);
-					return graph.valConst(t, if(val != null, val.values[index], null));
-				}
-				if (x.optag() == Opcode.TupleCreate.tag) {
-					// TupleGetElem[n](x:TupleCreate(...)) => x[n]
-					return SsaApplyOp.!(x).inputs[index].dest;
-				}
-			}
-			CallMethod(method) => {
-				i.facts |= method.facts & Fact.O_PURE;
-				if (i.inputs.length > 0 && i.input0().facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
-				state.kill();
-			}
-			CallClassMethod(method) => {
-				i.facts |= method.facts & Fact.O_PURE;
-				var target = nullcheck(i);
-				state.kill();
-				if (SsaThrow.?(target) || state.end) return target;
-				var x = i.input0();
-				if (x == null) Terminal.put2("@%d:CallClassMethod(0) == null, end=%z\n", i.uid, state.end);
-				if (i.inputs.length > 0 && i.input0().facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
-			}
-			CallClassVirtual(method) => {
-				var receiver = i.input0(), meth = V3Op.extractIrSpec(i.op, method);
-				receiver = nullcheck(i);
-				if (state.end) return receiver;
-				if (i.input0().facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
-				var dv = devirtualize(meth, receiver);
-				state.kill();
-				if (dv != null) return replaceOp(i, V3Op.newCallClassMethod(dv));  // CallClassVirtual[m](K) => CallClassMethod[m](k)
-			}
-			CallVariantVirtual(method) => {
-				var receiver = i.input0(), meth = V3Op.extractIrSpec(i.op, method);
-				if (i.input0().facts.V_NON_ZERO) i.facts |= Fact.O_NO_NULL_CHECK;
-				var dv = devirtualize(meth, receiver);
-				state.kill();
-				if (dv != null) return replaceOp(i, V3Op.newCallMethod(dv));  // CallVariantVirtual[m](K) => CallMethod[m](k)
-			}
-			CallClosure => {
-				var target = nullcheck(i);
-				state.kill();
-				if (SsaThrow.?(target) || state.end) return target;
-				var xval = unop(i), xop: Operator;
-				var i_recvr: SsaInstr, newOp: Operator, newFacts: Fact.set;
-				if (xconst) {
-					var d = Closure.!(xval);
-					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
-					// CallClosure(K) => CallMethod[K.m]
-					i_recvr = graph.valConst(d.memberRef.getClosureReceiver(), d.val);
-					newOp = V3Op.newCallMethod(d.memberRef);
-					newFacts = Fact.O_NO_NULL_CHECK;
-				} else if (SsaApplyOp.?(x)) match ((xop = SsaApplyOp.!(x).op).opcode) {
-					// XXX: look through TypeCast / TypeSubsume of functions
-					ClassGetMethod(method) => {
-						// CallClosure(GetClassMethod[m]) => CallMethod[m]
-						var spec = V3Op.extractIrSpec(xop, method);
-						newOp = V3Op.newCallMethod(spec);
-						i_recvr = x.input0();
-						newFacts = i.facts & Fact.O_NO_NULL_CHECK;
-					}
-					ClassGetVirtual(method) => {
-						// CallClosure(GetClassVirtual[m]) => CallClassVirtual[m]
-						var spec = V3Op.extractIrSpec(xop, method);
-						newOp = V3Op.newCallClassVirtual(spec);
-						i_recvr = x.input0();
-						newFacts = i.facts & Fact.O_NO_NULL_CHECK;
-					}
-					CreateClosure(method) => {
-						// CallClosure(CreateClosure[m](p), ...) => CallMethod[m](p, ...);
-						var spec = V3Op.extractIrSpec(xop, method);
-						newOp = V3Op.newCallMethod(spec);
-						i_recvr = if (V3.isComponent(spec.receiver), graph.nullReceiver(), x.input0());
-						if (V3.isComponent(spec.receiver)) newFacts |= Fact.O_NO_NULL_CHECK;
-						else newFacts |= x.facts & Fact.O_NO_NULL_CHECK;
-					}
-					_ => {
-						if (!i.facts.O_PURE) state.kill();
-					}
-				}
-				if (newOp != null) return replaceWithDirectCall(i, newOp, i_recvr, i.inputs[1 ...]).setFact(newFacts);
-			}
-			CallFunction => {
-				var target = nullcheck(i);
-				if (SsaThrow.?(target)) return target;
-				state.kill();
-				var xval = unop(i);
-				if (xconst && FuncVal.?(xval)) {
-					var d = FuncVal.!(xval);
-					if (d == null) return addThrow(i.source, V3Exception.NullCheck);
-					// CallFunction(#K) => CallMethod
-					var newOp = V3Op.newCallMethod(d.memberRef);
-					var i_recvr: SsaInstr = null;
-					return replaceWithDirectCall(i, newOp, i_recvr, i.inputs[1 ...]).setFact(Fact.O_NO_NULL_CHECK);
-				}
-			}
-			CallAddress => {
-				var t = i.input0();
-				if (SsaConst.?(t)) {
-					var target = SsaConst.!(t).val;
-					if (target == null) return addThrow(i.source, V3Exception.NullCheck);
-					// XXX: CallAddress(#K) => CallMethod
-				}
-				state.kill();
-			}
-			CallVariantSelector, SystemCall, CallKernel => { // XXX: optimize CallVariantSelector
-				state.kill();
+				// CallClosure(GetClassVirtual[m]) => CallClassVirtual[m]
+				var spec = V3Op.extractIrSpec(xop, method);
+				newOp = V3Op.newCallClassVirtual(spec);
+				i_recvr = x.input0();
+				newFacts = app.facts & Fact.O_NO_NULL_CHECK;
 			}
 			CreateClosure(method) => {
-				if (i.op.isPolymorphic()) return i;
-				var xval = unop(i);
-				if (!fold) return i;
-				// CreateClosure(#K) => #K
-				var spec = V3Op.extractIrSpec(i.op, method);
-				return graph.valConst(spec.getBoundType(), Closure.new(xval, spec));
+				// CallClosure(CreateClosure[m](p), ...) => CallMethod[m](p, ...);
+				var spec = V3Op.extractIrSpec(xop, method);
+				newOp = V3Op.newCallMethod(spec);
+				i_recvr = if (V3.isComponent(spec.receiver), graph.nullReceiver(), x.input0());
+				if (V3.isComponent(spec.receiver)) newFacts |= Fact.O_NO_NULL_CHECK;
+				else newFacts |= x.facts & Fact.O_NO_NULL_CHECK;
 			}
-			VariantGetTag => {
-				var xval = unop(i);
-				if (fold) {
-					// GetVariantTag(#K) => #K
-					if (Record.?(xval)) return graph.intConst(V3.getVariantTag(Record.!(xval).rtype));
-					return graph.intConst(V3.unboxI32(xval));
-				}
+			_ => {
+				if (!app.facts.O_PURE) state.kill();
 			}
-			ConditionalThrow(exception) => {
-				var xval = unop(i);
-				if (!fold) return i;
-				// ConditionalThrow(#K) => throw | nop
-				if (Bool.unbox(xval)) return addThrow(i.source, exception);
-				else return Ssa.killInstr(i);
-			}
-			RefLayoutSetField,
-			RefLayoutSetRepeatedField,
-			ByteArraySetField => {
-				if (optimize_loads) state.killArrayElems();
-			}
-			PtrAdd => {
-				binop(i);
-				if (yzero) return x;
-				if (!fold) return i;
-				if (!Addr.?(xval)) return i;
-				var a = Addr.!(xval);
-				match (yval) {
-					yi: Box<int> => { // TODO(addr64)
-						var na: Addr;
-						if (a != null) {
-							na = a.add(yi.val);
-						} else if (MachProgram.?(context.prog.tprog)) {
-							na = Addr.new(MachProgram.!(context.prog.tprog).dataRegion, null, yi.val);
-							na.absolute = yi.val;
-						}
-						if (na != null) return graph.valConst(i.getType(), na);
-					}
-				}
-			}
-			PtrCmpSwp => {
-				nullcheck(i);
-				state.kill();
-			}
-			// XXX: PtrAdd, PtrSub, PtrLt
-			PtrLoad => {
-				var ptr = nullcheck(i);
-				// XXX: use Fact.O_FOLDABLE to indicate a load of an immutable value
-				if (optimize_loads) {
-					return state.loadPtr(ptr, i.op.typeArgs[1], i);
-				}
-			}
-			PtrStore => {
-				var ptr = nullcheck(i);
-				state.killArrayElems();
-				state.killPointedAt();
-				// XXX: use a fact to indicate an initializing store that cannot kill previous loads
-				if (optimize_loads) {
-					state.storePtr(ptr, i.op.typeArgs[1], i, i.input1());
-				}
-			}
-			_ => if (!i.facts.O_PURE) state.kill();
 		}
-		return i;
+		if (newOp != null) return reduceTo(replaceWithDirectCall(app, newOp, i_recvr, app.inputs[1 ...]).setFact(newFacts));
+	}
+	def visitCallFunction(opcode: Opcode.CallFunction, ft: FuncType) {
+		var target = nullcheck(app);
+		if (SsaThrow.?(target)) return reduceTo(target);
+		state.kill();
+		var xval = unop(app);
+		if (xconst && FuncVal.?(xval)) {
+			var d = FuncVal.!(xval);
+			if (d == null) return reduceTo(addThrow(app.source, V3Exception.NullCheck));
+			// CallFunction(#K) => CallMethod
+			var newOp = V3Op.newCallMethod(d.memberRef);
+			var i_recvr: SsaInstr = null;
+			return reduceTo(replaceWithDirectCall(app, newOp, i_recvr, app.inputs[1 ...]).setFact(Fact.O_NO_NULL_CHECK));
+		}
+	}
+	def visitCreateClosure(opcode: Opcode.CreateClosure, spec: IrSpec) {
+		if (op.isPolymorphic()) return;
+		var xval = unop(app);
+		if (!fold) return;
+		// CreateClosure(#K) => #K
+		return reduceTo(graph.valConst(spec.getBoundType(), Closure.new(xval, spec)));
+	}
+	def visitRefLayoutSetField(opcode: Opcode.RefLayoutSetField, rt: RefType, ft: Type)			{ if (optimize_loads) state.killArrayElems(); }
+	def visitRefLayoutSetRepeatedField(opcode: Opcode.RefLayoutSetRepeatedField, rt: RefType, ft: Type)	{ if (optimize_loads) state.killArrayElems(); }
+	def visitByteArraySetField(opcode: Opcode.ByteArraySetField, ft: Type, startType: Type)			{ if (optimize_loads) state.killArrayElems(); }
+	def visitSystemCall(opcode: Opcode.SystemCall)								{ state.kill(); }
+	def visitPtrAdd(opcode: Opcode.PtrAdd, pt: Type, it: IntType) {
+		binop(app);
+		if (yzero) return reduceTo(x);
+		if (!fold) return;
+		if (!Addr.?(xval)) return;
+		var a = Addr.!(xval);
+		match (yval) {
+			yi: Box<int> => { // TODO(addr64)
+				var na: Addr;
+				if (a != null) {
+					na = a.add(yi.val);
+				} else if (MachProgram.?(context.prog.tprog)) {
+					na = Addr.new(MachProgram.!(context.prog.tprog).dataRegion, null, yi.val);
+					na.absolute = yi.val;
+				}
+				if (na != null) return reduceTo(graph.valConst(app.getType(), na));
+			}
+		}
+	}
+	def visitPtrCmpSwp(opcode: Opcode.PtrCmpSwp, pt: PointerType, vt: Type) {
+		nullcheck(app);
+		state.kill();
+	}
+	// XXX: PtrAdd, PtrSub, PtrLt
+	def visitPtrLoad(opcode: Opcode.PtrLoad, pt: Type, vt: Type) {
+		var ptr = nullcheck(app);
+		// XXX: use Fact.O_FOLDABLE to indicate a load of an immutable value
+		if (optimize_loads) {
+			return reduceTo(state.loadPtr(ptr, vt, app));
+		}
+	}
+	def visitPtrStore(opcode: Opcode.PtrStore, pt: Type, vt: Type) {
+		var ptr = nullcheck(app);
+		state.killArrayElems();
+		state.killPointedAt();
+		// XXX: use a fact to indicate an initializing store that cannot kill previous loads
+		if (optimize_loads) {
+			state.storePtr(ptr, vt, app, app.input1());
+		}
+	}
+	def visitCallAddress(opcode: Opcode.CallAddress, pt: PointerType) {
+		var t = app.input0();
+		if (SsaConst.?(t)) {
+			var target = SsaConst.!(t).val;
+			if (target == null) return reduceTo(addThrow(app.source, V3Exception.NullCheck));
+			// XXX: CallAddress(#K) => CallMethod
+		}
+		state.kill();
+	}
+	def visitCallKernel(opcode: Opcode.CallKernel, typeArgs: Array<Type>)	{ state.kill(); }
+	def visitDefaultOp(op: Operator)					{ if (!app.facts.O_PURE) state.kill(); }
+	def reduceEq() {
+		def ABOVE_BELOW_ZERO = Fact.V_NON_ZERO | Fact.V_NON_NEGATIVE | Fact.V_BELOW_ZERO;
+		norm_binop(app);
+		if (fold) return reduceTo(graph.boolConst(Values.equal(xval, yval)));
+		if (x == y) return reduceTo(graph.trueConst());
+		// XXX: look through type casts and subsumes for RefEq
+		var and = x.facts & y.facts, or = x.facts | y.facts;
+		if (Facts.NONE != (and & Fact.V_ZERO)) return reduceTo(graph.trueConst()); // 0 == 0 == true
+		if (ABOVE_BELOW_ZERO == (or & ABOVE_BELOW_ZERO)) return reduceTo(graph.falseConst()); // neg == pos == false
 	}
 	def tryEval(apply: SsaApplyOp) -> SsaInstr {
 		for (i in apply.inputs) if (!SsaConst.?(i.dest)) return null; // only evaluate if all inputs are constants
@@ -1554,10 +1536,6 @@ class SsaInstrReducer(context: SsaContext) extends SsaInstrMatcher {
 		return i;
 	}
 	def killUnused(i_old: SsaInstr) -> SsaInstr {
-		// Any remaining uses are debug metadata only (see {hasNonDebugUses}).
-		// Repoint them at a constant of the same type so the dead value is not
-		// kept alive for the debugger; keeping it alive would change the frame
-		// layout and thus the program when compiling with debug information.
 		if (i_old.useList != null) i_old.replace(graph.nullConst(i_old.getType()));
 		i_old.kill();
 		i_old.remove();
