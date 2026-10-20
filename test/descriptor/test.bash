@@ -14,3 +14,7 @@ else
 fi
 
 execute_tests
+
+# At -O2, the machine code is optimized again after descriptor accesses are lowered.
+V3C_OPTS="$V3C_OPTS -O2"
+execute_tests
