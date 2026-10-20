@@ -58,34 +58,29 @@ class SsaOptimizer(context: SsaContext) extends SsaInstrVisitor {
 			l.licm(); 
 		}
 	}
-	def checkAndPruneGraph() -> bool {
-		var changed = false, print = context.shouldPrintOpt();
+	def checkAndPruneGraph() {
+		var print = context.shouldPrintOpt();
 		marker.reset(context.graph);
 		def reachable = Vector<SsaBlock>.new();
 		reachable.put(context.graph.startBlock);
-		var mark = marker.allocMark(context.graph.startBlock);
-		// Mark everything reachable from start.
-		var markInstrs = false;
+		marker.setMark(context.graph.startBlock, 0);
+		// Mark everything reachable from start, numbering blocks in breadth-first order.
 		for (i < reachable.length) {
 			var block = reachable[i];
 			if (print) Terminal.put1("block #%d\n", block.uid);
 			var succs = block.succs();
-			if (markInstrs) for (x = block.next; x != block; x = x.next) {
-				if (print) Terminal.put1(" inst #%d\n", x.uid);
-				marker.setMark(x, mark);
-			}
 			var end = block.end();
 			if (end == null) {
 				context.fail1("block #%d has no end", block.uid);
 				continue;
 			}
-			marker.setMark(end, mark);
+			marker.setMark(end, 0);
 			for (s in succs) {
 				var d = s.dest;
 				if (marker.getMark(d) < 0) {
 					if (print) Terminal.put1(" succ #%d\n", d.uid);
+					marker.setMark(d, u31.!(reachable.length));
 					reachable.put(d);
-					marker.setMark(d, mark);
 				}
 			}
 		}
@@ -97,12 +92,88 @@ class SsaOptimizer(context: SsaContext) extends SsaInstrVisitor {
 				if (marker.getMark(pred.src) < 0) {
 					if (context.shouldPrintOpt()) Terminal.put2("  remove edge #%d -> #%d\n", pred.src.uid, pred.dest.uid);
 					Ssa.removeEdge(pred, true);
-					changed = true;
 				}
 				else j++;
 			}
 		}
-		return changed;
+		if (remove_pure_ops) eliminateDeadCode(reachable);
+	}
+	// Remove or reduce instructions with no live uses.
+	def eliminateDeadCode(blocks: Vector<SsaBlock>) {
+		for (k < blocks.length) {
+			var block = blocks[k], preds = block.preds;
+			for (j < preds.length) {
+				var e = preds[j];
+				if (e == null || marker.getMark(e.src.block()) < k) continue;
+				// Conservatively mark the inputs to loop phi's backedges live.
+				for (x = block.next; SsaPhi.?(x); x = x.next) {
+					var i = (SsaPhi.!(x).inputs[j].dest);
+					marker.setMark(i, 0);
+				}
+			}
+		}
+		for (k = blocks.length - 1; k >= 0; k--) {
+			var block = blocks[k];
+			for (x = block.prev; x != block; ) {
+				var p = x.prev;
+				sweep(x);
+				x = p;
+			}
+		}
+	}
+	// Removes or reduces {i} if no live instruction uses it; otherwise marks its inputs as live.
+	def sweep(i: SsaLink) {
+		var inputs: Array<SsaDfEdge>;
+		match (i) {
+			x: SsaPhi => {
+				inputs = x.inputs;
+				if (marker.getMark(x) < 0) return void(killUnused(x));
+			}
+			x: SsaApplyOp => {
+				inputs = x.inputs;
+				if (marker.getMark(x) < 0) {
+					if (x.facts.O_PURE) return void(killUnused(x));
+					else if (x.facts.O_FOLDABLE && reduceUnused(x) == null) return;
+				}
+			}
+			// Debug uses don't keep inputs alive.
+			x: SsaCheckpoint => 	return;
+			x: SsaNewVar => 	return;
+			x: SsaUpdateVar => 	return;
+			// Otherwise, all inputs are live.
+			x: SsaInstr => 		inputs = x.inputs;
+		}
+		for (e in inputs) marker.setMark(e.dest, 0);
+	}
+	// Reduces {i}, a foldable instruction whose value is unused, to only the checks it performs.
+	// Returns {i} if it must be kept, {null} if it was removed, or the instruction that replaces it.
+	def reduceUnused(i: SsaApplyOp) -> SsaInstr {
+		match (i.op.opcode) {
+			NullCheck => {
+				if (nullCheckNeeded(i)) return i;
+				killUnused(i);
+				return null;
+			}
+			ClassGetField(field) => return reduceToNullCheck(i);
+			ClassGetMethod(method) => return reduceToNullCheck(i);
+			ClassGetVirtual(method) => return reduceToNullCheck(i);
+			ClassGetSelector(selector) => return reduceToNullCheck(i);
+			ArrayGetLength => return reduceToNullCheck(i);
+			_ => return i;
+		}
+	}
+	def nullCheckNeeded(i: SsaApplyOp) -> bool {
+		return !context.compiler.nullity(i, i.input0()).O_NO_NULL_CHECK;
+	}
+	// Replaces {i} with a null check of its receiver, if needed.
+	def reduceToNullCheck(i: SsaApplyOp) -> SsaInstr {
+		var check: SsaInstr;
+		if (nullCheckNeeded(i)) {
+			ssa.setPrev(i.prev);
+			check = add(i.source, V3Op.newNullCheck(i.op.sig.paramTypes[0]), [i.input0()]);
+		}
+		killUnused(i);
+		return check;
 	}
 	// Uses a new builder for insertions during a pass over {g}.
 	def useGraph(g: SsaGraph) {
