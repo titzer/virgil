@@ -23,11 +23,9 @@ for target in $TEST_TARGETS; do
     elif [ "$target" = wasm-gc ]; then
         TESTS=$(ls $TEST_LIST)
     elif [ "$target" = x86-linux ]; then
-#       TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc)
-        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc | grep -v ranges) # temporary, because of reg alloc issue
+        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc)
     elif [ "$target" = x86-darwin ]; then :
-#       TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc)
-        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc | grep -v ranges) # temporary, because of reg alloc issue
+        TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _64 | grep -v _gc)
     elif [ "$target" = x86-64-linux ]; then
         TESTS=$(ls $TEST_LIST | grep -v _pn | grep -v _gc)
     elif [ "$target" = x86-64-darwin ]; then
