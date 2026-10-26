@@ -13,6 +13,7 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 	var env: IrSpec;
 	def specMap = IrUtil.newIrSpecMap<SpecMethod>();
 	def virtMap = IrUtil.newIrSpecMap<SpecMethod>();
+	def monoMap = HashMap<RaMethod, SpecMethod>.new(RaMethod.uid, RaMethod.==);
 	def specSet = IrUtil.newIrItemMap<SpecSet>();
 	var virtList: List<(RaClass, List<RaMethod>)>;
 	def valMap = LazyMap.new(Values.hash, Values.identical, uniquify<Val>);
@@ -20,6 +21,8 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 	def queue = WorkQueue.new();
 
 	def specialize() {
+		// delegates to distinct methods must compare unequal, so never share code
+		ra.classes.apply(markDelegates);
 		// create SpecMethod and SpecSet for each method of each class
 		ra.classes.apply(createSpecs);
 		// create the virtual specs
@@ -31,6 +34,13 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 		queue.drain();
 		// create the normalized/specialized versions of the method
 		ra.liveMethods.apply(createNewIrMethod);
+		if (CLOptions.PRINT_SPEC.val) ra.liveMethods.apply(printSpec);
+	}
+	def printSpec(rm: RaMethod) {
+		if (rm.spec == null) return;
+		var sm = specMap[rm.spec];
+		if (sm == null || sm.set == null) return;
+		Terminal.put2("spec-set #%d: %q\n", sm.set.uid, rm.spec.render);
 	}
 	def createSpecs(rc: RaClass) {
 		for (ml in rc.methods) {
@@ -44,9 +54,20 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 			if (vlist != null) virtList = List.new((rc, vlist), virtList);
 		}
 	}
+	def markDelegates(rc: RaClass) {
+		for (ml in rc.methods) {
+			for (l = ml; l != null; l = l.tail) {
+				var rm = l.head;
+				if (!rm.raFacts.RM_DELEGATE || rm.virtual == null) continue;
+				for (k = rm.virtual.impls; k != null; k = k.tail) k.head.raFacts |= RaFact.RM_DELEGATE;
+			}
+		}
+	}
 	def createInitialSpec(rm: RaMethod) {
 		var specMethod = SpecMethod.new(uid++, rm);
 		specMap[rm.spec] = specMethod;
+		if (rm.raFacts.RM_DELEGATE) return; // fully specialized
+		if (ra.polyMap[rm.orig] == null) return; // operators not analyzed, e.g. equality methods
 		// create initial SpecSet and add method
 		var set = specSet[rm.orig];
 		if (set == null) {
@@ -56,26 +77,37 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 		set.put(specMethod);
 	}
 	def createVirtualSpec(rc: RaClass, list: List<RaMethod>) {
-		// make the spec methods for all instantiations of this virtual method
-		// in the same class instantiation
-		if (list.tail == null) return; // only one instantiation; doesn't matter
-		var m = list.head.orig, set = SpecSet.new(uid++, m), length = 0;
-		// create a "virtual" node that calls all the implementations directly
+		// make a "virtual" node for each instantiation of this virtual method in
+		// this class instantiation, which calls all the live implementations directly
+		var sig = SpecSignature.new();
 		for (l = list; l != null; l = l.tail) {
 			var sm = SpecMethod.new(uid++, l.head);
 			virtMap[l.head.spec] = sm;
-			sm.set = set;
-			set.instantiations = List.new(sm, set.instantiations);
-			// set up direct calls to all live implementations
 			var calls = Vector<SpecEdge>.new();
 			for (k = l.head.virtual.impls; k != null; k = k.tail) {
-				calls.put(SpecEdge.new(calls.length, sm, specMap[k.head.spec]));
+				calls.put(SpecEdge.new(calls.length, sm, implNode(k.head)));
 			}
-			length = calls.length;
 			sm.calls = calls.extract();
+			sig.putInt(sm.calls.length);
+			sig.finish(sm);
 		}
-		// treat the set of virtual nodes like other sets
-		set.setDirty(length);
+		// virtual nodes with the same number of implementations form the initial sets
+		sig.root.apply(createVirtualSet(list.head.orig, _));
+	}
+	// get the node for an implementation of a virtual method
+	def implNode(rm: RaMethod) -> SpecMethod {
+		if (rm.spec != null) return specMap[rm.spec];
+		// monomorphic methods are never in a set, but must be distinguished
+		var sm = monoMap[rm];
+		if (sm == null) monoMap[rm] = sm = SpecMethod.new(uid++, rm);
+		return sm;
+	}
+	def createVirtualSet(m: IrMethod, list: List<SpecMethod>) {
+		if (list.tail == null) return; // only one instantiation; fully specialized
+		var set = SpecSet.new(uid++, m);
+		set.instantiations = list;
+		set.setDirty(list.head.calls.length);
+		set.attachToSpecMethods();
 		queueMethod(set);
 		set.dirtyAll();
 	}
@@ -84,8 +116,7 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 		var specMethod = specMap[rm.spec];
 		if (specMethod.set == null) return;
 		if (specMethod.set.newMethod != null) return;
-		specMethod.set.getNewIrSpec(ra, rn);
-		rm.norm = specMethod.set.newMethod;
+		specMethod.set.getNewIrSpec();
 	}
 	def normCode(context: SsaContext, rm: RaMethod, empty: bool) -> bool {
 		var spec = specMap[rm.spec];
@@ -109,6 +140,7 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 		// add any polymorphic keys to the current key array
 		var exp = apply.op, ta = exp.typeArgs;
 		var t0 = if(ta.length > 0, normType(ta[0]));
+		sig.putInt(exp.opcode.tag);
 		match (exp.opcode) {
 			OverloadedEq,
 			VariantEq => {
@@ -139,7 +171,12 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 					TRUE,
 					SUBSUME,
 					THROW_IF_NOT_NULL,
-					THROW => ; // these dont depend on types
+					THROW,
+					RANGE_PROMOTE_ARRAY => {
+						// these only depend on the representation of values
+						sig.putShape(t0);
+						sig.putShape(t1);
+					}
 					_ => {
 						sig.addOldType(this, t0);
 						sig.addOldType(this, t1);
@@ -154,7 +191,7 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 				match (query) {
 					TRUE,
 					TRUE_IF_NOT_NULL,
-					FALSE => ;  // these dont depend on types
+					FALSE => sig.putShape(t0);  // only depends on the representation of values
 					_ => {
 						sig.addOldType(this, t0);
 						sig.addOldType(this, t1);
@@ -171,6 +208,24 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 			ArraySetElem => {
 				sig.putMemory(normType(V3Array.elementType(ta[0])).newType);
 			}
+			ArrayFill,
+			ArrayGetElemElem,
+			ArraySetElemElem,
+			RangeFromTo,
+			RangeFromPlus,
+			RangeGetElem,
+			RangeSetElem,
+			RangeGetLength => {
+				sig.putShape(t0);
+				sig.putMemory(normType(V3Array.elementType(ta[0])).newType);
+				for (i = 1; i < ta.length; i++) {
+					// index types matter exactly; an element type only by its representation
+					var t = env.instantiateType(ta[i]);
+					if (IntType.?(t)) sig.putInt(typeMap[t]);
+					else sig.putShape(rn.norm(t));
+				}
+			}
+			RefEq => sig.putShape(t0);
 			NullCheck,
 			BoundsCheck,
 			ArrayGetLength => {
@@ -214,25 +269,50 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 				if (sig.first) sig.addDirectCall(V3Op.extractIrSpec(exp, method));
 				putCallConv(sig, exp.sig);
 			}
+			CallClassMethod(method) => {
+				if (sig.first) sig.addDirectCall(V3Op.extractIrSpec(exp, method));
+				putCallConv(sig, exp.sig);
+			}
 			CallClosure => {
 				putCallConv(sig, exp.sig);  // TODO XXX: can ignore closure?
 			}
 			SystemCall => {
 				sig.putType(this, t0); // full specialization
 			}
-			_ => ;
+			DefaultValue => {
+				sig.putShape(t0);
+				// the normalized default value is used in the code
+				var v = if(ra.defaultValues != null, ra.defaultValues[t0.oldType]);
+				var nv = rn.normAsBoxVal(v, t0);
+				if (BoxVal.?(nv)) for (e in BoxVal.!(nv).values) sig.putVal(this, e);
+				else sig.putVal(this, nv);
+			}
+			_ => {
+				// conservatively specialize on all type arguments of any other operator
+				for (t in ta) sig.putInt(typeMap[env.instantiateType(t)]);
+			}
 		}
 	}
 	def putField(apply: SsaApplyOp, field: IrField, sig: SpecSignature) {
 		var rf = ra.makeField(apply, field, env);
-		var nf = rf.liveFields(ra);
-		if (nf.length == 0) {
-			sig.putInt(-1);
+		if (rf.isConst()) {
+			// reads of the field are replaced with its constant value
+			sig.put(EQUAL);
 			sig.putVal(this, rf.val);
-		} else {
-			sig.putInt(nf[0].asField().machOffset);
-			sig.putMemory(rf.typeNorm.newType);
 		}
+		var rc = ra.getClass(rf.receiver);
+		sig.putInt(rf.normIndices.0);
+		sig.putInt(rf.normIndices.1);
+		sig.put(if(rf.raFacts.RF_READ, '\x01', '\x00'));
+		sig.put(if(ra.usesDescriptorHeader(rc), '\x01', '\x00'));
+		// the machine offset of the field depends on all fields before it
+		var end = if(rc.liveFields == null, 0, rf.normIndices.1);
+		for (i < end) {
+			var nf = rc.liveFields[i].asField();
+			sig.put(if(nf.flags.F_DESCRIPTOR, '\x01', '\x00'));
+			sig.putMemory(nf.fieldType);
+		}
+		sig.put(EQUAL);
 	}
 	def putCallConv(spec: SpecSignature, sig: Signature) {
 		// TODO: should use actual calling convention from backend
@@ -266,17 +346,23 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 
 		// add all the polymorphic properties to the splitter
 		var sig = SpecSignature.new();
+		var traces: List<string>;
 		for (l = list; l != null; l = l.tail) {
 			// for each instantiation
 			this.env = l.head.raMethod.spec;
+			if (CLOptions.PRINT_SPEC.val) sig.trace = StringBuilder.new().puts("callconv");
 			// add calling convention of specialized method
 			putCallConv(sig, poly.method.sig);
 			for (op = ra.polyMap[env.asMethod()]; op != null; op = op.tail) {
 				// visit each polymorphic operator
-				if (op.head != null) polySignature(op.head, sig);
+				if (op.head == null) continue;
+				if (sig.trace != null) sig.trace.puts(" | ").puts(op.head.op.opcode.name).puts(":");
+				polySignature(op.head, sig);
 			}
+			if (sig.trace != null) traces = List.new(sig.trace.toString(), traces);
 			sig.finish(l.head);
 		}
+		if (traces != null) printTraceDiffs(Lists.reverse(traces), list);
 		poly.allocCalls(sig);
 		if (sig.root.splits != null) {
 			// not all polymorphic signatures match; split into subsets
@@ -297,19 +383,44 @@ class Specializer(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) {
 			meth.calls = calls.extract();
 		}
 	}
+	// print the first operator at which each instantiation differs from the first
+	def printTraceDiffs(traces: List<string>, list: List<SpecMethod>) {
+		var t0 = traces.head;
+		for (l = traces.tail; l != null; l = l.tail) {
+			list = list.tail;
+			var t = l.head, i = 0;
+			while (i < t.length && i < t0.length && t[i] == t0[i]) i++;
+			if (i == t.length && i == t0.length) continue;
+			var start = i;
+			while (start > 0 && t0[start - 1] != '|') start--;
+			var end = start;
+			while (end < t0.length && t0[end] != ':') end++;
+			Terminal.put2("spec-diff: %q differs at %s\n", list.head.raMethod.spec.render, Arrays.range(t0, start, end));
+		}
+	}
 	def addDirectCallEdges(sig: SpecSignature, calls: Vector<SpecEdge>, meth: SpecMethod) {
 		for (c in sig.directCalls.copy()) { // XXX: no need to make a copy
-			var dest = specMap[meth.raMethod.spec.instantiateIrSpec(c)];
+			var dest = lookup(specMap, meth.raMethod.spec.instantiateIrSpec(c));
 			calls.put(SpecEdge.new(calls.length, meth, dest));
-			Terminal.put2("direct edge %q -> %q\n", meth.raMethod.orig.render, dest.raMethod.orig.render);
 		}
 	}
 	def addVirtualCallEdges(sig: SpecSignature, calls: Vector<SpecEdge>, meth: SpecMethod) {
 		for (c in sig.virtualCalls.copy()) { // XXX: no need to make a copy
-			var dest = virtMap[meth.raMethod.spec.instantiateIrSpec(c)];
+			var dest = lookup(virtMap, meth.raMethod.spec.instantiateIrSpec(c));
 			calls.put(SpecEdge.new(calls.length, meth, dest));
-			Terminal.put2("virtual edge %q -> %q\n", meth.raMethod.orig.render, dest.raMethod.orig.render);
 		}
+	}
+	// look up the node for a method reference, resolving it to its RaMethod if necessary
+	def lookup(map: HashMap<IrSpec, SpecMethod>, spec: IrSpec) -> SpecMethod {
+		var sm = map[spec];
+		if (sm != null) return sm;
+		var rm = spec.asMethod().raMethod;
+		if (rm == null) {
+			var rc = ra.getClass(spec.receiver);
+			if (rc != null) rm = rc.findMethod(spec.member.index, spec.typeArgs);
+		}
+		if (rm == null || rm.spec == null) return null;
+		return map[rm.spec];
 	}
 	// split a SpecSet into a new subset that only includes the given list
 	def splitSpecSet(orig: SpecSet, dirty: bool, list: List<SpecMethod>) {
@@ -359,28 +470,15 @@ class SpecMethod(uid: int, raMethod: RaMethod) {
 	var calls: Array<SpecEdge>;
 	var set: SpecSet;
 	var useList: SpecEdge;
-	def getNormIndex() -> int {
-		return if(set != null, set.normIndex, raMethod.normIndex);
-	}
-	def setNormIndex(i: int) {
-//		Terminal.put2("  setNormIndex %q = %d\n", raMethod.getSpec().render, i);
-		if (set != null && set.normIndex == -1) {
-			set.normIndex = i;
-			if (set.newMethod != null) set.newMethod.index = i; // TODO
-		}
-		if (raMethod.normIndex < 0) raMethod.normIndex = i;
-		if (raMethod.norm.index < 0) raMethod.norm.index = i;
-	}
 }
 // A set of polymorphic instantiations of a method.
 class SpecSet(uid: int, method: IrMethod) {
-	var newMethod: IrMethod;		// new IrMethod
-	var newIrSpec: IrSpec;			// IrSpec with sets substituted in
+	var newMethod: IrMethod;		// shared normalized IrMethod
+	var newIrSpec: IrSpec;			// IrSpec used to normalize the shared code
 	var instantiations: List<SpecMethod>;	// instantiations of the method
 	var dirty: Array<bool>;			// which outgoing call edges are dirty
 	var queued: bool;			// currently on the queue
 	var split: bool;			// this set has been split
-	var normIndex = -1;			// new method index
 
 	def put(meth: SpecMethod) {
 		instantiations = List.new(meth, instantiations);
@@ -405,47 +503,19 @@ class SpecSet(uid: int, method: IrMethod) {
 	def first() -> IrSpec {
 		return instantiations.head.raMethod.spec;
 	}
-	def getNewIrSpec(ra: ReachabilityAnalyzer, rn: ReachabilityNormalizer) -> IrSpec {
+	def getNewIrSpec() -> IrSpec {
 		if (newIrSpec != null) return newIrSpec;
-		// gather two lists of type args from the instantiations
-		var l1: List<TypeArgs>, l2: List<TypeArgs>;
+		// the code is normalized with the first instantiation, which is also used
+		// for method and field references, so reuse its normalized method
+		var rm = instantiations.head.raMethod;
+		newIrSpec = rm.spec;
+		newMethod = rm.norm;
 		for (l = instantiations; l != null; l = l.tail) {
-			var tt = l.head.raMethod.spec.getTypes().typeArgsList;
-			l1 = List.new(tt.head, l1);
-			if (tt.tail != null) l2 = List.new(tt.tail.head, l2);
-		}
-		var typeArgsList = List.new(buildNewTypeArgs(l1), null);
-		if (l2 != null) typeArgsList = List.new(buildNewTypeArgs(l2), typeArgsList);
-		var methodTypeArgs: TypeArgs;
-		var typeArgs: Array<Type>;
-		// find the one with method type arguments (if any)
-		if (method.typeArgs != null) {
-			for (l = typeArgsList; l != null; l = l.tail) {
-				if (method.typeArgs.typeEnv == l.head.typeEnv) methodTypeArgs = l.head;
-			}
-			typeArgs = Array<Type>.new(1 + methodTypeArgs.types.length);
-			Arrays.copyInto(methodTypeArgs.types, typeArgs, 1);
-		} else {
-			typeArgs = Array<Type>.new(1);
-		}
-		// instantiate IrSpecTypes
-		var types = IrSpecTypes.new(typeArgsList, methodTypeArgs);
-		var receiver = types.instantiateType(this.method.receiver);
-		// instantiate IrSpec
-		newIrSpec = IrSpec.new(typeArgs[0] = receiver, typeArgs, method);
-		newIrSpec.types = types; // no need to rebuild IrSpecTypes next time
-
-		var tn = FuncNorm.!(rn.norm(newIrSpec.getMethodType()));
-		var newSig = FuncType.!(tn.sub[0]).sig();
-		newMethod = IrMethod.new(receiver, methodTypeArgs, newSig);
-		newMethod.source = method.source;
-		for (l = instantiations; l != null; l = l.tail) {
-			l.head.raMethod.norm = newMethod;
+			var o = l.head.raMethod;
+			o.norm = newMethod;
+			o.funcNorm = rm.funcNorm;
 		}
 		return newIrSpec;
-	}
-	def buildNewTypeArgs(list: List<TypeArgs>) -> TypeArgs {
-		return list.head; // just return the first instantiation
 	}
 }
 // A customized datastructure that divides a set of SpecMethod's based on
@@ -457,6 +527,7 @@ class SpecSignature {
 	def virtualCalls = Vector<IrSpec>.new();
 	var cur = root;
 	var first = true;
+	var trace: StringBuilder;
 
 	def addDirectCall(spec: IrSpec) {
 		directCalls.put(spec);
@@ -466,6 +537,7 @@ class SpecSignature {
 	}
 	def put(key: byte) {
 		cur = cur.put(key);
+		if (trace != null) trace.putx_8(key);
 	}
 	// add a type to the signature
 	def putType(spec: Specializer, t: TypeNorm) {
@@ -478,12 +550,17 @@ class SpecSignature {
 		if (v == null) putInt(0);
 		else putInt(spec.valMap[v]);
 	}
+	// add the representation of a normalized type to the signature
+	def putShape(t: TypeNorm) {
+		putInt(t.size);
+		putMemory(t.newType);
+	}
 	// add an integer to the signature
 	def putInt(h: int) {
-		put(byte.!(h));
-		put(byte.!(h >>> 8));
-		put(byte.!(h >>> 16));
-		put(byte.!(h >>> 24));
+		put(byte.view(h));
+		put(byte.view(h >>> 8));
+		put(byte.view(h >>> 16));
+		put(byte.view(h >>> 24));
 	}
 	// add a memory reference to the signature
 	def putMemory(t: Type) {
@@ -498,12 +575,14 @@ class SpecSignature {
 			COMPONENT,
 			VOID => put('\x00');
 			FLOAT => put(if(V3.isDouble(t), '\x0c', '\x0d'));
+			VARIANT => put('\x09'); // a boxed variant is a reference
+			POINTER => put('\x0e');
 			TUPLE => {
 				put(TUPLE_MARK);
 				Lists.apply(Tuple.toTypeList(t), putMemory);
 				put(TUPLE_MARK);
 			}
-			_ => ; // TODO
+			_ => { put(EQUAL); put(byte.view(t.typeCon.kind.tag)); }
 		}
 	}
 	// add a parameter type to the signature
@@ -517,12 +596,14 @@ class SpecSignature {
 			CLOSURE => put('\x08');
 			FUNCREF => put('\x04');
 			FLOAT => put(if(V3.isDouble(t), '\x0c', '\x0d'));
+			VARIANT => put('\x05'); // a boxed variant is a reference
+			POINTER => put('\x0e');
 			TUPLE => {
 				put(TUPLE_MARK);
 				Lists.apply(Tuple.toTypeList(t), addParam);
 				put(TUPLE_MARK);
 			}
-			_ => ; // TODO
+			_ => { put(EQUAL); put(byte.view(t.typeCon.kind.tag)); }
 		}
 	}
 	// finish the current array and associate it with the given item
