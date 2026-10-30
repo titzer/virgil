@@ -1,0 +1,377 @@
+// Copyright 2026 Virgil authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Shared core for converting binary floating point numbers to and from decimal,
+// used by {Floats} (32-bit) and {Doubles} (64-bit). Formats are described by
+// the significand width {mbits} including the implicit bit (24 or 53) and the
+// exponent {bias} (127 or 1023); values are passed as raw bits.
+//
+// Implements "unrounded scaling" by Russ Cox (https://research.swtch.com/fp),
+// which builds on Schubfach (Giulietti), Eisel-Lemire, and Dragonbox (Jeon).
+// Adapted from https://github.com/rsc/fpfmt, Copyright 2025 The Go Authors (BSD).
+// An "unrounded" number is a u64 holding floor(4 * x) in its upper 62 bits,
+// or'd with a sticky bit that is set if 4 * x is not an integer. Such a number
+// can be correctly rounded in any rounding mode.
+component FpConv {
+	private def POW10_MIN = -348;
+	private def POW10_MAX = 347;
+	// 128-bit mantissas of 10^p, as interleaved (hi, lo) pairs representing
+	// hi * 2^64 - lo, normalized so that the high bit of hi is set.
+	private def pow10tab = genPow10Table();
+	private def pow10 = [
+		1uL, 10uL, 100uL, 1000uL, 10000uL, 100000uL, 1000000uL, 10000000uL,
+		100000000uL, 1000000000uL, 10000000000uL, 100000000000uL, 1000000000000uL,
+		10000000000000uL, 100000000000000uL, 1000000000000000uL, 10000000000000000uL,
+		100000000000000000uL, 1000000000000000000uL, 10000000000000000000uL
+	];
+
+	// Decode {bits} into an integer significand {m} and exponent {e}, such that
+	// the value is m * 2^e. Ignores the sign bit.
+	private def decode(bits: u64, mbits: int, bias: int) -> (u64, int) {
+		var fbits = u6.view(mbits - 1), m = bits & ((1uL << fbits) - 1);
+		var be = int.view((bits >> fbits) & u64.view(2 * bias + 1));
+		if (be == 0) return (m, 1 - bias - fbits);
+		return (m | (1uL << fbits), be - bias - fbits);
+	}
+	// Like {decode}, but left-justifies the significand. The value must not be zero.
+	def unpack(bits: u64, mbits: int, bias: int) -> (u64, int) {
+		var r = decode(bits, mbits, bias), s = 63 - Longs.log(r.0);
+		return (r.0 << u6.view(s), r.1 - s);
+	}
+	// Compute the shortest decimal {d * 10^p} that rounds back to {m * 2^e},
+	// where {m, e} is the result of {unpack}.
+	def shortest(m: u64, e: int, mbits: int, bias: int) -> (u64, int) {
+		var minExp = -62 - bias, z = 64 - mbits, p: int, min: u64;
+		if (m == 1uL << 63 && e > minExp) {
+			// at a power of 2, the gap to the next lower number is half as big
+			p = 0 - skewed(e + z);
+			min = m - (1uL << u6.view(z - 2));
+		} else {
+			if (e < minExp) z += minExp - e; // subnormal
+			p = 0 - log10Pow2(e + z);
+			min = m - (1uL << u6.view(z - 1));
+		}
+		var max = m + (1uL << u6.view(z - 1)), odd = (m >> u6.view(z)) & 1;
+		var s = prescale(e, p);
+		var dmin = ceil(uscale(min, p, s) + odd), dmax = floor(uscale(max, p, s) - odd);
+		var d = dmax / 10;
+		if (d * 10 >= dmin) return trimZeros(d, 1 - p); // there is a shorter candidate
+		if (dmin < dmax) return (round(uscale(m, p, s)), 0 - p);
+		return (dmin, 0 - p);
+	}
+	// Compute {m * 2^e} rounded to {n} significant decimal digits as {d * 10^p},
+	// where {1 <= n <= 18}.
+	def fixed(m: u64, e: int, n: int) -> (u64, int) {
+		var p = n - 1 - log10Pow2(e + 63);
+		var u = uscale(m, p, prescale(e, p)), d = round(u);
+		if (d >= pow10[n]) return (round(div(u, 10)), 1 - p);
+		return (d, 0 - p);
+	}
+	// Compute {m * 2^e} rounded to {dd} decimal places as {d * 10^p}, rounding
+	// instead to {max} significant digits if that is fewer.
+	def fixedDecimals(m: u64, e: int, dd: int, max: int) -> (u64, int) {
+		var n = dd + 1 + log10Pow2(e + 63); // number of digits, or one fewer
+		if (n >= max) return fixed(m, e, max);
+		if (n < -1) return (0, 0 - dd);
+		var x = if(n < 1, 1 - n, 0), p = dd + x; // compute at least 1 digit
+		var u = uscale(m, p, prescale(e, p));
+		if (x > 0) u = div(u, pow10[x]);
+		return (round(u), 0 - dd);
+	}
+	// Round {d * 10^p} to the nearest floating point number and return its bits.
+	// {d} must have at most 19 decimal digits.
+	def parse(d: u64, p: int, mbits: int, bias: int) -> u64 {
+		var fbits = u6.view(mbits - 1), inf = u64.view(2 * bias + 1) << fbits;
+		if (d == 0 || p < POW10_MIN) return 0;
+		if (p > POW10_MAX) return inf;
+		var b = 1 + Longs.log(d), lp = log2Pow10(p), emax = bias + mbits - 2;
+		if (b + lp < -2 - emax) return 0; // less than half the smallest subnormal
+		var e = mbits - b - lp; // d * 10^p * 2^e has {mbits} bits
+		if (e > emax) e = emax;
+		var u = uscale(d << u6.view(64 - b), p, prescale(e - 64 + b, p));
+		if (u >= (1uL << u6.view(mbits + 2)) - 2) { // rounds up to 2^mbits
+			u = (u >> 1) | (u & 1);
+			e--;
+		}
+		var r = round(u), be = emax + 1 - e;
+		if (r < (1uL << fbits)) return r; // subnormal
+		if (be > 2 * bias) return inf;
+		return (r & ((1uL << fbits) - 1)) | (u64.view(be) << fbits);
+	}
+	// Parse a decimal floating point number "[-]digits[.digits][(e|E)[+|-]digits]",
+	// "[-]Infinity", or "[-]NaN" starting at {a[pos]}. Returns the number of characters
+	// parsed (<= 0 on failure) and the bits of the result.
+	def parseDecimal(a: Array<byte>, pos: int, mbits: int, bias: int) -> (int, u64) {
+		var fbits = u6.view(mbits - 1), inf = u64.view(2 * bias + 1) << fbits;
+		var i = pos, sign = 0uL;
+		if (i < a.length && a[i] == '-') {
+			sign = (inf << 1) & ~inf; // the bit just above the exponent
+			i++;
+		}
+		if (matches(a, i, "NaN")) return (i + 3 - pos, sign | inf | (1uL << u6.view(mbits - 2)));
+		if (matches(a, i, "Infinity")) return (i + 8 - pos, sign | inf);
+		// accumulate up to 19 significant digits into {d}, scaled by 10^x
+		var d = 0uL, nd = 0, x = 0, dot = -1, start = i, inexact = false;
+		while (i < a.length) {
+			var c = a[i++], v = c - '0';
+			if (c == '.' && dot < 0) {
+				dot = i;
+			} else if (v > 9) {
+				i--;
+				break;
+			} else if (nd < 19) {
+				d = d * 10 + v;
+				if (d > 0) nd++;
+				if (dot >= 0) x--;
+			} else {
+				if (v != 0) inexact = true;
+				if (dot < 0) x++;
+			}
+		}
+		var end = i;
+		if (end - start - (if(dot >= 0, 1, 0)) <= 0) return (-1, 0);
+		var exp = 0;
+		if (i < a.length && (a[i] == 'e' || a[i] == 'E')) {
+			var neg = false;
+			i++;
+			if (i < a.length && (a[i] == '+' || a[i] == '-')) neg = a[i++] == '-';
+			var estart = i;
+			while (i < a.length && Chars.isDecimal(a[i])) {
+				if (exp < 100000) exp = exp * 10 + (a[i] - '0');
+				i++;
+			}
+			if (i == estart) return (-1, 0);
+			if (neg) exp = 0 - exp;
+		}
+		var r = parse(d, exp + x, mbits, bias);
+		if (inexact && r != parse(d + 1, exp + x, mbits, bias)) {
+			// the true value is between (d, d+1) * 10^p; decide between r and r+1
+			r = parseSlow(a, start, end, exp, r, mbits, bias);
+		}
+		return (i - pos, sign | r);
+	}
+
+	// Render {bits} using the shortest decimal that rounds back to the same value,
+	// in fixed notation if 10^-3 <= value < 10^7, e.g. "1234.0" or "0.001", otherwise
+	// in scientific notation, e.g. "1.5E-7" or "1E10".
+	def render(bits: u64, mbits: int, bias: int, a: Array<byte>, pos: int) -> int {
+		var start = pos, x = renderPrefix(bits, mbits, bias, a, pos);
+		if (x.2) return x.0;
+		pos += x.0;
+		if (x.1 == 0) {
+			a[pos++] = '0';
+			return pos - start;
+		}
+		var r = unpack(x.1, mbits, bias), s = shortest(r.0, r.1, mbits, bias);
+		var d = s.0, nd = digits(d), k = nd + s.1; // value = 0.ddd * 10^k
+		if (k > 7 || k < -2) {
+			pos += renderDigits(d, nd, 0, 0, nd - 1, a, pos);
+			a[pos++] = 'E';
+			var ex = k - 1;
+			if (ex < 0) {
+				a[pos++] = '-';
+				ex = 0 - ex;
+			}
+			var ux = u64.view(ex);
+			pos += renderDigits(ux, digits(ux), 0, 0, 0, a, pos);
+		} else if (k <= 0) {
+			pos += renderDigits(d, nd, 1 - k, 0, nd - k, a, pos);
+		} else if (k >= nd) {
+			pos += renderDigits(d, nd, 0, k - nd + 1, 1, a, pos);
+		} else {
+			pos += renderDigits(d, nd, 0, 0, nd - k, a, pos);
+		}
+		return pos - start;
+	}
+	// Render {bits} correctly rounded to exactly {dd} decimal places, but with at most
+	// {max} significant digits, followed by zeros.
+	def renderDecimals(bits: u64, mbits: int, bias: int, dd: int, max: int, a: Array<byte>, pos: int) -> int {
+		var x = renderPrefix(bits, mbits, bias, a, pos);
+		if (x.2) return x.0;
+		var r = (0uL, 0 - dd);
+		if (x.1 != 0) {
+			var u = unpack(x.1, mbits, bias);
+			r = fixedDecimals(u.0, u.1, dd, max);
+		}
+		var nd = digits(r.0), z = r.1 + dd, w = nd + z - dd; // w = integer digits
+		return x.0 + renderDigits(r.0, nd, if(w < 1, 1 - w, 0), z, dd, a, pos + x.0);
+	}
+	// Render the sign of {bits}, and NaN or Infinity. Returns the number of characters
+	// rendered, the absolute value bits, and whether rendering is complete.
+	private def renderPrefix(bits: u64, mbits: int, bias: int, a: Array<byte>, pos: int) -> (int, u64, bool) {
+		var inf = u64.view(2 * bias + 1) << u6.view(mbits - 1), sign = (inf << 1) & ~inf;
+		var n = 0;
+		if ((bits & sign) != 0) a[pos + n++] = '-';
+		bits &= sign - 1;
+		if (bits < inf) return (n, bits, false);
+		var str = if(bits == inf, "Infinity", "NaN");
+		Arrays.copyInto(str, a, pos + n);
+		return (n + str.length, bits, true);
+	}
+
+	// Render {lead} zeros, the {nd} digits of {d}, then {trail} zeros into {a[pos ...]},
+	// inserting a decimal point before the last {frac} digits if {frac > 0}.
+	private def renderDigits(d: u64, nd: int, lead: int, trail: int, frac: int, a: Array<byte>, pos: int) -> int {
+		var len = lead + nd + trail, end = pos + len;
+		for (i < lead) a[pos + i] = '0';
+		for (i < trail) a[end - 1 - i] = '0';
+		for (i = end - trail - 1; i >= pos + lead; i--) {
+			a[i] = byte.view('0' + d % 10);
+			d /= 10;
+		}
+		if (frac <= 0) return len;
+		for (i = end; i > end - frac; i--) a[i] = a[i - 1];
+		a[end - frac] = '.';
+		return len + 1;
+	}
+	// Return the number of decimal digits in {d}, with 0 having 1 digit.
+	private def digits(d: u64) -> int {
+		var n = log10Pow2(1 + Longs.log(d));
+		return if(d >= pow10[n], n + 1, if(n == 0, 1, n));
+	}
+
+	// Compute the shift for unrounded scaling {x * 2^e * 10^p}.
+	private def prescale(e: int, p: int) -> u6 {
+		return u6.view(0 - (e + log2Pow10(p) + 3));
+	}
+	// Compute unrounded {x * 2^e * 10^p}, where {s = prescale(e, p)}.
+	private def uscale(x: u64, p: int, s: u6) -> u64 {
+		var i = 2 * (p - POW10_MIN);
+		var r = mul64(x, pow10tab[i]), hi = r.0, sticky = 1uL;
+		if ((hi & ((1uL << s) - 1)) == 0) {
+			// subtracting the low part may borrow from {hi}, or show exactness
+			var mid = r.1, mid2 = mul64(x, pow10tab[i + 1]).0;
+			if (mid - mid2 <= 1) sticky = 0;
+			if (mid < mid2) hi--;
+		}
+		return (hi >> s) | sticky;
+	}
+	private def floor(u: u64) -> u64 { return u >> 2; }
+	private def ceil(u: u64) -> u64 { return (u + 3) >> 2; }
+	private def round(u: u64) -> u64 { return (u + 1 + ((u >> 2) & 1)) >> 2; } // ties to even
+	private def div(u: u64, d: u64) -> u64 {
+		var q = u / d;
+		return q | (u & 1) | (if(q * d != u, 1uL, 0uL));
+	}
+	// Remove up to 16 trailing zeros from {x * 10^p}, using the modular inverses
+	// of powers of 5 to test divisibility (from Dragonbox).
+	private def trimZeros(x: u64, p: int) -> (u64, int) {
+		var t = rotr(x * 0xcccccccccccccccduL, 1);
+		if (t > u64.max / 10) return (x, p);
+		x = t; p++;
+		t = rotr(x * 0xc767074b22e90e21uL, 8);
+		if (t <= u64.max / 100000000) { x = t; p += 8; }
+		t = rotr(x * 0xd288ce703afb7e91uL, 4);
+		if (t <= u64.max / 10000) { x = t; p += 4; }
+		t = rotr(x * 0x8f5c28f5c28f5c29uL, 2);
+		if (t <= u64.max / 100) { x = t; p += 2; }
+		t = rotr(x * 0xcccccccccccccccduL, 1);
+		if (t <= u64.max / 10) { x = t; p += 1; }
+		return (x, p);
+	}
+	private def rotr(x: u64, k: u6) -> u64 {
+		return (x >> k) | (x << u6.view(64 - k));
+	}
+	// Compute the 128-bit product of {x} and {y} as (hi, lo).
+	private def mul64(x: u64, y: u64) -> (u64, u64) {
+		var x0 = x & 0xFFFFFFFFu, x1 = x >> 32, y0 = y & 0xFFFFFFFFu, y1 = y >> 32;
+		var p00 = x0 * y0, p01 = x0 * y1, p10 = x1 * y0;
+		var mid = (p00 >> 32) + (p01 & 0xFFFFFFFFu) + (p10 & 0xFFFFFFFFu);
+		return (x1 * y1 + (p01 >> 32) + (p10 >> 32) + (mid >> 32), (mid << 32) | (p00 & 0xFFFFFFFFu));
+	}
+	// floor(log10(2^x))
+	private def log10Pow2(x: int) -> int { return (x * 78913) >> 18; }
+	// floor(log2(10^x))
+	private def log2Pow10(x: int) -> int { return (x * 108853) >> 15; }
+	// floor(log10(3/4 * 2^x))
+	private def skewed(x: int) -> int { return (x * 631305 - 261663) >> 21; }
+
+	private def matches(a: Array<byte>, pos: int, s: string) -> bool {
+		if (pos + s.length > a.length) return false;
+		for (i < s.length) if (a[pos + i] != s[i]) return false;
+		return true;
+	}
+	// Decide whether the decimal digits {a[start ... end]} times 10^exp round to {r} or
+	// {r + 1}, by an exact comparison with their midpoint.
+	private def parseSlow(a: Array<byte>, start: int, end: int, exp: int, r: u64, mbits: int, bias: int) -> u64 {
+		var x = FpSketch.new(), dot = false;
+		for (i = start; i < end; i++) {
+			var c = a[i];
+			if (c == '.') dot = true;
+			else {
+				x.addDecDigit(c - '0');
+				if (dot) exp--;
+			}
+		}
+		// the midpoint is (2 * m + 1) * 2^(e - 1)
+		var m = decode(r, mbits, bias), y = FpSketch.new();
+		y.mulAdd32(1, u32.view(m.0 >> 31)).mulAdd32(1u << 31, u32.view(m.0 & 0x7FFFFFFF)).mulAdd32(2, 1);
+		// compare x * 10^exp with y * 2^e2
+		if (exp > 0) x.mulPow10(u32.view(exp));
+		else y.mulPow10(u32.view(0 - exp));
+		var e2 = m.1 - 1;
+		var z = if(e2 < 0, x, y);
+		for (k = if(e2 < 0, 0 - e2, e2); k > 0; k -= 31) z.mulAdd32(1u << u5.view(if(k > 31, 31, k)), 0);
+		var c = compare(x, y);
+		return if(c < 0 || (c == 0 && (r & 1) == 0), r, r + 1);
+	}
+	private def compare(x: FpSketch, y: FpSketch) -> int {
+		var hx = x.highestOneBit(), hy = y.highestOneBit();
+		if (hx != hy) return hx - hy;
+		for (i = hx >> 5; i >= 0; i--) {
+			var a = x.words[i], b = y.words[i];
+			if (a != b) return if(a < b, -1, 1);
+		}
+		return 0;
+	}
+	// Generate the table of powers of 10 using exact multi-word arithmetic.
+	private def genPow10Table() -> Array<u64> {
+		var t = Array<u64>.new(2 * (POW10_MAX - POW10_MIN + 1));
+		var w = Array<u32>.new(44); // little-endian words
+		w[4] = 1; // 2^128 * 10^p, for p >= 0
+		for (p = 0; p <= POW10_MAX; p++) {
+			top128(t, 2 * (p - POW10_MIN), w, false);
+			var carry = 0uL;
+			for (i < w.length) {
+				var v = u64.view(w[i]) * 10 + carry;
+				w[i] = u32.view(v);
+				carry = v >> 32;
+			}
+		}
+		w = Array<u32>.new(44);
+		w[43] = 1; // floor(2^1376 / 10^-p), for p < 0
+		for (p = -1; p >= POW10_MIN; p--) {
+			var rem = 0uL;
+			for (i = w.length - 1; i >= 0; i--) {
+				var v = (rem << 32) | w[i];
+				w[i] = u32.view(v / 10);
+				rem = v % 10;
+			}
+			top128(t, 2 * (p - POW10_MIN), w, true);
+		}
+		return t;
+	}
+	// Store the top 128 bits of {w}, rounded up, into {t[i]} and {t[i + 1]}.
+	private def top128(t: Array<u64>, i: int, w: Array<u32>, inexact: bool) {
+		var h = w.length - 1;
+		while (w[h] == 0) h--;
+		var b = 32 * h + Longs.log(w[h]) - 127, bw = b >> 5; // lowest bit of the top 128
+		var hi = 0uL, lo = 0uL;
+		for (k < 4) {
+			var x = u64.view(w[bw + k]);
+			if (bw + k + 1 < w.length) x |= u64.view(w[bw + k + 1]) << 32;
+			var c = u64.view(u32.view(x >> u5.view(b)));
+			if (k < 2) lo |= c << u6.view(32 * k);
+			else hi |= c << u6.view(32 * k - 64);
+		}
+		for (j < bw) inexact |= w[j] != 0;
+		inexact |= (w[bw] & ((1u << u5.view(b)) - 1)) != 0;
+		if (inexact && ++lo == 0) hi++;
+		if (lo != 0) {
+			hi++;
+			lo = 0uL - lo;
+		}
+		t[i] = hi;
+		t[i + 1] = lo;
+	}
+}
