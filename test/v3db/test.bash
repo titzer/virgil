@@ -14,6 +14,9 @@ case " $V3C_OPTS " in
     *" -O3 "*)
 	TESTS=$(for t in $TESTS; do grep -qx "$t" O3.skip || echo $t; done)
 	;;
+    *" -O4 "*)
+	TESTS=$(for t in $TESTS; do grep -qx "$t" O4.skip || echo $t; done)
+	;;
 esac
 
 target=v3db
