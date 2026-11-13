@@ -32,7 +32,7 @@ AENEAS_SOURCES=${AENEAS_SOURCES:=$(ls $VIRGIL_LOC/aeneas/src/*/*.v3)}
 AENEAS_LOC=${AENEAS_LOC:=${VIRGIL_LOC}/aeneas/src}
 
 # Set defaults.
-V3C_HEAP_SIZE=${V3C_HEAP_SIZE:="-heap-size=1500m"}
+V3C_HEAP_SIZE=${V3C_HEAP_SIZE:=}  # if unset, chosen per target in compile_aeneas
 TEST_GC_WASM=${TEST_GC_WASM:=1}
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
@@ -446,7 +446,14 @@ function compile_aeneas() {
     if [ ! -x $CMD ]; then
 	CMD=bin/dev/v3c-$target
     fi
-    V3C=$HOST_AENEAS $CMD $V3C_HEAP_SIZE $V3C_OPTS -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
+    local HEAP_SIZE=$V3C_HEAP_SIZE
+    if [ -z "$HEAP_SIZE" ]; then
+	case "$target" in
+	    x86-linux|x86-darwin) HEAP_SIZE="-heap-size=800m" ;;
+	    *) HEAP_SIZE="-heap-size=2000m" ;;
+	esac
+    fi
+    V3C=$HOST_AENEAS $CMD $HEAP_SIZE $V3C_OPTS -jvm.script -jvm.args="$AENEAS_JVM_TUNING" -output=$TARGET_DIR $SRCS
     EXIT_CODE=$?
     popd > /dev/null
     if [ $EXIT_CODE != 0 ]; then
