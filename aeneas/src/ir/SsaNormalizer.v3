@@ -52,10 +52,18 @@ class SsaRaNormalizer extends SsaRebuilder {
 					newParams.put(SsaParam.new(newParams.length, tn.newType));
 					start++; // skip synthesized receiver
 				} else if (VariantNorm.?(tn)) {
-					// receiver became flattened data
-					var newIrType = norm.ra.getClass(tn.oldType).newIrType;
-					newParams.put(SsaParam.new(newParams.length, newIrType));
-					start++; // skip synthesized receiver
+					if (V3.isEnum(tn.oldType) && !norm.config.NonRefClosureReceiver
+							&& context.method.source != null && VstMethod.?(context.method.source)) {
+						// JVM enum: Oop receiver, no synthesized component
+						newParams.put(SsaParam.new(newParams.length, MachModule.getAnyRefType()));
+						newRanges.put(start, newParams.length);
+						continue;
+					} else if (!V3.isEnum(tn.oldType)) {
+						// variant: synthesized component receiver
+						var newIrType = norm.ra.getClass(tn.oldType).newIrType;
+						newParams.put(SsaParam.new(newParams.length, newIrType));
+						start++;
+					}
 				}
 			}
 			if (tn.size == 1) {
@@ -101,6 +109,15 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 
 		// Map old parameters to new parameters
+		// JVM user-defined enum methods: unbox Oop param to int tag
+		if (!norm.config.NonRefClosureReceiver && oldParams.length > 0
+		    && V3.isEnum(oldParams[0].vtype)
+		    && context.method.source != null && VstMethod.?(context.method.source)) {
+			var b = SsaBuilder.new(context, newGraph, newGraph.startBlock);
+			var tagType = V3.getVariantTagType(oldParams[0].vtype);
+			newValues[0] = b.opTypeSubsume(MachModule.getAnyRefType(), tagType, newValues[0]);
+		}
+
 		for (i < newRanges.length) {
 			var t = newRanges[i], size = t.1 - t.0;
 			var oldParam = oldParams[i];
@@ -374,8 +391,8 @@ class SsaRaNormalizer extends SsaRebuilder {
 	def visitIntViewI(opcode: Opcode.IntViewI, ft: IntType, tt: IntType) {
 		map1(app, ssa.opIntViewI(op, genRef1(app.inputs[0])));
 	}
-	def visitEnumViewI(opcode: Opcode.EnumViewI, ft: IntType, tt: EnumType) {
-		var it = IntType.!(tt.enumDecl.tagType);
+	def visitEnumViewI(opcode: Opcode.EnumViewI, ft: IntType, tt: ClassType) {
+		var it = IntType.!(tt.classDecl.tagType);
 		map1(app, genEnumViewI(tt, it, ft, genRef1(app.inputs[0])));
 	}
 	def visitEnumSetViewI(opcode: Opcode.EnumSetViewI, ft: IntType, tt: EnumSetType) {
@@ -730,7 +747,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			return;
 		}
 		normType(raField.receiver); // XXX: normType() side-effect of flattening
-		if (raField != null && rc.isUnboxed()) {
+		if (raField != null && rc.isUnboxed() && !V3.isEnum(rc.oldType)) {
 			// field of unboxed data type
 			var vals = genVariantGetField(rc, raField, rc.variantNorm, ai_new);
 			return mapNnf(i_old, vals);
@@ -787,7 +804,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 			// OPT: remove write of zero-width field
 			// OPT: remove write of write-only field
 			return addNullCheck(i_old, receiver);
-		} else if (rc.isUnboxed()) {
+		} else if (rc.isUnboxed() && !V3.isEnum(rc.oldType)) {
 			// init/set of field of flattened data type
 			return map0(i_old);
 		} else if (nf.length == 1) {
@@ -890,6 +907,28 @@ class SsaRaNormalizer extends SsaRebuilder {
 	private def funcRef(m: IrSpec) -> SsaInstr {
 		return newGraph.valConst(Function.funcRefType(m.getFuncType()), FuncVal.new(m));
 	}
+	// Look up a function in an mtable record by tag. Returns the function SSA value.
+	private def lookupMtable(sel: IrSelector, tag: SsaInstr, tagType: IntType) -> SsaInstr {
+		if (sel.mtable.compactRecord != null) {
+			var rc = norm.ra.getClass(sel.mtable.root.receiver);
+			var slotMap = newGraph.valConst(rc.compactSlotMap.rtype, rc.compactSlotMap);
+			var slot = ssa.opArrayGetElem(rc.compactSlotMap.rtype, tagType, Facts.O_SAFE_BOUNDS, slotMap, tag);
+			var table = newGraph.valConst(sel.mtable.compactRecord.rtype, sel.mtable.compactRecord);
+			return ssa.opArrayGetElem(sel.mtable.compactRecord.rtype, rc.compactSlotType, Facts.O_SAFE_BOUNDS, table, slot);
+		}
+		var record = sel.mtable.record;
+		var table = newGraph.valConst(record.rtype, record);
+		return ssa.opArrayGetElem(record.rtype, tagType, Facts.O_SAFE_BOUNDS, table, tag);
+	}
+	// For JVM/wasm-gc: box enum tag to AnyRef for closure receiver slot.
+	private def boxEnumClosureReceiver(rc: RaClass, obj: SsaInstr) -> SsaInstr {
+		if (V3.isEnum(rc.oldType)
+		    && (!context.compiler.NormConfig.NonRefClosureReceiver
+		        || context.compiler.NormConfig.ExplicitRefTypeCast)) {
+			return ssa.opTypeSubsume(V3.getVariantTagType(rc.oldType), MachModule.getAnyRefType(), obj);
+		}
+		return obj;
+	}
 	def normArgs(funcNorm: FuncNorm, args: Array<SsaInstr>) -> Array<SsaInstr> {
 		if (funcNorm.ovfParamTypes.length > 0) {
 			// write overflow arguments into globals and truncate args array
@@ -949,13 +988,38 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	def visitVariantGetMethod(opcode: Opcode.VariantGetMethod, spec: IrSpec) {
 		var obj = genRef1(app.inputs[0]);
-		mapN(app, [funcRef(extractMethodRef(spec).1), obj]);
+		var rc = norm.ra.getClass(spec.receiver);
+		obj = boxEnumClosureReceiver(rc, obj);
+		var m = extractMethodRef(spec).1;
+		var fref: SsaInstr;
+		if (V3.isEnum(rc.oldType)
+		    && (!context.compiler.NormConfig.NonRefClosureReceiver
+		        || context.compiler.NormConfig.ExplicitRefTypeCast)) {
+			var funcNorm = normFuncType(app.getType());
+			fref = newGraph.valConst(funcNorm.sub[0], FuncVal.new(m));
+		} else {
+			fref = funcRef(m);
+		}
+		mapN(app, [fref, obj]);
 	}
 	def visitVariantGetVirtual(opcode: Opcode.VariantGetVirtual, spec: IrSpec) {
+		var rc = norm.ra.getClass(spec.receiver);
 		var t = extractVirtualRef(spec), obj = genRef1(app.inputs[0]);
 		if (t.2) { // still a virtual dispatch
-			mapN(app, [ssa.opGetSelector(t.1, obj), obj]);
+			if (V3.isEnum(rc.oldType)) {
+				var sel = IrSelector.!(t.1.member);
+				if (sel.mtable != null && sel.mtable.record != null) {
+					var func = lookupMtable(sel, obj, V3.getVariantTagType(rc.oldType));
+					obj = boxEnumClosureReceiver(rc, obj);
+					mapN(app, [func, obj]);
+				} else {
+					mapN(app, [funcRef(t.1), obj]);
+				}
+			} else {
+				mapN(app, [ssa.opGetSelector(t.1, obj), obj]);
+			}
 		} else {
+			obj = boxEnumClosureReceiver(rc, obj);
 			mapN(app, [funcRef(t.1), obj]);
 		}
 	}
@@ -969,8 +1033,16 @@ class SsaRaNormalizer extends SsaRebuilder {
 			// add back void for component
 			ai_new = Arrays.prepend(context.graph.nullConst(m.receiver), ai_new);
 		}
-		if (V3.isVariant(rc.oldType)) {
-			if (rc.isUnboxed()) {
+		if (rc.isUnboxed()) {
+			app.facts |= Fact.O_NO_NULL_CHECK;
+			if (V3.isEnum(rc.oldType)) {
+				var method = opcode.method;
+				if (!context.compiler.NormConfig.NonRefClosureReceiver
+				    && method.source != null && VstMethod.?(method.source)) {
+					// JVM: user-defined enum methods take a boxed (AnyRef) tag receiver
+					ai_new[0] = ssa.opTypeSubsume(V3.getVariantTagType(rc.oldType), MachModule.getAnyRefType(), ai_new[0]);
+				}
+			} else {
 				// flattened data type becomes component call and needs new receiver
 				ai_new = Arrays.prepend(newGraph.nullReceiver(), ai_new);
 			}
@@ -1009,26 +1081,46 @@ class SsaRaNormalizer extends SsaRebuilder {
 	def visitCallVariantVirtual(opcode: Opcode.CallVariantVirtual, spec: IrSpec) {
 		// devirtualize methods that are not overridden
 		var rc = norm.ra.getClass(spec.receiver);
+		if (rc.isUnboxed()) app.facts |= Fact.O_NO_NULL_CHECK;
 		var t = extractVirtualRef(spec), funcNorm = t.0, m = t.1;
 		var ai_new = normArgs(funcNorm, genRefs(app.inputs));
 		if (t.2) { // still a virtual dispatch
 			if (rc.isUnboxed()) {
-				// use the variant tag as an index into a table of functions
-				var tag = normVariantGetRepTag(rc.variantNorm, ai_new);
 				var selector = IrSelector.!(m.member);
-				var record = selector.mtable.record;
-				var table = newGraph.valConst(record.rtype, record);
-				var func = ssa.opArrayGetElem(record.rtype, rc.variantNorm.tagType(), Facts.O_SAFE_BOUNDS, table, tag);
-				ai_new = Arrays.concat([func, newGraph.nullReceiver()], ai_new);
-				normCall(app, funcNorm, V3Op.newCallFunction(funcNorm.sub[0]), ai_new);
+				if (selector.mtable != null && selector.mtable.record != null) {
+					// use the variant tag as an index into a table of functions
+					var tag = normVariantGetRepTag(rc.variantNorm, ai_new);
+					var func = lookupMtable(selector, tag, rc.variantNorm.tagType());
+					if (V3.isEnum(rc.oldType)) {
+						if (!context.compiler.NormConfig.NonRefClosureReceiver
+						    || context.compiler.NormConfig.ExplicitRefTypeCast) {
+							// JVM/wasm-gc enum: box tag to AnyRef
+							var tagType = V3.getVariantTagType(rc.oldType);
+							var boxedTag = ssa.opTypeSubsume(tagType, MachModule.getAnyRefType(), ai_new[0]);
+							var userArgs = Arrays.range(ai_new, 1, ai_new.length);
+							var userFuncType = Function.newType(
+								if(userArgs.length > 0, Tuple.fromTypeArray(Arrays.map(userArgs, SsaInstr.getType)), Void.TYPE),
+								funcNorm.sig().returnType());
+							ai_new = Arrays.concat([func, boxedTag], userArgs);
+							normCall(app, funcNorm, V3Op.newCallFunction(userFuncType), ai_new);
+						} else {
+							ai_new = Arrays.prepend(func, ai_new);
+							normCall(app, funcNorm, V3Op.newCallFunctionDirect(funcNorm.sub[0]), ai_new);
+						}
+					} else {
+						ai_new = Arrays.concat([func, newGraph.nullReceiver()], ai_new);
+						normCall(app, funcNorm, V3Op.newCallFunction(funcNorm.sub[0]), ai_new);
+					}
+				} else {
+					if (!V3.isEnum(rc.oldType)) ai_new = Arrays.prepend(newGraph.nullReceiver(), ai_new);
+					normCall(app, funcNorm, V3Op.newCallMethod(m), ai_new);
+				}
 			} else {
 				normCall(app, funcNorm, V3Op.newCallVariantSelector(m), ai_new);
 			}
 		} else {
-			if (rc.isUnboxed()) {
-				// flattened data type becomes component call and needs new receiver
-				ai_new = Arrays.prepend(newGraph.nullReceiver(), ai_new);
-			}
+			// flattened data type becomes component call and needs new receiver
+			if (rc.isUnboxed() && !V3.isEnum(rc.oldType)) ai_new = Arrays.prepend(newGraph.nullReceiver(), ai_new);
 			normCall(app, funcNorm, V3Op.newCallMethod(m), ai_new);
 		}
 	}
@@ -1130,6 +1222,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 	}
 	def visitNullCheck(opcode: Opcode.NullCheck, t: Type) {
+		if (V3.isEnum(t)) return; // enum values are tags, never null
 		var newArgs = genRefs(app.inputs);
 		if (newArgs.length >= 1) addNullCheck(app, newArgs[0]);
 	}
@@ -1239,16 +1332,16 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
 		var result: SsaInstr;
 
-		match (fn.oldType) {
+		if (V3.isEnum(fn.oldType)) {
+			var x = ClassType.!(fn.oldType);
+			var it = IntType.!(x.classDecl.tagType);
+			var wt = Int.getType(false, it.byteSize * 8);
+			result = ssa.opByteArrayGetField(wt, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start);
+			result = genEnumViewI(x, it, wt, result);
+		} else match (fn.oldType) {
 			x: BoolType,
 			x: IntType,
 			x: FloatType => result = ssa.opByteArrayGetField(fn.oldType, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start);
-			x: EnumType => {
-				var it = IntType.!(x.enumDecl.tagType);
-				var wt = Int.getType(false, it.byteSize * 8);
-				result = ssa.opByteArrayGetField(wt, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start);
-				result = genEnumViewI(x, it, wt, result);
-			}
 			_ => context.fail1("unexpected type %q", fn.oldType.render);
 		}
 		return map1(app, result);
@@ -1260,15 +1353,14 @@ class SsaRaNormalizer extends SsaRebuilder {
 		var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
 		var result: SsaInstr;
 
-		match (fn.oldType) {
+		if (V3.isEnum(fn.oldType)) {
+			var it = IntType.!(V3.getDecl(fn.oldType).tagType);
+			var wt = Int.getType(false, it.byteSize * 8);
+			result = ssa.opByteArraySetField(wt, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start, val);
+		} else match (fn.oldType) {
 			x: BoolType,
 			x: IntType,
 			x: FloatType => result = ssa.opByteArraySetField(fn.oldType, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start, val);
-			x: EnumType => {
-				var it = IntType.!(x.enumDecl.tagType);
-				var wt = Int.getType(false, it.byteSize * 8);
-				result = ssa.opByteArraySetField(wt, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start, val);
-			}
 		}
 		return map1(app, result);
 	}
@@ -1303,17 +1395,16 @@ class SsaRaNormalizer extends SsaRebuilder {
 			ssa.opIntAdd(start, ssa.opIntMul(index, newGraph.intConst(opcode.scale)))
 		);
 		var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
-		match (fn.oldType) {
+		if (V3.isEnum(fn.oldType)) {
+			var it = IntType.!(V3.getDecl(fn.oldType).tagType);
+			result = ssa.opByteArrayGetField(it, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start);
+			var caseCount = newGraph.intConst(enumTagCount(fn.oldType));
+			var inBound = ssa.opIntULt(it, it, result, caseCount);
+			result = ssa.addSelect(it, inBound, result, newGraph.nullConst(it));
+		} else match (fn.oldType) {
 			x: BoolType,
 			x: IntType,
 			x: FloatType => result = ssa.opByteArrayGetField(fn.oldType, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start);
-			x: EnumType => {
-				var it = IntType.!(x.enumDecl.tagType);
-				result = ssa.opByteArrayGetField(it, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start);
-				var caseCount = newGraph.intConst(x.enumDecl.cases.length);
-				var inBound = ssa.opIntULt(it, it, result, caseCount);
-				result = ssa.addSelect(it, inBound, result, newGraph.nullConst(it));
-			}
 			_ => ;
 		}
 		return map1(app, result);
@@ -1333,14 +1424,13 @@ class SsaRaNormalizer extends SsaRebuilder {
 		);
 		var facts: Fact.set = Fact.O_NO_BOUNDS_CHECK;
 		var result: SsaInstr;
-		match (fn.oldType) {
+		if (V3.isEnum(fn.oldType)) {
+			var it = IntType.!(V3.getDecl(fn.oldType).tagType);
+			result = ssa.opByteArraySetField(it, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start, val);
+		} else match (fn.oldType) {
 			x: BoolType,
 			x: IntType,
 			x: FloatType => result = ssa.opByteArraySetField(fn.oldType, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start, val);
-			x: EnumType => {
-				var it = IntType.!(x.enumDecl.tagType);
-				result = ssa.opByteArraySetField(it, norm.rangeStartType, opcode.offset, opcode.order, facts, array, start, val);
-			}
 		}
 		return map1(app, result);
 	}
@@ -1691,8 +1781,12 @@ class SsaRaNormalizer extends SsaRebuilder {
 			result.put(wrapTypeCast(ssa, atn.newType, rtn.newType, ai_old[offset]));
 		}
 	}
-	def genEnumViewI(et: EnumType, it: IntType, wt: IntType, val: SsaInstr) -> SsaInstr {
-		var caseCount = newGraph.intConst(et.enumDecl.cases.length);
+	// Number of valid tags of an enum type (open enum hierarchies use DFS tags up to tagHi).
+	def enumTagCount(et: Type) -> int {
+		return Ints.max(V3.getDecl(et).cases.length, V3.getTagHi(et) + 1);
+	}
+	def genEnumViewI(et: ClassType, it: IntType, wt: IntType, val: SsaInstr) -> SsaInstr {
+		var caseCount = newGraph.intConst(enumTagCount(et));
 		var inBound = ssa.opIntULt(norm.config.ArrayLengthType, it, val, caseCount);
 		var narrowed = ssa.opIntViewI0(it, wt, val);
 		return ssa.addSelect(it, inBound, narrowed, newGraph.nullConst(it));
@@ -1858,6 +1952,7 @@ class SsaRaNormalizer extends SsaRebuilder {
 		}
 		// Case: Scalar is IntType; Interval represents a BoolType or FloatType
 		if (interval.start > 0) scalar = ssa.addApplyF(ift.opShr(), [scalar, newGraph.intConst(interval.start)], Facts.O_SAFE_SHIFT);
+		if (V3.isEnum(tt)) return ssa.opIntView(ift, V3.getDecl(tt).tagType, scalar);
 		match (tt) {
 			x: BoolType => {
 				def oneConst = if(ift.width > 32, newGraph.valConst(ift, Long.box(1L)), newGraph.intConst(1));
@@ -1867,10 +1962,6 @@ class SsaRaNormalizer extends SsaRebuilder {
 			x: FloatType => {
 				if (x.is64) return apply(V3Op.newFloat64ViewI(ift), [scalar]);
 				else return apply(V3Op.newFloat32ViewI(ift), [scalar]);
-			}
-			x: EnumType => {
-				scalar = ssa.opIntView(ift, x.enumDecl.tagType, scalar);
-				return scalar;
 			}
 			x: EnumSetType => {
 				scalar = ssa.opIntView(ift, x.repType, scalar);
@@ -1894,9 +1985,9 @@ class SsaRaNormalizer extends SsaRebuilder {
 	}
 	// Returns true if {t} needs a sign extension at the representation level
 	def isSignedRep(t: Type) -> bool {
+		if (V3.isEnum(t)) return V3.getDecl(t).tagType.signed;
 		match (t) {
 			x: IntType => return x.signed;
-			x: EnumType => return x.enumDecl.tagType.signed;
 			x: EnumSetType => return x.repType.signed;
 			x: FloatType => return true;	// Float{32,64}ViewI yields a signed int
 			_ => return false;
