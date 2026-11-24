@@ -63,7 +63,7 @@ NUM_RE = re.compile(r'-?\b0x[0-9a-f]+\b|-?\b\d+\b')
 ALIASES = {
     # 0xCC: binutils gives it a distinct mnemonic; handled specially below.
     'repz': 'rep', 'repnz': 'repne',
-    'retq': 'ret', 'retf': 'retf', 'leaveq': 'leave', 'iretq': 'iret',
+    'retq': 'ret', 'retf': 'retf', 'leaveq': 'leave', 'iretq': 'iret', 'iretd': 'iret',
     'callq': 'call', 'jmpq': 'jmp', 'pushq': 'push', 'popq': 'pop',
     'cltd': 'cdq', 'cqto': 'cqo', 'cwtl': 'cwde', 'cltq': 'cdqe',
     'movsxd': 'movsxd', 'movslq': 'movsxd',
@@ -257,6 +257,9 @@ def normalize_operand(op, target_base):
         if op.startswith(w) and re.match(r'^[-+\[0-9]|^$', op[len(w):]):
             op = op[len(w):]
             break
+    # NASM 3 marks an absolute address explicitly, "[abs 0x4000]", and adds the address
+    # size for a 64-bit one, "[abs qword 0x...]".
+    op = re.sub(r'\[abs(qword|dword)?(?=[-0-9])', '[', op)
     # NASM writes a RIP-relative address as its absolute target: "[rel 0x1234]".
     m = re.fullmatch(r'\[rel(-?(0x[0-9a-f]+|\d+))\]', op)
     if m and target_base is not None:
