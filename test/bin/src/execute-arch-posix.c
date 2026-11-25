@@ -17,11 +17,13 @@
 #define STDERR_BUF_SIZE 1024
 #define SPEC_BUF_SIZE 16384
 
-// Seconds a test may run before it is killed; emulated targets build the runner
-// with a larger value (-DTIMEOUT=...).
+// Seconds a test may run before it is killed. The default suits a native host.
+// Set V3_TEST_TIMEOUT in the environment to override it, e.g. when the tests run
+// under emulation, where they are many times slower.
 #ifndef TIMEOUT
 #define TIMEOUT 5
 #endif
+long test_timeout = TIMEOUT;
 
 typedef struct run {
   int num;
@@ -81,6 +83,8 @@ int main(int argc, char **argv) {
     printf("Usage: <exe_dir> <test1> ...\n");
     return 1;
   }
+  char *timeout = getenv("V3_TEST_TIMEOUT");
+  if (timeout != NULL && atol(timeout) > 0) test_timeout = atol(timeout);
   tests_total = argc - 2;
   tests_running = 1;
   pthread_create(&thread, NULL, &timeout_thread, NULL);
@@ -95,8 +99,11 @@ int main(int argc, char **argv) {
     end_test(&test, result);
   }
   tests_running = 0;
-
-  return tests_failed > 0 ? 1 : 0;
+  // Leave at once instead of returning from main. Under qemu's user-mode emulation
+  // the normal exit path of this (static, threaded) program crashes, and as process 1
+  // of a container that crash is ignored, so the runner would hang instead of exiting.
+  fflush(stdout);
+  _exit(tests_failed > 0 ? 1 : 0);
 }
 
 void begin_test(v3_test *test) {
@@ -412,7 +419,7 @@ long now_ms() {
 
 void begin_timeout(int pid) {
   pthread_mutex_lock(&timeout_lock);
-  test_deadline = now_ms() + TIMEOUT * 1000;
+  test_deadline = now_ms() + test_timeout * 1000;
   test_pid = pid;
   pthread_mutex_unlock(&timeout_lock);
 }
