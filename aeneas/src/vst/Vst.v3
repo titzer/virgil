@@ -5,7 +5,7 @@
 class VstModule {
 	def classes = Vector<VstClass>.new();
 	def components = Vector<VstComponent>.new();
-	def enums = Vector<VstEnum>.new();
+	def enums = Vector<VstClass>.new();
 	def exports = Vector<ExportDecl>.new();
 	def layouts = Vector<VstLayout>.new();
 	def packings = Vector<VstPacking>.new();
@@ -19,10 +19,11 @@ class VstModule {
 class VstFile extends ParsedFile {
 	def classes = Vector<VstClass>.new();
 	def components = Vector<VstComponent>.new();
-	def enums = Vector<VstEnum>.new();
+	def enums = Vector<VstClass>.new();
 	def exports = Vector<ExportDecl>.new();
 	def layouts = Vector<VstLayout>.new();
 	def packings = Vector<VstPacking>.new();
+	def extensions = Vector<VstExtension>.new();	// top-level def Foo.bar / def Comp.x extensions
 	var synthetic: VstComponent;	// declaration for synthesized component
 	var typeEnv: TypeEnv;
 
@@ -134,7 +135,7 @@ class VstCompound extends Decl {
 	def getParams() -> List<ParamDecl> {
 		return if(params != null, params.list);
 	}
-	def isEnum() -> bool { return VstEnum.?(this); }
+	def isEnum() -> bool { return VstClass.?(this) && VstClass.!(this).kind == Kind.ENUM; }
 	def isVariant() -> bool { return VstClass.?(this) && VstClass.!(this).kind == Kind.VARIANT; }
 	def isVariantCase() -> bool { return VstClass.?(this) && VstClass.!(this).variantCase != null; }
 
@@ -171,15 +172,31 @@ class VstClass extends VstCompound {
 	var hasDefaultCase: bool;
 	var minTag: int = -1;
 	var maxTag: int = -1;
+	// Open enum hierarchy fields (enums only; variants use {subclasses}, {minTag}, {maxTag}).
+	var qualifiers: List<Token>;			// dot-separated qualifier path, e.g. [E] for "enum E.More"
+	var subtypes: HashMap<string, VstClass>;	// direct subtype enums of this enum (filled by verifier)
+	var subtypeOrder: List<VstClass>;		// subtypes in reverse declaration order (complement to subtypes map)
+	var tagLo: int = -1;				// first DFS tag in enum subtype's range
+	var tagHi: int = -1;				// inclusive upper bound of enum DFS tag range
 	var syntheticDefault: VstClass;			// hidden "$default" case for types with no named cases
 	var invalidSuperclass: bool;			// superclass reference was rejected (cyclic or wrong kind) and is ignored
 	var variantCase: VstCaseMember;
+	var hasDefault: bool;				// true if enum has a "case _" (open enum)
+	var superParams: bool;				// if enum mentions 'super' params
+	var extraParams: VstList<ParamDecl>;		// enum subtype-only params (new fields beyond root's)
+	var parentEnum: VstClass;			// immediate parent in hierarchy (set by verifier)
 
 	new(isPrivate: bool, name: Token, typeParams: List<TypeParamType>, params: VstList<ParamDecl>,
 		superclass, superclause: SuperClause, members: List<VstMember>)
 		super(isPrivate, name, typeParams, params, superclause, members) { }
 	def hasDescriptor() -> bool {
 		return descriptorInfo != null && descriptorInfo.descriptorTypeRef != null;
+	}
+	def findDefaultCase() -> VstClass {
+		for (c in cases) {
+			if (Strings.equal(c.name(), "_")) return c.decl;
+		}
+		return null;
 	}
 }
 
@@ -189,28 +206,6 @@ class VstComponent extends VstCompound {
 	def isThread: bool;
 	var recordIndex: int;
 	new(isPrivate: bool, isThread, importName, name: Token, members: List<VstMember>) super(isPrivate, name, null, null, null, members) { }
-}
-// Parsed "enum X { ... }"
-class VstEnum extends VstCompound {
-	def cases: Array<VstEnumCase>;
-	def tagType = V3.getTagType(cases.length);
-
-	new(isPrivate: bool, name: Token, params: VstList<ParamDecl>, cases, members: List<VstMember>)
-		super(isPrivate, name, null, params, null, members) {
-		// XXX: move type creation somewhere else?
-		typeCon = TypeCon.new(token.image, Kind.ENUM, 0, TypeUtil.globalCache);
-		var enumType = EnumType.new(typeCon.uid, this, typeCon);
-		typeCon.singleton = enumType;
-		typeCon = typeCon;
-		if (cases.length <= Int.MAX_WIDTH) {
-			var setName = Strings.builderOf(token.image).puts(".set").toString();
-			var typeCon = TypeCon.new(setName, Kind.ENUM_SET, 0, TypeUtil.globalCache);
-			var count = if(cases.length == 0, 1, cases.length);
-			var repType = Int.getType(false, count);
-			var enumSetType = EnumSetType.new(typeCon.uid, this, repType, typeCon);
-			enumType.setType = typeCon.singleton = enumSetType;
-		}
-	}
 }
 // Parsed "layout L { ... }"
 class VstLayout extends VstCompound {
@@ -232,16 +227,6 @@ class VstPacking extends VstCompound {
 	new(name: Token, pparams, expr, size) super(false, name, null, null, null, null) {}
 }
 
-// Member of an enum.
-class VstEnumCase extends VstMember {
-	def caseNum: int;
-	def tag = caseNum;
-	def args: VstList<Expr>;
-	new(caseNum, name: Token, args) super(false, name) { }
-	def getType() -> Type {
-		return receiver.getDeclaredType();
-	}
-}
 // Member of a layout
 class VstLayoutField extends VstMember {
 	def offset: Literal;
@@ -275,15 +260,15 @@ class VariantDesugaring(isPrivate: bool, outer: VstIdent<TypeParamType>, params:
 		var nameToken = Token.new(fileName, "name", line, col);
 		var list: List<VstMember>;
 		if (params == null) {
-			list = List.new(VstVariantTagMember.new(tagToken), list);
-			list = List.new(VstVariantNameMember.new(nameToken), list);
+			list = List.new(VstTagMember.new(tagToken), list);
+			list = List.new(VstNameMember.new(nameToken), list);
 		}
 		return list;
 	}
 	def synthesizeTopLevelClass(members: List<VstMember>) -> VstClass {
 		var decl = VstClass.new(isPrivate, outer.name, outer.list(), params, parent, null, members);
 		if (params != null) {
-			var vc = VstCaseMember.new(0, outer.name, decl);
+			var vc = VstCaseMember.new(0, outer.name, decl, null);
 			cases.put(vc);
 			decl.variantCase = vc;
 		}
@@ -302,10 +287,60 @@ class VariantDesugaring(isPrivate: bool, outer: VstIdent<TypeParamType>, params:
 		var buf = StringBuilder.new().puts(superclass.name.image);
 		buf.putc('.');
 		synthetic.fullName = buf.puts(id.name.image).toString();
-		var c = VstCaseMember.new(caseNum, id.name, synthetic);
+		var c = VstCaseMember.new(caseNum, id.name, synthetic, null);
 		cases.put(c);
 		synthetic.variantCase = c;
 		return c;
+	}
+}
+// A helper class for desugaring enums into VstClasses.
+class EnumDesugaring(isPrivate: bool, id: VstIdent<void>, params: VstList<ParamDecl>) {
+	var cases = Vector<VstCaseMember>.new();
+	var hasDefault = false;
+	def synthesizeMembers(fileName: string, line: int, col: int) -> List<VstMember> {
+		var tagToken = Token.new(fileName, "tag", line, col);
+		var nameToken = Token.new(fileName, "name", line, col);
+		var shortNameToken = Token.new(fileName, "shortName", line, col);
+		var list: List<VstMember>;
+		list = List.new(VstTagMember.new(tagToken), list);
+		list = List.new(VstNameMember.new(nameToken), list);
+		// An enum may already have a field named shortName; keep that one.
+		if (!declaresParam("shortName")) list = List.new(VstShortNameMember.new(shortNameToken), list);
+		return list;
+	}
+	private def declaresParam(name: string) -> bool {
+		if (params == null) return false;
+		for (l = params.list; l != null; l = l.tail) {
+			if (Strings.equal(l.head.token.image, name)) return true;
+		}
+		return false;
+	}
+	def synthesizeTopLevelClass(members: List<VstMember>) -> VstClass {
+		var decl = VstClass.new(isPrivate, id.name, null, params, null, null, members);
+		decl.kind = Kind.ENUM;
+		decl.cases = cases.extract();
+		decl.hasDefault = hasDefault;
+		return decl;
+	}
+	def synthesizeEnumCaseMember(name: Token, args: VstList<Expr>, members: List<VstMember>) -> VstCaseMember {
+		var tag = cases.length;
+		var isDefault = Strings.equal(name.image, "_");
+		var synthetic: VstClass;
+		if (!isDefault) {
+			synthetic = VstClass.new(false, name, null, null, null, null, members);
+			synthetic.kind = Kind.ENUM;
+			synthetic.isSynthetic = true;
+			var buf = StringBuilder.new().puts(id.name.image);
+			buf.putc('.');
+			synthetic.fullName = buf.puts(name.image).toString();
+		}
+		var c = VstCaseMember.new(tag, name, synthetic, args);
+		c.members = members;
+		return c;
+	}
+	def addCase(c: VstCaseMember) {
+		if (Strings.equal(c.name(), "_")) hasDefault = true;
+		cases.put(c);
 	}
 }
 
@@ -317,6 +352,8 @@ class VstMember extends Decl {
 	var index: int;
 	var repHints: List<VstRepHint>;
 	var initEnv: MethodEnv;
+	var declarationFile: VstFile;	// non-null for extension members; gates file-scoped private access
+	var privateAlts: List<VstMember>;	// private extensions of the same name on the target from other files
 
 	new(isPrivate, name: Token) super(name) { }
 
@@ -326,34 +363,49 @@ class VstMember extends Decl {
 		return buf.puts(token.image);
 	}
 }
-// Desugared case member from a variant.
+// Desugared case member from a variant/enum.
 class VstCaseMember extends VstMember {
-	def caseNum: int;
+	def caseNum: int;			// local parse-order index (for covered[] array in match)
 	def tag = caseNum;
 	def decl: VstClass;
+	def args: VstList<Expr>;	// for enums
+	var enumTag: int;			// runtime tag; initialized to caseNum, may be reassigned by DFS
+	var members: List<VstMember>;	// per-case method overrides
 
-	new(caseNum, name: Token, decl) super(false, name) { }
+	new(caseNum, name: Token, decl, args) super(false, name) {
+		enumTag = caseNum;
+	}
 
+	def runtimeTag() -> int {
+		if (decl != null && decl.isVariant()) return decl.minTag;
+		return enumTag;
+	}
 	def getType() -> Type {
-		return if(decl == null, receiver.declType, decl.declType);
+		if (decl == null) return receiver.declType;
+		if (decl.isEnum() && decl.isSynthetic) return receiver.declType;
+		return decl.declType;
 	}
 	def isDefaultCase() -> bool {
 		return Strings.equal("_", name());
 	}
 }
-// Synthesized .tag member from a variant.
-class VstVariantTagMember extends VstMember {
+// Synthesized .tag member from a variant/enum.
+class VstTagMember extends VstMember {
 	new(name: Token) super(false, name) { }
 	def getType() -> Type {
 		match (receiver) {
 			x: VstClass => return x.tagType;
-			x: VstEnum => return x.tagType;
 			_ => return null;
 		}
 	}
 }
-// Synthesized .name member from a variant.
-class VstVariantNameMember extends VstMember {
+// Synthesized .name member from a variant/enum.
+class VstNameMember extends VstMember {
+	new(name: Token) super(false, name) { }
+	def getType() -> Type { return V3.stringType; }
+}
+// Synthesized .shortName member from an enum.
+class VstShortNameMember extends VstMember {
 	new(name: Token) super(false, name) { }
 	def getType() -> Type { return V3.stringType; }
 }
@@ -465,6 +517,19 @@ class SuperClause {
 	def args: TupleExpr;
 	var constructor: VstNew;
 	new(point, args) { }
+}
+
+// A top-level extension declaration: "def Target<T>.member(...)" or "def Target.field: T = init;".
+// The target path may contain multiple dot-separated qualifiers (e.g. "E.More" for an enum subtype).
+// The verifier resolves the target compound and attaches the member as if it had been declared inside.
+class VstExtension(
+	isPrivate: bool,
+	targetPath: List<Token>,			// dotted target name, e.g. [E, More] for "E.More.bar"
+	targetTypeParams: List<VstList<TypeParamType>>,	// fresh type params per qualifier (parallel to targetPath)
+	member: VstMember,				// VstMethod or VstField
+	file: VstFile					// the file in which this extension was declared
+) {
+	var targetCompound: VstCompound;		// resolved by verifier in attachExtensions
 }
 
 type VstRepHint {
@@ -743,6 +808,7 @@ class MatchPattern(expr: Expr, params: VstList<VarDecl>) {
 	var vdecl: VarDecl;			// if this is a type case (including variant subtype patterns)
 	var isDefault: bool;			// true for "_" and "id: _" patterns
 	var val: Val;
+	var subtypeEnumType: Type;  // set when pattern names a subtype enum (e.g. E1.More)
 	def decl() -> VstClass { return variantCase.decl; }
 }
 // continue;
@@ -995,7 +1061,7 @@ type VarBinding {
 	case ComponentMethod(member: VstMethod, typeArgs: TypeArgs);
 	case VariantCase(receiver: Type, member: VstCaseMember);
 	case VariantField(receiver: Type, member: VstField);	// writable if unboxed
-	case EnumConst(member: VstEnumCase);
+	case EnumConst(member: VstCaseMember);
 	case Inst(op: Operator, facts: Fact.set);		// instantiate {op}
 	case Apply(op: Operator, facts: Fact.set);		// apply {op} to receiver
 	case Partial(op: Operator, facts: Fact.set);		// partially apply {op} to receiver
@@ -1086,10 +1152,11 @@ type VstOperator {
 	case FloatFraction;	// desugared to (u23|u52).!(u32|u64.view(float|double))
 
 	case VariantGetName;	// desugared to ArrayGetElem(#names, VariantGetTag(x))
+	case VariantGetShortName;	// desugared to ArrayGetElem(#shortNames, VariantGetTag(x))
 
 	case EnumGetParam(field: VstField);	// desugared to ArrayGetElem(#field, x)
 
-	case EnumSetHas(vcase: VstEnumCase);	// desugared to (1 << k) & x != 0
+	case EnumSetHas(vcase: VstCaseMember);	// desugared to (1 << k) & x != 0
 	case EnumSetUnion;			// desugared to x | y
 	case EnumSetIntersect;			// desugared to x & y
 	case EnumSetSubtract;			// desugared to x & ~(x & y)
