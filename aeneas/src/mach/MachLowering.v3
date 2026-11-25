@@ -289,8 +289,14 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 	}
 	var maybeDead: List<SsaInstr>;
+	var barriers: Array<IrSpec>;		// the runtime's write barriers by WriteBarrierKind, if any
+	var barrierActive: bool;		// whether the current method gets barriers
+	def barrierCalls = Vector<(SsaApplyOp, IrSpec)>.new();
 	def doMethod(method: IrMethod) {
 		context.enterMethod(method);
+		// The barriers' own components are not instrumented, so a barrier cannot recurse.
+		barrierActive = barriers != null;
+		if (barriers != null) for (b in barriers) if (b != null && method.receiver == b.receiver) barrierActive = false;
 		var graph = method.ssa;
 		if (graph == null) return;
 		reset(graph);
@@ -1589,7 +1595,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		for (i = 0; i < inputs.length; (i = i + stride, offset = offset + scale)) {
 			// generate unchecked pointer stores to initialize the array
 			// XXX: cache type normalization across calls to this method
-			genNormTypedStores(Fact.O_NO_NULL_CHECK, true, machType, narr, offset, inputs, i);
+			genNormTypedStores(narr, Fact.O_NO_NULL_CHECK, true, machType, narr, offset, inputs, i);
 		}
 		return narr;
 	}
@@ -1603,7 +1609,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 				var inputs = normRefN(val);
 				var offset = arrayRep.headerSize + arrayRep.offsets[j] + i * arrayRep.elemScale;
 				// XXX: cache type normalization across calls to this method
-				genNormTypedStores(Fact.O_NO_NULL_CHECK, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
+				genNormTypedStores(narr, Fact.O_NO_NULL_CHECK, true, arrayRep.elemTypes[j], narr, offset, inputs, 0);
 			}
 		}
 		return narr;
@@ -1629,7 +1635,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var offset = genArrayElemOffset(arrayRep.getElemElemOffset(elem), arrayRep.elemScale, nindex);
 		// XXX: fold null check into pointer access if no bounds check
 		var machType = mach.machType(arrayRep.getElemElemType(arrayType, elem));
-		genNormTypedStores(nullity, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
+		genNormTypedStores(narr, nullity, false, machType, ptrAdd(narr, offset), 0, inputs, 2);
 		i_old.kill();
 		i_old.remove();
 	}
@@ -1658,7 +1664,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var offset = genArrayElemOffset(if(arrayRep.offsets != null, arrayRep.offsets[elem], 0), arrayRep.elemScale, nindex);
 		var pos = ptrAdd(ptrAdd(narr, rangeStart), offset);
 		var machType = mach.machType(arrayRep.getElemElemType(rangeType, elem));
-		genNormTypedStores(Fact.O_NO_NULL_CHECK, false, machType, pos, 0, inputs, 3);
+		genNormTypedStores(narr, Fact.O_NO_NULL_CHECK, false, machType, pos, 0, inputs, 3);
 		i_old.kill();
 		i_old.remove();
 	}
@@ -1847,7 +1853,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 			var f = ic.fields[i];
 			var machType = mach.machType(f.fieldType);
 			var tn = normIntType(machType);
-			genNormTypedStores(Fact.O_NO_NULL_CHECK, true, machType, i_new, f.machOffset, ai_inputs, start);
+			genNormTypedStores(i_new, Fact.O_NO_NULL_CHECK, true, machType, i_new, f.machOffset, ai_inputs, start);
 			start += if(tn != null, tn.size, 1);
 		}
 		return map1(i_old, i_new);
@@ -1891,7 +1897,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var offset = getClassFieldOffset(fieldRef);
 		var machType = mach.machType(fieldRef.getFieldType());
 		var nullity = compiler.nullity(i_old, nobj);
-		genNormTypedStores(nullity, init, machType, nobj, offset, inputs, 1);
+		genNormTypedStores(nobj, nullity, init, machType, nobj, offset, inputs, 1);
 		i_old.kill();
 		i_old.remove();
 	}
@@ -1944,7 +1950,7 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		var inputs = normRefs(i_old.inputs);
 		var machType = mach.machType(fieldRef.getFieldType());
 		var ptr = componentFieldPtr(fieldRef);
-		genNormTypedStores(Fact.O_NO_NULL_CHECK, false, machType, ptr, 0, inputs, 1);
+		genNormTypedStores(null, Fact.O_NO_NULL_CHECK, false, machType, ptr, 0, inputs, 1);
 		i_old.kill();
 		i_old.remove();
 	}
@@ -2233,21 +2239,55 @@ class MachLowering(mach: MachProgram, compiler: Compiler, config: MachLoweringCo
 		}
 		return loads;
 	}
-	def genNormTypedStores(nullity: Fact.set, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
+	// Store {vals} at {base + offset}, which is inside heap object {obj} (or {null} if not in the heap).
+	def genNormTypedStores(obj: SsaInstr, nullity: Fact.set, init: bool, machType: Type, base: SsaInstr, offset: int, vals: Array<SsaInstr>, start: int) {
 		var tn = normIntType(machType), nullCheck = !nullity.O_NO_NULL_CHECK;
-		if (tn == null) {
-			var val = vals[start];
-			if (nullCheck) ptrStoreT(machType, base, offset, val);
-			else if (isNonTrivialStore(init, val)) ptrStore(machType, base, offset, val);
-			return;
-		}
-		var check = if(nullCheck, 0, -1);
+		if (tn == null) return genStore(obj, nullCheck, init, machType, base, offset, vals[start]);
 		for (i < tn.size) {
-			var et = tn.sub[i], val = vals[start + i];
-			if (i == check) ptrStoreT(et, base, offset, val);
-			else if (isNonTrivialStore(init, val)) ptrStore(et, base, offset, val);
+			var et = tn.sub[i];
+			genStore(obj, nullCheck && i == 0, init, et, base, offset, vals[start + i]);
 			offset = offset + mach.sizeOf(et);
 		}
+	}
+	// Store {val} at {base + offset}, trapping on null if {check}, with any write barriers for a reference.
+	def genStore(obj: SsaInstr, check: bool, init: bool, t: Type, base: SsaInstr, offset: int, val: SsaInstr) {
+		if (!check && !isNonTrivialStore(init, val)) return;
+		if (!barrierActive || obj == null || !mach.isRefType(t)) {
+			if (check) ptrStoreT(t, base, offset, val);
+			else ptrStore(t, base, offset, val);
+			return;
+		}
+		var before = barriers[WriteBarrierKind.BEFORE.tag];
+		var after = barriers[WriteBarrierKind.AFTER.tag];
+		var replace = barriers[WriteBarrierKind.REPLACE.tag];
+		// A barrier that replaces the store needs an explicit null check; a before barrier handles null itself.
+		if (check && replace != null) {
+			genNullCheck0(obj);
+			check = false;
+		}
+		if (ssa.end()) return;
+		var slot = ptrAddAs(mach.data.ptrType, base, context.graph.intConst(offset));
+		if (before != null) genWriteBarrier(before, obj, slot, val);
+		if (replace != null) genWriteBarrier(replace, obj, slot, val);
+		else if (check) ptrStoreT(t, base, offset, val);
+		else ptrStore(t, base, offset, val);
+		if (after != null) genWriteBarrier(after, obj, slot, val);
+	}
+	// Call write barrier {spec} with (object, slot, value), to be inlined later if it is #inline.
+	def genWriteBarrier(spec: IrSpec, obj: SsaInstr, slot: SsaInstr, val: SsaInstr) {
+		var funcRep = mach.funcRep(spec);
+		var func = context.graph.valConst(funcRep.machType, getCodeAddress(spec));
+		var receiver = context.graph.nullConst(funcRep.paramTypes[0]);
+		var call = apply(V3Op.newCallAddress(funcRep), [func, receiver, obj, slot, val]);
+		if (spec.asMethod().flags.M_INLINE) barrierCalls.put((SsaApplyOp.!(call), spec));
+	}
+	// Inline the barrier calls made while lowering the current method.
+	def inlineWriteBarriers() {
+		for (i < barrierCalls.length) {
+			var t = barrierCalls[i];
+			SsaInliner.new(context, t.0, t.1).inline();
+		}
+		barrierCalls.length = 0;
 	}
 	def isNonTrivialStore(init: bool, v: SsaInstr) -> bool {
 		if (init) {
